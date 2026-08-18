@@ -1,0 +1,1245 @@
+{
+  "data": [
+    {
+      "hostId": "9C05D651C70F0000000007F029BD00000000085B1BBA0000000065D3A543:163644042",
+      "hostName": "H.WOOD DLH LA - NVR.100.001",
+      "devices": [
+        {
+          "id": "6643a84e019c2d03e4000415",
+          "mac": "44D9E794D07E",
+          "name": "CAM.115 (PP.13:18)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.115",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:20:27Z",
+          "adoptionTime": "2024-05-14T20:30:01Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84f00ae2d03e4000428",
+          "mac": "D021F992C5AB",
+          "name": "CAM.103 (PP.03:10)",
+          "model": "G4 Pro",
+          "shortname": "UVC G4 Pro",
+          "ip": "10.0.14.103",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S5L.v5.3.95.67.148b9a3.260612.0521",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:54Z",
+          "adoptionTime": "2024-05-14T18:46:26Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "37780143-f874-4b07-bad7-d350982ee79a",
+            "id": "fc65bd1c-f4d3-4c81-a29e-708e184cf2a8",
+            "images": {
+              "default": "cd661048a838bc1ff60222a6a68cdb3f",
+              "nopadding": "89a4a559e7cb92a9906023f8d78e519f",
+              "topology": "fb701075b3df41f1ee0d20b1e97ff554"
+            }
+          }
+        },
+        {
+          "id": "6643a84f020d2d03e400042e",
+          "mac": "F4E2C60BA003",
+          "name": "CAM.136 (PP.03:23)",
+          "model": "G4 Bullet",
+          "shortname": "UVC G4 Bullet",
+          "ip": "10.0.14.136",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S5L.v5.3.95.67.148b9a3.260612.0521",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:56:20Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "f7d8d4e4-243c-45c0-996d-9d6244cde198",
+            "id": "137d6537-f2d8-413b-8eb7-565abbb69498",
+            "images": {
+              "default": "9ccac6e35c09355b0675eb7dfbb48775",
+              "nopadding": "11155838b1baa04f3aa2864613795dca",
+              "topology": "3cbbecec6b719a2664ee7689946d4af5"
+            }
+          }
+        },
+        {
+          "id": "664d310d02583503e4251ab6",
+          "mac": "F4E2C67A3163",
+          "name": "CAM.104",
+          "model": "AI 360",
+          "shortname": "UVC AI 360",
+          "ip": "10.0.14.104",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.CV2X.v5.3.95.67.148b9a3.260612.0652",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:56:34Z",
+          "adoptionTime": "2024-05-21T23:42:02Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "19294b80-0922-4a83-b5c5-1022ca22764a",
+            "id": "14612913-3fb1-4524-97f9-edc40085d1fe",
+            "images": {
+              "default": "28ca921e3d1ea43b9d6bf8fa825c6ab6",
+              "nopadding": "4a44ede88c72506cbd8c518cd49825be",
+              "topology": "ae619f12d7a41268db572298cc52d61e"
+            }
+          }
+        },
+        {
+          "id": "6643a84e03022d03e4000420",
+          "mac": "7483C2CF55F7",
+          "name": "CAM.123 (PP.03:06)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.123",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:21:59Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84e03472d03e4000425",
+          "mac": "D021F992C6CD",
+          "name": "CAM.112 (G3) (PP.02:08)",
+          "model": "G4 Pro",
+          "shortname": "UVC G4 Pro",
+          "ip": "10.0.14.112",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S5L.v5.3.95.67.148b9a3.260612.0521",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:34Z",
+          "adoptionTime": "2024-05-14T19:45:42Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "37780143-f874-4b07-bad7-d350982ee79a",
+            "id": "fc65bd1c-f4d3-4c81-a29e-708e184cf2a8",
+            "images": {
+              "default": "cd661048a838bc1ff60222a6a68cdb3f",
+              "nopadding": "89a4a559e7cb92a9906023f8d78e519f",
+              "topology": "fb701075b3df41f1ee0d20b1e97ff554"
+            }
+          }
+        },
+        {
+          "id": "682e29fb007a4803e434f32c",
+          "mac": "847848064CD3",
+          "name": "DOOR.100.003-KITCHEN BOH",
+          "model": "UA G3 Pro B",
+          "shortname": "UA G3 Pro",
+          "ip": "10.0.14.142",
+          "productLine": "access",
+          "status": "online",
+          "version": "1.14.22.0",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-30T17:29:13Z",
+          "adoptionTime": "2025-08-14T16:05:10Z",
+          "note": "",
+          "uidb": {
+            "guid": "70da7cc6-e3f6-2e14-ceeb-b68e2e74bf77",
+            "iconId": "06dab714-6249-10d4-303b-d4dd7a925d69",
+            "id": "9a6fb05e-e3da-8404-ed03-8c84879d0347",
+            "images": {
+              "default": "53f97d5f0b56ceff5f7b9e595ddeac4e",
+              "nopadding": "ad72c5046ac24ab04321554a16f2cf3c",
+              "topology": "7a9d28862f6f77f2e2b5ba1a7671d959"
+            }
+          }
+        },
+        {
+          "id": "6643a84f02282d03e4000430",
+          "mac": "F4E2C60D90A3",
+          "name": "CAM.119 (PP.03:20)",
+          "model": "G5 Dome",
+          "shortname": "UVC G5 Dome",
+          "ip": "10.0.14.119",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.SAV530q.v5.3.95.67.148b9a3.260612.0645",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:38Z",
+          "adoptionTime": "2024-05-14T22:10:52Z",
+          "note": "",
+          "uidb": {
+            "guid": "982a69fe-5163-408d-8285-5d13a302b1c1",
+            "iconId": "4ea46db7-8408-4100-9e70-d76bad57b8d4",
+            "id": "9185f35a-f2c5-4ad4-987e-a9528ddb3494",
+            "images": {
+              "default": "73031b2b0f8215524fbf8a67869cd086",
+              "nopadding": "1d0ae2b338a82f05c4fcabbe60b93eed",
+              "topology": "c969ca263d414ea10207b70f875a1353"
+            }
+          }
+        },
+        {
+          "id": "6643a84f00c92d03e400042a",
+          "mac": "F4E2C60D90DB",
+          "name": "CAM.129",
+          "model": "G5 Dome",
+          "shortname": "UVC G5 Dome",
+          "ip": "10.0.14.129",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.SAV530q.v5.3.95.67.148b9a3.260612.0645",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:38Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": "982a69fe-5163-408d-8285-5d13a302b1c1",
+            "iconId": "4ea46db7-8408-4100-9e70-d76bad57b8d4",
+            "id": "9185f35a-f2c5-4ad4-987e-a9528ddb3494",
+            "images": {
+              "default": "73031b2b0f8215524fbf8a67869cd086",
+              "nopadding": "1d0ae2b338a82f05c4fcabbe60b93eed",
+              "topology": "c969ca263d414ea10207b70f875a1353"
+            }
+          }
+        },
+        {
+          "id": "6643a84e02af2d03e400041b",
+          "mac": "74ACB9011E1A",
+          "name": "CAM.105",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.105",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:18:37Z",
+          "adoptionTime": "2024-05-14T18:57:01Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "682e29ed01744803e434f07f",
+          "mac": "847848064927",
+          "name": "DOOR.100.002-OFFICE",
+          "model": "UA G3 Pro B",
+          "shortname": "UA G3 Pro",
+          "ip": "10.0.14.140",
+          "productLine": "access",
+          "status": "online",
+          "version": "1.14.22.0",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-30T17:28:56Z",
+          "adoptionTime": "2025-08-14T16:02:30Z",
+          "note": "",
+          "uidb": {
+            "guid": "70da7cc6-e3f6-2e14-ceeb-b68e2e74bf77",
+            "iconId": "06dab714-6249-10d4-303b-d4dd7a925d69",
+            "id": "9a6fb05e-e3da-8404-ed03-8c84879d0347",
+            "images": {
+              "default": "53f97d5f0b56ceff5f7b9e595ddeac4e",
+              "nopadding": "ad72c5046ac24ab04321554a16f2cf3c",
+              "topology": "7a9d28862f6f77f2e2b5ba1a7671d959"
+            }
+          }
+        },
+        {
+          "id": "6643a84e01ca2d03e4000416",
+          "mac": "44D9E794DDC7",
+          "name": "CAM.130 (PP.03:21)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.130",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:24:42Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84e026c2d03e400041a",
+          "mac": "802AA84E2C2B",
+          "name": "CAM.116 (PP.03:04)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.116",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:20:26Z",
+          "adoptionTime": "2024-05-14T20:46:16Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84f00bd2d03e4000429",
+          "mac": "F4E2C60D911E",
+          "name": "CAM.121 (PP.13:18)",
+          "model": "G5 Dome",
+          "shortname": "UVC G5 Dome",
+          "ip": "10.0.14.121",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.SAV530q.v5.3.95.67.148b9a3.260612.0645",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:36Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": "982a69fe-5163-408d-8285-5d13a302b1c1",
+            "iconId": "4ea46db7-8408-4100-9e70-d76bad57b8d4",
+            "id": "9185f35a-f2c5-4ad4-987e-a9528ddb3494",
+            "images": {
+              "default": "73031b2b0f8215524fbf8a67869cd086",
+              "nopadding": "1d0ae2b338a82f05c4fcabbe60b93eed",
+              "topology": "c969ca263d414ea10207b70f875a1353"
+            }
+          }
+        },
+        {
+          "id": "6643a84e015f2d03e4000410",
+          "mac": "74ACB901CDAD",
+          "name": "CAM.107",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.107",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:18:31Z",
+          "adoptionTime": "2024-05-14T19:09:50Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84f02352d03e4000431",
+          "mac": "F4E2C60D9135",
+          "name": "CAM.102",
+          "model": "G5 Dome",
+          "shortname": "UVC G5 Dome",
+          "ip": "10.0.14.102",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.SAV530q.v5.3.95.67.148b9a3.260612.0645",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:35Z",
+          "adoptionTime": "2024-05-14T18:41:11Z",
+          "note": "",
+          "uidb": {
+            "guid": "982a69fe-5163-408d-8285-5d13a302b1c1",
+            "iconId": "4ea46db7-8408-4100-9e70-d76bad57b8d4",
+            "id": "9185f35a-f2c5-4ad4-987e-a9528ddb3494",
+            "images": {
+              "default": "73031b2b0f8215524fbf8a67869cd086",
+              "nopadding": "1d0ae2b338a82f05c4fcabbe60b93eed",
+              "topology": "c969ca263d414ea10207b70f875a1353"
+            }
+          }
+        },
+        {
+          "id": "6758d53200fcd603e41c3d6e",
+          "mac": "28704E190077",
+          "name": "CAM.138",
+          "model": "G5 Turret Ultra",
+          "shortname": "UVC G5 Turret Ultra",
+          "ip": "10.0.14.148",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.SAV530q.v5.3.95.67.148b9a3.260612.0645",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:41Z",
+          "adoptionTime": "2024-12-10T23:57:51Z",
+          "note": "",
+          "uidb": {
+            "guid": "d3784320-1c25-43d1-b7a0-5b640bf2adff",
+            "iconId": "0a05724b-3c4c-41cd-852a-595b4770847c",
+            "id": "127e181e-8e08-4f85-9f9c-84d2c7285f40",
+            "images": {
+              "default": "aa26f84044f300f3a0ace571d4d81639",
+              "nopadding": "77147d037bd99fe3ab35265aeb7a4512",
+              "topology": "86e181a61833e6bafbc09d020eea84ab"
+            }
+          }
+        },
+        {
+          "id": "6847631700351403e4bf0a6a",
+          "mac": "84784806E7D3",
+          "name": "DOOR.100.001-PARKING DOOR",
+          "model": "UA G3 Pro W",
+          "shortname": "UA G3 Pro",
+          "ip": "10.0.14.146",
+          "productLine": "access",
+          "status": "online",
+          "version": "1.14.22.0",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-30T17:28:32Z",
+          "adoptionTime": "2025-08-14T16:00:01Z",
+          "note": "",
+          "uidb": {
+            "guid": "3ea175ec-b901-25d4-c0c3-e21573850acd",
+            "iconId": "ac16b78a-d211-d0b4-cbcb-971eb39fb960",
+            "id": "6e1f6943-5616-0194-ce43-367d33212042",
+            "images": {
+              "default": "6d29945526ad7239eb935e4a6b9a0563",
+              "nopadding": "85cc6421fbd5e471e8e045cbea8ad8e8",
+              "topology": "027b512138f9d75f7c4c7514655000d1"
+            }
+          }
+        },
+        {
+          "id": "6643a84e01442d03e400040f",
+          "mac": "44D9E794DD7B",
+          "name": "CAM.118 (G6) (PP.03:22)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.118",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:20:18Z",
+          "adoptionTime": "2024-05-14T21:39:18Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84e012a2d03e400040d",
+          "mac": "74ACB90103DB",
+          "name": "CAM.113 (G4) (PP.02:13)",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.113",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:20:52Z",
+          "adoptionTime": "2024-05-14T19:56:28Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84f01f32d03e400042c",
+          "mac": "F4E2C60D90B4",
+          "name": "CAM.131 (GLIMPSE 5)",
+          "model": "G5 Dome",
+          "shortname": "UVC G5 Dome",
+          "ip": "10.0.14.131",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.SAV530q.v5.3.95.67.148b9a3.260612.0645",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:42Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": "982a69fe-5163-408d-8285-5d13a302b1c1",
+            "iconId": "4ea46db7-8408-4100-9e70-d76bad57b8d4",
+            "id": "9185f35a-f2c5-4ad4-987e-a9528ddb3494",
+            "images": {
+              "default": "73031b2b0f8215524fbf8a67869cd086",
+              "nopadding": "1d0ae2b338a82f05c4fcabbe60b93eed",
+              "topology": "c969ca263d414ea10207b70f875a1353"
+            }
+          }
+        },
+        {
+          "id": "9C05D651C70F",
+          "mac": "9C05D651C70F",
+          "name": "H.WOOD DLH LA - NVR.100.001",
+          "model": "UNVR Pro",
+          "shortname": "UNVRPRO",
+          "ip": "10.0.14.10",
+          "productLine": "protect",
+          "status": "online",
+          "version": "5.0.16",
+          "firmwareStatus": "updateAvailable",
+          "updateAvailable": "5.1.25+84c48e7",
+          "isConsole": true,
+          "isManaged": true,
+          "startupTime": "2026-07-31T23:56:09Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": "10b3fc63-28eb-4f7e-b8de-7579cd609cf5",
+            "iconId": "3c1a4721-cf28-43d9-9cd6-b612622b7788",
+            "id": "73a1d73d-f16f-4c19-9c13-8a62bb2da9d6",
+            "images": {
+              "default": "7478abf0ea9850c0100338b0cd59fc80",
+              "nopadding": "1b2f455e430a6cdcabd35600978b9644",
+              "topology": "f34deae78967532c788e68ba4f7782b7"
+            }
+          }
+        },
+        {
+          "id": "6643a84e03102d03e4000421",
+          "mac": "B4FBE47E90C7",
+          "name": "CAM.122",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.122",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:21:57Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84e02402d03e4000419",
+          "mac": "802AA84E2E4E",
+          "name": "CAM.126 (PP.03:11)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.126",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:22:03Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84f00a02d03e4000427",
+          "mac": "F4E2C60D90BB",
+          "name": "CAM.120 (PP.03:09)",
+          "model": "G5 Dome",
+          "shortname": "UVC G5 Dome",
+          "ip": "10.0.14.120",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.SAV530q.v5.3.95.67.148b9a3.260612.0645",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:39Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": "982a69fe-5163-408d-8285-5d13a302b1c1",
+            "iconId": "4ea46db7-8408-4100-9e70-d76bad57b8d4",
+            "id": "9185f35a-f2c5-4ad4-987e-a9528ddb3494",
+            "images": {
+              "default": "73031b2b0f8215524fbf8a67869cd086",
+              "nopadding": "1d0ae2b338a82f05c4fcabbe60b93eed",
+              "topology": "c969ca263d414ea10207b70f875a1353"
+            }
+          }
+        },
+        {
+          "id": "6643a84e01382d03e400040e",
+          "mac": "74ACB901CE09",
+          "name": "CAM.109",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.109",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:18:24Z",
+          "adoptionTime": "2024-05-14T19:28:17Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84e02d82d03e400041d",
+          "mac": "44D9E794DE47",
+          "name": "CAM.124 (PP.03:20)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.124",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:22:02Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84e032b2d03e4000423",
+          "mac": "74ACB901CDB0",
+          "name": "CAM.108",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.108",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:18:29Z",
+          "adoptionTime": "2024-05-14T19:15:30Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84e01162d03e400040c",
+          "mac": "B4FBE47E8C54",
+          "name": "CAM.137",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.137",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:25:49Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84e01912d03e4000414",
+          "mac": "B4FBE47F5CBB",
+          "name": "CAM.135",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.135",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:25:18Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84e02c52d03e400041c",
+          "mac": "74ACB9011E9D",
+          "name": "CAM.117",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.117",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:20:24Z",
+          "adoptionTime": "2024-05-14T20:58:13Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84e02e62d03e400041e",
+          "mac": "802AA84E2CAE",
+          "name": "CAM.128 (PP.03:24)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.128",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:22:01Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84e01f32d03e4000417",
+          "mac": "44D9E794DD67",
+          "name": "CAM.134",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.134",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:25:21Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84f01ff2d03e400042d",
+          "mac": "D021F9917778",
+          "name": "CAM.110 (G1) (PP.02:11)",
+          "model": "G4 Bullet",
+          "shortname": "UVC G4 Bullet",
+          "ip": "10.0.14.110",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S5L.v5.3.95.67.148b9a3.260612.0521",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:56:25Z",
+          "adoptionTime": "2024-05-14T19:29:42Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "f7d8d4e4-243c-45c0-996d-9d6244cde198",
+            "id": "137d6537-f2d8-413b-8eb7-565abbb69498",
+            "images": {
+              "default": "9ccac6e35c09355b0675eb7dfbb48775",
+              "nopadding": "11155838b1baa04f3aa2864613795dca",
+              "topology": "3cbbecec6b719a2664ee7689946d4af5"
+            }
+          }
+        },
+        {
+          "id": "6643a84e031d2d03e4000422",
+          "mac": "74ACB9011E24",
+          "name": "CAM.133",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.133",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:25:21Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6643a84e01772d03e4000412",
+          "mac": "74ACB901CD11",
+          "name": "CAM.106",
+          "model": "G3 Bullet",
+          "shortname": "UVC G3",
+          "ip": "10.0.14.106",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:18:35Z",
+          "adoptionTime": "2024-05-14T19:00:08Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fd65593a-2cbe-456c-ab39-f9f61f067287",
+            "id": "1ebed7f4-dd78-4d2c-b5d0-6adfaa2a4587",
+            "images": {
+              "default": "3e525dc73a7ab869541ccffea6aad4b8",
+              "nopadding": "5ea3f4926947e01a47083d1299cb8a99",
+              "topology": "149a37cb776b6be167741e818c5ff799"
+            }
+          }
+        },
+        {
+          "id": "6759dd900358d603e420d244",
+          "mac": "28704E18FEFC",
+          "name": "CAM.139",
+          "model": "G5 Turret Ultra",
+          "shortname": "UVC G5 Turret Ultra",
+          "ip": "10.0.14.147",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.SAV530q.v5.3.95.67.148b9a3.260612.0645",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:55:40Z",
+          "adoptionTime": "2024-12-11T18:45:47Z",
+          "note": "",
+          "uidb": {
+            "guid": "d3784320-1c25-43d1-b7a0-5b640bf2adff",
+            "iconId": "0a05724b-3c4c-41cd-852a-595b4770847c",
+            "id": "127e181e-8e08-4f85-9f9c-84d2c7285f40",
+            "images": {
+              "default": "aa26f84044f300f3a0ace571d4d81639",
+              "nopadding": "77147d037bd99fe3ab35265aeb7a4512",
+              "topology": "86e181a61833e6bafbc09d020eea84ab"
+            }
+          }
+        },
+        {
+          "id": "6643a84e03382d03e4000424",
+          "mac": "D021F992C5BC",
+          "name": "CAM.111 (G2) (PP.02:09)",
+          "model": "G4 Pro",
+          "shortname": "UVC G4 Pro",
+          "ip": "10.0.14.111",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S5L.v5.3.95.67.148b9a3.260612.0521",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:58:09Z",
+          "adoptionTime": "2024-05-14T19:39:05Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "37780143-f874-4b07-bad7-d350982ee79a",
+            "id": "fc65bd1c-f4d3-4c81-a29e-708e184cf2a8",
+            "images": {
+              "default": "cd661048a838bc1ff60222a6a68cdb3f",
+              "nopadding": "89a4a559e7cb92a9906023f8d78e519f",
+              "topology": "fb701075b3df41f1ee0d20b1e97ff554"
+            }
+          }
+        },
+        {
+          "id": "6643a84f007f2d03e4000426",
+          "mac": "D021F999EBCD",
+          "name": "CAM.101 (PP.03:09)",
+          "model": "G4 Pro",
+          "shortname": "UVC G4 Pro",
+          "ip": "10.0.14.101",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S5L.v5.3.95.67.148b9a3.260612.0521",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-06-24T14:56:23Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "37780143-f874-4b07-bad7-d350982ee79a",
+            "id": "fc65bd1c-f4d3-4c81-a29e-708e184cf2a8",
+            "images": {
+              "default": "cd661048a838bc1ff60222a6a68cdb3f",
+              "nopadding": "89a4a559e7cb92a9906023f8d78e519f",
+              "topology": "fb701075b3df41f1ee0d20b1e97ff554"
+            }
+          }
+        },
+        {
+          "id": "6643a84e02f62d03e400041f",
+          "mac": "802AA84E2CC2",
+          "name": "CAM.127",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.127",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:22:06Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84e020d2d03e4000418",
+          "mac": "44D9E794DB7C",
+          "name": "CAM.132",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.132",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:25:24Z",
+          "adoptionTime": null,
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "6643a84e01832d03e4000413",
+          "mac": "802AA84E2C70",
+          "name": "CAM.114 (PP.03:01)",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.114",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:20:58Z",
+          "adoptionTime": "2024-05-14T20:23:00Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        },
+        {
+          "id": "F4E2C61FAB2F",
+          "mac": "F4E2C61FAB2F",
+          "name": "ACTRL.100.001",
+          "model": "EAH 8",
+          "shortname": "EAH-8",
+          "ip": "10.0.14.141",
+          "productLine": "access",
+          "status": "online",
+          "version": "HE.mt7621.v5.10.25.0.geebd9c2.260429.2108",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-05-21T16:48:20Z",
+          "adoptionTime": "2025-05-21T19:24:46Z",
+          "note": "",
+          "uidb": {
+            "guid": "63ff0828-8a02-4625-85bb-b6cae8c89018",
+            "iconId": "7d86ca12-86cd-4259-bcfc-2e931a16518b",
+            "id": "25c5e4f8-c354-4c2b-8866-ab6e87b40cc4",
+            "images": {
+              "default": "36b00339ae42e9c79f114afbae0857ff",
+              "nopadding": "c02c33803066d34b9516e5f5994b0c88",
+              "topology": "ee6ddb2c0766c16cf6e4017e7e4e2f9c"
+            }
+          }
+        },
+        {
+          "id": "6643a84e016b2d03e4000411",
+          "mac": "FCECDA8F2431",
+          "name": "CAM.125",
+          "model": "G3 Dome",
+          "shortname": "UVC G3 Dome",
+          "ip": "10.0.14.125",
+          "productLine": "protect",
+          "status": "online",
+          "version": "UVC.S2L.v4.75.66.67.9cdac69.260331.1630",
+          "firmwareStatus": "upToDate",
+          "updateAvailable": "",
+          "isConsole": false,
+          "isManaged": true,
+          "startupTime": "2026-04-13T20:21:58Z",
+          "adoptionTime": "2025-04-24T12:27:09Z",
+          "note": "",
+          "uidb": {
+            "guid": null,
+            "iconId": "fee1fa20-77ae-4af5-ae24-b3c9afbd0000",
+            "id": "e8006f66-1914-4159-b01d-a9a2fa8a4ec2",
+            "images": {
+              "default": "d8594ad6c9cf32910b210da58ace5d25",
+              "nopadding": "b5fd4a541f4c6705dfcee6eaddb62a53",
+              "topology": "f332b99bb57c40ace2c13365d72a6e9a"
+            }
+          }
+        }
+      ],
+      "updatedAt": "2026-08-04T23:44:01Z"
+    }
+  ],
+  "httpStatusCode": 200,
+  "traceId": "b9d3494acae4736f3822d8c511baaa34"
+}

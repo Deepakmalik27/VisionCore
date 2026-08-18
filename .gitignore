@@ -1,0 +1,39 @@
+# ── data & artefacts (never in git) ─────────────────────────────────────────
+data/
+output/
+poc_output/
+drive_chunks/
+*.mp4
+*.avi
+*.mkv
+
+# model weights — 40 MB+, fetch them, don't commit them
+models/*.pt
+models/*.onnx
+models/*.engine        # TensorRT engines are GPU-architecture specific anyway
+
+# faces are personal data. DPDP Act applies; see docs/DELILAH_CV_MASTER_DOC.tex
+staff_gallery/*
+!staff_gallery/.gitkeep
+extracted_faces/
+
+# ── notebook noise ──────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.BACKUP-*.ipynb
+notebooks/*_executed.ipynb     # papermill output copies
+
+# ── python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ── logs ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── secrets ─────────────────────────────────────────────────────────────────
+.env
+kaggle.json
+*.pem

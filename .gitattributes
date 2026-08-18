@@ -1,0 +1,9 @@
+# Shell scripts MUST keep LF endings. These files are executed by bash on
+# Linux — over SSH, in WSL, on the GPU box — and a CR at the end of every
+# line makes bash fail with `$'\r': command not found` on line 1, which reads
+# like a corrupt script rather than a line-ending problem.
+#
+# Git on Windows defaults to core.autocrlf=true and rewrote deploy.sh to CRLF
+# on checkout, which is exactly how that happened.
+*.sh text eol=lf
+*.py text eol=lf
