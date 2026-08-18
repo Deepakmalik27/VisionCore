@@ -1,0 +1,18 @@
+{
+  "_comment": "GROUND TRUTH for door entries, CAM.112, 6.30.00pm chunk. Read by eye from output/door_dense.png (frames every 0.5s, entrance crop x>=1150 y>=380). This is the FIRST real entry ground truth for this camera: the earlier 100 hand-labelled frames contain ZERO entry events, so the counting path had never been graded against anything.",
+  "window_s": [305.0, 318.0],
+  "entries": [
+    {"id": "P1", "first_seen_s": 306.0, "desc": "light blue/white shirt, dark hair"},
+    {"id": "P2", "first_seen_s": 308.5, "desc": "striped top, grey/blonde curly hair"},
+    {"id": "P3", "first_seen_s": 310.0, "desc": "dark tank top"},
+    {"id": "P4", "first_seen_s": 311.0, "desc": "white shirt/tank"},
+    {"id": "P5", "first_seen_s": 312.5, "desc": "white shirt man, dark hair"},
+    {"id": "P6", "first_seen_s": 313.5, "desc": "dark suit man, curly hair"}
+  ],
+  "uncertain": [
+    {"id": "P7?", "first_seen_s": 309.5, "desc": "figure at the right frame edge 309-311; may be P2 or P3 re-seen"}
+  ],
+  "truth_count": 6,
+  "truth_count_upper": 7,
+  "note": "GROUP arrival - a party walking in together, mutually occluding. This is the hard case for any one-track-per-person counter."
+}

@@ -4659,10 +4659,15 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     if crossings:
         _staff_c = [c for c in crossings
                     if roles.get(c["track_id"]) == "staff"]
+        # spans: co-visibility evidence. Two tracks alive at the same instant
+        # cannot be one person, so a GROUP arriving together must not collapse
+        # into one arrival. track_time is already {tid: [first_t, last_t]}.
+        _spans = {k: (v[0], v[1]) for k, v in track_time.items()
+                  if isinstance(v, (list, tuple)) and len(v) >= 2}
         _, _in_k = tier_a_crossings(crossings, plane=_ground,
-                                    direction="in", roles=roles)
+                                    direction="in", roles=roles, spans=_spans)
         _, _out_k = tier_a_crossings(crossings, plane=_ground,
-                                     direction="out", roles=roles)
+                                     direction="out", roles=roles, spans=_spans)
         _deduped = sorted(_staff_c + _in_k + _out_k, key=lambda c: c["t"])
         if len(_deduped) < len(crossings):
             _log.info(f"tier-A crossing dedupe: {len(crossings)} raw crossing "

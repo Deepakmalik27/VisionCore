@@ -2373,8 +2373,9 @@ def confirm_crossings(crossings, confirm_s=5.0, per_line=None,
     return kept, dropped
 
 
-def tier_a_crossings(crossings, plane=None, dedupe_s=6.0, dedupe_m=1.2,
-                     dedupe_px=140.0, direction="in", roles=None):
+def tier_a_crossings(crossings, plane=None, dedupe_s=2.5, dedupe_m=1.2,
+                     dedupe_px=140.0, direction="in", roles=None, spans=None,
+                     overlap_s=0.4):
     """TIER A: how many people came through the door, WITHOUT depending on
     identity holding together for ten hours.
 
@@ -2390,6 +2391,42 @@ def tier_a_crossings(crossings, plane=None, dedupe_s=6.0, dedupe_m=1.2,
 
     Needs each crossing to carry a position; crossings without one fall back to
     unique-id behaviour for that event, which is the old answer, never worse.
+
+    CO-VISIBILITY (spans), added 2026-08-18 on measured evidence.
+
+    "Close in time and space" is what one person crossing once looks like. It
+    is ALSO what a GROUP walking in abreast looks like, and this function had
+    no way to tell them apart -- so a party arriving together collapsed to a
+    single arrival.
+
+    Ground truth (eval/gt_entries_305_318.json): six guests entered CAM.112
+    between 305s and 318s, ids 135/138/144/150 beginning within seconds of one
+    another at x=1739/1785/1696/1766 -- well inside dedupe_s=6.0 and
+    dedupe_px=140. The window counted 2 of 6.
+
+    Two tracks that are visible AT THE SAME MOMENT cannot be one person, so
+    they are never folded together however close they are. The pipeline
+    already relies on this principle for Re-ID (ENABLE_COVISIBILITY_BLOCK);
+    it simply was not applied to counting.
+
+    spans: {track_id: (t_first, t_last)}. Without it the check is skipped and
+    behaviour is exactly as before -- no silent half-enforcement.
+
+    dedupe_s 6.0 -> 2.5, and it is NOT independent of the co-visibility guard:
+    measured on the four abreast ids above, neither change works alone.
+
+        dedupe_s   no spans   +co-visibility
+           6.0         2            2     <- old default, fails either way
+           4.0         2            4
+           2.5         2            4     <- chosen
+           1.5         2            4
+           1.0         2            4
+
+    Without spans the party collapses at EVERY window, because the ids really
+    are close in time and space. With spans but a 6s window, a middle id stays
+    in `kept` long enough for the later arrivals to match against it instead of
+    against a co-visible one. 2.5s is bounded below too: at 1.0s a single
+    person whose id is re-minted 1.2s later splits into two.
     """
     # Only crossings at a VENUE ENTRANCE. A dining-room threshold and a staff
     # gate are movements INSIDE the building, not arrivals, and counting them
@@ -2417,6 +2454,12 @@ def tier_a_crossings(crossings, plane=None, dedupe_s=6.0, dedupe_m=1.2,
             if (d is not None and d <= dedupe_m) or (
                     d is None and math.hypot(p[0] - k["pos"][0],
                                              p[1] - k["pos"][1]) <= dedupe_px):
+                if spans is not None:
+                    _a = spans.get(c.get("track_id"))
+                    _b = spans.get(k.get("track_id"))
+                    if (_a and _b
+                            and min(_a[1], _b[1]) - max(_a[0], _b[0]) > overlap_s):
+                        continue      # co-visible -> two people, not one
                 dup = True
                 break
         if not dup:

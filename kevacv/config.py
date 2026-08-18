@@ -934,6 +934,14 @@ RUN_CONFIG_KEYS = {
     #
     # Hysteresis itself is right (high bar to start, low bar to continue). What
     # was never measured is whether a 0.10 gap is the correct width.
+    # The floor the DETECTOR is asked for. BYTE (ECCV 2022) is explicit that
+    # discarding low-score boxes "inadvertently eliminates legitimate objects
+    # that are partially occluded or experiencing motion blur, leading to
+    # fragmented trajectories and identity switches" -- which is this camera's
+    # exact symptom (69 fragments for 18 people). Measured at the backlit door
+    # on 2026-08-18: conf 0.25 yields 1 box on a frame with ~5 arriving
+    # guests; conf 0.10 yields 7. The people are there; the bar deletes them.
+    "analysis.detect_conf_floor": "DETECT_CONF_FLOOR",
     "analysis.new_track_conf": "NEW_TRACK_CONF",
     "analysis.keep_track_conf": "KEEP_TRACK_CONF",
     # Frames per detector call. MUST NOT EXCEED the batch a TensorRT engine was
