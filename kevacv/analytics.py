@@ -482,7 +482,8 @@ def apply_staff_zone_override(events, staff_zones, min_staff_dwell_s=60.0,
                               min_share=0.6, min_share_dwell_s=15.0,
                               observation_s=None, min_visits=2,
                               min_spread=0.25, sole_dwell_s=None,
-                              return_evidence=False, exclude_ids=()):
+                              return_evidence=False, exclude_ids=(),
+                              premerge_visits=None):
     """Re-label tracks as 'staff' from where and how they spent their time.
 
     THE RULE THAT WAS HERE, AND WHY IT WAS WRONG
@@ -518,6 +519,13 @@ def apply_staff_zone_override(events, staff_zones, min_staff_dwell_s=60.0,
 
     observation_s: length of the analysed period. Without it spread cannot be
         computed and the function falls back to dwell/share.
+    premerge_visits: optional {track_id: visits} measured BEFORE Re-ID
+        stitching. When given, rule (a) additionally requires the identity to
+        have earned min_visits on its own, un-merged evidence. Without this a
+        wrong merge fabricates a staff member out of several guests: pooling
+        N one-visit fragments yields N visits spread across the whole window,
+        which is precisely the signature (a) looks for. Rule (b) is unaffected
+        — real dwell cannot be manufactured by relabelling.
     return_evidence: also return the per-track evidence dict, for logging.
 
     Returns a new events list; input is never mutated.
@@ -534,6 +542,16 @@ def apply_staff_zone_override(events, staff_zones, min_staff_dwell_s=60.0,
         if observation_s:
             by_spread = (x["visits"] >= min_visits
                          and x["spread"] >= min_spread)
+            # MERGE-MANUFACTURED SPREAD (see premerge_visits in the docstring):
+            # when this identity only reaches min_visits because Re-ID glued
+            # several one-visit fragments together, the "returns" are an
+            # artefact of the merge, not behaviour. Measured on CAM.112: the
+            # staff verdict went 1-of-32 before stitching to 7-of-13 after,
+            # and five of the six new ones had exactly ONE visit pre-merge.
+            if by_spread and premerge_visits is not None:
+                if premerge_visits.get(tid, 0) < min_visits:
+                    by_spread = False
+                    x["merge_only"] = True
             by_sole = x["dwell_s"] >= sole_dwell_s
             x["reason"] = ("spread" if by_spread else
                            "sole_occupancy" if by_sole else None)
@@ -2267,7 +2285,8 @@ def _rebuild_plane(run):
                                         person_h=_ph, hfov_deg=_hf)
 
 
-def confirm_crossings(crossings, confirm_s=5.0, per_line=None):
+def confirm_crossings(crossings, confirm_s=5.0, per_line=None,
+                      track_first_seen=None, min_prior_s=0.0):
     """Drop crossings that a person did not COMMIT to. -> (kept, dropped)
 
     THE PROBLEM, in one sentence: your entry line sits where guests pause.
@@ -2292,10 +2311,33 @@ def confirm_crossings(crossings, confirm_s=5.0, per_line=None):
     interior threshold people walk briskly through wants far less, or the wait
     itself starts deleting real transits.
 
+    PRIOR STABILITY (min_prior_s), added 2026-08-18.
+
+    The published spec for a valid crossing has six conditions; this function
+    implemented four of them. The one missing here is the FIRST: a person must
+    have been stably visible on one side BEFORE the crossing counts.
+
+    Without it, a track that is BORN near the line counts as a transit even
+    though nobody walked anywhere. That is not hypothetical on this camera —
+    16.3% of detections cannot start a track at all, ids churn constantly, and
+    the operator's frame-by-frame audit found exactly this signature: "dining
+    entry IN 2" with a single staff member visible, and "staff entry OUT 6"
+    while those staff were still in the room. Counts accumulating with no
+    corresponding movement.
+
+    So a crossing is discarded unless its track existed for at least
+    min_prior_s BEFORE the crossing moment. A real transit has a history of
+    approaching; a track invented on the line does not.
+
+    track_first_seen: {track_id: t} — when each track was first observed.
+    Without it this check cannot run and is skipped, which is the old
+    behaviour: no silent half-enforcement.
+
     Pure and order-independent: takes a list, returns lists. No plane, no
     frames, no GPU — so the edge cases are tested rather than argued about.
     """
     per_line = per_line or {}
+    track_first_seen = track_first_seen or {}
     by = {}
     for c in crossings or []:
         by.setdefault((c.get("track_id"), c.get("line") or "entry"), []).append(c)
@@ -2314,7 +2356,19 @@ def confirm_crossings(crossings, confirm_s=5.0, per_line=None):
                 # crossed and came straight back: neither event happened
                 used[i] = used[i + 1] = True
                 dropped += [a, b]
-        kept += [e for e, u in zip(evs, used) if not u]
+        for e, u in zip(evs, used):
+            if u:
+                continue
+            # PRIOR STABILITY: was this track already around before it crossed?
+            if min_prior_s > 0 and track_first_seen:
+                born = track_first_seen.get(e.get("track_id"))
+                if born is not None and float(e.get("t", 0.0)) - float(born) < min_prior_s:
+                    e = dict(e, dropped_reason="born at the line "
+                             f"({float(e.get('t',0.0)) - float(born):.1f}s of "
+                             f"history, need {min_prior_s:.1f}s)")
+                    dropped.append(e)
+                    continue
+            kept.append(e)
     kept.sort(key=lambda c: float(c.get("t", 0.0)))
     return kept, dropped
 

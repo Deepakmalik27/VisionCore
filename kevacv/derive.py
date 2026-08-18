@@ -116,6 +116,36 @@ def region_arrivals_by_id(run, roles=None):
     roles = roles or run.get("roles") or {}
     _n, arr, _why = arrivals_from_regions(
         run.get("events") or [], run.get("zone_roles") or {}, roles=roles)
+    # WHAT THE STAFF FILTER COSTS, stated rather than inferred.
+    #
+    # Both arrival paths drop anyone whose role is "staff". That is correct
+    # when the roles are correct — and on this camera they are not: a run
+    # reporting 5 people called 4 of them staff, and an hour called 18 of 25
+    # staff at a desk with ONE receptionist. Every one of those is a guest who
+    # was detected, tracked and crossed the line correctly, then deleted at the
+    # very last step.
+    #
+    # Without this line the failure is invisible: "guests = 2" looks like a
+    # detection problem and sends you back to the detector, which is where a
+    # week went. Counting the same arrivals with the filter OFF separates
+    # "we never saw them" from "we saw them and threw them away".
+    try:
+        _n_all, _arr_all, _ = arrivals_from_regions(
+            run.get("events") or [], run.get("zone_roles") or {}, roles=None)
+        _lost = len({a.get("track_id") for a in (_arr_all or [])}) - \
+                len({a.get("track_id") for a in (arr or [])})
+        run["arrivals_without_staff_filter"] = _n_all
+        if _lost > 0:
+            import logging
+            logging.getLogger("kevacv").warning(
+                f"\U0001f6a8 STAFF FILTER DROPPED {_lost} ARRIVAL(S): "
+                f"{_n_all} people entered, {_n} counted as guests. Those "
+                f"{_lost} were detected, tracked and crossed correctly — they "
+                f"were removed for being classified staff. If the staff "
+                f"classification is wrong, so is the guest count, and the "
+                f"detector is not the problem.")
+    except Exception:
+        pass
     out = {}
     for a in arr or []:
         tid, t = a.get("track_id"), float(a.get("t", 0.0))

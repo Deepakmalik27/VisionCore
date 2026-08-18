@@ -2166,17 +2166,78 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         _log.info(f"DEAD AREAS active (reflection/poster suppression): "
               f"{sorted(_mask_names)}")
 
-    def _drop_masked(dets):
-        """v53: detections whose feet land inside a mask/ignore zone are
-        phantoms (mirror, glass reflection, poster, TV) - dropped before
-        they can mint ids or pollute counts."""
+    # A mask region usually contains BOTH the static thing it was drawn for AND
+    # floor that people walk on. Remembering where boxes recently appeared lets
+    # us tell those apart by MOTION instead of by location.
+    _mask_hist = defaultdict(list)     # grid cell -> [(t, cx, cy)]
+
+    def _drop_masked(dets, t=None):
+        """Detections inside a mask/ignore zone are phantoms — mirror, glass
+        reflection, poster, TV, plant — dropped before they can mint ids.
+
+        MOTION VETO (MASK_REQUIRE_MOTION), added 2026-08-18.
+
+        The blunt version of this rule deleted EVERYTHING whose feet landed in a
+        mask polygon. On CAM.112 the "plant area mask" spans x 995-1430,
+        y 190-1080 — 18.7% of the frame — because the plant is tall. But the
+        bottom of that rectangle is not plant, it is FLOOR, beside the main
+        entrance, where guests stand. Measured against hand labels: person 5's
+        feet were inside the mask in 100 of 100 frames and he was detected 29%
+        of the time. The mask was deleting a real guest at the door, and the
+        stage as a whole removed 18,501 detections and emptied 212 frames.
+
+        Location alone cannot separate a plant from a person standing in front
+        of it — they occupy the same polygon. Motion can. The published answer
+        to static distractors is "static foreground region detection", i.e.
+        separate static from moving WITHIN a region, and it is the same
+        discriminator phantoms.py already uses successfully: measured on this
+        footage a statue holds size cv ~0.004 while a standing person holds
+        ~0.080, a 19x margin.
+
+        So the mask becomes "there is a known static distractor here — require
+        motion" rather than "delete everything here". A plant never moves and
+        stays suppressed; a guest walking to the door is kept.
+
+        OFF by default (MASK_REQUIRE_MOTION = 0.0) so it can be A/B'd on one
+        chunk rather than assumed. Two constants have already been shipped on
+        reasoning here and both had to be reverted.
+        """
         if not _mask_names or len(dets) == 0:
             return dets
+        _need = float(globals().get("MASK_REQUIRE_MOTION", 0.0) or 0.0)
+        _static_s = float(globals().get("MASK_STATIC_S", 30.0))
+        _win = float(globals().get("MASK_MOTION_WINDOW_S", 60.0))
+        _rad = 90.0
         _keep = []
         for (_mx1, _my1, _mx2, _my2) in dets.xyxy:
             _bc = ((_mx1 + _mx2) / 2.0, _my2)
-            _keep.append(not any(_in_poly(polygons[_n], _bc)
-                                 for _n in _mask_names))
+            _inside = any(_in_poly(polygons[_n], _bc) for _n in _mask_names)
+            if not _inside:
+                _keep.append(True)
+                continue
+            if _need <= 0 or t is None:
+                _keep.append(False)          # OFF: original behaviour
+                continue
+            # Everything seen NEAR this point recently. Keying by grid cell was
+            # wrong: a walking person leaves a cell before accumulating much
+            # displacement, so motion looked small for exactly the case we want
+            # to keep. Radius + time-span is the phantoms.py formulation.
+            _k = (int(_bc[0] // 128), int(_bc[1] // 128))
+            _near = [h for h in _mask_hist[_k]
+                     if t - h[0] <= _win
+                     and math.hypot(_bc[0] - h[1], _bc[1] - h[2]) <= _rad]
+            _mask_hist[_k] = ([h for h in _mask_hist[_k] if t - h[0] <= _win]
+                              + [(t, _bc[0], _bc[1])])[-400:]
+            if not _near:
+                _keep.append(True)           # no evidence of stillness yet
+                continue
+            _span = t - min(h[0] for h in _near)
+            _spread = max(math.hypot(a[1] - b[1], a[2] - b[2])
+                          for a in _near for b in _near) if len(_near) > 1 else 0.0
+            # Drop ONLY when something has sat here, essentially motionless,
+            # for longer than any guest plausibly would. A plant does this
+            # permanently; a guest pausing at the door does not.
+            _keep.append(not (_span >= _static_s and _spread < _need))
         return dets[np.array(_keep, dtype=bool)]
 
     # ── ZONE-COMPLETENESS GUARD ─────────────────────────────────────────────
@@ -2691,7 +2752,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         dets = _drop_implausible(dets, _persp, _supp_stats)
         _funnel.record("implausible size", _n, len(dets))
         _n = len(dets)
-        dets = _drop_masked(dets)
+        dets = _drop_masked(dets, t)
         _funnel.record("dead-area mask", _n, len(dets))
         # LIVE phantom suppression (symptoms 5/6/7). The end-of-chunk pass
         # still runs and still has the last word; this stops a plant consuming
@@ -3646,6 +3707,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     # with a perfectly drawn entry polygon.
     events = rec.events(min_event_by_zone={z: 0.5 for z, rs in zone_roles.items()
                                            if "entry" in rs})
+    _staff_ev_pre = {}          # never unbound: the post-merge re-run reads it
     if staff_zones_here:
         events, _staff_ev = apply_staff_zone_override(
             events, staff_zones_here, STAFF_OVERRIDE_MIN_S,
@@ -3653,6 +3715,10 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             observation_s=duration_s, min_visits=STAFF_MIN_VISITS,
             min_spread=STAFF_MIN_SPREAD, sole_dwell_s=STAFF_SOLE_DWELL_S,
             return_evidence=True)
+        # Kept for the post-merge re-run: the ONLY record of how many separate
+        # visits each identity earned before Re-ID pooled them. See
+        # premerge_visits in apply_staff_zone_override.
+        _staff_ev_pre = _staff_ev
         # Printed in full, every run. A wrong staff label is invisible in every
         # downstream number — it looks exactly like a right one — so the only
         # place it can be caught is here, next to the evidence it was made on.
@@ -4290,6 +4356,21 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                     # more importantly their VISITS — two fragments of one
                     # receptionist are two visits only once they are known to
                     # be the same person, which is precisely what spread needs.
+                    #
+                    # ...which is ALSO precisely what a WRONG merge fabricates.
+                    # Gluing five one-visit guests together produces one
+                    # identity that visited the desk five times across the
+                    # whole window — indistinguishable from a receptionist.
+                    # Measured on CAM.112 (600s, IR, p10 crop 86px): staff went
+                    # 1-of-32 pre-merge to 7-of-13 post-merge, and the region
+                    # arrival count fell to 1 because the extras were deleted
+                    # as staff. So carry the pre-merge visit counts forward and
+                    # require the identity to have earned its returns itself.
+                    _pre_visits = {}
+                    for _raw, _canon in (mapping or {}).items():
+                        _v = (_staff_ev_pre.get(_raw) or {}).get("visits", 0)
+                        if _v > _pre_visits.get(_canon, 0):
+                            _pre_visits[_canon] = _v
                     events, _staff_ev = apply_staff_zone_override(
                         events, staff_zones_here, STAFF_OVERRIDE_MIN_S,
                         min_share_dwell_s=STAFF_OVERRIDE_SHARE_MIN_S,
@@ -4297,7 +4378,17 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                         min_visits=STAFF_MIN_VISITS,
                         min_spread=STAFF_MIN_SPREAD,
                         sole_dwell_s=STAFF_SOLE_DWELL_S,
+                        premerge_visits=_pre_visits,
                         return_evidence=True)
+                    _merge_only = sorted(t for t, x in _staff_ev.items()
+                                         if x.get("merge_only"))
+                    if _merge_only:
+                        _log.info(
+                            f"🧷 {len(_merge_only)} identity(ies) were staff "
+                            f"ONLY because Re-ID pooled single-visit fragments "
+                            f"— reverted to customer: {_merge_only}. Each had "
+                            f"fewer than {STAFF_MIN_VISITS} visit(s) of its "
+                            f"own. Dwell-based staff are untouched.")
                     for _sl in describe_staff_decision(
                             _staff_ev, ).splitlines():
                         _log.info(_sl)
@@ -4590,8 +4681,30 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     if ENABLE_CROSSING_CONFIRM and crossings:
         from .analytics import confirm_crossings
         _n_before = len(crossings)
+        # PRIOR STABILITY: when was each track FIRST seen? A real transit has
+        # a history of approaching the line; a track invented ON the line does
+        # not. frame_log is the only place that knows, so build it here.
+        _first_seen = {}
+        for _fi, _ft, _fb in frame_log:
+            for _b in _fb:
+                _bid = _safe_id(_b[0])
+                if _bid not in _first_seen:
+                    _first_seen[_bid] = _ft
         crossings, _uturn = confirm_crossings(
-            crossings, confirm_s=CROSSING_CONFIRM_S, per_line=zcfg_confirm)
+            crossings, confirm_s=CROSSING_CONFIRM_S, per_line=zcfg_confirm,
+            track_first_seen=_first_seen,
+            min_prior_s=float(globals().get("CROSSING_MIN_PRIOR_S", 0.0)))
+        _born = [u for u in _uturn if u.get("dropped_reason")]
+        if _born:
+            _bl = {}
+            for _u in _born:
+                _k = _u.get("line") or "entry"
+                _bl[_k] = _bl.get(_k, 0) + 1
+            _log.info(f"\U0001f6b7 born-at-the-line: dropped {len(_born)} "
+                      f"crossing(s) whose track had less than "
+                      f"{globals().get('CROSSING_MIN_PRIOR_S', 0.0)}s of history "
+                      f"before crossing — nobody walked anywhere. per door: {_bl}")
+        _uturn = [u for u in _uturn if not u.get("dropped_reason")]
         if _uturn:
             _byline = {}
             for _u in _uturn:

@@ -251,6 +251,24 @@ analysis:
   #   get redrawn against it next.
   foot_anchor_frac: 1.0
 
+  # head_to_body_ratio / head_recovery_aspect — CAMERA GEOMETRY.
+  #   Head recovery rebuilds ~740 boxes per run from orphan head detections.
+  #   The defaults (7.0 heads tall, 0.42 as wide as tall) are standing-figure
+  #   anthropometry — right for a side view, wrong for a ceiling camera where
+  #   the body is foreshortened. They produced h/w 2.38 boxes, which is the
+  #   2.51 seen in this pipeline's output, while the DETECTOR itself outputs
+  #   1.33 and the hand-labelled truth is 1.14. The tall boxes were built
+  #   here, not detected.
+  #
+  #   MEASURED on this camera from real head boxes matched to hand-labelled
+  #   bodies (n=2, the one frame whose labels were not carried forward):
+  #       ratio  7.0  -> 2.52        aspect 0.42 -> 0.82
+  #       implied h/w 2.38 -> 1.22   (hand labels 1.14)
+  #   Provisional on n=2, but the old values are provably wrong and two
+  #   independent derivations agree on the new ones.
+  head_to_body_ratio: 2.52
+  head_recovery_aspect: 0.82
+
   # profiling — per-stage wall time in the log AND the run ledger, so the next
   #   run diffs the PROFILE automatically. Leave it on; it costs microseconds.
   profiling: true

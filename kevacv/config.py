@@ -484,6 +484,33 @@ FOOT_ANCHOR_FRAC = 1.0
 # drawn, and the current lines were placed for feet. A/B it on one chunk.
 ENTRY_LINE_ANCHOR = "bottom_center"
 
+# ── mask regions: require MOTION rather than deleting everything ────────────
+# A mask polygon is drawn around a static distractor (plant, mirror, poster),
+# but it inevitably also covers floor that people walk on. On CAM.112 the
+# "plant area mask" is 18.7% of the frame and its lower half is the floor
+# beside the MAIN ENTRANCE. Measured against hand labels: person 5's feet were
+# inside it in 100 of 100 frames, detected 29% of the time. The stage removed
+# 18,501 detections and emptied 212 frames.
+#
+# Location cannot separate a plant from a person standing in front of it. Motion
+# can, and it is the same discriminator phantoms.py already relies on: a statue
+# holds size cv ~0.004 on this footage while a standing person holds ~0.080.
+#
+# MASK_REQUIRE_MOTION is how many PIXELS a detection at that spot must have
+# moved within MASK_MOTION_WINDOW_S to survive a mask region.
+#   0.0  = OFF, delete everything in the mask (previous behaviour)
+#   ~40  = a person crossing a 64px cell survives; a plant does not
+# Default OFF: A/B it on one chunk. Two constants have already been shipped
+# here on reasoning alone and both had to be reverted.
+# MASK_REQUIRE_MOTION is the SPREAD in pixels below which a spot counts as
+# motionless; MASK_STATIC_S is how long it must stay that way before the mask
+# deletes it. A plant sits still permanently; a guest pausing at the entrance
+# does not last 30 s within 40 px.
+#   0.0 = OFF, delete everything inside a mask (previous behaviour)
+MASK_REQUIRE_MOTION = 0.0
+MASK_STATIC_S = 30.0
+MASK_MOTION_WINDOW_S = 60.0
+
 ENABLE_ABSURD_SIZE_CAP = True
 MAX_BOX_HEIGHT_FRAC = 0.70
 MAX_BOX_AREA_FRAC = 0.30
@@ -518,9 +545,37 @@ STATIC_MIN_LIFE_BY_ROLE = {
 }
 STATIC_CENTRE_JITTER = 0.02
 STATIC_SIZE_JITTER = 0.03
-PHANTOM_MIN_SPAN_S = 240.0
+# ── phantom gates, RE-MEASURED 2026-08-18 against real tracks ──────────────
+# These were set from a SYNTHETIC test that claimed a statue holds size cv
+# ~0.004. Real tracks from run10 say otherwise:
+#
+#     REAL static objects (tracks 145, 49)   size cv 0.034-0.045
+#                                            centre move 1.2 px
+#                                            span 129-146 s
+#     REAL moving people                     size cv 0.116-0.299
+#                                            centre move 50-310 px
+#
+# So both gates in front of the good discriminator were too strict to ever
+# reach it:
+#     PHANTOM_SIZE_CV 0.015  is BELOW the real statue's 0.034  -> never matches
+#     PHANTOM_MIN_SPAN_S 240 is ABOVE the statue's 129-146 s   -> never matches
+# which is why the statue survived a whole chunk and was only removed by the
+# end-of-chunk pass, 44 minutes too late, after holding a canonical id
+# throughout.
+#
+# CENTRE MOVEMENT is the strong signal — 1.2 px vs 50-310 px is roughly 40x
+# separation, against 7.6x for size cv. PHANTOM_CENTRE_JITTER 0.02 (as a
+# fraction of body height) already sits correctly between them: the statue
+# measures ~0.0024, real people ~0.10. That gate was never wrong; it was just
+# unreachable.
+#
+# So: relax the two blocking gates to sit in the MEASURED gap, and let centre
+# jitter do the discriminating it was designed for.
+#     size_cv  0.015 -> 0.07   (static 0.045 | 0.07 | 0.116 moving)
+#     span     240 s -> 120 s  (statue tracks span 129-146 s)
+PHANTOM_MIN_SPAN_S = 120.0
 PHANTOM_CENTRE_JITTER = 0.02
-PHANTOM_SIZE_CV = 0.015
+PHANTOM_SIZE_CV = 0.07
 
 # ── evidence-scaled patience for the LIVE suppressor ────────────────────────
 # On the 18:30 chunk the live stage reported "removed nothing all chunk". Not a
@@ -540,6 +595,10 @@ PHANTOM_SIZE_CV = 0.015
 # 0.0 = OFF (previous behaviour). Turn it on as a single A/B knob and read the
 # ledger: 'live phantom suppress' should stop removing nothing, and the tracker
 # should mint fewer ids. Do not ship it unmeasured.
+# Re-based on the real numbers above. 0.30 * 0.07 = 0.021, which the real
+# statue (0.034-0.045) still misses — so the fast path needs ~0.70 to be
+# reachable at all. The old 0.30 * 0.015 = 0.0045 was 8-10x stricter than the
+# thing it was hunting, which is why it measured zero effect.
 PHANTOM_FAST_CV_RATIO = 0.0
 PHANTOM_FAST_MIN_S = 30.0      # never suppress on less than this, whatever cv
 ENABLE_CARRIED_SUPPRESS = True
@@ -568,10 +627,45 @@ CARRIED_MIN_HEAD_DROP = 0.15
 # and when it splits, both are re-born as new ids. Symptom 9, driving 4/11/15.
 ENABLE_MERGED_SPLIT = True
 ENABLE_HEAD_RECOVERY = True
-HEAD_TO_BODY_RATIO = 7.0        # body height in head-box heights. The
-                                # figure-drawing canon is ~7.5 for crown-to-
-                                # heel; a detector head box is crown-to-chin
-                                # with no neck, so slightly under.
+# ── head->body geometry: THE SOURCE OF THE TALL BOXES ───────────────────────
+# These two constants manufactured the defect that was blamed on the detector
+# for a week. Head recovery rebuilds 734-749 boxes per run, and it built them
+# at 1/0.42 = h/w 2.38 — almost exactly the 2.51 measured in the pipeline's
+# output. Meanwhile the DETECTOR itself outputs h/w 1.33, and the hand-labelled
+# truth is 1.14. The detector was never the problem; this reconstruction was.
+#
+# Both values are standing-figure anthropometry: the figure-drawing canon of
+# ~7.5 heads, and a body roughly 0.42 as wide as it is tall. Correct for a
+# person seen from the SIDE. From a ceiling camera the body is foreshortened —
+# you see head, shoulders and a compressed torso.
+#
+# MEASURED on CAM.112 from real head boxes matched to hand-labelled bodies:
+#     HEAD_TO_BODY_RATIO    7.0  -> 2.52
+#     HEAD_RECOVERY_ASPECT  0.42 -> 0.82
+#     implied h/w           2.38 -> 1.22   (hand labels say 1.14)
+#
+# n=2 pairs on the one frame whose labels were not carried forward, so treat
+# the exact figures as provisional — but the OLD values are provably wrong
+# (they produce 2.38 where truth is 1.14-1.22) and two independent derivations
+# agree on the new ones.
+#
+# These are CAMERA GEOMETRY, not universal constants: a wall-mounted camera
+# really does see ~7 heads. The canon stays the default for unknown cameras;
+# per-camera values belong in config/<cam>.yaml.
+# TODO (deferred by the operator until IN/OUT reaches ~98%): THESE SHOULD NOT
+# BE TYPED AT ALL. Both are measurable from the run itself, with no labels:
+# every frame where a head box sits inside a person box yields one
+# ratio = person_h / head_h and one aspect = person_w / person_h sample. A few
+# thousand such pairs accumulate in minutes, and the median is a better answer
+# than any constant — and it is per-camera automatically, which is the whole
+# problem here (7.0 is right for a wall camera and wrong for a ceiling one).
+#
+# The same argument applies to MAX_BOX_HEIGHT_FRAC, REID_SIM_THRESHOLD,
+# NEW_TRACK_CONF and the phantom gates: this file is full of numbers that the
+# footage could measure. F2 (_PerspectiveModel) already does exactly this for
+# expected body height, so the pattern exists in the codebase — it just was
+# never applied to these.
+HEAD_TO_BODY_RATIO = 7.0        # overridden per camera — see above
 HEAD_RECOVERY_ASPECT = 0.42     # body width as a fraction of body height
 HEAD_RECOVERY_MIN_CONF = 0.35   # ignore weak heads — a recovered box from a
                                 # noisy head is a phantom with extra steps
@@ -678,6 +772,21 @@ ENTRY_LINE_FLIP = True
 # settings — entry_lines_band and entry_lines_confirm_s.
 LINE_CROSS_FRAMES = 2
 ENABLE_CROSSING_CONFIRM = True
+
+# PRIOR STABILITY — the first of the six published conditions for a valid
+# crossing, and the one this pipeline was missing.
+#
+# A crossing only counts if the track existed for this many seconds BEFORE it.
+# Without it, a track BORN near a line counts as a transit though nobody
+# walked anywhere. On this camera that is common: 16.3% of detections cannot
+# start a track, and ids churn. The operator's frame-by-frame audit found the
+# exact signature — "dining entry IN 2" with one staff member visible, and
+# "staff entry OUT 6" while those staff were still in the room.
+#
+# 0.0 = OFF (previous behaviour). ~1.5s is roughly 12 frames at 8 fps: long
+# enough that a real approach qualifies, short enough that a brisk transit
+# through an interior threshold is not eaten. A/B it on one chunk.
+CROSSING_MIN_PRIOR_S = 0.0
 CROSSING_CONFIRM_S = 5.0
 
 # ── render ──────────────────────────────────────────────────────────────────
@@ -837,10 +946,16 @@ RUN_CONFIG_KEYS = {
     "analysis.det_batch": "DET_BATCH",
     "analysis.foot_anchor_frac": "FOOT_ANCHOR_FRAC",
     "analysis.entry_line_anchor": "ENTRY_LINE_ANCHOR",
+    "analysis.mask_require_motion": "MASK_REQUIRE_MOTION",
+    "analysis.mask_motion_window_s": "MASK_MOTION_WINDOW_S",
+    "analysis.mask_static_s": "MASK_STATIC_S",
     "analysis.proxy_render": "PROXY_RENDER",
     "analysis.profiling": "ENABLE_PROFILING",
     "analysis.crossing_confirm_s": "CROSSING_CONFIRM_S",
     "analysis.line_cross_frames": "LINE_CROSS_FRAMES",
+    "analysis.crossing_min_prior_s": "CROSSING_MIN_PRIOR_S",
+    "analysis.head_to_body_ratio": "HEAD_TO_BODY_RATIO",
+    "analysis.head_recovery_aspect": "HEAD_RECOVERY_ASPECT",
     # Tile geometry as config, because "how expensive is tiling" is a question
     # you answer by TURNING THE KNOB, not by turning the feature off. At
     # 1920x1080: 640px = 9 calls/frame, 1280px = 3. The published guidance is
