@@ -143,6 +143,14 @@ def load_zone_config(path, frame_size=None):
     # U7: an explicit roles map in the zones file wins over keyword guessing, so
     # a zone named in any language still gets its role instead of silently
     # becoming "other" and having its metrics vanish from the report.
+    # C8 (2026-08-19): CLEAR FIRST. This is a process-global that was written
+    # to and never reset, so camera A's role map persisted into classify_zones
+    # for camera B and for the next chunk in the same process. Zone names
+    # collide across venues by design ("reception", "dining", "queue"), and
+    # roles decide which zone counts as entry, interior and staff -- so the
+    # wrong role map silently changes who is a guest and where an arrival is.
+    # run_night.py and any multi-camera loop hit this.
+    ZONE_AI_OVERRIDES.clear()
     for zname, rs in (cfg.get("roles") or {}).items():
         ZONE_AI_OVERRIDES[zname] = list(rs) if isinstance(rs, (list, tuple)) else [rs]
     return polygons, entry_lines

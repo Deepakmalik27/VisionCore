@@ -1,0 +1,11 @@
+{
+  "_comment": "NEGATIVE ground truth: timestamps Prabh flagged after watching the full 20-minute annotated video (new.txt). These are events the pipeline generated where the entrance was empty, or where the person was nowhere near the line. A fix must REMOVE these while keeping recall on eval/gt_entries_*.json.",
+  "source": "new.txt, operator review of output/slit20_annotated.mp4",
+  "run": "output/slit20/events.json (94 events, IN 51 / OUT 43)",
+  "false_events_s": [169.4, 269.4, 286.7, 302.6, 402.0, 486.8, 489.2, 493.1,
+                     495.4, 541.0, 677.8, 686.2, 691.3, 974.6, 1023.2, 1068.0,
+                     1096.2],
+  "impossible_reversals_s": [[482.5, 482.8], [1018.2, 1019.0], [1019.0, 1020.6]],
+  "note": "0.3s IN->OUT cannot be two independent crossings. Operator's core verdict: the system cannot distinguish a completed crossing from someone merely moving near the line.",
+  "tolerance_s": 0.6
+}

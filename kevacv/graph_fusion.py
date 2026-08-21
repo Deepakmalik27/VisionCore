@@ -158,7 +158,14 @@ def solve_graph_fusion(tracklets: List[Dict[str, Any]],
                        weights: Optional[FusionWeights] = None,
                        ground_plane: Optional[Any] = None,
                        cost_cutoff: float = 0.45) -> Dict[int, int]:
-    """Solve global tracklet identity association graph using Hungarian optimization.
+    """Solve global tracklet identity association graph.
+
+    NOTE: this is greedy cheapest-edge-first agglomeration over a union-find,
+    NOT the Hungarian assignment the module docstring advertises. scipy's
+    linear_sum_assignment is imported at the top of this file and never
+    called. Agglomeration is the right shape here anyway (one person may own
+    many tracklets, which a 1-to-1 assignment forbids) -- but the name was
+    wrong, and a wrong name is how this module got trusted without reading.
     
     tracklets: List of dicts, each containing:
                - id: int
@@ -183,10 +190,18 @@ def solve_graph_fusion(tracklets: List[Dict[str, Any]],
     # Cost Matrix Construction
     cost_matrix = np.full((n, n), fill_value=np.inf)
 
+    # VETOED pairs are remembered separately. cost_matrix cannot carry this:
+    # it stores inf for "impossible" AND for "merely too expensive", and those
+    # two must not be confused when the transitive check below runs.
+    forbidden: Set[Tuple[int, int]] = set()
+
     for i in range(n):
         for j in range(i + 1, n):
             c = compute_pairwise_cost(tracklets[i], tracklets[j], weights, ground_plane)
-            if c <= cost_cutoff:
+            if c == float('inf'):
+                forbidden.add((raw_ids[i], raw_ids[j]))
+                forbidden.add((raw_ids[j], raw_ids[i]))
+            elif c <= cost_cutoff:
                 cost_matrix[i, j] = c
 
     # Linear Sum Assignment / Hungarian matching
@@ -220,11 +235,27 @@ def solve_graph_fusion(tracklets: List[Dict[str, Any]],
         if root_i != root_j:
             parent[root_j] = root_i
 
+    # Members of each component, so a merge can be checked against EVERY pair it
+    # would create -- not just the one edge that triggered it.
+    members: Dict[int, Set[int]] = {tid: {tid} for tid in raw_ids}
+
     for cost, i, j in valid_pairs:
-        id_i = raw_ids[i]
-        id_j = raw_ids[j]
-        if find(id_i) != find(id_j):
-            union(id_i, id_j)
+        root_i = find(raw_ids[i])
+        root_j = find(raw_ids[j])
+        if root_i == root_j:
+            continue
+        # SINGLE-LINKAGE LEAKS THROUGH A VETO.
+        # A~B cheap and B~C cheap used to merge A with C even when cost(A,C) was
+        # inf -- i.e. even when A and C were on screen AT THE SAME TIME, or
+        # carried contradictory face ids. That is the exact "false merge locked
+        # in" failure this module's docstring says it exists to prevent, and it
+        # was reachable with three tracklets. Refuse the merge if ANY
+        # cross-component pair is vetoed.
+        if any((a, b) in forbidden for a in members[root_i] for b in members[root_j]):
+            continue
+        union(root_i, root_j)
+        merged = members[root_i] | members[root_j]
+        members[find(root_i)] = merged
 
     for tid in raw_ids:
         canon_map[tid] = find(tid)

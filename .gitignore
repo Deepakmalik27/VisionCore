@@ -9,6 +9,7 @@ drive_chunks/
 
 # model weights — 40 MB+, fetch them, don't commit them
 models/*.pt
+*.pt                   # ultralytics downloads bare names into the CWD (repo root)
 models/*.onnx
 models/*.engine        # TensorRT engines are GPU-architecture specific anyway
 

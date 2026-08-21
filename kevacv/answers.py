@@ -230,7 +230,8 @@ def greet_latency(arrivals, contacts, tier=PROXY):
 
 
 # ── Q3 ─────────────────────────────────────────────────────────────────────
-def guest_count(unique_ids, confidence=None, low_conf_bar=60, source="line"):
+def guest_count(unique_ids, confidence=None, low_conf_bar=60, source="line",
+                agreement=None):
     """How many guests? ESTIMATE with a range, because identity had to hold.
 
     The range is not decoration. Measured separability is ~0.66, so a single
@@ -258,13 +259,27 @@ def guest_count(unique_ids, confidence=None, low_conf_bar=60, source="line"):
                          "a point — treat the width as unknown, not as zero")
     a.caveats.append(f"derived from the {source} method; identity must hold "
                      f"across the whole visit for this to be right")
+
+    # CROSS-ESTIMATOR AGREEMENT. `tier` says how this answer was DERIVED
+    # (ESTIMATE, because identity had to hold). This says whether the
+    # INDEPENDENT estimators agree it is right -- a different question, and
+    # one the report never asked. Measured on CAM.112:
+    #     line=1 region=4  -> published "4"
+    #     line=3 region=7  -> published "7"
+    # Both printed a single confident number while their two independent
+    # sources disagreed by 57-75%, because `trust=` resolved it silently.
+    # A gap that size is not a count, it is a review item.
+    if agreement:
+        a.caveats.append(f"cross-check {agreement['tier']}: {agreement['why']}")
+        if agreement.get("tier") == "UNCERTAIN":
+            a.tier = WEAK
     return a
 
 
 def answer_set(*, events=None, staff_zones=(), waiting_zones=(),
                observed_windows=None, roles=None, arrivals=None, contacts=None,
                unique_ids=None, confidence=None, arrival_source="line",
-               findings=()):
+               findings=(), agreement=None):
     """The full set, in the ratified priority order, ready for report_slim.
 
     Q1 first because it is CRITICAL and achievable; Q3 last because it is the

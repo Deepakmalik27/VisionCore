@@ -49,9 +49,18 @@ print("=" * 74)
 print("  fine-tuning set: refuses the two sets that would teach the wrong thing")
 print("=" * 74)
 
-if not PKG.exists():
-    print(f"  SKIP  {PKG} not present")
-    sys.exit(0)
+# PYTEST VISIBILITY. This file's checks run at IMPORT and reported only via
+# an exit code. A module-level sys.exit aborts pytest COLLECTION, which hid
+# 59 of 74 test files -- and simply guarding the exit would have hidden the
+# FAILURES instead. So the same condition is also asserted as a real test.
+def test_script_level_checks_passed():
+    assert not (not PKG.exists()), "module-level checks in this file failed"
+
+
+if __name__ == "__main__":
+    if not PKG.exists():
+        print(f"  SKIP  {PKG} not present")
+        sys.exit(0)
 
 # 1. every frame identical -> only frame 1 survives -> too few to train
 rows = [f"{f},{i+1},100.00,200.00,290.00,330.00,1,1,1"
@@ -104,4 +113,13 @@ check("head" in y.lower(), "dataset.yaml flags the head-class trade-off")
 
 print()
 print("  ALL PASS" if not fail else "  FAILURES ABOVE")
-sys.exit(fail)
+# PYTEST VISIBILITY. This file's checks run at IMPORT and reported only via
+# an exit code. A module-level sys.exit aborts pytest COLLECTION, which hid
+# 59 of 74 test files -- and simply guarding the exit would have hidden the
+# FAILURES instead. So the same condition is also asserted as a real test.
+def test_script_level_checks_passed():
+    assert not (fail), "module-level checks in this file failed"
+
+
+if __name__ == "__main__":
+    sys.exit(fail)

@@ -71,10 +71,25 @@ def frame_at(video, t_s):
     """One frame, by seeking — never by decoding forward to it."""
     cmd = ["ffmpeg", "-v", "error", "-ss", f"{t_s:.3f}", "-i", str(video),
            "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]
-    out = subprocess.run(cmd, capture_output=True).stdout
-    if not out:
+    try:
+        out = subprocess.run(cmd, capture_output=True).stdout
+    except FileNotFoundError:
+        out = None          # no ffmpeg on this box -- fall through to cv2
+    if out:
+        return cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
+    # FALLBACK. ffmpeg is not installed everywhere this repo is checked out
+    # (it is absent from the WSL box this was written on), and without this
+    # every frame-grabbing tool raises FileNotFoundError and produces nothing.
+    # cv2's seek is less exact on long files, which is why ffmpeg stays first.
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
         return None
-    return cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(t_s) * 1000.0)
+        ok, frame = cap.read()
+        return frame if ok else None
+    finally:
+        cap.release()
 
 
 def build(pred_path, video, fps, out_dir, analysed_w=1280):

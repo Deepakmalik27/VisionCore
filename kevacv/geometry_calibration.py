@@ -21,12 +21,20 @@ from .ground_plane import GroundPlane, PERSON_H_M
 
 def fit_robust_ground_plane(detections: List[Tuple[float, float, float, float]],
                             frame_size: Tuple[int, int],
-                            person_h: float = PERSON_H_M) -> GroundPlane:
+                            person_h: Optional[float] = None) -> GroundPlane:
     """Robustly fit ground plane line h(y) = a*y + b using RANSAC to exclude seated/crouching detections.
-    
+
     detections: List of (x1, y1, x2, y2) bounding boxes.
     frame_size: (width, height)
+    person_h: metres; defaults to the CURRENT config value, resolved at call
+        time. It used to be `person_h: float = PERSON_H_M`, which binds once
+        when this def executes at import -- so apply_run_config could set
+        geometry_calibration.PERSON_H_M (this module IS in its propagation
+        list) and every call here would still use the import-time number. Same
+        defect as ground_plane's, in the module that fits the plane.
     """
+    if person_h is None:
+        person_h = globals()["PERSON_H_M"]
     fw, fh = frame_size
     
     # Filter valid standing aspect ratios (~2.0 to 4.5)
@@ -40,7 +48,22 @@ def fit_robust_ground_plane(detections: List[Tuple[float, float, float, float]],
             valid_pts.append((y2, h))
 
     if len(valid_pts) < 10:
-        return GroundPlane.none("Insufficient valid standing person detections for robust calibration.")
+        # A bare "insufficient" sent the run to the drifting bin-median fit
+        # without saying WHICH filter emptied the set, so nobody could tell a
+        # quiet clip from a mis-tuned gate. On CAM.112 it is the gate: the
+        # camera is oblique enough that the MEDIAN person box measures 1.58
+        # h/w, while "standing" here means 2.0-4.8. Report the distribution so
+        # the next refusal is diagnosable instead of merely discouraging.
+        _asp = sorted(float(y2 - y1) / float(x2 - x1)
+                      for x1, y1, x2, y2 in detections
+                      if x2 > x1 and y2 > y1)
+        _med = _asp[len(_asp) // 2] if _asp else float("nan")
+        return GroundPlane.none(
+            f"Insufficient valid standing person detections for robust "
+            f"calibration: {len(valid_pts)} of {len(detections)} boxes passed "
+            f"aspect 2.0-4.8 and the below-horizon cut (median aspect "
+            f"{_med:.2f}). A median below 2.0 means the gate, not the clip, "
+            f"is the reason.")
 
     ys = np.array([p[0] for p in valid_pts], dtype=np.float64)
     hs = np.array([p[1] for p in valid_pts], dtype=np.float64)

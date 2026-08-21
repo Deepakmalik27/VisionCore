@@ -270,7 +270,27 @@ def main(argv=None):
                         "the kevacv.config defaults")
     p.add_argument("--out", default=str(ROOT / "output"))
     p.add_argument("--camera-id", default="CAM.112")
-    p.add_argument("--detector", default=str(ROOT / "models" / "best.pt"))
+    # DEFAULT CHANGED best.pt -> yolo11x.pt, 2026-08-19.
+    # MEASURED 2026-08-19 against gt.txt (100 labelled frames, 600 boxes, 6 people),
+    # single variable, same config/fps/zones, head recovery off in both:
+    #
+    #                        best.pt (CrowdHuman)   yolo11x (stock)   change
+    #   HOTA                      0.2590               0.4762          +84%
+    #   DetA                      0.1871               0.3976         +113%
+    #   AssA                      0.3680               0.5807          +58%
+    #   precision                 0.1954               0.6440         +230%
+    #   recall                    0.0850               0.4883         +474%
+    #   TP / FP                   51 / 210             293 / 162
+    #
+    # Strictly better on every metric -- recall up AND false positives down.
+    # HOTA 0.4762 clears SUCCESS_CRITERIA.md hota_floor 0.40 for the first time.
+    #
+    # WHY the fine-tune lost: trained on CrowdHuman *fbox* (amodal -- full body
+    # INCLUDING the occluded part), so it predicts box bottoms through the
+    # reception desk; 10 epochs on ~4-6k outdoor-daylight images for an indoor
+    # IR-flipping lobby; and it was a capacity downgrade too (yolo11x -> yolo11m).
+    # Two confounded changes, never scored. Every notebook version used stock.
+    p.add_argument("--detector", default="yolo11x.pt")
     p.add_argument("--staff-gallery", default=str(ROOT / "staff_gallery"))
     p.add_argument("--tz", default="America/Chicago")
     p.add_argument("--device", default=None, help="cuda / cpu (default: auto)")
@@ -363,9 +383,46 @@ def main(argv=None):
     if not a.video or not a.zones:
         p.error("--video (or --drive-folder) and --zones are required")
 
+    # analysis.detector, actually consumed.
+    #
+    # It was listed in RUN_CONFIG_CALLER_KEYS as "consumed by the caller" and
+    # then read by nobody -- so a venue profile could name a detector, be
+    # exempted from the unknown-key warning, and be silently ignored. That is
+    # worse than an unrecognised key, because the yaml reads as authoritative.
+    # An explicit --detector on the command line still wins.
+    if a.config and "--detector" not in sys.argv:
+        try:
+            import yaml as _yaml
+            _cfgd = (_yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))
+                     or {}).get("analysis") or {}
+            if _cfgd.get("detector"):
+                a.detector = str(_cfgd["detector"])
+                print(f"  detector from {Path(a.config).name}: {a.detector}")
+        except Exception as _de:
+            print(f"  (could not read analysis.detector: {_de})")
+
+    # The detector is the single largest measured lever in this pipeline
+    # (best.pt vs yolo11x: GT coverage 66.2% -> 76.3%), and a 5-minute
+    # annotated video was once produced with the WRONG one because a config
+    # file still named it. Print it where nobody can miss it, and say out loud
+    # when it is not the measured-best choice.
+    print(f"  DETECTOR: {a.detector}")
+    if "best.pt" in str(a.detector):
+        print("  !! WARNING: models/best.pt is the CrowdHuman fine-tune, "
+              "measured WORSE than stock yolo11x on this camera "
+              "(66.2% vs 76.3% GT coverage). It was trained on amodal boxes "
+              "that include the occluded part of a body, so it predicts box "
+              "bottoms through the reception desk. Pass --detector yolo11x.pt "
+              "unless you are deliberately A/B-ing it.")
+
     video, zones_path = Path(a.video), Path(a.zones)
-    for label, path in (("video", video), ("zones", zones_path),
-                        ("detector", Path(a.detector))):
+    _checks = [("video", video), ("zones", zones_path)]
+    # A BARE model name ("yolo11x.pt") is not a path -- ultralytics resolves and
+    # downloads it. Only check the detector when it is given as a path, or the
+    # stock-model default fails preflight on a clean box.
+    if "/" in a.detector or "\\" in a.detector or Path(a.detector).exists():
+        _checks.append(("detector", Path(a.detector)))
+    for label, path in _checks:
         if not path.exists():
             print(f"  MISSING {label}: {path}")
             return 2

@@ -38,6 +38,7 @@ from .log import get_logger, stage, banner
 _log = get_logger("analytics")
 
 
+import bisect
 import math
 from collections import Counter, defaultdict
 
@@ -373,44 +374,6 @@ def staff_visits(events, table_zone, window, visit_min_s=8.0, merge_gap_s=30.0):
             if iv[1] - iv[0] >= visit_min_s]
 
 
-def table_service_metrics(events, table_zones, party_gap_s=120.0,
-                          min_party_s=60.0, visit_min_s=8.0):
-    """Per party per table: seating->first-visit ('order' proxy),
-    first->second visit ('food' proxy), total visit count.
-    Returns (per_party_rows, averages_dict)."""
-    rows = []
-    for table in sorted(table_zones):
-        for party in detect_parties(events, table, party_gap_s, min_party_s):
-            visits = staff_visits(events, table, party, visit_min_s)
-            seat_t = party[0]
-            order_t = visits[0][0] if len(visits) >= 1 else None
-            food_t = visits[1][0] if len(visits) >= 2 else None
-            rows.append({
-                "table": table,
-                "party_start": round(seat_t, 1),
-                "party_end": round(party[1], 1),
-                "n_staff_visits": len(visits),
-                "seating_to_order_s": (round(order_t - seat_t, 1)
-                                       if order_t is not None else None),
-                "order_to_food_s": (round(food_t - order_t, 1)
-                                    if food_t is not None else None),
-            })
-
-    def avg(key):
-        vals = [r[key] for r in rows if r[key] is not None]
-        return round(sum(vals) / len(vals), 1) if vals else None
-
-    averages = {
-        "avg_seating_to_order_s": avg("seating_to_order_s"),
-        "avg_order_to_food_s": avg("order_to_food_s"),
-        "avg_visits_per_party": (round(sum(r["n_staff_visits"] for r in rows)
-                                       / len(rows), 2) if rows else None),
-        "n_parties": len(rows),
-    }
-    return rows, averages
-
-
-
 # v42 mix track_id sort key (some are integers, some are string names like 'jane')
 def track_sort_key(tid):
     if isinstance(tid, str) and not tid.isdigit():
@@ -534,6 +497,19 @@ def apply_staff_zone_override(events, staff_zones, min_staff_dwell_s=60.0,
         return (events, {}) if return_evidence else events
     if sole_dwell_s is None:
         sole_dwell_s = min_staff_dwell_s * 10.0
+    # SHORT-RUN UNREACHABILITY (measured 2026-08-20 on the 10-minute CAM.112
+    # delivery run, which reported "0 staff" over a permanently-manned desk).
+    # min_spread is a FRACTION of the observation window; sole_dwell_s was an
+    # ABSOLUTE 600 s. On a 600 s clip rule (b) therefore demanded 100% of the
+    # window with not one missed frame -- arithmetically impossible. And rule
+    # (a) cannot catch a receptionist who never leaves, because that is ONE
+    # contiguous visit, which is the exact case (b) exists to cover. So on a
+    # short run neither rule can fire and the answer is always zero.
+    # Cap it to half the window, never below min_staff_dwell_s: 300 s at a desk
+    # is still far beyond any plausible single customer interaction.
+    if observation_s:
+        sole_dwell_s = max(min_staff_dwell_s,
+                           min(sole_dwell_s, 0.5 * float(observation_s)))
 
     ev = staff_evidence(events, staff_zones, observation_s=observation_s,
                         exclude_ids=exclude_ids)
@@ -615,6 +591,89 @@ def occupancy_timeline(events, t_end, step_s=10.0):
         for r in roles:
             counts[r][i] = len(seen[r])
     return times, counts
+
+
+def reconcile_occupancy(events, crossings, t_end, step_s=30.0,
+                        line_name=None, initial=None):
+    """Does the door arithmetic agree with the people actually on screen?
+
+    audit.txt RED FLAG #3, which the overlay had already contradicted itself
+    about in public:  "people in frame = 5, entered = 8, exited = 6"  ->
+    1 + 8 - 6 = 3, but 5 were visible. The pipeline held both numbers and
+    compared them nowhere, so it could not notice.
+
+        expected(t) = initial + IN(<=t) - OUT(<=t)      the doors
+        observed(t) = distinct people on screen         the tracker
+
+    Neither is truth. They are two independent estimates of one quantity, and
+    the gap between them is the error bar we have never printed. A persistent
+    positive drift means missed exits or double-counted entries; negative
+    means missed entries or people appearing from nowhere.
+
+    initial: occupancy before the clip. Defaults to the observed count in the
+    first step, because assuming an empty room is the one choice guaranteed to
+    be wrong at a reception desk that is already staffed.
+
+    -> {"steps": [...], "max_abs_drift": float, "final_drift": int,
+        "worst_t": float, "initial": int}
+    """
+    times, counts = occupancy_timeline(events, t_end, step_s=step_s)
+    observed = [sum(counts[r][i] for r in counts) for i in range(len(times))]
+    if initial is None:
+        initial = observed[0] if observed else 0
+
+    cr = [c for c in (crossings or [])
+          if line_name is None or c.get("line") == line_name]
+    ins = sorted(float(c["t"]) for c in cr
+                 if str(c.get("direction", "")).lower() in ("in", "+1", "1"))
+    outs = sorted(float(c["t"]) for c in cr
+                  if str(c.get("direction", "")).lower() in ("out", "-1"))
+
+    steps = []
+    for i, t0 in enumerate(times):
+        t1 = t0 + step_s
+        # bisect_LEFT, not right: a crossing at exactly t1 belongs to the NEXT
+        # step, because that is the step in which occupancy_timeline first sees
+        # the person on screen. bisect_right counted the door a step before the
+        # room and manufactured a phantom -2 drift in the opening window.
+        n_in = bisect.bisect_left(ins, t1)
+        n_out = bisect.bisect_left(outs, t1)
+        exp = initial + n_in - n_out
+        steps.append({"t": t0, "expected": exp, "observed": observed[i],
+                      "drift": observed[i] - exp,
+                      "in": n_in, "out": n_out})
+    worst = max(steps, key=lambda s: abs(s["drift"])) if steps else None
+    return {"steps": steps,
+            "initial": initial,
+            "max_abs_drift": abs(worst["drift"]) if worst else 0,
+            "worst_t": worst["t"] if worst else None,
+            "final_drift": steps[-1]["drift"] if steps else 0,
+            "line": line_name}
+
+
+def describe_reconciliation(rec, width=78):
+    """The drift, in words, because a JSON field nobody reads is not a check."""
+    if not rec or not rec["steps"]:
+        return "OCCUPANCY RECONCILIATION — no data"
+    L = ["=" * width,
+         "  OCCUPANCY RECONCILIATION — do the doors agree with the room?",
+         "=" * width,
+         f"  initial occupancy assumed: {rec['initial']}"
+         f"   (line: {rec['line'] or 'all doors'})",
+         f"  {'t':>8}{'expected':>10}{'observed':>10}{'drift':>8}"
+         f"{'IN':>6}{'OUT':>6}"]
+    for s in rec["steps"]:
+        flag = "  <-- worst" if s["t"] == rec["worst_t"] else ""
+        L.append(f"  {s['t']:>8.0f}{s['expected']:>10}{s['observed']:>10}"
+                 f"{s['drift']:>+8}{s['in']:>6}{s['out']:>6}{flag}")
+    L.append("  " + "-" * (width - 4))
+    L.append(f"  worst disagreement {rec['max_abs_drift']} "
+             f"person(s) at t={rec['worst_t']}s; ends {rec['final_drift']:+d}")
+    if rec["max_abs_drift"] >= 2:
+        L.append("  !! the doors and the tracker disagree by >=2 people. One of")
+        L.append("     them is wrong and the counts downstream inherit it.")
+    L.append("=" * width)
+    return "\n".join(L)
 
 
 # ---------------------------------------------------------------------------
@@ -1042,7 +1101,8 @@ def _handoff_hsv_contradicts(a, b, raw_crops):
 def calibrate_appearance_threshold(windows, positions, anchor_embeddings,
                                    handoff_gap_s=2.5, handoff_px=90.0,
                                    stationary_px=30.0, role_hint=None,
-                                   duplicate_px=40.0):
+                                   duplicate_px=40.0,
+                                   stationary_max_gap_s=None):
     """Diagnostic (v30): measures THIS run's actual same-person vs
     different-person cosine-similarity distribution for whichever appearance
     backbone loaded (CLIP-ReID or OSNet), instead of reusing OSNet's
@@ -1140,7 +1200,19 @@ def calibrate_appearance_threshold(windows, positions, anchor_embeddings,
                 continue
             dist = math.hypot(first_pos[0] - second_pos[0],
                               first_pos[1] - second_pos[1])
-            if (((gap <= handoff_gap_s and dist <= handoff_px) or dist <= stationary_px)
+            # THE SAME-PERSON SAMPLE MUST NOT BE BUILT BY A RULE THAT MERGES
+            # STRANGERS. `dist <= stationary_px` alone has no time bound, and
+            # measured on CAM.112 that rule bridged pairs 14px/62.3s and
+            # 17px/125.1s apart -- successive guests at one reception desk.
+            # Feeding those in as "same person" is why this calibration
+            # concluded "the distributions overlap, clip's appearance signal is
+            # not cleanly separating same/different at ANY threshold": it was
+            # measuring the similarity between DIFFERENT PEOPLE and labelling
+            # it same-person. A conclusion that circular has been used to
+            # justify giving up on appearance matching entirely.
+            _stat_ok = dist <= stationary_px and (
+                stationary_max_gap_s is None or gap <= stationary_max_gap_s)
+            if (((gap <= handoff_gap_s and dist <= handoff_px) or _stat_ok)
                     and not _handoff_appearance_contradicts(a, b, anchor_embeddings)):
                 s = _cosine(anchor_embeddings[a], anchor_embeddings[b])
                 same_sims.append(s)
@@ -1182,6 +1254,54 @@ def calibrate_appearance_threshold(windows, positions, anchor_embeddings,
     }
 
 
+def _report_cost_weighted(same_sims, diff_sims, chosen):
+    """Print what an ASYMMETRIC error cost would have chosen instead.
+
+    WHY REPORT AND NOT APPLY
+        find_optimal_threshold maximises balanced accuracy, which weights the
+        two mistakes EQUALLY. kevacv/threshold.py argues at length that they are
+        not equal here:
+
+            FALSE REJECT   one person becomes two fragments. Guest count +1,
+                           everything else still correct.
+            FALSE ACCEPT   two people become one. Guest count -1, AND their
+                           dwell merges, AND their zone visits merge, AND a
+                           customer can inherit a staff member's desk minutes,
+                           AND greet latency is computed from the wrong arrival.
+
+        threshold.py was written to act on that, has 13 passing tests, and had
+        never been called by anything -- one of ten modules in that state. It is
+        wired here as a REPORT first, deliberately: its own compare() docstring
+        says "never returns 'apply this' ... changing a merge threshold without
+        a scored A/B is how a pipeline quietly starts fusing people". So this
+        changes no number today; it puts the number in the log so the switch can
+        be argued from evidence instead of from the docstring.
+
+        Failures are swallowed on purpose. A diagnostic that can abort a
+        four-hour run is worse than no diagnostic.
+    """
+    try:
+        # describe() renders cost_weighted_threshold()'s report, NOT compare()'s
+        # -- handed compare()'s dict it returns "no data" without raising. The
+        # one-line summary below carries the decision-relevant numbers anyway.
+        from .threshold import compare
+        rep = compare(same_sims, diff_sims, current=chosen)
+        if "suggested" not in rep:
+            _log.info(f"  [cost-weighted] not usable: {rep.get('reason', rep)}")
+            return
+        cur, sug = rep["current"], rep["suggested"]
+        _log.info(
+            f"  [cost-weighted] balanced-accuracy picked {cur['threshold']:.3f} "
+            f"(FA {cur['false_accept_rate']:.3f} / FR {cur['false_reject_rate']:.3f}); "
+            f"asymmetric cost would pick {sug['threshold']:.3f} "
+            f"(FA {sug['false_accept_rate']:.3f} / FR {sug['false_reject_rate']:.3f}), "
+            f"{rep.get('direction', '?')}, expected cost {rep['cost_delta']:+.4f}")
+        _log.info("  [cost-weighted] REPORTED ONLY — nothing applied. "
+                  "A/B it before switching.")
+    except Exception as exc:                       # pragma: no cover
+        _log.debug(f"  [cost-weighted] skipped ({type(exc).__name__}: {exc})")
+
+
 def suggest_appearance_thresholds(cal, current_thresh, current_anchor,
                                   floor=0.35, ceiling=0.85):
     """(v37) Turns calibrate_appearance_threshold()'s report into thresholds
@@ -1194,6 +1314,7 @@ def suggest_appearance_thresholds(cal, current_thresh, current_anchor,
         suggested = opt_thresh
         anchor_suggested = opt_thresh + 0.08
         _log.info(f"  [EER Sweep] Optimal threshold found at {opt_thresh:.3f} (balanced accuracy = {metrics['balanced_accuracy']:.4f})")
+        _report_cost_weighted(same_sims, diff_sims, opt_thresh)
     else:
         same_p10, diff_p90 = cal.get("same_p10"), cal.get("diff_p90")
         if same_p10 is None or diff_p90 is None:
@@ -1632,7 +1753,8 @@ def merge_fragmented_tracks(track_windows, embeddings,
                             raw_crops=None, hsv_sim_threshold=0.75,
                             face_embeddings=None, face_sim_threshold=0.35,
                             plane=None, handoff_m=1.6, stationary_m=0.6,
-                            ir_hint=None):
+                            ir_hint=None, blocked_pairs=None,
+                            stationary_max_gap_s=None):
     """Merge track fragments that are the same person reappearing.
 
     track_windows: {track_id: (t_first, t_last)} visibility window per track
@@ -1774,6 +1896,9 @@ def merge_fragmented_tracks(track_windows, embeddings,
             if gap < 0:
                 _rej(a, b, "windows overlap (co-visible, so two people)")
                 continue         # windows overlap — not a reappearance
+            if blocked_pairs and ((a, b) in blocked_pairs or (b, a) in blocked_pairs):
+                _rej(a, b, "topology veto (impossible reappearance location/gap)")
+                continue
             if _role_conflict(a, b):
                 role_conflict_count += 1
                 _rej(a, b, "role conflict (one staff, one customer)")
@@ -1798,7 +1923,28 @@ def merge_fragmented_tracks(track_windows, embeddings,
                         spatial_penalty = min(MAX_SPATIAL_PENALTY, excess_ratio * SPATIAL_PENALTY_SCALE)
                 required += spatial_penalty
                 
-                if (sim >= required and not _ir_mismatch(a, b)
+                # C7 (2026-08-19): MAX_BODY_GAP_S, finally applied.
+                #
+                # config.py has said since the port that "appearance-only tiers
+                # get a tighter cap than face" and shipped MAX_BODY_GAP_S=300
+                # for it -- but the constant was imported into this module and
+                # referenced ZERO times. It printed in the run ledger and
+                # changed nothing, so `analysis.max_body_gap_s` was a knob an
+                # operator could turn with no effect at all.
+                #
+                # The rule is sound and matters here: body appearance decays
+                # with time (people turn, lighting shifts, this camera flips
+                # colour<->IR every ~12s), while a FACE match does not -- which
+                # is why face is allowed the full REID_MAX_GAP_S and the
+                # appearance-only tiers are not.
+                _body_capped = (MAX_BODY_GAP_S is not None
+                                and gap > MAX_BODY_GAP_S)
+                if _body_capped:
+                    _rej(a, b, f"appearance-only tier past the body gap cap "
+                               f"(gap {gap:.0f}s > MAX_BODY_GAP_S "
+                               f"{MAX_BODY_GAP_S:.0f}s); face and hand-off "
+                               f"tiers can still bridge it")
+                elif (sim >= required and not _ir_mismatch(a, b)
                         and not _appearance_hsv_contradicts(a, b, raw_crops)):
                     pairs.append((sim, a, b, "gallery"))
                 elif sim < required:
@@ -1863,6 +2009,9 @@ def merge_fragmented_tracks(track_windows, embeddings,
                     a2, b2 = b, a
                 else:
                     a2, b2 = a, b
+                if blocked_pairs and ((a2, b2) in blocked_pairs or (b2, a2) in blocked_pairs):
+                    _rej(a2, b2, "topology veto (impossible reappearance location/gap)")
+                    continue
                 if _role_conflict(a2, b2):
                     role_conflict_count += 1
                     _rej(a2, b2, "role conflict (one staff, one customer)")
@@ -1943,6 +2092,8 @@ def merge_fragmented_tracks(track_windows, embeddings,
                     pseudo = 0.90 + 0.09 * conf   # 0.90-0.99
                     pairs.append((pseudo, a2, b2, "hand-off"))
                 elif (_near_static
+                        and (stationary_max_gap_s is None
+                             or gap <= stationary_max_gap_s)
                         and not _handoff_appearance_contradicts(a2, b2, anchor_embeddings)
                         and not (_hsv_veto_ok
                                  and _handoff_hsv_contradicts(a2, b2, raw_crops))):
@@ -1955,6 +2106,12 @@ def merge_fragmented_tracks(track_windows, embeddings,
                     conf = 1.0 - dist / stationary_px
                     pseudo = 0.85 + 0.09 * conf   # 0.85-0.94
                     pairs.append((pseudo, a2, b2, "stationary"))
+                elif (_near_static and stationary_max_gap_s is not None
+                        and gap > stationary_max_gap_s):
+                    _rej(a2, b2, f"stationary match {dist:.0f}px apart but "
+                                 f"{gap:.0f}s apart — beyond the "
+                                 f"{stationary_max_gap_s:.0f}s stationary cap. "
+                                 f"Same SPOT is not same PERSON at a desk.")
                 elif not _near_static:
                     _rej(a2, b2, f"{dist:.0f}px apart — beyond stationary_px "
                                  f"{stationary_px:.0f} and hand-off_px "

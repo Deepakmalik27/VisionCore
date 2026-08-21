@@ -35,8 +35,9 @@ def _zones_with(zone_roles, roles):
     return {z for z, rs in (zone_roles or {}).items() if set(rs) & roles}
 
 
-def arrivals_from_regions(events, zone_roles, roles=None, dedupe_s=6.0,
-                          dedupe_m=1.2, plane=None, positions=None):
+def arrivals_from_regions(events, zone_roles, roles=None, dedupe_s=2.5,
+                          dedupe_m=1.2, plane=None, positions=None,
+                          spans=None, overlap_s=0.4):
     """Arrivals inferred from zone transitions instead of a line crossing.
 
     An arrival is a track that is seen in an ENTRY zone and then, later, in an
@@ -46,6 +47,27 @@ def arrivals_from_regions(events, zone_roles, roles=None, dedupe_s=6.0,
     -> (count, arrivals, why). `why` is never None: when the zones cannot
     support the question at all it says so rather than returning 0, because 0
     and "cannot tell" must never look the same in a report.
+
+    CO-VISIBILITY (spans), added 2026-08-19 (C11).
+
+    This function had the SAME group-collapse bug that tier_a_crossings was
+    fixed for: "close in time and space" is what one person arriving once
+    looks like, and it is also what a PARTY walking in together looks like.
+    Ground truth (eval/gt_entries_305_318.json): six guests entered CAM.112 in
+    13 seconds, several within 1-2s of each other at nearly the same spot.
+
+    It was latent only by accident -- every caller omits `positions`, so the
+    spatial branch never ran. The signature invites it, and the region count is
+    the PREFERRED arrival source (derive.arrivals_by_id(prefer="region")) that
+    feeds the headline guest number. The first caller to pass positions would
+    have started deleting real people.
+
+    Two tracks visible at the same instant cannot be one person, so they are
+    never folded together. Without `spans` the check is skipped and behaviour
+    is unchanged -- no silent half-enforcement.
+
+    dedupe_s 6.0 -> 2.5 to match tier_a_crossings, where 6.0 was measured to
+    swallow a party arriving over 6.7 seconds even WITH the co-visibility guard.
     """
     ez = _zones_with(zone_roles, ENTRY_ROLES)
     iz = _zones_with(zone_roles, INTERIOR_ROLES)
@@ -88,6 +110,12 @@ def arrivals_from_regions(events, zone_roles, roles=None, dedupe_s=6.0,
                 d = plane.dist_m(p, q) if (plane is not None and plane.ok) else None
                 if (d is not None and d <= dedupe_m) or (
                         d is None and math.hypot(p[0] - q[0], p[1] - q[1]) <= 140):
+                    if spans is not None:
+                        _a = spans.get(a.get("track_id"))
+                        _b = spans.get(k.get("track_id"))
+                        if (_a and _b
+                                and min(_a[1], _b[1]) - max(_a[0], _b[0]) > overlap_s):
+                            continue      # co-visible -> two people, not one
                     dup = True
                     break
             elif k["track_id"] == a["track_id"]:

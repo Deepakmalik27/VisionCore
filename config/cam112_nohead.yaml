@@ -1,0 +1,321 @@
+# Run settings as DATA, not as edits inside a notebook cell.
+#
+# ARCHITECTURE_DECISION.md: "Profile/config is data, not notebook cells."
+#
+# STATUS: the `analysis` block below is APPLIED to the run by
+# kevacv.config.apply_run_config, called from tools/run_pipeline.py. What it
+# changed is printed in full at the top of every run.
+#
+# It did not used to be. The previous header here claimed "run.sh reads this
+# and exports it into the environment" — run.sh only `sed`s the file into the
+# log. So this said fps 8, kevacv/config.py said 15, and the notebook said 7;
+# 15 is what ran, because it was the only one anything actually read. Printed
+# but not obeyed is the worst state for a config file to be in.
+#
+# Sections other than `analysis` remain descriptive: `camera` and `chunk` are
+# consumed by the caller, and `measured_baseline` is a record of a past run,
+# not an instruction for this one.
+
+camera:
+  id: CAM.112                      # keep dots/spaces OUT of anything used as a
+                                   # filename — see V73, pathlib eats them
+  # VENUE CORRECTED 2026-08-16 — this was `delilah_la` and it was WRONG.
+  # The NVR burns an overlay into the exported video, and the raw source says
+  #     2026-07-28 06:34:58 PM | CAM.112 (PP.09:12)
+  # "PP.09:12" appears exactly once across all 17 H.WOOD consoles: DLH DAL.
+  # Three things agree:
+  #     PP.09:12         -> H.WOOD DLH DAL, a G6 Turret at 10.0.14.112
+  #     filename "CDT"   -> Central time. Dallas. (LA is PDT, Miami EDT)
+  #     default --tz     -> America/Chicago, which is Dallas
+  # DLH LA also has a CAM.112 — "(G3) (PP.02:08)", a G4 Pro — a DIFFERENT
+  # camera in a different city. The name collision is what hid this.
+  #
+  # What it cost: the staff gallery is enrolled from photos that may be LA
+  # staff, which would explain "enrolled but NEVER matched: staff2, staff4"
+  # and a face coverage of ~2% that was being blamed on thresholds.
+  venue: delilah_dallas
+  source_resolution: [3840, 2160]
+  generation: G6                   # G6 Turret (was recorded as G4 Pro, wrong
+                                   # camera). G3 cameras cannot do person
+                                   # detection; G6/AI models detect on-device.
+
+chunk:
+  # CHUNK_FILTER must be applied BEFORE the download and the clock parse.
+  # Getting that wrong analysed the 4:30pm video with a 19:30 clock.
+  filter: "7.30.00pm"
+  drive_folder_id: "1CP-EdRntJ6LsApDddKI35tQniQigX8G0"
+  max_chunks: null                 # null = the whole night
+
+analysis:
+  fps: 8                           # authoritative — overrides kevacv.config
+                                   # FPS_TARGET. Drives eff_fps, and through it
+                                   # the live re-id distance gate, the lost-track
+                                   # buffer and the frame step every dwell is
+                                   # measured in. Change it here, nowhere else.
+  imgsz: 1280
+
+  # A/B: the notebook has NO detection-filter stack. Scored against gt.txt.
+  enable_head_recovery: false
+  enable_merged_split: false
+  # DETECTOR: stock yolo11x, measured 2026-08-19 against gt.txt, one variable:
+  #     best.pt (CrowdHuman fine-tune)   yolo11x (stock)
+  #     GT >=60% covered   66.2%             76.3%
+  #     recall @IoU>=0.2   67.5%             80.7%
+  #     box h/w median      1.70              1.58   (labels say 1.14)
+  # best.pt was trained on CrowdHuman *fbox* = amodal boxes that include the
+  # OCCLUDED part of a body, so it predicts box bottoms through the reception
+  # desk. It was also a capacity downgrade (yolo11x -> yolo11m). Two confounded
+  # changes, never scored until now.
+  detector: yolo11x.pt
+  tracker: botsort-reid
+  reid_weights: clip_market1501.pt
+
+  # ── THE A/B KNOBS ──────────────────────────────────────────────────────
+  # Set to TODAY'S DEFAULTS, so writing them here changes nothing. They are
+  # here to be turned, ONE AT A TIME, against the run ledger — which now
+  # prints "dedup_nms_iou 0.7 -> 0.55  AND  crossings 0 -> 12" in one place.
+  #
+  # Until 2026-08-13 these lived only in kevacv/config.py, so every
+  # experiment was an untracked source edit you could forget to revert. That
+  # is why "we tried tiling once" is a memory instead of a number.
+  #
+  # tiled — SAHI. Cuts the frame into overlapping tiles so a 60px guest at
+  #   the door is detected at ~2x effective resolution. Built and tested in
+  #   kevacv/tiled.py, wired to nothing, off by default. It MULTIPLIES
+  #   detector calls; cost_estimate() is logged at startup. Try it alone.
+  #   TURNED ON 2026-08-13 at the operator's explicit instruction. NOTE it
+  #   lands in the SAME run as dedup_nms_iou 0.55 and the D0 cap, so the
+  #   ledger will show three changes against one set of counters -- if the
+  #   result is worse, flip them back one at a time to find which.
+  #   TURNED OFF 2026-08-14 on the evidence, not on preference:
+  #     SOURCE crop height median 439-487px vs TILE_TARGET_MIN_PX 110 -- nobody
+  #       in this scene is small enough for tiling to be the tool.
+  #     dedup NMS removed 0.4-0.6% -- the tiles were not finding extra people.
+  #     cost: 9 detector calls/frame AND ~11.4 detections/frame each needing a
+  #       CLIP-ReID embedding, which is what actually made a 1h chunk take 2h40m.
+  #   Flip back to true and compare the funnel in the ledger if you ever move
+  #   this camera further from the room.
+  tiled: false
+
+  # conf — the detection floor. Lower finds more people AND more plants.
+  conf: 0.35
+
+  # fisheye_k — radial lens correction. 0.0 = off (costs nothing).
+  #   MEASURED, never typed: run
+  #     python3 tools/autocalib_fisheye.py --frame <full-res still> --write
+  #   It fits k to the straight edges already in the picture and refuses to
+  #   write one that fails a hold-out check. On the 960x540 reference frame it
+  #   reached k=-0.083 with 100% of held-out chains improving but residual
+  #   0.0172 vs a 0.015 bar -- edges are blurred by the 4x downscale. Re-run on
+  #   a 3840x2160 still.
+  fisheye_k: 0.0
+
+  # max_box_height_frac / max_box_area_frac — D0 absurd-size cap. A box bigger
+  #   than this cannot be a person on a ceiling camera, whatever the ground
+  #   plane says, and unlike D1 this is NOT relaxable. Kills the frame-wide
+  #   boxes at the doorway and over the background.
+  #
+  #   0.70 -> 0.95 TRIED AND REVERTED, 2026-08-15. Both halves are true and
+  #   only the second one is visible in the funnel, so record both.
+  #
+  #   WHY IT WAS RAISED: 0.70 is below a real person. The F2 fit in the same
+  #   run measures 804px = 0.744 of frame for someone standing at the frame
+  #   bottom -- which is where the main entrance is. D0 dropped 8,246 boxes per
+  #   600s, every one on HEIGHT and none on area, and 97% were within 1.35x
+  #   what F2 expects at their own foot position. That is real recall loss at
+  #   the door and it is still true today.
+  #
+  #   WHY IT WENT BACK: the funnel said the raise worked (+3,716 detections
+  #   past D0). The FRAME LOG said the opposite. Diffing profC vs profE frame
+  #   by frame:
+  #       frames seeing MORE people   417
+  #       frames seeing FEWER people  869      <- 2:1 against
+  #       populated -> empty          214
+  #       boxes lost there            median 45x82px -- SMALL, distant people
+  #   A cap that only removes BIG boxes cost small distant ones, because the
+  #   giant phantoms it now keeps enter F2's sample pool. F2's fit moved
+  #   (slope 0.807 -> 0.814) and D1, which sizes people from that fit, went
+  #   from dropping 460 to 1,806; the tracker lost 1,529 more on top.
+  #
+  #   THE LESSON, worth more than the knob: never conclude from the funnel
+  #   alone. tools/audit_frames.py diffs the frame logs; run it before
+  #   believing any recall claim.
+  #
+  #   A TOP-ANCHOR bound was proposed here as "the real fix" and is now
+  #   WITHDRAWN, having been checked rather than assumed:
+  #       P3 phantom     top 0.081        P11 phantom   top 0.139
+  #       leaning guest  top 0.167        near-cam guest top 0.256
+  #   P11 to a leaning guest is 28 pixels, fitted to two examples. That is not
+  #   a discriminator, it is a coincidence with a threshold drawn round it.
+  #
+  #   NO single-frame geometry separates these. Height, area and top-anchor all
+  #   interleave. The one signal with real margin is TIME: a wall artefact
+  #   holds size cv ~0.004 while a standing person holds ~0.080, which is 19x,
+  #   and that belongs to the phantom stage, not to D0. See
+  #   analysis.phantom_fast_cv_ratio below -- that is where the fix now lives.
+  max_box_height_frac: 0.70
+  max_box_area_frac: 0.30
+
+  # proxy_render — cache every analysed frame as a JPEG for the render pass.
+  #   FALSE since 2026-08-14: with tiling off the run is CPU-bound (GPU at 14%)
+  #   and JPEG encoding is the largest per-frame CPU cost. An hour wrote ~27,000
+  #   files / 8.4 GB, and a crashed run left every byte behind. Pass 2 re-decodes
+  #   instead. Same frames, same pixels, no accuracy change.
+  proxy_render: false
+
+  # tile_px / tile_overlap — tiling GEOMETRY, when tiled: true.
+  #   cost_estimate at 1920x1080:  640px = 9 calls/frame · 1280px = 3.
+  #   The 2.8 it/s that got tiling switched off was measured with proxy_render
+  #   STILL ON (27k CPU JPEG encodes, GPU at 14%). That was the real cost, not
+  #   the tiles. With proxy off, tiled:true + tile_px:1280 is worth re-testing
+  #   before giving up the small-object recall.
+  tile_px: 1280
+  tile_overlap: 0.2
+
+  # reid_sim_threshold — the bar two track fragments must clear to be judged
+  #   the same person by the offline stitcher. THE knob behind "customers are
+  #   labelled staff".
+  #     0.37 (profC): 98 merges, only 58 corroborated by the independent HSV
+  #       check. The 40 disputed ones sit at 0.46-0.56 — ID 41 <-> ID 208 was
+  #       merged on gallery_sim 0.544 while anchor_sim said 0.098. Merging
+  #       strangers builds identities whose desk visits are scattered across
+  #       the whole window, and apply_staff_zone_override reads scatter as
+  #       STAFF. Result: 8 of 10 identities called staff at a one-receptionist
+  #       desk.
+  #     0.61 TRIED AND REVERTED, 2026-08-15. The A/B (profE 0.37 vs profF 0.61,
+  #       single knob, everything else identical) barely moved:
+  #           identities   18 -> 20      merges       63 -> 61
+  #           HSV disputed 57 -> 52      staff called  8 ->  8
+  #           guests / events / crossings / desk coverage   ALL IDENTICAL
+  #       So the merge bar is NOT what inflates staff, and the theory above
+  #       that it is -- mine -- is not supported. The calibration pass says why
+  #       in its own words: "distributions overlap — clip's appearance signal
+  #       is not cleanly separating same/different person on this footage at
+  #       ANY single threshold". There is no good value to find here.
+  #   Change this ALONE and read the ledger: merges, identities, and how many
+  #   the HSV check disputes should all move together.
+  reid_sim_threshold: 0.37
+
+  # phantom_fast_cv_ratio — let the LIVE phantom suppressor skip the clock,
+  #   never the evidence, when a location is provably more rigid than a person.
+  #     THE PROBLEM: profC/profE both logged "live phantom suppress removed
+  #       nothing all chunk". Not a bug — the plant and mirror sit in
+  #       reception/seating, which get 240s patience because people
+  #       legitimately stand still there. On a 600s run the phantom therefore
+  #       lives the whole chunk, holding a canonical id and blocking real
+  #       people from resolving to it. Only the end-of-chunk pass removes it,
+  #       far too late to undo the id breaks it already caused.
+  #     THE MARGIN: statue size cv ~0.004 vs standing person ~0.080 = 19x.
+  #       At 0.30 the fast path demands cv <= 0.30*0.015 = 0.0045 — the statue
+  #       clears it, a person misses by an order of magnitude. Verified in
+  #       tests/test_phantom_fast_patience.py: statue caught at 30s, a person
+  #       standing 600s is never caught even at ratio 1.00.
+  #   MEASURED 2026-08-15 (profG, ratio 0.30): NO EFFECT. 'live phantom
+  #   suppress' still removed nothing, and every downstream number was
+  #   identical to the 0.0 baseline (72 fragments -> 16 people, guests 3,
+  #   contacts 4). Not a regression — there is simply nothing rigid enough in
+  #   the 18:30 chunk: the lowest size cv measured anywhere in the frame log
+  #   is 0.12, and this bar is 0.30*0.015 = 0.0045, 27x tighter. The statue
+  #   and mirror the original audit described are not present at that
+  #   rigidity in this window. Left OFF: correct code, no demonstrated value
+  #   here. Worth retrying on a chunk where a phantom is actually visible.
+  phantom_fast_cv_ratio: 0.0
+  phantom_fast_min_s: 30.0
+
+  # det_batch — frames per detector call. Must be <= the batch a TensorRT
+  #   engine was compiled for; exceeding it does not fail cleanly, it raises
+  #   "cudaError 700: an illegal memory access" and kills the run. The engine
+  #   at models/best.engine was exported at batch 4 (batch 24 OOM'd the 30 GB
+  #   box during ONNX conversion). With models/best.pt any value works; 24 was
+  #   the default.
+  det_batch: 24
+
+  # foot_anchor_frac — where the FOOT is inside a detection box.
+  #   1.0 = the bottom edge, which every zone test and entry-line crossing
+  #   assumed until 2026-08-17. Measured against 600 hand-labelled boxes it is
+  #   wrong: the detector's boxes are 1.6x taller than the person (CrowdHuman
+  #   street-level h/w ~2.5 vs this overhead camera's ~1.14), so the bottom
+  #   edge lands a median 260px BELOW the real feet.
+  #
+  #   *** THE 0.59 BELOW IS RETRACTED, 2026-08-17. *** The ground truth it was
+  #   calibrated on is 99% COPY-FORWARD: the labeller drew 6 boxes on frame 1
+  #   and pressed C ninety-nine times. Their boxes have a median step of 0.0px
+  #   while the pipeline's real per-frame detections have a median step of
+  #   5.3px and a median total drift of 69px (one person moved 255px). So 99 of
+  #   100 frames carry STALE positions and every number below was matched
+  #   against them. Back to 1.0 until a properly-labelled window exists.
+  #
+  #   What SURVIVES the retraction: the box SHAPE mismatch, which is visible in
+  #   a single frame and needs no tracking — pipeline 194x542 (h/w 2.80) vs
+  #   hand-drawn 290x330 (h/w 1.14). The direction of the anchor error is real;
+  #   the magnitude is not yet known.
+  #
+  #   ORIGINAL (unreliable) MEASUREMENT, kept for the record:
+  #       1.00 (old)   161/442 = 36.4% of people in the right zone
+  #       0.59 (this)  239/442 = 54.1%     -> +17.6 percentage points
+  #   The failure it removes: 172x "waiting area -> None" and 82x
+  #   "dining -> None" — people shoved below every polygon entirely.
+  #
+  #   WHY 0.59 AND NOT 0.95: a sweep scores 0.95 higher (58.6%), but there is a
+  #   22-point cliff between 0.95 and 1.00, which means 0.95 wins by barely
+  #   clearing a polygon EDGE rather than by being where feet are. That is
+  #   fitting to zones that are themselves misdrawn (26% of real people stand
+  #   in no zone at all). 0.59 is the physically measured position; the zones
+  #   get redrawn against it next.
+  foot_anchor_frac: 1.0
+
+  # head_to_body_ratio / head_recovery_aspect — CAMERA GEOMETRY.
+  #   Head recovery rebuilds ~740 boxes per run from orphan head detections.
+  #   The defaults (7.0 heads tall, 0.42 as wide as tall) are standing-figure
+  #   anthropometry — right for a side view, wrong for a ceiling camera where
+  #   the body is foreshortened. They produced h/w 2.38 boxes, which is the
+  #   2.51 seen in this pipeline's output, while the DETECTOR itself outputs
+  #   1.33 and the hand-labelled truth is 1.14. The tall boxes were built
+  #   here, not detected.
+  #
+  #   MEASURED on this camera from real head boxes matched to hand-labelled
+  #   bodies (n=2, the one frame whose labels were not carried forward):
+  #       ratio  7.0  -> 2.52        aspect 0.42 -> 0.82
+  #       implied h/w 2.38 -> 1.22   (hand labels 1.14)
+  #   Provisional on n=2, but the old values are provably wrong and two
+  #   independent derivations agree on the new ones.
+  head_to_body_ratio: 2.52
+  head_recovery_aspect: 0.82
+
+  # profiling — per-stage wall time in the log AND the run ledger, so the next
+  #   run diffs the PROFILE automatically. Leave it on; it costs microseconds.
+  profiling: true
+
+  # dedup_nms_iou — how much two boxes must overlap before one is dropped.
+  #   0.7 keeps anything overlapping LESS than 70%, which is why three people
+  #   at the desk produced six boxes at 15:58. CrowdHuman deliberately trains
+  #   the detector to keep overlapping boxes, so this has to be tighter here
+  #   than the usual default — but too tight merges two real people in a
+  #   crowd, which is the error CrowdHuman exists to prevent. 0.55 is the
+  #   value to try. Do not ship it unmeasured.
+  #   0.55 -> 0.75 TRIED AND REVERTED 2026-08-16. Loosening it recovered only
+  #   147 detections (dedup removed 174 -> 27) and guests went 3 -> 2. At 0.55
+  #   this stage removes 0.5% of the funnel, so it CANNOT be the cause of
+  #   missing 4 of 7 people in a crowded frame. The single box seen covering
+  #   two people at t=05:56 is the DETECTOR emitting a merged box, not NMS
+  #   deleting one — a different bug in a different place.
+  dedup_nms_iou: 0.55
+
+# Everything below was measured on run 68b97311f9 and is NOT yet acted upon.
+# Recorded so the next run can be compared against it rather than guessed at.
+measured_baseline:
+  reid_balanced_accuracy: 0.658    # circular — see kevacv/calibration.py
+  merges_accepted: 69
+  merges_starved_by_overlap: 356
+  merge_tiers: {stationary: 54, hand_off: 7, gallery: 6, attire: 1}
+  infrared_fraction: 0.58
+  face_coverage: 0.02              # 6 detections in a full hour
+  entry_line_crossings: 0          # line too short AND entry zone misplaced
+
+targets:                           # SUCCESS_CRITERIA.md, ratified 2026-08-06
+  desk_coverage_accuracy: 0.90     # never allowed to regress
+  ungreeted_recall: 0.75
+  guest_count_tolerance: 0.10
+  hota_floor: 0.40
+  hota_goal: 0.55
+  ir_allowance: 0.15               # night may run 15% below daylight HOTA

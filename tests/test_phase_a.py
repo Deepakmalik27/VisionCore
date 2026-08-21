@@ -28,7 +28,11 @@ from kevacv import (
 
 class TestPreflightValidation(unittest.TestCase):
     def setUp(self):
-        self.valid_zone_path = Path(__file__).parent / str(_P(__file__).resolve().parent.parent / "zones" / "CAM.112_zone.json")
+        # WAS CAM.112_zone.json, which is NOT valid and has not been since the
+        # entry line was found lying inside 'plant area mask' -- the fault that
+        # made the door read "IN 0 | OUT 0" while people walked through it.
+        self.valid_zone_path = (_P(__file__).resolve().parent.parent
+                                / "zones" / "CAM.112_zone_v5.json")
         with open(self.valid_zone_path, "r") as f:
             self.valid_cfg = json.load(f)
 
@@ -48,7 +52,8 @@ class TestPreflightValidation(unittest.TestCase):
             run_preflight_checks(bad_cfg, strict=True)
         
         err_msg = str(ctx.exception)
-        self.assertIn("Entry line is too short", err_msg)
+        # the message now names WHICH line, since a venue has several
+        self.assertIn("is too short", err_msg)
 
     def test_invalid_polygon_vertices(self):
         """Polygon with fewer than 3 vertices should fail preflight."""

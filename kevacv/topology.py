@@ -84,7 +84,13 @@ def doors_from_zones(zone_polygons, zone_roles, roles=("entry",)):
     want = {z for z, rs in (zone_roles or {}).items() if set(rs) & set(roles)}
     out = []
     for name, poly in (zone_polygons or {}).items():
-        if name not in want or not poly:
+        # `not poly` RAISES on a numpy array, and engine.py stores polygons as
+        # numpy arrays -- so this line, not the verdict logic, is what threw
+        # "truth value of an array is ambiguous" on every real run. The veto
+        # therefore died while BUILDING the doors: it never evaluated a single
+        # pair, the engine's handler failed open, and every merge went through
+        # unfiltered. Length, not truthiness.
+        if name not in want or poly is None or len(poly) == 0:
             continue
         xs = [float(p[0]) for p in poly]
         ys = [float(p[1]) for p in poly]
@@ -183,9 +189,20 @@ def veto_pairs(pairs, doors, frame_wh, **kw):
     else on the dict is carried through untouched, so this drops into an
     existing merge pipeline without reshaping its data.
     """
+    # NUMPY AMBIGUITY (seen 2026-08-20: "truth value of an array with more
+    # than one element is ambiguous"). Any caller handing in a numpy point or
+    # gap makes `at_exit and at_entry` an array test, which raises -- and the
+    # engine's handler fails OPEN, so impossible pairs get merged silently and
+    # the unique-person count moves. Coerce at the boundary: this kills the
+    # whole class rather than the one caller that happened to trip it.
+    def _pt(v):
+        return (float(v[0]), float(v[1]))
+
     kept, vetoed = [], []
     for p in pairs:
-        v = reappearance_verdict(p["death_pos"], p["birth_pos"], p.get("gap_s"),
+        _g = p.get("gap_s")
+        v = reappearance_verdict(_pt(p["death_pos"]), _pt(p["birth_pos"]),
+                                 None if _g is None else float(_g),
                                  doors, frame_wh, **kw)
         (kept if v["allow"] else vetoed).append({**p, "topology": v})
     return kept, vetoed

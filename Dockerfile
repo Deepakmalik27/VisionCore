@@ -49,7 +49,8 @@ RUN python3 -m pip install \
       pandas openpyxl jinja2 matplotlib tqdm scikit-learn \
       gdown \
       papermill jupyter nbformat ipykernel \
-      pyyaml
+      pyyaml \
+      "psycopg[binary]==3.3.4"
 
 WORKDIR /app
 

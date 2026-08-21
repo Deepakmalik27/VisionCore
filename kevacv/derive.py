@@ -144,8 +144,23 @@ def region_arrivals_by_id(run, roles=None):
                 f"were removed for being classified staff. If the staff "
                 f"classification is wrong, so is the guest count, and the "
                 f"detector is not the problem.")
-    except Exception:
-        pass
+    except Exception as _sfd:
+        # C10 (2026-08-19): this was `except Exception: pass`.
+        #
+        # The block above computes the ONE diagnostic that separates "we never
+        # saw them" from "we saw them and threw them away" -- and swallowing
+        # its failure silently means the guest count reads as a detection
+        # problem, which is exactly the wrong place to look. That mistake cost
+        # a week once already, per the comment fifteen lines up.
+        #
+        # It must never take the run down (it is a diagnostic), but it must
+        # never disappear either.
+        import logging
+        logging.getLogger("kevacv").error(
+            f"!! staff-filter diagnostic FAILED: {_sfd}. The guest count below "
+            f"cannot be distinguished from a detection failure -- if it looks "
+            f"low, do NOT conclude the detector is at fault without rerunning "
+            f"this check.")
     out = {}
     for a in arr or []:
         tid, t = a.get("track_id"), float(a.get("t", 0.0))
@@ -462,6 +477,61 @@ def report_rows(run, clock=None):
     return people, staff, anomalies
 
 
+def build_customer_registry(run):
+    """Build persistent Global Customer IDs (C001, C002, ...) from resolved tracklets.
+    
+    Guarantees:
+      1. One real customer = one permanent customer identity for the entire chunk.
+      2. Unique IN = 1, Unique OUT = 1 per customer.
+      3. Staff are completely excluded from customer registries.
+    """
+    roles = run.get("roles") or {}
+    canon_map = run.get("canon_map") or {}
+    arrivals = run.get("arrivals_by_id") or {}
+    crossings = run.get("crossings") or []
+    events = run.get("events") or []
+
+    canon_tracks = defaultdict(list)
+    for raw_id in set(e.get("track_id") for e in events) | set(c.get("track_id") for c in crossings):
+        if raw_id is None:
+            continue
+        canon_id = canon_map.get(raw_id, raw_id)
+        if roles.get(canon_id) == "staff" or roles.get(raw_id) == "staff":
+            continue
+        canon_tracks[canon_id].append(raw_id)
+
+    spans = _span_by_track(run)
+    sorted_canons = sorted(
+        canon_tracks.keys(),
+        key=lambda c: (arrivals.get(c, spans.get(c, (0, 0))[0]), str(c))
+    )
+
+    customers = {}
+    track_to_customer = {}
+
+    for idx, cid in enumerate(sorted_canons, 1):
+        cust_id = f"C{idx:03d}"
+        in_events = [c for c in crossings if c.get("direction") == "in" and c.get("track_id") in canon_tracks[cid]]
+        out_events = [c for c in crossings if c.get("direction") == "out" and c.get("track_id") in canon_tracks[cid]]
+
+        customers[cust_id] = {
+            "customer_id": cust_id,
+            "canonical_track_id": cid,
+            "raw_tracks": canon_tracks[cid],
+            "in_counted": len(in_events) > 0 or cid in arrivals,
+            "out_counted": len(out_events) > 0,
+            "first_seen": spans.get(cid, (None, None))[0],
+            "last_seen": spans.get(cid, (None, None))[1],
+            "in_events": in_events,
+            "out_events": out_events,
+        }
+        for tid in canon_tracks[cid]:
+            track_to_customer[tid] = cust_id
+        track_to_customer[cid] = cust_id
+
+    return customers, track_to_customer
+
+
 def enrich(run):
     """Add every derived field the answers need. Returns the same dict.
 
@@ -476,12 +546,15 @@ def enrich(run):
     run.setdefault("guest_ids", gids)
     run.setdefault("contacts", staff_contacts(run, roles))
     run.setdefault("id_confidence", id_confidence(run, gids))
+    custs, t2c = build_customer_registry(run)
+    run.setdefault("customers", custs)
+    run.setdefault("track_to_customer", t2c)
     obs = run["observed_windows"]
     _src = run.get("arrival_source", "none")
     _log.info(f"derived: observed={len(obs)} window(s) "
               f"({sum(b - a for a, b in obs):.0f}s)  "
               f"arrivals={len(arr)} (source: {_src})  "
-              f"guests={len(gids)}  contacts={len(run['contacts'])}")
+              f"guests={len(gids)} ({len(custs)} global customers)  contacts={len(run['contacts'])}")
     if _src == "line":
         _log.warning("arrival times came from the LINE, not the region method "
                      "— the region method produced nothing, which means the "

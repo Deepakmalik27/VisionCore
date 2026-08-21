@@ -1,5 +1,6 @@
 """phantoms.py — PHASE 10. Kill static false positives that CHANGE ID.
 
+
 WHY THIS EXISTS
     D2 (detect_filters.static_track_ids) asks "did this TRACK ID sit still for
     a long time?". On the real CAM.112 hour it caught 3 ids and reported them
@@ -65,10 +66,24 @@ HOW STRONG IS THE SEPARATION, HONESTLY
     So: never rely on jitter alone, and always enroll staff faces. If a real
     person is ever flagged, that is a bug worth a test, not a tuning exercise.
 """
+
+
 from __future__ import annotations
 
 import math
 from collections import defaultdict
+
+# Declared at module level so apply_run_config can REACH them.
+#
+# These were read only via globals().get(...), and config propagation uses
+# `if hasattr(module, name)` -- which is False for a name that does not exist,
+# so the setattr was skipped and the fast path was permanently off at 0.0.
+# A yaml A/B on this knob was run and recorded in config/cam112.yaml as
+# "MEASURED 2026-08-15 (profG, ratio 0.30): NO EFFECT". That conclusion is
+# INVALID: the value never arrived. A dead knob produced a written finding
+# that then guided later decisions.
+PHANTOM_FAST_CV_RATIO = 0.0
+PHANTOM_FAST_MIN_S = 30.0
 
 # Defaults derived from the measured CAM.112 numbers, not guessed:
 #   D2's confirmed furniture      centre jitter 0.008 - 0.012 of body height

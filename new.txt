@@ -1,0 +1,509 @@
+Yes. I checked this one as a **full ~20-minute sequence**, not just a few frames. The video is about **1201 seconds / 12,014 frames at 10 FPS**. I also cross-checked the **entire event log** against the video, including frames immediately before and after every logged IN/OUT event.
+
+The event file contains **94 events: 51 IN and 43 OUT**, ending at `1121.9s`. 
+
+## Complete pipeline audit
+
+### 1. 🔴 False IN/OUT events happen when nobody is crossing the line
+
+This is the **biggest problem**.
+
+Examples:
+
+* **02:49.4 — OUT**: person is not at the line.
+* **04:46.7 — OUT**: no person at the crossing area.
+* **05:02.6 — OUT**: person is elsewhere, not crossing.
+* **08:06.8 — IN**
+* **08:09.2 — IN**
+* **08:13.1 — IN**
+* **09:01.0 — IN**
+* **11:17.8 — OUT**
+* **16:14.6 — OUT**
+* **17:03.2 — IN**
+* **17:48.0 — OUT**
+* **18:10.6 — OUT**
+* **18:58.9 — OUT**
+* **19:21.9 — IN**
+
+In several of these frames the entrance area is essentially empty. Yet the pipeline creates an event.
+
+The event log confirms these rapid/isolated events, e.g. `269.4 OUT`, `286.7 OUT`, `302.6 OUT`, etc. 
+
+---
+
+### 2. 🔴 Same person can generate multiple events within seconds
+
+This is a serious **debouncing/tracking failure**.
+
+Examples:
+
+* **08:02.5 IN → 08:02.8 OUT** — only **0.3 sec apart**
+* **09:07.2 OUT → 09:10.5 IN → 09:11.1 OUT → 09:12.1 IN**
+* **16:34.6 OUT → 16:36.8 IN → 16:41.2 OUT**
+* **16:49.8 IN → 16:54.6 IN → 16:57.0 IN**
+* **17:37.1 OUT → 17:43.2 IN**
+* **16:58.2 OUT → 16:59.0 IN → 17:00.6 OUT → 17:03.2 IN**
+
+These sequences are highly suspicious for a single person lingering around/crossing the line rather than multiple people actually entering and leaving.
+
+The event log explicitly shows these sub-second/short-interval direction reversals.  
+
+---
+
+### 3. 🔴 IN/OUT direction is unstable
+
+The system frequently changes direction without enough physical movement to justify it.
+
+Strong examples:
+
+**482.5 IN → 482.8 OUT**
+
+That's only **0.3 seconds**.
+
+Another:
+
+**1018.2 OUT → 1019.0 IN → 1020.6 OUT**
+
+That's effectively:
+
+> OUT → IN → OUT
+
+within **2.4 seconds**.
+
+This indicates the line-crossing state is not stable.
+
+---
+
+### 4. 🔴 The system is triggering on people who are nowhere near the virtual line
+
+This is different from a missed detection.
+
+The person can be clearly visible elsewhere in the room while the pipeline produces an entrance event.
+
+For example:
+
+* **269.4s OUT** — person is around the dining/desk area, not at the entrance line.
+* **302.6s OUT** — person is away from the line.
+* **402.0s OUT** — no meaningful crossing at the line.
+* **493.1s IN / 495.4s IN** — people are visible in the room but the event does not correspond cleanly to crossing.
+* **1096.2s OUT** — visible person is away from the actual crossing point.
+
+So this is not simply "the line is slightly misplaced." There appears to be a **bad association between detected object position and line-crossing logic**.
+
+---
+
+### 5. 🔴 Huge number of tiny detections/events
+
+The `area` values are extremely small for many events:
+
+* `262`
+* `364`
+* `372`
+* `383`
+* `405`
+* `408`
+* `410`
+* `414`
+* `420`
+* `438`
+* `440`
+* `451`
+* `463`
+* `470`
+* `471`
+* `479`
+* `483`
+* etc.
+
+There are **19 events below area 500** and **36 below area 1000**.
+
+That strongly suggests the pipeline is allowing very small detections to participate in line-crossing logic.  
+
+This is especially dangerous because a tiny false detection can become a complete IN/OUT event.
+
+---
+
+### 6. 🔴 The plant/entrance geometry is a major source of risk
+
+The virtual lines run immediately beside the large plant.
+
+The entrance path is also very close to the plant and bright doorway.
+
+This creates a difficult situation:
+
+**person → plant occlusion → line → doorway**
+
+A person can partially disappear behind the plant while crossing, causing the tracked point/bounding box to jump.
+
+The line should be evaluated against the **actual walking path**, not just visually placed near the doorway.
+
+---
+
+### 7. 🔴 Occlusion causes unstable event generation
+
+This becomes particularly bad around:
+
+* **05:07–05:31**
+* **05:23–05:41**
+* **12:27–13:57**
+* **14:07–14:18**
+* **16:07–16:29**
+* **17:54–18:11**
+
+When several people gather around the entrance, events become much more frequent and contradictory.
+
+For example around **307–318s**, the system produces:
+
+`IN → IN → OUT → IN → IN → OUT → IN → IN`
+
+within about 10 seconds. 
+
+That is a very strong indication that **tracking + crossing-state logic is breaking under crowding/occlusion**.
+
+---
+
+### 8. 🔴 Same-direction duplicate events are also occurring
+
+It's not only IN/OUT oscillation.
+
+Examples:
+
+* **133.1 OUT → 136.0 OUT**
+* **146.1 IN → 147.9 IN**
+* **222.6 IN → 223.7 IN → 225.6 IN**
+* **307.7 IN → 308.8 IN**
+* **316.6 IN → 318.0 IN**
+* **323.5 IN → 325.9 IN**
+* **358.4 OUT → 359.7 OUT**
+* **747.1 IN → 748.3 IN**
+* **749.5 OUT → 751.2 OUT**
+* **1062.0 OUT → 1063.3 OUT**
+
+These could represent multiple real people in some cases, but the very short spacing plus the visual frames show that the system is often reacting repeatedly to the same doorway activity.
+
+---
+
+### 9. 🔴 The counters are therefore mathematically consistent with the bad events — but physically unreliable
+
+This is important.
+
+The counter itself is not necessarily "broken."
+
+The system appears to be doing:
+
+> **event detected → increment IN/OUT**
+
+So if the event detector produces a false `OUT`, the counter correctly increments OUT.
+
+For example, the log eventually reaches:
+
+**51 IN / 43 OUT**
+
+But that does **not** mean 51 people genuinely entered and 43 genuinely exited.
+
+It means the event engine generated 51 IN events and 43 OUT events.
+
+The event log contains all 94 of these events. 
+
+So the actual root problem is **upstream of the counter**.
+
+---
+
+### 10. 🔴 Long periods of empty entrance still produce events
+
+This is especially concerning.
+
+Examples:
+
+* **486.8 IN**
+* **489.2 IN**
+* **493.1 IN**
+* **495.4 IN**
+
+There are several events within a short period even though the crossing region isn't showing corresponding clean crossings.
+
+Likewise:
+
+* **677.8 OUT**
+* **686.2 OUT**
+* **691.3 OUT**
+
+The entrance area is largely empty around these detections.
+
+This shows the event engine isn't sufficiently requiring:
+
+**valid person + valid trajectory + actual line crossing**
+
+before generating an event.
+
+---
+
+### 11. 🔴 Camera mode changes make the problem harder
+
+The camera repeatedly switches between:
+
+* **IR/grayscale**
+* **normal/color**
+
+Examples occur around:
+
+* **~160s**
+* **~330s**
+* **~550s**
+* **~580s**
+* **~690–700s**
+* **~830–840s**
+* **~970s**
+* **~1090s**
+
+The same entrance looks substantially different between these modes.
+
+This can affect:
+
+* person detection
+* bounding-box size
+* confidence
+* tracking
+* appearance matching
+* line-crossing point
+
+The pipeline needs to be tested separately under both IR and color conditions.
+
+---
+
+### 12. 🟠 Detection quality changes significantly with crowd size
+
+When there is one person:
+
+**~400–450s**
+
+the scene is relatively stable.
+
+When several people enter together:
+
+**~300–380s**
+
+the event stream becomes extremely noisy.
+
+When there is a large group:
+
+**~740–835s**
+
+the number of rapid events increases substantially.
+
+So the pipeline isn't robust to **multi-person entrance scenarios**.
+
+---
+
+### 13. 🔴 The entrance event logic is too sensitive to movement near the line
+
+A person doesn't necessarily need to complete a clean entrance/exit.
+
+Someone can:
+
+* approach the doorway
+* stop
+* turn around
+* lean
+* step sideways
+* partially cross
+* move back
+
+and the system can produce an event.
+
+The **794–811s** region demonstrates this particularly well:
+
+`OUT → IN → OUT → IN → IN → IN`
+
+The person/group is continuously around the doorway. 
+
+---
+
+### 14. 🔴 There is no strong evidence of per-person event deduplication
+
+A robust system should have something like:
+
+> Person ID 17 crossed IN → don't allow another IN for that ID until it has clearly crossed back OUT.
+
+This pipeline appears much closer to:
+
+> detection crosses boundary → immediately generate event
+
+That's why the same person can cause multiple events.
+
+---
+
+### 15. 🔴 There is no reliable "crossing confirmation" period
+
+The system appears to react almost immediately.
+
+A better system should confirm:
+
+**approach → line proximity → crossing → movement continues to other side → confirm**
+
+Instead, the current system sometimes reacts within a fraction of a second.
+
+The clearest example is:
+
+**482.5 IN → 482.8 OUT**
+
+which is impossible to trust as two independent real crossings. 
+
+---
+
+### 16. 🟠 The large person with the white hat exposes the scale problem
+
+Around:
+
+**336–360s**
+
+a person wearing a very large/light-colored hat gets a very large detected area.
+
+The event areas reach:
+
+* **55,919**
+* **6,728**
+* etc.
+
+This isn't necessarily a false detection—the person is real—but it demonstrates that **bbox/area varies massively based on appearance and distance**.
+
+Therefore, using a simple fixed area threshold alone will not solve the problem.
+
+---
+
+### 17. 🟠 Very large area detections also need validation
+
+Examples:
+
+* **323.5s — area 24,720**
+* **325.9s — 19,140**
+* **336.6s — 55,919**
+* **834.4s — 58,482**
+* **962.0s — 21,802**
+* **1092.1s — 23,230**
+
+Large areas are not automatically wrong because people can be close to the camera, but these detections need proper person-box validation before being used for counting.  
+
+---
+
+### 18. 🟠 There are missed opportunities to count cleanly
+
+There are situations where a person is clearly moving through the doorway but the event timing is delayed or happens before/after the person is visibly at the line.
+
+Examples around:
+
+* **478–495s**
+* **541–552s**
+* **958–975s**
+* **1007–1023s**
+* **1092–1122s**
+
+So even when the system eventually generates an event, **the event timestamp doesn't always correspond cleanly to the physical crossing**.
+
+---
+
+### 19. 🔴 The event timestamps themselves can be misleading
+
+Because the event can trigger slightly before or after the visible crossing, an operator looking at the event timestamp may see:
+
+> "There is nobody crossing here."
+
+The person may have crossed just before/after that exact frame.
+
+This is another reason to require a **trajectory window**, not a single-frame decision.
+
+---
+
+### 20. 🔴 Final overall problem: this is an event-generation problem, not just a counting problem
+
+The pipeline currently has failures at:
+
+**Detection**
+→ small/unstable detections
+
+**Tracking**
+→ unstable trajectory around entrance
+
+**Line association**
+→ events when person isn't visibly at line
+
+**Direction determination**
+→ IN/OUT flipping
+
+**Debouncing**
+→ repeated events within 0.3–3 sec
+
+**Occlusion handling**
+→ severe degradation with groups
+
+**Camera robustness**
+→ IR/color changes
+
+**Counting**
+→ faithfully accumulates unreliable events
+
+---
+
+# Most important timestamps for the new agent
+
+If I were handing this to another engineer, I would make them inspect these first:
+
+| Time                  | Why it matters                                |
+| --------------------- | --------------------------------------------- |
+| **02:49.4**           | OUT event while person is not crossing        |
+| **04:46.7**           | False OUT / no valid crossing                 |
+| **05:02.6**           | False OUT away from line                      |
+| **05:07–05:18**       | Rapid IN/OUT instability                      |
+| **05:23–05:31**       | Crowd + repeated events                       |
+| **05:23.5 / 05:25.9** | Two IN events during same crowd movement      |
+| **05:29.2 / 05:31.1** | OUT events without clean crossing             |
+| **05:36.6**           | Very large detection                          |
+| **05:58–06:01**       | OUT → OUT → IN behavior                       |
+| **06:42–06:43**       | OUT → IN almost immediately                   |
+| **07:58.3**           | IN                                            |
+| **08:02.5 → 08:02.8** | **IN → OUT in 0.3 sec**                       |
+| **08:06.8–08:13.1**   | Multiple events around empty/unclear entrance |
+| **09:01.0**           | False-looking IN                              |
+| **09:07.2–09:12.1**   | **OUT → IN → OUT → IN**                       |
+| **09:23.2–09:24.6**   | Large crowd / event instability               |
+| **11:17.8**           | OUT with no clear crossing                    |
+| **11:26.8–11:32.1**   | Repeated events around doorway                |
+| **12:27–13:57**       | Major crowded-entry section                   |
+| **13:21.9**           | Large detection                               |
+| **13:28–13:40**       | Multiple direction changes                    |
+| **14:07–14:18**       | Hat/person + repeated events                  |
+| **15:58.3**           | IN                                            |
+| **16:02.5 → 16:02.8** | **IN → OUT in 0.3 sec**                       |
+| **16:06.8–16:15.4**   | Multiple suspicious IN events                 |
+| **16:58.2–17:03.2**   | **OUT → IN → OUT → IN**                       |
+| **17:27–17:31**       | Multiple IN/OUT events                        |
+| **17:38.4–17:48.0**   | Crowd + repeated crossing                     |
+| **17:54–18:11**       | Heavy crowd / many events                     |
+| **18:14.6**           | OUT                                           |
+| **18:19.0**           | IN/OUT instability                            |
+| **18:58.9**           | OUT with unclear crossing                     |
+| **19:01.9**           | IN                                            |
+| **19:16.9 → 19:20.6** | **IN → OUT → IN → OUT**                       |
+| **19:21.9**           | IN event without clear crossing               |
+
+The event sequence itself confirms how noisy these sections are.  
+
+## Final verdict
+
+**This version is better in the sense that real people do trigger many legitimate events, but the counting pipeline is still not reliable.**
+
+The **#1 problem is not that it never detects people**. It actually detects many genuine crossings.
+
+The real problem is:
+
+> **It cannot reliably distinguish a genuine completed crossing from a person merely being near/moving around the line.**
+
+That causes:
+
+**false events + duplicate events + IN/OUT flipping + inflated cumulative counts.**
+
+The new agent should therefore **not start by tuning the final counter**. The priority should be:
+
+**1. Person tracking → 2. stable ID → 3. crossing-state machine → 4. debounce/cooldown → 5. line/zone geometry → 6. only then IN/OUT counter.**
+
+The event log itself is very strong evidence of this: **94 events in ~20 minutes**, including multiple sub-second direction reversals and many events where the visual frame does not show a completed crossing.  

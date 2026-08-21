@@ -1,0 +1,796 @@
+I read both codebases — not just the docs. Here's the evidence trail first, then the comparison.
+
+What I actually opened: supervision develop @ c1d7b901 (v0.31.0.dev0) — all 100 source files under src/, 43,313 LOC: line_zone.py, polygon_zone.py, smoother.py, inference_slicer.py, the full ByteTrack (core/kalman_filter/matching/single_object_track), geometry/core.py, _cv2/*, metrics/*, detection/core.py, compact_mask.py, vlm.py, annotators/core.py, all 7 examples, pyproject.toml, AGENTS.md, plus a per-branch diff of all 60 remote branches. And keva_vision main @ 91fe078 — 40,848 LOC, all 39 kevacv/ modules, 43 tools/, 100 test files, Dockerfile, run.sh, config surface, the cv-pipeline-fixes branch, and the run artefacts in output/.
+
+---
+
+1 · Identity — these are not the same kind of thing
+
+                    supervision (roboflow)          keva_vision (yours)
+─────────────────── ─────────────────────────────── ──────────────────────────────
+what it is          a LIBRARY of primitives         an APPLICATION that answers
+                    ("here is a LineZone")          3 business questions
+version             0.31.0.dev0                     git 91fe078, no version
+licence             MIT                             private
+LOC (python)        43,313 in src/                  40,848 (kevacv+tools+tests)
+files               100 src, avg 433 LOC            39 kevacv, avg 1,048 LOC
+biggest file        detection/core.py   3,551 LOC   engine.py        285 KB
+                    annotators/core.py  3,536 LOC   analytics.py     130 KB
+                                                    config.py         73 KB / 201 knobs
+tests               tests/ mirrors src/, doctests   100 test_*.py files
+                    enforced via --doctest-modules
+CI/typing           mypy strict, ruff (A,E,F,I,PT,  none enforced; run.sh loops
+                    Q,RUF,S,UP,W), pre-commit       tests and counts pass/fail
+state               STATELESS per call              STATEFUL across the whole night
+
+The single most important structural fact: supervision is a stateless toolbox. Almost every class holds at most a small ring buffer (DetectionsSmoother: a deque per track; LineZone: a deque of booleans per track). keva_vision is a stateful evidence system — _IdentityMemory, OccupancyRecorder, LiveSeparability, DetectionFunnel, GroundPlane, the phantom suppressor all carry state for the entire run and then a whole second offline pass re-decides identity globally.
+
+You are not competing with supervision. You are consuming it — supervision==0.26.1 is pinned in your Dockerfile, and you use exactly 10 symbols from it.
+
+---
+
+2 · What you actually take from supervision today
+
+sv.Detections      17 uses   ← the data contract, that's the real dependency
+sv.Position         4
+sv.Point            2
+sv.PolygonZone      1
+sv.LineZone         1
+sv.ByteTrack        1        ← ⚠ DEPRECATED 0.28.0, REMOVED in 0.31.0
+sv.BoxAnnotator     1
+
+And engine.py:150-204 monkeypatches supervision from the outside:
+
+_sv_geo.get_polygon_center   = _get_polygon_center   # numpy 2.5 removed 2-D np.cross
+_sv_pz.get_polygon_center    = _get_polygon_center
+_sv_internal.cross_product   = _cross_product
+_sv_lz.cross_product         = _cross_product
+
+That patch is already obsolete upstream. supervision develop ships detection/utils/internal.py::cross_product with the exact determinant form, docstring included ("Replaces the deprecated np.cross 2-D path"). Worse: your copy of get_polygon_center is the pre-fix version. Upstream commit 04ec1ec0 fix(geometry): prevent polygon centroid overflow now subtracts polygon[0] before computing signed areas; yours doesn't. At 1920px it makes no difference — so this is a latent, not a live, bug. Upgrading deletes ~55 lines of yours.
+
+---
+
+3 · All 60 supervision branches — what each one is doing
+
+I diffed every branch against develop. Grouped by what they're fixing:
+
+█ ARCHITECTURE (the big ones — these tell you where the library is going)
+copilot/fix-opencv-dependency-issue  156 files, +18,440/-2,726
+    ▸ DROPS opencv-python as a hard dependency. Creates src/supervision/_cv2/
+      — 1,700 LOC reimplementing 40 cv2 functions in numpy + PyAV + PIL.
+      BACKEND_NAME = "opencv" if importable else "fallback".  ALREADY MERGED to develop.
+drop/cv2-gui                          27 files, +932/-514
+    ▸ removes cv2.imshow/waitKey. Replaces with Tk-based sv.ImageWindow.
+rle/paint                              7 files, +1,221/-131
+    ▸ perf: vectorised RLE span extraction, batch scatter, MaskAnnotator
+      default → crop_dense. Pure speed on segmentation masks.
+docs/refactor_pt_1                    25 files, +269/-664
+    ▸ drops create_tiles from public API; moves examples to `pycon` doctest format.
+
+█ TRACKING (relevant to you)
+medium/Dataset-3        fix(tracker): harden ByteTrack edge cases
+line-zone-unit-tests    +429 LOC of LineZone tests (behaviour lock)
+line-zone-class-test    per-class line counting
+fix/make_detections_smoother_work_with_edge_cases   +27/-8
+
+█ NEW DETECTION SOURCES / VLM
+add-gemini-3.5-vlm-support   feat/kosmos-2   feat/paligemma_segmentation
+add-rekognition-data-loader  add-multiclass-classification-loader
+codex/add-image-url-loader   detection/scaled (scale_detections for resized imgs)
+
+█ KEYPOINTS / POSE  ← the layer you don't have at all
+feat/add-hand-skeleton-keypoints   feat/mp/hand-landmarker
+feat/keypoints-from-inference-piotr  update/key-points (+531/-447)
+feature/keypoint-annotators-color-lookup-support (+637/-113)
+[merged to develop: de533c09 "feat: add MediaPipe hand landmark support"]
+
+█ METRICS
+medium/Dataset-2       fix(metrics): harden scoring edge cases
+fix/metrics_plot_spacking       revert-1898-fix/negative-mAP-values
+wip/abandoned-mAP-metrics-attempt  (+830 — an ABANDONED rewrite, worth reading
+                                    before you write your own mAP)
+
+█ EXAMPLES ≈ your use case
+example/time-in-zone, time-in-zone-new, time-in-zone-4   dwell timing
+example/self_service_checkout                            retail behaviour
+example/speed_estimation_recording                       homography speed
+add-manual-assembly-qa-example                           workstation QA
+
+█ RELEASE/CI/DOCS plumbing (no engineering content)
+ci/build/changes  combined-prs-branch  releasing/0.29.0  sv-badge  fix/doc-env
+fix/update-ga-tag  doc-formatter-config  gh-pages  promo-supervision-0-18-0
+docs/{detect_objects_in_zone, refactor_0.27.0_pt2, polygon_zone_letterbox_and_readme,
+      extending_how_to_tutorials_with_mmdetection_examples}
+cursor/cloud-env-setup-66f5  fix/dataset-merge-error  copilot/fix-annotation-id-collision
+lazy-dataset-loading-updated  fix/video-processor-does-not-finish-on-exception
+feature/samurai (1 commit, "test" — empty)  feat/strobe-annotator
+joao/fix/removes-expired-images-from-sahi-cookbook  medium/Dataset, -4
+
+Three real signals from the branch graph:
+1. They are aggressively shedding dependencies (opencv out, PyAV in). Their bottleneck was install fragility — the same thing that produced your 130-line Kaggle self-healing cell.
+2. They are exiting tracking. ByteTrack carries @deprecated_class(deprecated_in="0.28.0", remove_in="0.31.0") and the docstring says use trackers. Tracking moved to a separate repo.
+3. Everything else is breadth (more model connectors, more annotators), not depth (no re-ID, no identity, no evidence model).
+
+---
+
+4 · Core architecture, side by side
+
+supervision                              keva_vision
+────────────────────────────────────     ─────────────────────────────────────────
+frame                                    frame_source (ffmpeg NVDEC, hwaccel)
+  ↓                                        ↓ frame_exposure()  measured EVERY frame
+model(frame)                               ↓ apply_clahe(clip scaled by severity)
+  ↓                                        ↓ IR detect (chroma + debounce)
+sv.Detections.from_ultralytics()           ↓ MOTION GATE (skip detector on static)
+  ↓                                      YOLO batch (DET_BATCH=24)
+tracker.update_with_detections()           ↓
+  ↓                                      _filter_chain — 8 stages, ONE definition:
+smoother.update_with_detections()          person/head split → merged-person split →
+  ↓                                        head recovery → carried-object suppress →
+zone.trigger(dets)  → bool[]               implausible size (needs ground plane) →
+line_zone.trigger() → (in[], out[])        dead-area mask (+motion veto) →
+  ↓                                        live phantom suppress → dedup NMS
+annotator.annotate(scene, dets)            ↓
+  ↓                                      BoT-SORT + CLIP-ReID (boxmot) │ or sv.ByteTrack
+sink.write_frame()                         ↓
+                                         _IdentityMemory.resolve()   ← local→global ID
+                                           split_duplicate_raws / try_swap
+                                           ↓
+                                         LiveSeparability.observe()  ← unsupervised
+                                           ↓                           threshold measurement
+                                         zones.trigger → OccupancyRecorder.add
+                                         line_zones.trigger → crossings
+                                         DatasetCollector (retrain set)
+                                           ↓
+                                       ══ END OF PASS 1 ══
+                                         apply_staff_zone_override (SPREAD rule)
+                                         merge_fragmented_tracks  ← offline re-ID stitch
+                                         link_tracklets_global    ← Hungarian, global
+                                         apply_face_veto / cross_validate_reid
+                                         static/phantom sweep → drop_tracks
+                                         confirm_crossings / tier_a_crossings
+                                         derive.enrich → answers.answer_set
+                                         report_slim.write_slim_outputs
+                                       ══ PASS 2: render_annotated ══
+
+supervision's loop is 7 steps and no memory. Yours is ~30 stages with two passes and a global optimisation. That difference is the entire comparison.
+
+---
+
+5 · Component matrix — same job, different implementation
+
+CAPABILITY            supervision (verified)           keva_vision (verified)          verdict
+───────────────────── ──────────────────────────────── ─────────────────────────────── ────────
+Line crossing         LineZone: 4-corner anchors,      slit_count.py: NO detector,     DIFFERENT
+                      cross_product sign flip,         NO tracker. Samples 220 pts     PROBLEM
+                      minimum_crossing_threshold       across doorway/frame, stacks
+                      (N-frame confirm), ROI limits    time on Y axis, per-row
+                      = 2 perpendicular vectors,       normalise, blob count.
+                      per-class counters,              + kevacv line_zones for the
+                      absent-frame eviction (coasting  tracked path, confirm_crossings
+                      gaps don't reset state)          (CROSSING_CONFIRM_S) and
+                                                       tier_a_crossings (dedupe_s 2.5,
+                                                       dedupe_m 1.2 in METRES)
+Zone occupancy        PolygonZone: rasterised bool     OccupancyRecorder: merge_       YOURS
+                      mask, anchor lookup, count only  intervals(gap=15s), min_event_s, DEEPER
+                      for THIS frame. require_all_     per-zone thresholds, roles from
+                      anchors flag. No history.        zone NAME keywords, complement_
+                                                       intervals for absence
+Dwell time            examples/time_in_zone/timers.py  OccupancyRecorder.events() +    YOURS
+                      FPSBasedTimer / ClockBasedTimer  clock.py DST/provenance verify  DEEPER
+                      = (now - first_seen). 40 LOC,    + venue business-day handling
+                      not even in the library.
+Tracking              ByteTrack — DEPRECATED, removed  BoT-SORT + CLIP-ReID via        THEY MOVED
+                      0.31.0. 8-D KF (x,y,a,h,+vel),   boxmot 19.0.0, GMC enabled,     ON; you're
+                      2-stage assoc (high 0.25, low    LOST_TRACK_BUFFER_S, plus       still on
+                      0.1), fuse_score, Hungarian via  ByteTrack as a fallback mode    a pin
+                      scipy linear_sum_assignment      (TRACKER_MODE switch)
+Re-ID                 ✗ NONE. Zero appearance code.    6-tier cascade: CLIP→Anchor→    YOURS ONLY
+                                                       HSV→Handoff→Stationary→Face.
+                                                       + reid_engine.py (FastReID
+                                                       SBS/AGW, IR-invariant dual-
+                                                       modality)
+Global identity       ✗ tracker_id IS the identity     _IdentityMemory (local→canon),  YOURS ONLY
+                                                       link_tracklets_global (Hungarian
+                                                       + union-find), graph_fusion.py
+                                                       (min-cost flow over 5 evidence
+                                                       channels simultaneously)
+Face                  ✗                                InsightFace, staff_gallery/,    YOURS ONLY
+                                                       cross_validate_faces,
+                                                       apply_face_veto, FACE_SCOPE
+Ground plane          examples only: cv2.getPerspec-   ground_plane.py GroundPlane:    YOURS
+                      tiveTransform on 4 hardcoded     robust fit, pixels→METRES,      DEEPER
+                      points, in a demo script, not    MAX_WALK_SPEED_MPS as the
+                      in the library                   universal threshold; +fisheye.py
+                                                       (FISHEYE_K undistort),
+                                                       geometry_calibration.py
+Tiled inference       InferenceSlicer — 776 LOC.       tiled.py — 234 LOC. slice_grid, YOURS
+                      ThreadPoolExecutor, batch_size,  height_roi (slices ONLY where   SMARTER,
+                      OBB thread-safety probe+fallback,the ground plane says people    THEIRS
+                      rasterio windowed reads (geoTIFF)are the right size),            STRONGER
+                      CompactMask RLE to avoid OOM,    _touches_interior_seam, NMS,
+                      NMS/NMM/IOS overlap filters      cost_estimate. Single-threaded.
+Detection filtering   with_nms / with_soft_nms /       detect_filters.py + engine      YOURS ONLY
+                      with_nmm. Geometry only.         _filter_chain: 8 semantic
+                                                       filters (carried object,
+                                                       implausible size, merged
+                                                       person split, head recovery,
+                                                       phantom, mask+motion veto)
+Phantom / static FP   ✗                                phantoms.py OnlineStaticSup-    YOURS ONLY
+                                                       pressor + phantom_regions;
+                                                       size-CV discriminator (statue
+                                                       cv≈0.004 vs person ≈0.080,
+                                                       19× margin, measured)
+Metrics               mAP, mAR, Precision, Recall,     eval_harness.py: HOTA (DetA ×   DIFFERENT
+                      F1, ConfusionMatrix — 6,678 LOC, AssA), MOT loader/writer,       AXIS
+                      pycocotools-parity, size-        Hungarian, score_conditions
+                      bucketed (S/M/L), plots          (day vs IR split);
+                      ✗ NO HOTA, NO MOTA, NO IDF1      scorecard.py: track_quality,
+                                                       pixel_height, verdicts
+Confidence model      ✗ a float per box                confidence.py 4 tiers          YOURS ONLY
+                                                       CONFIRMED/PROBABLE/UNCERTAIN/
+                                                       REJECTED; arrival_tier fires
+                                                       UNCERTAIN when line and region
+                                                       estimators disagree
+Threshold selection   ✗ hardcoded defaults             threshold.py cost_weighted_    YOURS ONLY
+                                                       threshold — false-ACCEPT costs
+                                                       more than false-REJECT because
+                                                       a bad merge corrupts count AND
+                                                       dwell AND greet AND role
+Observability         FPSMonitor. That's it.           funnel.py DetectionFunnel      YOURS ONLY
+                                                       (8-stage ledger + "emptied"
+                                                       frames), capabilities.py,
+                                                       camera_health.py, decision_
+                                                       log.py, log.py stage timeline,
+                                                       build_id.py content hash → HUD
+Annotators            24 classes, 3,536 LOC            render_annotated() — one        THEIRS
+                      (Box/Mask/Halo/Ellipse/Trace/    ~490-line function              MUCH
+                      Heatmap/RichLabel/Icon/Blur/                                     STRONGER
+                      Pixelate/Comparison/…)
+Dataset I/O           COCO/YOLO/PascalVOC/CreateML/    dataset_collector.py            THEIRS
+                      LabelMe, train/val/test split,   (pseudo-label export only),     STRONGER
+                      merge, lazy loading              make_trainset.py, label_pkg/
+VLM connectors        PaliGemma, Florence-2, Qwen2.5/  ✗ none                          THEIRS ONLY
+                      3-VL, Gemini 2.0/2.5/3.5,
+                      Moondream, DeepSeek-VL2 + SAM3
+Keypoints / pose      KeyPoints, 6 vertex annotators,  ✗ none                          THEIRS ONLY
+                      COCO/hand skeletons, MediaPipe
+Video I/O             PyAV backend, VideoInfo,         ffmpeg NVDEC direct, hwaccel    YOURS
+                      VideoSink, frame generator,      args, proxy JPEG → libx264,     FASTER,
+                      process_video                    RENDER_CRF, motion gate         THEIRS
+                                                                                       PORTABLE
+Deps                  av, numpy, scipy, pillow,        torch, ultralytics, boxmot,     THEIRS
+                      matplotlib, pyyaml, requests,    insightface, onnxruntime-gpu,   FAR
+                      tqdm, defusedxml, pydeprecate    supervision, cv2, scipy,        LIGHTER
+                      NO opencv, NO torch              gdown, papermill, pandas…
+
+---
+
+6 · Mathematics / engineering principles, head to head
+
+                    supervision                          keva_vision
+─────────────────── ──────────────────────────────────── ───────────────────────────────
+crossing test       2-D cross product sign vs the line   same, PLUS: temporal slit-scan
+                    vector; "in limits" = the anchor is  (Ma & Chan CVPR 2013) with
+                    between two perpendicular vectors    per-row normalisation to cancel
+                    at the line endpoints; both left     the colour↔IR global brightness
+                    AND right anchors present → skip     flip. Zero identity involved.
+motion model        Kalman, 8-D constant-velocity        same via boxmot, PLUS a metric
+                    (x,y,aspect,h + velocities).         plausibility gate on the FLOOR:
+                    std scales with box height h         "no one walks >2 m/s", correct
+                    (_std_weight_position = 1/20)        at every depth in the image
+association         Hungarian (scipy linear_sum_         Hungarian for tracklets too,
+                    assignment) on 1−IoU, with           PLUS graph_fusion min-cost flow
+                    fuse_score = 1−(IoU·conf).           over 5 weighted channels at
+                    Two rounds: high conf, then low.     once (CLIP + HSV + floor
+                                                         distance + face + temporal)
+                                                         instead of first-tier-wins
+smoothing           arithmetic mean of xyxy over a       DetectionsSmoother not used;
+                    deque(maxlen=5); OBB corners are     HUD_SMOOTH_S, RENDER_COAST_S
+                    roll/reverse-aligned to a reference  do display smoothing only
+                    before averaging (8 candidates,
+                    min sum-of-squares) — genuinely
+                    clever, you have no equivalent
+duplicate removal   IoU NMS / soft-NMS / NMM (merge)     dedup NMS (DEDUP_NMS_IOU) PLUS
+                    + remove_duplicate_tracks(IoU<0.05,  co-visibility blocking: two ids
+                    younger track loses)                 seen in the SAME frame can
+                                                         never be the same person
+threshold policy    fixed constants in signatures        cost-weighted: FA_COST > FR_COST
+                                                         because a false merge corrupts
+                                                         4 downstream numbers
+error accounting    mAP/mAR/F1 vs a labelled set         HOTA = √(DetA × AssA) + an
+                                                         8-stage funnel that names WHICH
+                                                         stage lost the person, and
+                                                         "emptied" frames as id-break
+                                                         candidates
+
+---
+
+7 · What supervision has that you're missing — ranked by effect on accuracy + speed
+
+I only list things I verified exist in the code I read, with a stated reason.
+
+ # WHAT                       WHERE IT IS                    WHY IT MOVES YOUR NUMBER
+── ─────────────────────────  ─────────────────────────────  ───────────────────────────────
+P0 InferenceSlicer's THREADED tools/inference_slicer.py      Your tiled.py is single-
+   + BATCHED slicing                                         threaded. Theirs takes a
+                                                             thread pool AND batch_size, and
+                                                             documents the right combo for
+                                                             GPU (batch>1, threads=1). Your
+                                                             tiled path is the fix for
+                                                             "60px guest at the door" —
+                                                             right now it's also the thing
+                                                             that makes a run too slow to
+                                                             enable. Pure SPEED win, and
+                                                             speed is what lets you leave
+                                                             tiling ON, which is the
+                                                             ACCURACY win.
+P0 Upgrade sv 0.26.1 → 0.31   pyproject/_cv2/line_zone       Deletes your 55-line monkey-
+                                                             patch, gets the centroid-
+                                                             overflow fix, gets LineZone
+                                                             absent-frame eviction (ByteTrack
+                                                             coasting gaps no longer reset
+                                                             crossing state mid-crossing —
+                                                             that is EXACTLY your "false
+                                                             IN/OUT with nobody at the line"
+                                                             symptom in new.txt), gets
+                                                             per-class in/out counters.
+                                                             ⚠ BREAKING: sv.ByteTrack is
+                                                             REMOVED in 0.31. You'd switch
+                                                             TRACKER_MODE to boxmot-only or
+                                                             `pip install trackers`.
+P0 minimum_crossing_threshold LineZone.__init__               You reimplemented this as
+   as N-frame confirmation                                   CROSSING_CONFIRM_S /
+                                                             LINE_CROSS_FRAMES. Theirs also
+                                                             requires the oldest state to be
+                                                             UNIQUE in the history window
+                                                             (`crossing_history.count(oldest)
+                                                             > 1 → skip`) — that rejects
+                                                             jitter across the line that a
+                                                             pure time threshold accepts.
+                                                             ~10 lines. Check yours does it.
+P1 CompactMask (RLE)          detection/compact_mask.py       Only if you ever go to
+                                                             segmentation. IoU and NMS run
+                                                             directly on RLE, never
+                                                             materialising (N,H,W). This is
+                                                             the OOM fix for 4K.
+P1 sv.metrics mAP/mAR/F1      metrics/*  (6,678 LOC)          You measure HOTA (tracking) but
+   size-bucketed S/M/L                                       have NO detector metric. Your
+                                                             own docs say "Domain Fine-tune:
+                                                             HOTA improves ≥5 points" —
+                                                             you cannot tell a detector
+                                                             regression from a tracker
+                                                             regression without mAP.
+                                                             Size-bucketed mAP would prove
+                                                             the "small people at the door"
+                                                             hypothesis in one number.
+P1 KeyPoints + pose           key_points/*                    Your own finding.txt calls pose
+                                                             the #1 addition. supervision
+                                                             already has the data structure,
+                                                             skeletons, and 6 annotators —
+                                                             you'd only add the model.
+                                                             Pose gives you a foot anchor
+                                                             that isn't box-bottom, which is
+                                                             your documented 350px error.
+P2 DetectionsSmoother's OBB   tools/smoother.py               Only if you adopt oriented
+   corner alignment                                          boxes. The roll/reverse
+                                                             alignment before averaging is
+                                                             the non-obvious part.
+P2 The 24 annotators          annotators/core.py              Your render_annotated() is one
+                                                             490-line function. TraceAnnotator
+                                                             and HeatMapAnnotator are free
+                                                             and would make your trajectory
+                                                             history (finding.txt item 4)
+                                                             visible for review.
+P2 _cv2 / PyAV backend        _cv2/*                          They deleted opencv as a hard
+                                                             dep. Your Dockerfile comment
+                                                             calls the numpy/scipy/ort
+                                                             fighting "scar tissue" — this
+                                                             is upstream's answer to the
+                                                             same disease. Adopt the
+                                                             pattern, not the code.
+✗  ByteTrack                  DEPRECATED                      Do not adopt. Removed 0.31.
+✗  VLM connectors             detection/vlm.py                Your SUCCESS_CRITERIA already
+                                                             says the greet metric needs a
+                                                             VLM (Phase 7d). When you get
+                                                             there, from_google_gemini_2_5
+                                                             / from_qwen_3_vl parse the
+                                                             box JSON for you. Not now.
+✗  dataset formats            dataset/formats/*               make_trainset.py + label_pkg
+                                                             already cover your loop.
+
+---
+
+8 · What you have that supervision does not — and won't
+
+This is your actual moat. None of it exists anywhere in their 43k LOC:
+
+▸ GLOBAL IDENTITY        _IdentityMemory + link_tracklets_global + graph_fusion.
+                         supervision has no concept of a person beyond tracker_id.
+▸ RE-ID, 6 tiers         + IR dual-modality (reid_engine.py). 46/78 tracks on CAM.112
+                         are IR — supervision would be blind on all of them.
+▸ METRIC GROUND TRUTH    ground_plane.py. One threshold in metres beats N tuned in
+                         pixels. supervision's homography lives in a demo script.
+▸ PHANTOM SUPPRESSION    phantoms.py. The size-CV discriminator (0.004 vs 0.080) is a
+                         real, measured, publishable-quality result.
+▸ EVIDENCE HONESTY       confidence.py tiers, capabilities.py DEGR/MISS, funnel.py's
+                         8-stage ledger, the [EXACT]/[PROXY]/[ESTIMATE]/[WEAK] tags in
+                         SUMMARY.txt, "HOTA NOT MEASURED — every accuracy claim below
+                         is an estimate". No CV library does this.
+▸ COST-WEIGHTED TUNING   threshold.py. Asymmetric error cost is correct and rare.
+▸ ABLATION DISCIPLINE    slit_count.py's docstring is the best artefact in the repo —
+                         six changes, one at a time, held-out vs tuned windows kept
+                         separate, three KEPT one REJECTED with the reason. That is
+                         how the whole pipeline should be tuned.
+▸ IDENTITY-FREE COUNTING slit-scan. Genuinely orthogonal to everything supervision does.
+
+---
+
+9 · Bottlenecks — theirs vs yours
+
+supervision's bottlenecks (visible in the branch graph)
+  ▸ install weight → answered by _cv2/PyAV (18k-line branch)
+  ▸ mask memory at 4K → answered by CompactMask RLE + rle/paint
+  ▸ tracking depth → they gave up and spun it out to roboflow/trackers
+  ▸ no state/no identity → by design, will never be fixed there
+
+keva_vision's bottlenecks (measured, in YOUR files)
+  ▸ ⛔ NO TRUSTWORTHY GROUND TRUTH. gt.txt is 600 rows of synthetic MOT — your own
+    audit called it static/fake. eval/gt_entries_*.json is 3 windows. SUCCESS_CRITERIA
+    says every target is "Untested (no ground truth)". Every number below this line is
+    an estimate, including "77% desk coverage" in the last run.
+  ▸ ⛔ Re-ID separability = 0.658 balanced accuracy. topology.py states it plainly:
+    same p50=0.435, diff p50=0.370. "No threshold rescues that." Every merge decision
+    downstream inherits a coin-flip-plus-a-bit.
+  ▸ ⛔ RESOLUTION STARVATION. Decode 3840×2160, analyse at 1280–1920. Guest at door
+    ≈60px, upscaled to 128×256 before the ReID backbone → the embedding is mostly
+    interpolation. This is the root cause of the 0.658, not the threshold.
+  ▸ ⛔ 201 config knobs, one video. That's an overfitting surface, not a control panel.
+  ▸ ⛔ engine.py 285 KB / analytics.py 130 KB. ARCHITECTURE_MAP says "there is exactly
+    one place for each number" — true for the leaf modules, not for these two.
+  ▸ ⛔ Two sources of truth: kevacv/ and the frozen copy inside notebooks/pipeline.ipynb.
+    run.sh admits it's stale and skips the check on the codebase path.
+  ▸ ⛔ Tracking scored 0% recall on held-out windows (slit_count.py docstring).
+    Slit-scan scored 100% recall / 1 FP. The identity-free method beats the
+    identity-full method on the only held-out data you have.
+
+---
+
+10 · Endgame = accuracy + speed. The ranked plan.
+
+Ordered by (measured effect) ÷ (effort), using only what I verified above:
+
+ #  ACTION                                          BUYS YOU
+──  ──────────────────────────────────────────────  ─────────────────────────────────
+ 1  Build real ground truth. 2 min busy window,     Everything else is unfalsifiable
+    hand-labelled MOT. Replace the synthetic        without it. Your own exit criteria
+    gt.txt. Score with eval_harness.score_          are gated on "HOTA ≥ 0.40" and you
+    conditions (day vs IR split, already built).    cannot compute it today.
+ 2  Enable tiled.py, and make it threaded/batched   Kills resolution starvation, which
+    the way InferenceSlicer is. height_roi()        is upstream of the 0.658 ReID
+    already limits slicing to where the ground      ceiling. This is the ONE change
+    plane says people are person-sized — that       that attacks accuracy and is
+    caps the cost. Measure with cost_estimate().    unblocked by the speed fix.
+ 3  Upgrade supervision 0.26.1 → 0.31. Drop the     Deletes 55 LOC, fixes the crossing-
+    monkeypatch. Move tracking fully to boxmot      state reset that plausibly causes
+    (sv.ByteTrack is gone in 0.31).                 your phantom IN/OUT events.
+ 4  Add sv.metrics mAP (size-bucketed S/M/L)        Separates "detector missed him"
+    beside your HOTA.                               from "tracker lost him". Right now
+                                                    you cannot attribute a regression.
+ 5  Ship slit-scan as the PRIMARY entry counter,    100% held-out recall vs 0%. Your
+    tracking as the cross-check. confidence.py      confidence layer already models
+    already models exactly this: agreement →        the disagreement — use it instead
+    CONFIRMED, disagreement → UNCERTAIN.            of picking a winner.
+ 6  Cut the 201 knobs. Anything not measured on     201 knobs on 1 video is overfitting
+    held-out data gets a default and loses its      with extra steps.
+    knob. Use the slit_count.py ablation ritual.
+ 7  Pose layer (sv.KeyPoints + a pose model).       Foot anchor from ankle keypoints
+    Run it ONLY on uncertain tracks, per your       instead of box-bottom fixes the
+    own finding.txt.                                documented 350px anchor error and
+                                                    feeds the greet proxy.
+ 8  Split engine.py. The _filter_chain is already   Makes 1–7 attributable.
+    "ONE definition, three branches" — lift it out.
+
+The honest headline: on the only held-out data that exists, your 40k-LOC identity pipeline scored 0% recall, and a 250-line detector-free slit-scan scored 100% with 1 false positive. supervision cannot help with that — it has no identity layer to fix. The fix is ground truth first, resolution second, and demoting identity from "the answer" to "a cross-check".
+
+---
+
+11 · Trending repos in the same space
+
+REPO                          WHAT IT IS                       WHY IT MATTERS TO YOU
+───────────────────────────── ──────────────────────────────── ──────────────────────────
+roboflow/trackers             Apache-2.0 clean-room SORT /     Where sv.ByteTrack WENT.
+                              ByteTrack / OC-SORT (+BoT-SORT,  Published HOTA: MOT17 SORT
+                              C-BIoU per repo). CLI `trackers  58.4 / ByteTrack 60.1 /
+                              track` + `trackers eval`.        OC-SORT 61.9. ⚠ v2.1.0
+                                                               DROPPED DeepSORT + ReIDModel.
+mikel-brostrom/boxmot         Your current tracker. Wiki       BoT-SORT 69.44 HOTA,
+                              publishes MOT17 private-detector BoostTrack 69.25,
+                              numbers per tracker.             OccluBoost 70.47 — all well
+                                                               above the trackers numbers.
+                                                               You're on boxmot 19.0.0
+                                                               (pinned for numpy 2.0.2);
+                                                               BoostTrack++ lives in newer.
+                                                               tracker_wrapper.py already
+                                                               exists to absorb the API break.
+UCMCTrack (AAAI 2024)         Camera-motion-compensated MOT    Uses estimated camera params
+                              using estimated camera params.   — the same idea as your
+                                                               ground_plane.py. Closest
+                                                               academic match to your bet.
+obss/sahi                     Slicing Aided Hyper Inference.   The paper tiled.py cites
+                              +6.8–14.5% AP on small objects.  (arXiv:2202.06934). You
+                                                               deliberately did NOT pip it
+                                                               (numpy pin) — that reasoning
+                                                               is sound; borrow the algorithm.
+blakeblackshear/frigate       Local-first NVR, real-time       The productised version of
+                              detection on IP streams.         "batch → real-time" that your
+                                                               ARCHITECTURE_DECISION defers.
+insight-platform/Savant       DeepStream-based high-perf       If speed ever becomes the
+                              Python video analytics.          binding constraint on NVIDIA
+sherlockchou86/VideoPipe      C++ cross-platform video         hardware, these two are the
+                              structuring framework.           reference pipelines.
+NVIDIA DeepStream SDK         GStreamer + TensorRT pipelines.  You already have
+                                                               tools/export_tensorrt.py.
+
+Sources: roboflow/trackers · boxmot MOT17 wiki · BoostTrack++ (arXiv 2408.13003) · Savant · VideoPipe · Frigate NVR · GitHub people-counting topic
+
+---
+
+Nothing above is inferred from a README alone — every keva_vision claim comes from the file named beside it, and every supervision claim from the source at c1d7b901. Where I could not verify (your live HOTA, current run accuracy) I said so rather than filling it in.
+
+Want me to start on #2 (threading/batching tiled.py against InferenceSlicer's pattern) or #3 (the 0.26.1 → 0.31 upgrade + monkeypatch removal)?
+
+✻ Crunched for 8m 44s
+
+❯ based on the verdit  what your recommdnation which we should do give me complete list which are missing and u think there approch will be much better and accuracy + speed 95++ soo lets stat building and fixing on top of it our pipeline
+
+Before I recommend, one thing has to be said plainly, and then I'll check what's actually on disk to build against.
+
+  Ran 5 shell commands
+
+Two corrections before the plan — both change what you should do:
+
+  Ran 2 shell commands
+
+Two corrections to what I told you last message. Both change the plan, so they go first.
+
+❌ I SAID                                  ✅ ACTUALLY TRUE (engine.py:2946-2980)
+────────────────────────────────────────   ──────────────────────────────────────────
+"make tiled.py threaded/batched like       tiled.py ALREADY has predict_batch_fn, and
+ InferenceSlicer — pure speed win"         engine._detect_tiled ALREADY passes it
+                                           (_predict_batch, all 9 images in ONE
+                                           ultralytics call). Nothing to build.
+                                           It is simply ENABLE_TILED_DETECT = False.
+
+"enable tiling → kills resolution          Tiling's ROI comes from height_roi(), which
+ starvation"                               reads the fitted ground plane. calibrate_
+                                           plane.py says that fit guessed camera height
+                                           1.12 → 1.25 → 1.48 → 2.87 → 3.08 → 2.72 →
+                                           3.26 → 2.42 m IN ONE HOUR, same room.
+                                           Turning tiling on before calibrating aims
+                                           the tiles with a number that moves 3×.
+
+---
+
+The actual verdict
+
+I audited all 45 feature flags. You are not missing features. You are missing measurement.
+
+45 feature flags        36 ON        9 BUILT-AND-SWITCHED-OFF
+13 regression cases     3 have ground truth        10 report NO-DATA, can never pass
+201 config knobs        tuned against 1 camera, ~3 windows totalling 39 seconds
+data/                   EMPTY — there is no video in the repo to run against
+
+Everything supervision has that would help you, you have already written a better version of. The three things I flagged as "adopt from them" that still stand are small. The gap between you and 95% is not code.
+
+---
+
+Honest answer on "95%+", per metric
+
+I'm not going to tell you 95% across the board is reachable, because your own files say otherwise and I'd be making it up.
+
+METRIC                    95%+?   WHY                                       EVIDENCE
+──────────────────────── ─────── ───────────────────────────────────────── ──────────────
+Desk covered / empty      ✅ YES  zone dwell only. identity irrelevant.     SUCCESS_CRITERIA
+                                  staff sit in one polygon for minutes.     Q1, target 90%
+Entry / exit COUNT        ✅ YES  slit-scan already scored 100% recall,     slit_count.py
+                                  1 FP on held-out. Path exists.            ablation table
+Ungreeted-guest recall    ⚠️ ~85% PROXY tier by construction — proximity    SUCCESS_CRITERIA
+                                  ≠ conversation. 95% needs a VLM.          Q2, own words
+UNIQUE guests (identity)  ❌ NO   ReID separability = 0.658 balanced acc.   topology.py:
+                                  same p50 0.435 vs diff p50 0.370.         "No threshold
+                                  95% unique-count needs ~0.90+.            rescues that."
+HOTA (tracking quality)   ❌ NO   your own exit bar is 0.40, goal 0.55.     SUCCESS_CRITERIA
+                                  0.95 HOTA does not exist on oblique
+                                  security footage anywhere.
+
+So the target that is actually winnable: 95%+ on desk coverage and IN/OUT counts, ±10% on guest count, HOTA ≥0.55. That is a real, defensible product. Chasing 95% HOTA burns the quarter.
+
+---
+
+The complete list — everything missing, ranked
+
+🔴 TIER 0 — blocks every measurement (do these or nothing below is verifiable)
+
+ #  MISSING                        WHY IT'S #1                         EFFORT
+──  ────────────────────────────   ──────────────────────────────────  ──────
+T0.1 A video in data/              Repo has zero footage. Cannot run,  you
+                                   cannot A/B, cannot score anything.
+T0.2 Ground plane calibration      4 floor points → GroundPlane.       1 hour
+     via tools/calibrate_plane.py  from_correspondences. Until then    of your
+                                   MAX_WALK_SPEED_MPS, REID_HANDOFF_M, time
+                                   REID_STATIONARY_M, _drop_implausible
+                                   and height_roi all ride a number
+                                   that moved 3× in one hour.
+                                   follow_up.txt says: DISABLE the
+                                   metre gates, don't tune them. Agreed.
+T0.3 GT for 10 of 13 cases         C02,C03,C04,C05,C07,C08,C09,C10,    1-2 days
+     tools/gt_kit.py seed          C11,C12 = NO-DATA forever. Half of  labelling
+     (CVAT correct-don't-draw,     them (C04 U-turn, C05 re-entry,
+     already built, 5-10× less     C03 stand-on-line) are EXACTLY the
+     clicking)                     15 false events in new.txt.
+T0.4 Replace synthetic gt.txt      600 rows of fake MOT. Any HOTA      same pass
+                                   computed from it is a fiction.
+
+🟠 TIER 1 — built, switched off, unmeasured. Turn on ONE AT A TIME, score, keep or revert.
+
+FLAG                        CURRENT   TURN ON WHEN              EXPECTED EFFECT
+─────────────────────────   ───────   ───────────────────────   ────────────────────
+ENABLE_ROBUST_GROUND_PLANE  False     immediately after T0.2    fixes every metre gate
+ENABLE_TILED_DETECT         False     after plane is trusted    the resolution fix.
+                                                                YOLO_IMGSZ//TILE_PX ×
+                                                                gain on 60px doorway
+                                                                people. Already batched.
+ENABLE_CLAHE                False     on the IR windows         exposure adapt is ON but
+                                                                CLAHE isn't — half the
+                                                                lighting fix is unwired
+ENABLE_GMC                  False     if camera has any drift   BoT-SORT global motion
+                                                                compensation
+MASK_REQUIRE_MOTION         0.0       after C13 quiet window    the blunt mask deleted
+                                      is re-scored              18,501 dets / emptied 212
+                                                                frames and was killing a
+                                                                real guest at the door
+ENABLE_IR_HARD_CUT          False     with C11 (IR transition)  46/78 tracks are IR
+ENABLE_DATASET_EXPORT       False     during every real run     free retrain set, costs
+                                                                nothing to leave on
+FISHEYE_K                   0.0       only after autocalib      correctly gated already
+PROXY_RENDER                False     for speed on long runs    render-only, no accuracy
+
+🟡 TIER 2 — genuinely missing, adopt from supervision
+
+ #  ADOPT                          FROM                        WHY
+──  ────────────────────────────   ─────────────────────────   ──────────────────────
+A1  sv 0.26.1 → 0.31 upgrade       pyproject + line_zone.py    deletes your 55-line
+    ⚠ BREAKING: sv.ByteTrack is                                monkeypatch; brings the
+    REMOVED. You're on                                         centroid-overflow fix and
+    TRACKER_MODE='botsort-reid'                                LineZone absent-frame
+    so the fallback path is the                                eviction — coasting gaps
+    only casualty.                                             no longer reset crossing
+                                                               state mid-crossing, which
+                                                               is your phantom IN/OUT
+                                                               symptom in new.txt
+A2  mAP / mAR, size-bucketed       supervision.metrics         you measure HOTA (tracking)
+    S/M/L                          6,678 LOC, pycocotools      but have NO detector metric.
+                                   parity                      Cannot attribute a
+                                                               regression to detector vs
+                                                               tracker today. Size-bucketed
+                                                               mAP proves or kills the
+                                                               "small people at the door"
+                                                               hypothesis in one number.
+A3  LineZone's unique-oldest-      line_zone.py trigger()      rejects jitter across the
+    state rule                     `crossing_history.count                line that a pure
+    (~10 lines)                     (oldest) > 1 → skip`       time threshold accepts
+A4  KeyPoints + a pose model       key_points/*                ankle keypoint instead of
+    on UNCERTAIN tracks only       skeletons + 6 annotators    box-bottom fixes your
+                                   already exist               documented 350px foot-anchor
+                                                               error; feeds the greet proxy
+A5  TraceAnnotator, HeatMap-       annotators/core.py          makes trajectory history
+    Annotator                      free, 2 lines each          reviewable by a human
+
+⚪ TIER 3 — explicitly do NOT adopt
+
+sv.ByteTrack           deprecated 0.28.0, removed 0.31.0. You're on boxmot.
+sv dataset formats     make_trainset.py + label_pkg already cover your loop.
+sv VLM connectors      correct call, wrong time — that's Phase 7d for the greet metric.
+InferenceSlicer        your tiled.py is smarter (ground-plane-aware ROI + seam drop).
+                       Only their thread pool is better, and you don't need it — you batch.
+roboflow/trackers      MOT17 HOTA 58.4/60.1/61.9. boxmot's BoT-SORT is 69.44. Stay.
+
+---
+
+The build order
+
+   T0.2 calibrate plane ──┬──> T1: ROBUST_GROUND_PLANE on ──> score
+                          │
+   T0.3 label 10 windows ─┼──> C01..C13 all scoreable ──────> baseline frozen
+                          │
+   T0.1 video on disk ────┘
+                                    │
+                                    ▼
+              ┌─────────── THE LADDER (one flag, one score, keep or revert)
+              │  1. ROBUST_GROUND_PLANE   → does _drop_implausible stop over-firing?
+              │  2. TILED_DETECT          → does DetA rise on the door?
+              │  3. MASK_REQUIRE_MOTION   → does C13 stay at 0 FP while recall rises?
+              │  4. CLAHE                 → does the IR window close the ≤15% gap?
+              │  5. IR_HARD_CUT           → C11
+              │  6. GMC                   → C07/C12 ID switches
+              └─── every step: gt_kit.py compare before.json after.json
+                                    │
+                                    ▼
+              A1 sv 0.31 upgrade (drop monkeypatch, drop ByteTrack fallback)
+              A2 mAP beside HOTA — now regressions are attributable
+                                    │
+                                    ▼
+              Promote slit-scan to PRIMARY entry counter, tracking to cross-check.
+              confidence.py already models it: agree → CONFIRMED, disagree → UNCERTAIN.
+              This is what gets you to 95% on counting.
+                                    │
+                                    ▼
+              A4 pose on uncertain tracks → greet metric + foot anchor
+              THEN cut the 201 knobs down to what the ladder proved.
+
+---
+
+I'm not going to write code yet, and here's the ponytail reason: every item in Tier 1 is already written and already wired. Building anything on top before flipping those nine switches against real ground truth would be adding to a pile nobody has measured. The first three steps cost zero lines of new code.
+
+Two things I genuinely cannot derive from the repo and that change what I do next:
+
+● User answered Claude's questions:
+· data/ is empty — where is the video I should run the ladder against? → video is on istance e2 ssh -i "yolo-surveillance-key.pem" ubuntu@ec2-54-81-52-35.compute-1.amazonaws.com
+· Which do I attack first — the two are different work? → Kill the 15 false IN/OUT events (Recommended)
+
+Target locked: the 15 false IN/OUT events. Let me find what's actually on disk here versus what's on the EC2 box.
+
+  Listed 1 directory, ran 1 shell command
+
+The key's in Downloads — but I don't need SSH yet. Both event files and the negative GT are already on disk. I can score the fix without the video.
+
+A5  TraceAnnotator, HeatMap-       annotators/core.py          makes trajectory history
+    Annotator                      free, 2 lines each          reviewable by a human
+
+⚪ TIER 3 — explicitly do NOT adopt
+
+sv.ByteTrack           deprecated 0.28.0, removed 0.31.0. You're on boxmot.
+sv dataset formats     make_trainset.py + label_pkg already cover your loop.
+sv VLM connectors      correct call, wrong time — that's Phase 7d for the greet metric.
+InferenceSlicer        your tiled.py is smarter (ground-plane-aware ROI + seam drop).
+                       Only their thread pool is better, and you don't need it — you batch.
+roboflow/trackers      MOT17 HOTA 58.4/60.1/61.9. boxmot's BoT-SORT is 69.44. Stay.
+
+---
+
+The build order
+
+   T0.2 calibrate plane ──┬──> T1: ROBUST_GROUND_PLANE on ──> score
+                          │
+   T0.3 label 10 windows ─┼──> C01..C13 all scoreable ──────> baseline frozen
+                          │
+   T0.1 video on disk ────┘
+                                    │
+                                    ▼
+              ┌─────────── THE LADDER (one flag, one score, keep or revert)
+              │  1. ROBUST_GROUND_PLANE   → does _drop_implausible stop over-firing?
+              │  2. TILED_DETECT          → does DetA rise on the door?
+              │  3. MASK_REQUIRE_MOTION   → does C13 stay at 0 FP while recall rises?
+              │  4. CLAHE                 → does the IR window close the ≤15% gap?
+              │  5. I
+                                    │
+                                    ▼
+              Promote slit-scan to PRIMARY entry counter, tracking to cross-check.
+              confidence.py already models it: agree → CONFIRMED, disagree → UNCERTAIN.
+              This is what gets you to 95% on counting.
+                                    │
+                                    ▼
+              A4 pose on uncertain tracks → greet metric + foot anchor
+              THEN cut the 201 knobs down to what the ladder proved.
+
+---
+
+I'm not going to write code yet, and here's the ponytail reason: every item in Tier 1 is already written and already wired. Building anything on top before flipping those nine switches against real ground truth would be adding to a pile nobody has measured. The first three steps cost zero lines of new code.
+
+Two things I genuinely cannot derive from the repo and that change what I do next:
+
+● User answered Claude's questions:
+· data/ is empty — where is the video I should run the ladder against? → video is on istance e2 ssh -i "yolo-surveillance-key.pem" ubuntu@ec2-54-81-52-35.compute-1.amazonaws.com
+· Which do I attack first — the two are different work? → Kill the 15 false IN/OUT events (Recommended)
+· data/ is empty — wher

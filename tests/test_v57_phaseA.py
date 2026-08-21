@@ -192,7 +192,16 @@ for tag in ("# Cell 2 — CONFIG", "def process_video",
         check(False, f"cell parses: {tag[:30]}", str(e))
 
 print(f"\n{'=' * 60}")
-if FAILED:
-    print(f"❌ {len(FAILED)} FAILED: {FAILED}")
-    sys.exit(1)
+# PYTEST VISIBILITY. This file's checks run at IMPORT and reported only via
+# an exit code. A module-level sys.exit aborts pytest COLLECTION, which hid
+# 59 of 74 test files -- and simply guarding the exit would have hidden the
+# FAILURES instead. So the same condition is also asserted as a real test.
+def test_script_level_checks_passed():
+    assert not (FAILED), "module-level checks in this file failed"
+
+
+if __name__ == "__main__":
+    if FAILED:
+        print(f"❌ {len(FAILED)} FAILED: {FAILED}")
+        sys.exit(1)
 print("✅ all Phase A checks passed")

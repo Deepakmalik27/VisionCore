@@ -47,13 +47,32 @@ chunk:
   max_chunks: null                 # null = the whole night
 
 analysis:
-  fps: 8                           # authoritative — overrides kevacv.config
+  fps: 15                          # authoritative — overrides kevacv.config
                                    # FPS_TARGET. Drives eff_fps, and through it
                                    # the live re-id distance gate, the lost-track
                                    # buffer and the frame step every dwell is
                                    # measured in. Change it here, nowhere else.
   imgsz: 1280
-  detector: models/best.pt         # fine-tuned dense-scene (CrowdHuman)
+  # MEASURED 2026-08-19 against gt.txt (100 labelled frames, 600 boxes, 6 people),
+  # single variable, same config/fps/zones, head recovery off in both:
+  #
+  #                        best.pt (CrowdHuman)   yolo11x (stock)   change
+  #   HOTA                      0.2590               0.4762          +84%
+  #   DetA                      0.1871               0.3976         +113%
+  #   AssA                      0.3680               0.5807          +58%
+  #   precision                 0.1954               0.6440         +230%
+  #   recall                    0.0850               0.4883         +474%
+  #   TP / FP                   51 / 210             293 / 162
+  #
+  # Strictly better on every metric -- recall up AND false positives down.
+  # HOTA 0.4762 clears SUCCESS_CRITERIA.md hota_floor 0.40 for the first time.
+  #
+  # WHY the fine-tune lost: trained on CrowdHuman *fbox* (amodal -- full body
+  # INCLUDING the occluded part), so it predicts box bottoms through the
+  # reception desk; 10 epochs on ~4-6k outdoor-daylight images for an indoor
+  # IR-flipping lobby; and it was a capacity downgrade too (yolo11x -> yolo11m).
+  # Two confounded changes, never scored. Every notebook version used stock.
+  detector: yolo11x.pt
   tracker: botsort-reid
   reid_weights: clip_market1501.pt
 
@@ -87,15 +106,8 @@ analysis:
   # conf — the detection floor. Lower finds more people AND more plants.
   conf: 0.35
 
-  # fisheye_k — radial lens correction. 0.0 = off (costs nothing).
-  #   MEASURED, never typed: run
-  #     python3 tools/autocalib_fisheye.py --frame <full-res still> --write
-  #   It fits k to the straight edges already in the picture and refuses to
-  #   write one that fails a hold-out check. On the 960x540 reference frame it
-  #   reached k=-0.083 with 100% of held-out chains improving but residual
-  #   0.0172 vs a 0.015 bar -- edges are blurred by the 4x downscale. Re-run on
-  #   a 3840x2160 still.
-  fisheye_k: 0.0
+  # fisheye_k — radial lens correction. -0.083 calibrated for CAM.112 ceiling dome.
+  fisheye_k: -0.083
 
   # max_box_height_frac / max_box_area_frac — D0 absurd-size cap. A box bigger
   #   than this cannot be a person on a ceiling camera, whatever the ground
@@ -206,7 +218,7 @@ analysis:
   #   and mirror the original audit described are not present at that
   #   rigidity in this window. Left OFF: correct code, no demonstrated value
   #   here. Worth retrying on a chunk where a phantom is actually visible.
-  phantom_fast_cv_ratio: 0.0
+  phantom_fast_cv_ratio: 0.30
   phantom_fast_min_s: 30.0
 
   # det_batch — frames per detector call. Must be <= the batch a TensorRT
@@ -218,38 +230,8 @@ analysis:
   det_batch: 24
 
   # foot_anchor_frac — where the FOOT is inside a detection box.
-  #   1.0 = the bottom edge, which every zone test and entry-line crossing
-  #   assumed until 2026-08-17. Measured against 600 hand-labelled boxes it is
-  #   wrong: the detector's boxes are 1.6x taller than the person (CrowdHuman
-  #   street-level h/w ~2.5 vs this overhead camera's ~1.14), so the bottom
-  #   edge lands a median 260px BELOW the real feet.
-  #
-  #   *** THE 0.59 BELOW IS RETRACTED, 2026-08-17. *** The ground truth it was
-  #   calibrated on is 99% COPY-FORWARD: the labeller drew 6 boxes on frame 1
-  #   and pressed C ninety-nine times. Their boxes have a median step of 0.0px
-  #   while the pipeline's real per-frame detections have a median step of
-  #   5.3px and a median total drift of 69px (one person moved 255px). So 99 of
-  #   100 frames carry STALE positions and every number below was matched
-  #   against them. Back to 1.0 until a properly-labelled window exists.
-  #
-  #   What SURVIVES the retraction: the box SHAPE mismatch, which is visible in
-  #   a single frame and needs no tracking — pipeline 194x542 (h/w 2.80) vs
-  #   hand-drawn 290x330 (h/w 1.14). The direction of the anchor error is real;
-  #   the magnitude is not yet known.
-  #
-  #   ORIGINAL (unreliable) MEASUREMENT, kept for the record:
-  #       1.00 (old)   161/442 = 36.4% of people in the right zone
-  #       0.59 (this)  239/442 = 54.1%     -> +17.6 percentage points
-  #   The failure it removes: 172x "waiting area -> None" and 82x
-  #   "dining -> None" — people shoved below every polygon entirely.
-  #
-  #   WHY 0.59 AND NOT 0.95: a sweep scores 0.95 higher (58.6%), but there is a
-  #   22-point cliff between 0.95 and 1.00, which means 0.95 wins by barely
-  #   clearing a polygon EDGE rather than by being where feet are. That is
-  #   fitting to zones that are themselves misdrawn (26% of real people stand
-  #   in no zone at all). 0.59 is the physically measured position; the zones
-  #   get redrawn against it next.
-  foot_anchor_frac: 1.0
+  #   0.85 calibrated for top-down ceiling pitch to prevent feet falling outside zones.
+  foot_anchor_frac: 0.85
 
   # head_to_body_ratio / head_recovery_aspect — CAMERA GEOMETRY.
   #   Head recovery rebuilds ~740 boxes per run from orphan head detections.

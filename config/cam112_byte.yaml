@@ -53,7 +53,16 @@ analysis:
                                    # buffer and the frame step every dwell is
                                    # measured in. Change it here, nowhere else.
   imgsz: 1280
-  detector: models/best.pt         # fine-tuned dense-scene (CrowdHuman)
+  # DETECTOR: stock yolo11x, measured 2026-08-19 against gt.txt, one variable:
+  #     best.pt (CrowdHuman fine-tune)   yolo11x (stock)
+  #     GT >=60% covered   66.2%             76.3%
+  #     recall @IoU>=0.2   67.5%             80.7%
+  #     box h/w median      1.70              1.58   (labels say 1.14)
+  # best.pt was trained on CrowdHuman *fbox* = amodal boxes that include the
+  # OCCLUDED part of a body, so it predicts box bottoms through the reception
+  # desk. It was also a capacity downgrade (yolo11x -> yolo11m). Two confounded
+  # changes, never scored until now.
+  detector: yolo11x.pt
   tracker: botsort-reid
   reid_weights: clip_market1501.pt
 

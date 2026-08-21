@@ -1,0 +1,31 @@
+{
+  "_comment": "The 13-case regression matrix from follow_up.txt. Every pipeline change is scored against these. A case with no labelled window reports NO-DATA and NEVER passes -- an unmeasurable check that reads green is how two accuracy claims got withdrawn on 2026-08-19.",
+  "cases": [
+    {"id": "C01", "name": "single person enters", "measures": "entry recall",
+     "window": "gt_entries_221_234.json", "expects": "entry line IN == truth"},
+    {"id": "C02", "name": "single person exits", "measures": "exit recall",
+     "window": null, "expects": "entry line OUT == truth"},
+    {"id": "C03", "name": "person stands ON the line", "measures": "count stability",
+     "window": null, "expects": "at most 1 event while dwelling"},
+    {"id": "C04", "name": "person turns around at the door", "measures": "U-turn rejection",
+     "window": null, "expects": "0 events; CROSSING_CONFIRM_S must eat it"},
+    {"id": "C05", "name": "person exits then re-enters", "measures": "visit vs unique",
+     "window": null, "expects": "unique_people == 1 AND n_visits == 2"},
+    {"id": "C06", "name": "two people cross together", "measures": "group arrival",
+     "window": "gt_entries_305_318.json", "expects": "no group collapse"},
+    {"id": "C07", "name": "two people occlude each other", "measures": "ID switches",
+     "window": null, "expects": "swap_pressure does not become an id switch"},
+    {"id": "C08", "name": "person temporarily disappears", "measures": "track recovery",
+     "window": null, "expects": "one chain, not two ids"},
+    {"id": "C09", "name": "staff and customer together", "measures": "role split",
+     "window": null, "expects": "staff excluded from guest count"},
+    {"id": "C10", "name": "staff crosses a customer path", "measures": "role confusion",
+     "window": null, "expects": "no role flip"},
+    {"id": "C11", "name": "IR / colour transition", "measures": "modality robustness",
+     "window": null, "expects": "track survives the flip"},
+    {"id": "C12", "name": "person partially occluded", "measures": "track persistence",
+     "window": null, "expects": "no mid-scene death in open floor"},
+    {"id": "C13", "name": "quiet window, nobody present", "measures": "false positives",
+     "window": "gt_entries_026_039.json", "expects": "0 events"}
+  ]
+}

@@ -34,6 +34,7 @@ DESIGN
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .answers import answer_set, to_report_rows
@@ -42,7 +43,8 @@ from .clock import (check_dst_span, check_frame_clock, parse_start,
                     verify_provenance)
 from .config import DEFAULT as TRACKING_DEFAULTS
 from .derive import enrich, report_rows
-from .detect_filters import (mirrored_pair_ids, protected_ids, rigid_track_ids,
+from .detect_filters import (
+    drop_tracks, mirrored_pair_ids, protected_ids, rigid_track_ids,
                              static_track_ids)
 from .log import banner, get_logger, stage
 from .report_slim import describe_video, write_slim_outputs
@@ -278,6 +280,34 @@ def _write_tracks(run, out_dir):
                   f"(score with: python -m kevacv score gt.txt {pred.name})")
     except Exception as exc:                      # noqa: BLE001
         _log.warning(f"(track export skipped: {exc})")
+    # E5 (2026-08-19): the crossings file check_closure has always wanted.
+    #
+    # tools/check_closure.py implements the one accuracy check that needs NO
+    # labels at all -- over a closed period everyone who entered also left, so
+    # |IN - OUT| is our own error, measured exactly, and occupancy can never
+    # go negative. It reads output/*/debug/<cam>_crossings.json, and NOTHING
+    # in this repo has ever written that file. The tool has been unusable
+    # since it was written, and its --from-summary fallback scrapes a per-door
+    # line that report_slim does not print either.
+    try:
+        _cr = run.get("crossings") or []
+        if _cr:
+            _cp = dbg / f"{cam}_crossings.json"
+            _cp.write_text(_json.dumps(
+                [{"t": float(c.get("t", 0.0)),
+                  "direction": c.get("direction"),
+                  "line": c.get("line"),
+                  "track_id": str(c.get("track_id"))} for c in _cr],
+                indent=1), encoding="utf-8")
+            made.append(_cp)
+            _ins = sum(1 for c in _cr if c.get("direction") == "in")
+            _outs = sum(1 for c in _cr if c.get("direction") == "out")
+            _log.info(f"   crossings -> {_cp.name}  (IN {_ins} / OUT {_outs}; "
+                      f"score with tools/check_closure.py — over a CLOSED "
+                      f"period these must balance, and a 10-min chunk is not "
+                      f"a closed period)")
+    except Exception as _ce:
+        _log.info(f"(crossings not persisted: {_ce})")
     return made
 
 
@@ -405,6 +435,7 @@ def resolve_identities(track_windows, embeddings, merge_fn=None, *,
         blocked = {(p["a"], p["b"]) for p in vetoed}
         _log.info(f"topology veto removed {len(blocked)} impossible pair(s) "
                   f"from {len(pairs)} candidates")
+        merge_kw["blocked_pairs"] = blocked
         merge_kw["role_hint"] = merge_kw.get("role_hint")
     mapping, edges, diag = merge_fn(track_windows, embeddings,
                                     positions=positions, **merge_kw)
@@ -423,6 +454,8 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
     out = Path(out_dir)
     (out / DEBUG_SUBDIR).mkdir(parents=True, exist_ok=True)
     result = {"camera_id": camera_id, "written": [], "findings": []}
+    _clock_start = None        # VERIFIED wall-clock start, or None
+    _clock_why = "preflight did not reach the clock checks"   # why it is None
 
     with stage("run", module="pipeline") as run_st:
         run_st.count("camera", camera_id)
@@ -454,14 +487,33 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                     frame_w=getattr(_Eg, "ANALYSIS_MAX_W", 1280))
             except Exception as _dfe:
                 findings.append(("INFO", f"disk check skipped: {_dfe}"))
-            findings += verify_provenance(analyse_kw.get("selected_name"),
-                                          video_path,
-                                          analyse_kw.get("clock_source_name"))
+            # Kept in their OWN list before being merged into `findings`, so
+            # the observation layer's clock gate can be judged on the CLOCK
+            # evidence alone. `findings` is a merged list -- zone roles, disk
+            # space, staff gallery -- and a preflight ERROR does not abort the
+            # run, so gating on it would blank `ts` for a venue whose only
+            # complaint is a missing zone polygon. A polygon has nothing to say
+            # about whether the file we decoded is the file the clock came from.
+            _clock_findings = verify_provenance(
+                analyse_kw.get("selected_name"), video_path,
+                analyse_kw.get("clock_source_name"))
             start = parse_start(video_path)
-            findings += check_dst_span(start, analyse_kw.get("expect_hours", 1),
-                                       tz_name)
+            _clock_findings += check_dst_span(
+                start, analyse_kw.get("expect_hours", 1), tz_name)
+            findings += _clock_findings
             st.count("clock_start", str(start))
             result["clock"] = {"start": str(start), "tz": tz_name}
+            # The observation layer stamps wall clock onto every row, and only
+            # a VERIFIED clock may do that: a provenance ERROR means the file
+            # we decoded is not the file the clock came from -- exactly how
+            # 19:30 got stamped onto 16:30 footage. Unverified stays None, and
+            # `_clock_why` records WHICH check said so, so a NULL ts column is
+            # traceable to a line in the log instead of to a mystery.
+            _clock_errs = [m for l, m in _clock_findings if l == "ERROR"]
+            _clock_start = None if (start is None or _clock_errs) else start
+            _clock_why = ("chunk filename carries no parsable start stamp"
+                          if start is None
+                          else ("; ".join(_clock_errs) if _clock_errs else None))
             st.count("findings", len(findings))
             result["findings"] = findings
             for lvl, msg in findings:
@@ -476,8 +528,62 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                          if k not in ('selected_name', 'clock_source_name',
                                       'expect_hours')}
             engine_kw.setdefault("camera_id", camera_id)
-            run = (analyse_fn or _default_analyse)(video_path, zones_path,
-                                                   **engine_kw)
+            # OBSERVATION LAYER (Task 5). One row per person per frame, out
+            # through a bounded non-blocking queue to append-only JSONL. The
+            # engine never opens the file itself; the queue is injected the
+            # same way BASE/OUTPUT_DIR are. Off by default.
+            from . import engine as _Eg_obs
+            _obs_eq = None
+            _obs_path = None
+            if getattr(_Eg_obs, "ENABLE_OBSERVATIONS", False):
+                from .event_queue import EventQueue as _OEQ, jsonl_sink as _osink
+                _obs_path = out / "observations.jsonl"
+                _obs_eq = _OEQ(sink=_osink(str(_obs_path)),
+                               maxsize=int(getattr(_Eg_obs, "OBS_QUEUE_MAXSIZE",
+                                                   20000)))
+                _obs_eq.start()
+                # run_id must match EXACTLY what engine.process_video computes
+                # for this same chunk (see its _obs_run_id comment) -- the
+                # ingest tool does delete-then-insert keyed on run_id, so a
+                # mismatch here would leave this run row orphaned instead of
+                # matching the obs/emb rows it describes. Never recompute the
+                # formula differently; mirror it.
+                _chunk_tag = analyse_kw.get("chunk_tag") or ""
+                _start_seconds = analyse_kw.get("start_seconds") or 0.0
+                _run_id = (f"{camera_id}_{_chunk_tag}" if _chunk_tag else
+                           f"{camera_id}_{Path(video_path).stem}_{int(_start_seconds)}")
+                from .build_id import compute as _build_compute
+                _obs_eq.put({"kind": "run", "run_id": _run_id,
+                             "camera_id": camera_id,
+                             "video_sha": None,
+                             "fps_analysed": float(getattr(_Eg_obs, "FPS_TARGET", 0) or 0),
+                             "started_at": _clock_start,
+                             "frames_analysed": None,
+                             "zones_cfg_hash": None,
+                             "git_sha": _build_compute()})
+                _Eg_obs.OBS_QUEUE = _obs_eq
+                # the datetime parse_start already returned, not a re-parse
+                _Eg_obs.VIDEO_START_DT = _clock_start
+                if _clock_start is None:
+                    _log.warning(f"observations: clock not verified — every row "
+                                 f"ships ts = NULL (t_s is still exact). "
+                                 f"Reason: {_clock_why}")
+            try:
+                run = (analyse_fn or _default_analyse)(video_path, zones_path,
+                                                       **engine_kw)
+            finally:
+                # in a finally, so a crashing run still flushes what it had
+                if _obs_eq is not None:
+                    _Eg_obs.OBS_QUEUE = None
+                    _Eg_obs.VIDEO_START_DT = None   # no stale start next run
+                    _st = _obs_eq.close()
+                    result["observations"] = {**_st, "path": str(_obs_path)}
+                    _log.info(f"\U0001f4dd observations -> {_obs_path.name}: "
+                              f"{_st['written']} written, {_st['dropped']} dropped, "
+                              f"{_st['sink_errors']} sink error(s)")
+                    if _st["lost"]:
+                        _log.error(f"!! observation queue LOST {_st['lost']} row(s) — "
+                                   f"the JSONL is INCOMPLETE for this run")
             st.count("events", len(run.get("events") or []))
             st.count("crossings", len(run.get("crossings") or []))
             st.count("duration_s", round(run.get("duration_s") or 0))
@@ -501,8 +607,32 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
             # detector is the thing that got the category wrong.
             fl = run.get("frame_log") or []
             keep = protected_ids(crossings=run.get("crossings") or (),
-                                 face_ids=run.get("face_ids") or ())
-            still = static_track_ids(fl, protected=keep)      # never moves
+                                 # 'face_ids' is NOT a key the engine returns -- the key is
+                                 # 'staff_matched_names'. So face protection here was
+                                 # ALWAYS empty, and a face-recognised receptionist
+                                 # standing at the desk past the flat 120s bar could be
+                                 # deleted from the count by this stage.
+                                 face_ids=run.get("staff_matched_names") or ())
+            # C14 (2026-08-19): the ENGINE already runs static_track_ids, and
+            # runs it BETTER -- engine.py:4515 passes canon=mapping (so a
+            # stitched identity is judged as one thing, not as its fragments),
+            # min_life_by_id (per-zone patience: 240s at a desk where staff
+            # legitimately stand still, 30s at a doorway) and the full
+            # protected set. This second pass had none of that: no canon, a
+            # flat 120s bar for every zone.
+            #
+            # Re-judging tracks the better-informed pass deliberately KEPT is
+            # how a face-recognised receptionist standing at the desk gets
+            # deleted from the count. So: skip it when the engine already did
+            # the work, and when it does run, give it the canon map.
+            _canon = run.get("canon_map") or run.get("id_merges") or {}
+            if run.get("static_dropped") is not None:
+                still = {}
+                _log.info(f"   static filter: already applied by the engine "
+                          f"({run.get('static_dropped')} dropped, with per-zone "
+                          f"patience and the canon map). Not re-judging here.")
+            else:
+                still = static_track_ids(fl, canon=_canon, protected=keep)
             rigid = rigid_track_ids(fl, protected=keep,       # never deforms
                                     frame_wh=frame_wh)  # and never travels
             mirror = mirrored_pair_ids(fl, protected=keep)    # never drifts
@@ -537,8 +667,20 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
             drop = set(still) | set(rigid)
             if drop:
                 before = len(run.get("guest_ids") or [])
-                run["events"] = [e for e in (run.get("events") or [])
-                                 if e.get("track_id") not in drop]
+                # C12 (2026-08-19): this hand-rolled loop filtered events,
+                # guests, roles, arrivals and contacts -- but NOT `crossings`.
+                # `line_n` is computed from `crossings` twenty lines below, so
+                # a phantom removed from every other structure still counted as
+                # an ARRIVAL. detect_filters.drop_tracks exists precisely so
+                # "a phantom cannot survive in one place after being removed
+                # from another", and it also carries the canon map so a merged
+                # phantom stops being DRAWN as well as counted.
+                run["events"], run["crossings"], run["frame_log"] = drop_tracks(
+                    run.get("events") or [],
+                    run.get("crossings") or [],
+                    run.get("frame_log") or [],
+                    drop,
+                    canon=run.get("canon_map") or run.get("id_merges") or {})
                 run["guest_ids"] = [g for g in (run.get("guest_ids") or [])
                                     if g not in drop]
                 for tid in drop:
@@ -567,13 +709,105 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
             region_n, _, _ = arrivals_from_regions(ev, zr,
                                                    roles=run.get("roles"))
             cov = entry_zone_coverage(ev, zr, roles=run.get("roles"))
-            line_n = len({c["track_id"] for c in (run.get("crossings") or [])
-                          if c.get("direction") == "in"})
+            # C3 (2026-08-18): this counted EVERY inbound crossing on EVERY
+            # door with no staff filter, while region_n above filters both.
+            # So the two halves of the cross-check were never counting the same
+            # thing: line_n was inflated by interior transits and by every
+            # staff member walking in, which is what drove the "LINE IS BROKEN"
+            # / DISAGREE alarms on a healthy camera.
+            # analytics.entered_count does it correctly and was called from
+            # nothing but tests.
+            _crossings = run.get("crossings") or []
+            from .analytics import entered_count, venue_entry_lines
+            _doors = venue_entry_lines({c.get("line") for c in _crossings
+                                        if c.get("line")}) or None
+            line_n = entered_count(_crossings, roles=run.get("roles"),
+                                   lines=_doors)
             movers = len({e["track_id"] for e in ev})
+
+            # E1: THIRD, INDEPENDENT ARRIVAL ESTIMATE — slit-scan.
+            #
+            # Both estimates above depend on identity holding together. On this
+            # camera it does not: track ids are REUSED (one id swept the whole
+            # frame width inside a 13s window), the camera flips colour<->IR 96
+            # times in 20 minutes so appearance Re-ID cannot separate people,
+            # and guests arrive in groups. Scored against the hand-read windows
+            # in eval/gt_entries_*.json:
+            #
+            #     tracking counter      0% held-out recall, 1 false positive
+            #     slit-scan            100% held-out recall, 1 false positive
+            #
+            # The slit has NO identity in it -- it samples a line of pixels per
+            # frame and counts blobs in the time-stacked image -- so id reuse,
+            # IR flips and fragmentation are structurally impossible there.
+            # It has been CLI-only (tools/slit_count.py) while the 0% estimator
+            # is the one wired in.
+            #
+            # Added as a THIRD OPINION, not a replacement: it is reported and
+            # cross-checked, and it does not overwrite line/region until it has
+            # been scored on more than three hand-read windows.
+            slit_n = None
+            try:
+                # The venue door, in SOURCE pixel coordinates, straight from
+                # the zones file -- not the built-in default, which is 1080p
+                # coordinates and would put the slit across the reception desk
+                # on a 4K source.
+                import json as _json
+                from .analytics import venue_entry_lines as _vel
+                _zc = _json.loads(Path(zones_path).read_text(encoding="utf-8"))
+                _lines = dict(_zc.get("entry_lines") or {})
+                if not _lines and _zc.get("entry_line"):
+                    _lines["entry"] = _zc["entry_line"]
+                _door = _vel(set(_lines)) if _lines else set()
+                _ln = next((_lines[k] for k in _lines if k in _door), None)
+                # Scale to the SOURCE resolution, not the analysed one.
+                # slit_count samples raw frames straight from the video file,
+                # so the line must be in SOURCE pixels. frame_wh here is the
+                # ANALYSED size (1920x1080 on a 3840x2160 source) -- using it
+                # would halve the coordinates and put the slit across the
+                # reception desk, which is a landmine that has already fired
+                # once in this project.
+                _ref = _zc.get("frame_size")
+                _cap2 = _cv2.VideoCapture(str(video_path))
+                _srcw = int(_cap2.get(_cv2.CAP_PROP_FRAME_WIDTH))
+                _srch = int(_cap2.get(_cv2.CAP_PROP_FRAME_HEIGHT))
+                _cap2.release()
+                if _ln and _ref and _srcw and tuple(_ref) != (_srcw, _srch):
+                    _sx, _sy = _srcw / _ref[0], _srch / _ref[1]
+                    _ln = [[_ln[0][0] * _sx, _ln[0][1] * _sy],
+                           [_ln[1][0] * _sx, _ln[1][1] * _sy]]
+                    _log.info(f"   slit line scaled {_ref[0]}x{_ref[1]} -> "
+                              f"{_srcw}x{_srch} (source)")
+                if _ln:
+                    from tools.slit_count import count as _slit_count
+                    _A, _B = _ln[0], _ln[1]
+                    _t0, _t1 = (run.get("observed_windows")
+                                or [(0.0, run.get("duration_s") or 0.0)])[0]
+                    _n, _evs = _slit_count(str(video_path),
+                                           float(_t0), float(_t1),
+                                           A=tuple(_A), B=tuple(_B))
+                    slit_n = sum(1 for e in _evs if e.get("dir") == "IN")
+                    result["arrivals_slit"] = {
+                        "in": slit_n,
+                        "out": sum(1 for e in _evs if e.get("dir") == "OUT"),
+                        "events": _evs}
+            except Exception as _se:
+                # Never let a third opinion take the run down.
+                _log.info(f"(slit arrival estimate unavailable: {_se})")
+
             xc = cross_check(line_n, region_n, movers=movers, coverage=cov)
             st.count("line", line_n).count("region", region_n)
+            if slit_n is not None:
+                st.count("slit", slit_n)
+                if line_n is not None and abs(slit_n - line_n) > max(2, 0.5 * max(slit_n, line_n)):
+                    _log.info(
+                        f"\u26a0\ufe0f  arrival estimates disagree: line={line_n} "
+                        f"region={region_n} slit={slit_n}. The slit needs no "
+                        f"identity, so a large gap points at id churn in the "
+                        f"other two, not at the slit.")
             st.count("trust", xc["trust"])
             result["arrivals"] = {"line": line_n, "region": region_n,
+                                  "slit": slit_n,
                                   "cross_check": xc, "coverage": cov}
             if xc["trust"] == "neither":
                 banner("ENTRY ZONE MISPLACED — trust neither arrival count",
@@ -589,7 +823,12 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
             # this pipeline never writes, so nothing could call it.
             #
             # Proposals only. A learned zone is evidence, not authority.
-            if xc["trust"] != "both":
+            # C5 (2026-08-18): this read `if xc["trust"] != "both"`, but
+            # cross_check only ever returns line/region/neither -- "both" is
+            # never produced -- so the condition was ALWAYS true and this full
+            # zone-learning pass over the frame log ran on every single run,
+            # including ones where the two sensors agreed.
+            if xc["trust"] == "neither":
                 result["learned_zones"] = _propose_entry(run, frame_wh)
 
             # The answers themselves. Denominator is OBSERVED footage, never
@@ -610,7 +849,11 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                 # labelling the count with the second while it came from the
                 # first is how a report says "line" over a region number.
                 arrival_source=run.get("arrival_source", "unknown"),
-                findings=result["findings"])
+                findings=result["findings"],
+                # Whether the INDEPENDENT arrival estimators agree. Without
+                # this the report resolves a 1-vs-4 disagreement through
+                # `trust=` and prints one confident number.
+                agreement=_arrival_agreement(result))
             result["answers"] = to_report_rows(answers)
             result["answer_objects"] = answers
             for a in answers:
@@ -661,9 +904,356 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
             # timeline thumbnails, not the {person_id: crop} this wants.
             # Nothing banks a per-person crop yet, so passing anything here
             # would either crash or write paths to files that do not exist.
-            result["written"] = [str(p) for p in written]
+            # S5: _write_tracks appends AFTER result["written"] was assigned,
+            # so the predictions.txt and frame log never appeared in the run's
+            # own list of outputs -- which is plausibly why nobody was scoring
+            # them. Write the debug artefacts FIRST, then publish the list.
             written += _write_tracks(run, out)
+            # E4: persist per-frame modality so a day/night split is possible.
+            try:
+                _ir = run.get("frame_ir") or {}
+                if _ir:
+                    _irp = out / "debug" / f"{camera_id}_modality.json"
+                    _irp.parent.mkdir(parents=True, exist_ok=True)
+                    _irp.write_text(json.dumps(
+                        {str(k): bool(v) for k, v in _ir.items()}),
+                        encoding="utf-8")
+                    written.append(_irp)
+                    _nir = sum(1 for v in _ir.values() if v)
+                    _log.info(f"   modality: {_nir}/{len(_ir)} analysed frames "
+                              f"infrared -> {_irp.name} (lets score_conditions "
+                              f"split day vs night)")
+            except Exception as _ie:
+                _log.info(f"(modality not persisted: {_ie})")
+            result["written"] = [str(p) for p in written]
             st.count("files", len(written))
+
+            # E3: SCORE THE RUN, if ground truth for this chunk exists.
+            #
+            # kevacv/eval_harness.py is complete and validated against planted
+            # errors, gt.txt sits in the repo, and run["hota"] was never
+            # assigned by anything -- so report_slim's quality line rendered
+            # blank on every run and every accuracy claim in this project was
+            # self-reported. _write_tracks even prints the command a human
+            # should type. Nobody typed it.
+            try:
+                _gt = next((g for g in (Path("gt.txt"),
+                                        out / "gt.txt",
+                                        Path(zones_path).parent / "gt.txt")
+                            if g.exists()), None)
+                _pred = next((Path(w) for w in written
+                              if str(w).endswith("_predictions.txt")), None)
+                if _gt and _pred:
+                    from .eval_harness import load_mot, score_sequence
+                    _g, _p = load_mot(str(_gt)), load_mot(str(_pred))
+                    if _g and _p:
+                        _sc = score_sequence(_g, _p)
+                        result["hota"] = {k: _sc.get(k) for k in
+                                          ("HOTA", "DetA", "AssA", "IDF1",
+                                           "MOTA", "precision", "recall")}
+                        _log.info(
+                            f"\U0001f4cf scored against {_gt.name}: "
+                            f"HOTA {_sc.get('HOTA', 0):.4f} "
+                            f"DetA {_sc.get('DetA', 0):.4f} "
+                            f"AssA {_sc.get('AssA', 0):.4f} "
+                            f"recall {_sc.get('recall', 0):.4f}")
+                        _log.info(
+                            f"   NOTE: gt.txt is tied to the frame sampling of "
+                            f"the run it came from. If this run used a "
+                            f"different fps the frame numbers do not align -- "
+                            f"use tools/score_by_time.py instead.")
+            except Exception as _ee:
+                _log.info(f"(run not scored: {_ee})")
+
+        # RUN SCORECARD — the run states its own case.
+        #
+        # Every number needed to accept or reject this run, in one block, plus
+        # the same content as JSON so two runs can be diffed mechanically.
+        # Before this, that evidence lived in three tools somebody ran BY HAND
+        # afterwards (the funnel in the log, tools/track_health.py,
+        # tools/score_line_entries.py) -- which made the person running them
+        # the instrument, and their summary the thing you had to trust.
+        #
+        # Fails open and LOUDLY: a scorecard that cannot be built must never
+        # take the run down, but it must not disappear quietly either, because
+        # a missing scorecard looks exactly like a clean one.
+        try:
+            from . import scorecard as _SC
+            _card = _build_scorecard(result, out, camera_id, video_path,
+                                     zones_path)
+            _log.info("\n" + _SC.render(_card))
+            _SC.write(_card, str(out), camera_id)
+        except Exception as _sce:
+            import traceback as _tb
+            _log.error(f"!! RUN SCORECARD FAILED: {_sce}. This run produced no "
+                       f"self-assessment -- judge it from the funnel and the "
+                       f"crossings file by hand, and do not read the absence "
+                       f"of a scorecard as a pass.")
+            _log.error(_tb.format_exc())
 
         run_st.count("outputs", len(result["written"]))
     return result
+
+
+def _arrival_agreement(result):
+    """Cross-estimator agreement for this run, or None if unavailable."""
+    try:
+        from .confidence import arrival_tier
+        arr = result.get("arrivals") or {}
+        if arr.get("line") is None and arr.get("region") is None:
+            return None
+        return arrival_tier(arr.get("line"), arr.get("region"),
+                            (result.get("arrivals_slit") or {}).get("count"))
+    except Exception:
+        return None
+
+
+def _build_scorecard(result, out, camera_id, video_path, zones_path):
+    """Assemble the scorecard from what the run already produced."""
+    import gzip as _gz
+    import json as _json
+    from . import scorecard as _SC
+    from . import engine as _Eg
+
+    dbg = Path(out) / "debug"
+    tracks, t_first, t_last = {}, None, None
+    fp = dbg / f"{camera_id}_frames.json.gz"
+    if fp.exists():
+        acc = {}
+        for _fi, _t, _dets in _json.load(_gz.open(fp, "rt")):
+            for _tid, _x1, _y1, _x2, _y2 in _dets:
+                acc.setdefault(_tid, []).append(
+                    (float(_t), float(_x1), float(_y1), float(_x2), float(_y2)))
+        for k in acc:
+            acc[k].sort()
+        tracks = acc
+        _ts = [p[0][0] for p in tracks.values()] + [p[-1][0] for p in tracks.values()]
+        t_first, t_last = (min(_ts), max(_ts)) if _ts else (None, None)
+
+    crossings = []
+    cp = dbg / f"{camera_id}_crossings.json"
+    if cp.exists():
+        _d = _json.load(open(cp))
+        crossings = _d if isinstance(_d, list) else _d.get("crossings", _d)
+
+    run = result.get("run") or {}
+
+    # The engine already returns both of these; nothing was reading them.
+    funnel_pct = {}
+    for st in (run.get("detection_funnel") or {}).get("stages", []):
+        funnel_pct[st["stage"]] = 100.0 * float(st.get("share_of_raw") or 0.0)
+
+    plane = {}
+    _pd = run.get("ground_plane")
+    if _pd:
+        import re as _re
+        _h = _re.search(r"camera height ([\d.]+) m", str(_pd))
+        _r = _re.search(r"horizon at row (-?\d+)", str(_pd))
+        plane = {"ok": True, "describe": str(_pd),
+                 "mode": run.get("ground_mode"),
+                 "camera_h_m": float(_h.group(1)) if _h else None,
+                 "horizon_row": int(_r.group(1)) if _r else None}
+
+    arr = result.get("arrivals") or {}
+    counts = {k: arr[k] for k in ("line", "region", "trust") if k in arr}
+    if result.get("people") is not None:
+        try:
+            counts["guests"] = len(result["people"])
+        except TypeError:
+            pass
+
+    aw = float(getattr(_Eg, "ANALYSIS_MAX_W", 1920) or 1920)
+    imgsz = float(getattr(_Eg, "YOLO_IMGSZ", 1280) or 1280)
+    card = {"run": str(out).rstrip("/").split("/")[-1],
+            "build": {"build_id": (run.get("build_id")
+                                   or result.get("build_id")
+                                   or getattr(_Eg, "BUILD_ID", None) or "?"),
+                      "config": (result.get("config")
+                                 or getattr(_Eg, "RUN_CONFIG_PATH", None) or "?"),
+                      "video": str(video_path),
+                      "zones": str(zones_path),
+                      "seconds": run.get("duration_s", "?"),
+                      "changed": result.get("config_changed") or {}},
+            "funnel": funnel_pct,
+            "ground_plane": plane,
+            "counts": counts}
+    # Zone polygons, scaled into the pixel space the TRACKS live in, so the
+    # scorecard can tell a person leaving through the dining doorway from the
+    # tracker dropping someone in open floor. Without this the fragmentation
+    # verdict counts doorways and furniture as failures and reads ~5x high.
+    zpolys = None
+    try:
+        _z = _json.load(open(zones_path))
+        _fw, _fh = _z.get("frame_size", [3840, 2160])[:2]
+        _ah = aw * float(_fh) / float(_fw)
+        _sx, _sy = aw / float(_fw), _ah / float(_fh)
+        zpolys = {nm: [(px * _sx, py * _sy) for px, py in pts]
+                  for nm, pts in (_z.get("polygons") or {}).items()}
+    except Exception:
+        zpolys = None
+
+    if tracks:
+        card["tracks"] = _SC.track_stats(tracks, aw, aw * 9.0 / 16.0,
+                                         zone_x=1500.0 * (aw / 1920.0),
+                                         t_first=t_first, t_last=t_last,
+                                         zones=zpolys)
+        card["pixel_height"] = _SC.pixel_height(tracks, aw, 3840.0, imgsz)
+        # P3: fragments-per-person, lost-buffer recoveries and swap pressure.
+        # None of these need labels, and they are the numbers a tracking change
+        # has to move -- until now "did that help the tracker?" had no answer.
+        card["track_quality"] = _SC.track_quality(
+            tracks, fps=float(getattr(_Eg, "FPS_TARGET", 8) or 8))
+    # Tier the headline arrival count by how far the INDEPENDENT estimators
+    # agree. Additive: the count itself is untouched, but a run where line and
+    # region disagree 1-vs-4 can no longer be read as a clean answer.
+    from .confidence import arrival_tier as _tier
+    _plane_ok = bool(plane) and not plane.get("failed_scale")
+    card["arrival_confidence"] = _tier(
+        arr.get("line"), arr.get("region"),
+        (result.get("arrivals_slit") or {}).get("count"),
+        plane_ok=_plane_ok)
+
+    # OCCUPANCY RECONCILIATION (audit.txt RED FLAG #3). The overlay published
+    # "people in frame = 5, entered = 8, exited = 6" and never noticed that
+    # 1 + 8 - 6 = 3. analytics.occupancy_timeline had existed the whole time
+    # with zero callers -- the observed half of the check was already written
+    # and simply never compared against the doors.
+    try:
+        from .analytics import (reconcile_occupancy as _rec,
+                                describe_reconciliation as _drec)
+        # `result` is the OUTER dict; the analyse payload lives under "run"
+        # (bound at the top of this function). Reading events off `result`
+        # silently returned [] and the whole check skipped without a word --
+        # which is exactly the class of failure this check exists to catch,
+        # so the skip is now logged instead of swallowed.
+        _evts = run.get("events") or []
+        _dur = float(run.get("duration_s") or 0.0)
+        if _evts and _dur > 0:
+            card["occupancy_reconciliation"] = _rec(_evts, crossings, _dur,
+                                                    line_name="entry line")
+            _log.info("\n" + _drec(card["occupancy_reconciliation"]))
+        else:
+            _log.warning(f"!! occupancy reconciliation SKIPPED: "
+                         f"{len(_evts)} events, duration {_dur}s")
+    except Exception as _roe:
+        _log.error(f"!! occupancy reconciliation failed: {_roe}")
+
+    # Person -> Visit -> Event. "unique people" and "visits" were the same
+    # field, so a guest who stepped out for a cigarette and came back was
+    # either two people or one visit, depending on which estimator won.
+    try:
+        from .visits import build_visits as _bv
+        card["visits"] = _bv(crossings, line_name="entry line")
+    except Exception as _ve:
+        _log.error(f"!! visit model failed: {_ve}")
+
+    card["entry_score"] = _SC.score_windows(crossings, video=str(video_path))
+    # observation layer stats, recorded by run_camera when the flag is on
+    if result.get("observations"):
+        card["observations"] = result["observations"]
+    # EVENT QUEUE (P7). Stream the run's events to append-only JSONL through a
+    # bounded, non-blocking queue. A module nothing imports is how this
+    # codebase accumulated four built-and-unwired features, so this is wired
+    # even though it defaults off.
+    if getattr(_Eg, "ENABLE_EVENT_QUEUE", False):
+        try:
+            from .event_queue import EventQueue as _EQ, jsonl_sink as _sink
+            _qpath = Path(out) / f"{camera_id}_events.jsonl"
+            _eq = _EQ(sink=_sink(str(_qpath)),
+                      maxsize=int(getattr(_Eg, "EVENT_QUEUE_MAXSIZE", 10000)))
+            _eq.start()
+            for _c in crossings:
+                _eq.put({"kind": "crossing", **_c})
+            for _v in (card.get("visits") or {}).get("visits", []):
+                _eq.put({"kind": "visit", **_v})
+            _qs = _eq.close()
+            card["event_queue"] = _qs
+            _log.info(f"\U0001f4e4 event queue -> {_qpath.name}: "
+                      f"{_qs['written']} written, {_qs['dropped']} dropped, "
+                      f"{_qs['sink_errors']} sink error(s)")
+            if _qs["lost"]:
+                _log.error(f"!! event queue LOST {_qs['lost']} event(s) — the "
+                           f"JSONL is incomplete for this run")
+        except Exception as _qe:
+            _log.error(f"!! event queue failed: {_qe}")
+
+    # PROVENANCE. Stamp what produced these numbers onto the OUTPUT, not just
+    # into a log on a box. Three failures today would have been a five-second
+    # lookup with this: a byte-identical funnel after a half-applied detector
+    # change, a GMC A/B where a duplicated key meant the flag never ran, and a
+    # held-out score measured against ground truth from a different hour.
+    try:
+        from .provenance import build_stamp as _stamp
+        card["provenance"] = _stamp(
+            build_id=card["build"].get("build_id"),
+            config_path=card["build"].get("config"),
+            zones_path=str(zones_path), video=str(video_path),
+            detector=str(getattr(_Eg, "DETECTOR_MODEL", "?")),
+            tracker=str(getattr(_Eg, "TRACKER_MODE", "?")),
+            reid_weights=str(getattr(_Eg, "CLIP_REID_WEIGHTS", "?")),
+            changed=card["build"].get("changed"),
+            ground_plane=plane,
+            fps=float(getattr(_Eg, "FPS_TARGET", 8) or 8),
+            analysis_w=aw, imgsz=imgsz)
+        import json as _j
+        with open(Path(out) / f"{camera_id}_provenance.json", "w") as _fh:
+            _j.dump(card["provenance"], _fh, indent=1, default=str)
+    except Exception as _pe:
+        _log.error(f"!! provenance stamp failed: {_pe}")
+
+    # Turn UNCERTAIN into an ACTION. Until now the tier was printed and the
+    # ambiguous cases still went into the same total as the confirmed ones.
+    try:
+        from .review import build_queue as _bq
+        card["review_queue"] = _bq(
+            arrival_confidence=card.get("arrival_confidence"),
+            visits=card.get("visits"),
+            camera=camera_id)
+        import json as _j
+        with open(Path(out) / f"{camera_id}_review_queue.json", "w") as _fh:
+            _j.dump(card["review_queue"], _fh, indent=1, default=str)
+    except Exception as _rqe:
+        _log.error(f"!! review queue failed: {_rqe}")
+
+    # DECISION LEDGER. Built in an earlier session to answer "a number with no
+    # provenance" and then imported by NOTHING -- the same orphan pattern as
+    # fit_robust_ground_plane and validate_entry_line. provenance.py now covers
+    # WHAT PRODUCED the run; this covers WHAT THE RUN DECIDED, per stage. Both
+    # are needed and neither replaces the other.
+    try:
+        from .decision_log import Ledger as _Ledger
+        _led = _Ledger(run_id=str(out).rstrip("/").split("/")[-1])
+        with _led.stage("scorecard", module="kevacv.scorecard",
+                        does="assemble the run's own evidence"):
+            for _st, _pct in (card.get("funnel") or {}).items():
+                _led.flow(_st, note=f"{_pct:.1f}% of raw dropped here")
+            for _v in card.get("verdicts") or []:
+                if _v.get("state") in ("FAIL", "NO-TRUTH"):
+                    _led.warn(_v["check"], why_it_matters=_v["detail"])
+        card["decision_log"] = _led.summary()
+        _led.write(str(out))
+    except Exception as _dle:
+        _log.error(f"!! decision ledger failed: {_dle}")
+
+    # POSE / ACTIVITY (P9). Off by default and correctly so -- it answers "what
+    # is this body doing", not "who is this", so it cannot move a count this
+    # pipeline is wrong about. Wired so it is a FLAG rather than an orphan.
+    if getattr(_Eg, "ENABLE_POSE", False) and tracks:
+        try:
+            from .pose import select_tracks as _sel
+            _chosen = _sel(tracks,
+                           max_tracks=int(getattr(_Eg, "POSE_MAX_TRACKS", 8)),
+                           min_seconds=float(getattr(_Eg, "POSE_MIN_TRACK_S", 2.0)))
+            card["pose"] = {"selected_tracks": _chosen,
+                            "model": str(getattr(_Eg, "POSE_MODEL", "?")),
+                            "stride": int(getattr(_Eg, "POSE_STRIDE", 8)),
+                            "note": "tracks selected; keypoint inference is a "
+                                    "second pass and is not run inline"}
+            _log.info(f"\U0001f9cd pose layer: {len(_chosen)} track(s) selected "
+                      f"of {len(tracks)} (budget "
+                      f"{getattr(_Eg, 'POSE_MAX_TRACKS', 8)})")
+        except Exception as _pe:
+            _log.error(f"!! pose layer failed: {_pe}")
+
+    card["verdicts"] = _SC.verdicts(card)
+    return card

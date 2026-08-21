@@ -1,0 +1,810 @@
+Yes. **This new probe changes the priority even further.** Your latest finding is strong evidence that the current failure is occurring **before tracking**, so I would stop tuning the tracker for the moment.
+
+You now have two measured detector-input failures:
+
+1. **Resolution starvation**
+2. **Entry-line mask deleting detections**
+
+Those should be fixed first.
+
+## My recommended sequence
+
+### 🔴 P0 — Fix the two detector-front-end failures
+
+#### 1. Fix `entry line = 0` / mask interaction first
+
+This is the easiest and most deterministic fix.
+
+You already have:
+
+```text
+MASK_REQUIRE_MOTION
+```
+
+and preflight already detects the dangerous configuration.
+
+But currently:
+
+```text
+Preflight
+   ↓
+ERROR
+   ↓
+pipeline continues anyway
+```
+
+That's a serious engineering problem.
+
+Change the contract to:
+
+```text
+Preflight
+   │
+   ├── PASS → run
+   │
+   └── FAIL → ABORT
+```
+
+**Never allow the production pipeline to run with a known-invalid counting configuration.**
+
+This should be a hard failure, not a warning.
+
+Also specifically validate:
+
+```text
+entry line intersects deletion mask
+```
+
+If yes:
+
+```text
+❌ INVALID CONFIGURATION
+```
+
+before processing a single frame.
+
+This prevents you from spending hours debugging "tracking" when the detector never receives the person at the counting boundary.
+
+---
+
+# 2. Fix the 1280-on-4K resolution problem
+
+This is now your second major P0.
+
+Your source:
+
+```text
+3840 × 2160
+```
+
+Current:
+
+```text
+imgsz = 1280
+```
+
+So yes, you're aggressively compressing the spatial information before inference.
+
+Your probe is particularly valuable because it gives you a **controlled experiment**:
+
+```text
+Same frame
+Same model
+
+Full @ 1920 → woman missed
+Full @ 2560 → woman still missed
+Crop + 2× upscale → woman detected
+```
+
+That tells us something very specific:
+
+> **The detector can detect her when sufficient pixels are allocated to her.**
+
+That's different from:
+
+> "YOLO isn't capable of detecting her."
+
+---
+
+# But don't immediately change everything to `imgsz=2560`
+
+This is important.
+
+If you simply go:
+
+```text
+1280 → 2560
+```
+
+you could potentially destroy your processing speed.
+
+Instead, I would test **three architectures**.
+
+### A — Full-frame high resolution
+
+```text
+3840×2160
+      ↓
+imgsz 1920/2560
+      ↓
+YOLO
+```
+
+This gives you your accuracy baseline.
+
+### B — Full frame + strategic crop
+
+```text
+3840×2160
+      │
+      ├── Full scene → normal detector
+      │
+      └── Entry/reception ROI → high-resolution detector
+```
+
+This is probably the architecture I'd favor for your camera.
+
+### C — Tiled inference
+
+```text
+4K frame
+   ↓
+┌───────┬───────┐
+│ Tile1 │ Tile2 │
+├───────┼───────┤
+│ Tile3 │ Tile4 │
+└───────┴───────┘
+   ↓
+detections
+   ↓
+merge/NMS
+```
+
+This costs more compute but preserves small-person detail.
+
+---
+
+# For your particular camera, I'd start with B
+
+Because you don't actually need 4K-level inference everywhere.
+
+Your business-critical area is:
+
+```text
+ENTRY LINE
+    ↓
+RECEPTION
+    ↓
+PATH TO DINING
+```
+
+So do something like:
+
+```text
+                    4K FRAME
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+        NORMAL SCENE        CRITICAL ROI
+              │                 │
+          imgsz 1280        high-res
+              │                 │
+              └────────┬────────┘
+                       ▼
+                 DETECTION FUSION
+                       │
+                       ▼
+                    TRACKER
+```
+
+This gives you:
+
+**speed where you can afford it + resolution where counting actually matters.**
+
+---
+
+# 3. But be careful with crop inference
+
+There is a major engineering trap here.
+
+You cannot just run a crop and concatenate detections.
+
+You need to convert crop coordinates back to the original frame:
+
+```text
+crop coordinates
+      ↓
+scale correction
+      ↓
+offset correction
+      ↓
+full-frame coordinates
+```
+
+Then perform duplicate suppression / association.
+
+Example:
+
+```text
+Full detector:
+P1 @ (600,740)
+
+ROI detector:
+P1 @ (598,742)
+
+                    ↓
+               same person
+                    ↓
+               merge detections
+```
+
+Otherwise you create duplicate boxes.
+
+---
+
+# 4. Do NOT put Re-ID into this yet
+
+This is important.
+
+Right now:
+
+```text
+Source
+ ↓
+Detector
+ ↓
+❌ missing person
+ ↓
+Tracker
+```
+
+Re-ID can't magically recover a person who **never enters the tracker**.
+
+So:
+
+```text
+Detector recall
+      ↓
+Track recall
+      ↓
+ID stability
+      ↓
+Re-ID
+```
+
+is the order.
+
+---
+
+# 5. Don't add pose either
+
+Same reason.
+
+Pose doesn't solve:
+
+> "The detector didn't see her."
+
+It solves:
+
+> "What is the person doing?"
+
+Later:
+
+```text
+P001
+ ↓
+pose
+ ↓
+walking / standing / bending
+```
+
+But not now.
+
+---
+
+# 6. Your detector should have two responsibilities
+
+I'd explicitly separate:
+
+### Scene detector
+
+```text
+Entire venue
+↓
+cheap / normal resolution
+↓
+general awareness
+```
+
+and
+
+### Critical-zone detector
+
+```text
+Entry / exit / reception
+↓
+high-resolution
+↓
+high recall
+```
+
+That's a much better design for your use case than forcing one detector configuration to solve every region.
+
+---
+
+# 7. Add a "critical zone" concept
+
+Your configuration could conceptually become:
+
+```text
+zones:
+  entry:
+    importance: CRITICAL
+    detection_mode: HIGH_RES
+    counting: true
+
+  reception:
+    importance: HIGH
+    detection_mode: HIGH_RES
+    counting: true
+
+  dining:
+    importance: NORMAL
+    detection_mode: NORMAL
+```
+
+Then your compute engine knows:
+
+> **Not every pixel has equal business value.**
+
+That's a very useful design principle.
+
+---
+
+# 8. Your preflight needs to become much stronger
+
+You already have preflight.
+
+I'd turn it into a **configuration safety gate**.
+
+Before processing:
+
+```text
+PRE-FLIGHT
+│
+├── Video resolution
+├── FPS
+├── Camera calibration
+├── Ground points
+├── Homography validity
+├── Zone validity
+├── Entry-line validity
+├── Mask/line collision
+├── ROI validity
+├── Modality configuration
+├── Detector resolution
+├── Tracker parameters
+├── Staff configuration
+└── Version compatibility
+```
+
+Then:
+
+```text
+ALL PASS
+   ↓
+START
+
+ANY CRITICAL FAIL
+   ↓
+ABORT
+```
+
+No silent degradation.
+
+---
+
+# 9. I would add detector-specific preflight
+
+Your new discovery makes this necessary.
+
+For example:
+
+```text
+Source = 3840×2160
+imgsz = 1280
+critical zone = entry
+```
+
+Preflight could warn:
+
+> **CRITICAL: critical-zone person height is expected to fall below detector operating range at configured input resolution.**
+
+Even better if you can estimate expected pixel height from calibration/scene geometry.
+
+Then your system can say:
+
+```text
+1280 → insufficient
+1920 → acceptable
+2560 → expensive
+ROI high-res → recommended
+```
+
+That's intelligent engineering rather than blindly choosing a model size.
+
+---
+
+# 10. Then rerun the detector audit
+
+After fixing the two issues:
+
+### Baseline
+
+```text
+1280
+current masks
+```
+
+### Test 1
+
+```text
+1280
+mask fix
+```
+
+### Test 2
+
+```text
+1920
+mask fix
+```
+
+### Test 3
+
+```text
+2560
+mask fix
+```
+
+### Test 4
+
+```text
+1280 full
++
+high-res critical crop
++
+mask fix
+```
+
+Compare:
+
+| Configuration       | Detector Recall |      FPS |      GPU | Missed Entry |
+| ------------------- | --------------: | -------: | -------: | -----------: |
+| Current             |        baseline | baseline | baseline |     baseline |
+| 1280 + mask fix     |               ? |        ? |        ? |            ? |
+| 1920 + mask fix     |               ? |        ? |        ? |            ? |
+| 2560 + mask fix     |               ? |        ? |        ? |            ? |
+| 1280 + high-res ROI |               ? |        ? |        ? |            ? |
+
+**I suspect the ROI approach will be your best speed/accuracy compromise**, but the experiment should decide.
+
+---
+
+# 11. Only after this, go back to tracking
+
+Once the detector is no longer starving the tracker:
+
+```text
+Detector
+   ↓
+Tracker
+```
+
+Then measure:
+
+### Track survival
+
+```text
+How long does each real person maintain identity?
+```
+
+### Fragmentation
+
+```text
+69 fragments → hopefully much lower
+```
+
+### ID switches
+
+```text
+P1 → P2 → P1
+```
+
+### Recovery
+
+```text
+lost → recovered same ID
+```
+
+---
+
+# 12. Then implement the recovery ladder
+
+Your next tracker change:
+
+```text
+ACTIVE
+ ↓
+DETECTION MISSING
+ ↓
+PREDICT
+ ↓
+SHORT LOST
+ ↓
+CANDIDATE SEARCH
+ ↓
+Re-ID + trajectory + topology
+ ↓
+RECOVER
+```
+
+Only terminate after the recovery budget expires.
+
+---
+
+# 13. Then formalize counting
+
+Only after stable tracking:
+
+```text
+TRACK
+ ↓
+ZONE
+ ↓
+LINE CROSSING
+ ↓
+DIRECTION
+ ↓
+STATE MACHINE
+ ↓
+EVENT
+```
+
+Not:
+
+```text
+DETECTION
+ ↓
+COUNT
+```
+
+---
+
+# 14. One more thing your new finding tells me
+
+Your previous observation:
+
+> "Nobody is small enough for tiling."
+
+was based on **source-image intuition**.
+
+Your new experiment demonstrates why that reasoning is dangerous.
+
+You need to distinguish:
+
+### Source pixel size
+
+from
+
+### Network pixel size
+
+A person can be:
+
+```text
+344 px tall in source
+```
+
+but after preprocessing:
+
+```text
+~115 px tall at inference
+```
+
+Those are completely different detector conditions.
+
+So from now on, I'd make **effective network pixel height** a first-class diagnostic.
+
+For every critical zone, report something like:
+
+```text
+Person:
+Source height:       344 px
+Network height:      115 px
+Inference scale:     1280
+Critical-zone:       YES
+```
+
+Then you'll know exactly why a person disappears.
+
+---
+
+# 15. And your IR discovery makes the resolution problem even more important
+
+You already found:
+
+> only ~24% of colour edges survive in IR.
+
+So you have two compounding effects:
+
+```text
+4K → 1280 downscale
+        +
+IR/monochrome degradation
+        ↓
+less spatial information
+        ↓
+weak detector evidence
+```
+
+Therefore I would **not tune a single universal confidence threshold** for the whole 24-hour video.
+
+Eventually you'll need:
+
+```text
+COLOR policy
++
+IR policy
+```
+
+But again, **after the detector-input problem is fixed.**
+
+---
+
+# My exact recommendation
+
+If you ask me:
+
+> **"What should I do tomorrow morning, in what order?"**
+
+I'd do exactly this:
+
+### 🔴 Step 1 — Hard-stop invalid configuration
+
+Fix:
+
+```text
+entry line inside deletion mask
+```
+
+and make preflight **abort**, not merely warn.
+
+### 🔴 Step 2 — Disable poisoned geometry
+
+Until homography is calibrated:
+
+```text
+MAX_WALK_SPEED_MPS
+distance gates
+metres-based vetoes
+```
+
+→ OFF.
+
+### 🔴 Step 3 — Run detector experiments
+
+Use the same sealed frames.
+
+Compare:
+
+```text
+1280
+1920
+2560
+1280 + critical ROI high-res
+```
+
+### 🔴 Step 4 — Measure effective pixel height
+
+Especially at:
+
+* entry line
+* reception
+* dining transition
+
+### 🔴 Step 5 — Fix detector filtering
+
+Audit:
+
+* confidence
+* height
+* dead band
+* ROI
+* mask
+* NMS
+
+### 🔴 Step 6 — Pick the fastest configuration that reaches your required detector recall
+
+**Don't choose 2560 just because it detects more.**
+
+### 🔴 Step 7 — Only now benchmark tracker
+
+A/B:
+
+```text
+GMC OFF
+vs
+GMC SOF
+```
+
+### 🔴 Step 8 — Fix track persistence
+
+Implement:
+
+```text
+ACTIVE
+→ LOST
+→ PREDICT
+→ SEARCH
+→ RE-ID
+→ RECOVER
+→ TERMINATE
+```
+
+### 🔴 Step 9 — Formalize identity state machine
+
+### 🔴 Step 10 — Formalize IN/OUT state machine
+
+### 🔴 Step 11 — Re-run the exact same ground-truth windows
+
+Only now can you say:
+
+> **"We improved it."**
+
+---
+
+## The key conclusion
+
+Your latest audit is actually **good news**.
+
+You found two concrete, reproducible failures **before the tracker**:
+
+```text
+                  CURRENT
+                     │
+                     ▼
+             4K SOURCE VIDEO
+                     │
+                     ▼
+               ❌ 1280 SCALE
+                     │
+                     ▼
+              DETECTOR INPUT
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+   PEOPLE LOST             MASK DELETES
+   BY RESOLUTION            LINE PEOPLE
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+              DAMAGED DETECTIONS
+                     │
+                     ▼
+              TRACKER FRAGMENTS
+                     │
+                     ▼
+                BAD GLOBAL IDs
+                     │
+                     ▼
+                BAD EVENTS
+                     │
+                     ▼
+                 BAD COUNT
+```
+
+So **don't touch the fancy layers yet**.
+
+Fix the two things at the top, calibrate the ground plane, then measure what the tracker does with a healthy detection stream.
+
+If you do that, the `69 fragments → 18 people` number becomes much more informative: we'll finally be able to tell **how much of the fragmentation is genuinely tracker/identity failure versus simply the detector starving the tracker of observations.**

@@ -53,10 +53,21 @@ try:
 except Exception:                                   # pragma: no cover
     cv2 = None
 
-PERSON_H_M = 1.7          # median adult standing height, the reference ruler
-DEFAULT_HFOV_DEG = 82.0   # typical wide fixed CCTV lens; only affects the DEPTH
-                          # axis, and only in AUTO mode. Override in config if
-                          # the real lens is known.
+# ONE DEFINITION, IN config.py. These used to be redefined here and had
+# DIVERGED from it:
+#
+#     config.py         DEFAULT_HFOV_DEG = 90.0   <- what analytics.py used
+#     ground_plane.py   DEFAULT_HFOV_DEG = 82.0   <- what THIS file used
+#
+#     focal_px = (frame_w / 2) / tan(hfov / 2)
+#     frame_w=1920:  82 deg -> 1104.4 px,  90 deg -> 960.0 px   = 15.0% apart
+#
+# One camera, two focal lengths, in the same run -- and every metre in the
+# pipeline is scaled by whichever module computed it: MAX_WALK_SPEED_MPS,
+# REID_HANDOFF_M, REID_STATIONARY_M, _drop_implausible, and tier_a_crossings'
+# 1.2 m dedupe. A shadowed constant is not a duplicate, it is a second source
+# of truth that no config change can reach.
+from .config import DEFAULT_HFOV_DEG, PERSON_H_M  # noqa: F401  (re-exported)
 
 
 class GroundPlane:
@@ -68,7 +79,14 @@ class GroundPlane:
     """
 
     def __init__(self, mode, *, a=None, b=None, cx=None, focal_px=None,
-                 person_h=PERSON_H_M, H=None, frame_size=None, note=""):
+                 person_h=None, H=None, frame_size=None, note=""):
+        # LATE-BOUND, not `person_h=PERSON_H_M`. A default argument is
+        # evaluated ONCE, when the def executes at import time, so a later
+        # `setattr(ground_plane, "PERSON_H_M", ...)` from apply_run_config
+        # would update the module global and change nothing at the call site.
+        # Resolving through globals() here is what makes the yaml knob real.
+        if person_h is None:
+            person_h = globals()["PERSON_H_M"]
         self.mode = mode                 # "auto" | "exact" | "none"
         self.a, self.b = a, b
         self.cx, self.focal_px = cx, focal_px
@@ -83,15 +101,23 @@ class GroundPlane:
         return cls("none", note=why)
 
     @classmethod
-    def from_perspective(cls, a, b, frame_w, frame_h, person_h=PERSON_H_M,
-                         hfov_deg=DEFAULT_HFOV_DEG, focal_px=None):
+    def from_perspective(cls, a, b, frame_w, frame_h, person_h=None,
+                         hfov_deg=None, focal_px=None):
         """Build from the fitted line  h(y) = a*y + b  (pixel height of a
         standing person whose feet are at image row y).
 
         a <= 0 would mean people get SHORTER as they come closer, which is not a
         camera looking at a floor — it is a broken fit, and we refuse it rather
         than produce confident nonsense from it.
+
+        person_h / hfov_deg default to the module globals AT CALL TIME rather
+        than in the signature, so apply_run_config can actually move them --
+        see __init__ for why a signature default cannot be reconfigured.
         """
+        if person_h is None:
+            person_h = globals()["PERSON_H_M"]
+        if hfov_deg is None:
+            hfov_deg = globals()["DEFAULT_HFOV_DEG"]
         if a is None or a <= 1e-6:
             return cls.none(f"perspective fit unusable (a={a}) — not a floor view")
         if focal_px is None:
@@ -238,9 +264,42 @@ class GroundPlane:
         return (f"ground plane: AUTO — implied camera height {hc:.2f} m, "
                 f"horizon at row {hy:.0f}, {self.note}" + warn)
 
-    def sanity(self, frame_h):
+    def check_scale_reference(self, ref):
+        """Compare the plane against ONE known real distance in the scene.
+
+        A negative horizon row is NOT automatically wrong -- a steeply
+        down-tilted ceiling camera genuinely puts the floor's vanishing point
+        above the frame -- so bounding the horizon by guesswork would reject
+        correct fits. A measured distance can arbitrate without guessing.
+
+        `ref` = {"row": y, "pixels": n, "metres": m, "tolerance": frac}, from
+        the zone file. For CAM.112 it is the floor checkerboard: 128.6 px at
+        row 780 is one tile diagonal, and the operator measured the tile edge
+        at 30 cm.
+
+        -> [] if acceptable, else one explanation.
+        """
+        if not ref or not self.ok:
+            return []
+        try:
+            row = float(ref["row"]); px = float(ref["pixels"])
+            want = float(ref["metres"]); tol = float(ref.get("tolerance", 0.35))
+        except (KeyError, TypeError, ValueError):
+            return []
+        got = self.dist_m((0.0, row), (px, row))
+        if got is None or want <= 0:
+            return []
+        err = abs(got - want) / want
+        if err > tol:
+            return [f"scale reference FAILED: {px:.0f} px at row {row:.0f} "
+                    f"measures {got:.3f} m but is known to be {want:.3f} m "
+                    f"({err*100:.0f}% off, tolerance {tol*100:.0f}%). The "
+                    f"metres this plane produces are not this room's metres."]
+        return []
+
+    def sanity(self, frame_h, scale_ref=None):
         """Cheap self-checks whose failure means 'do not trust the metres'."""
-        out = []
+        out = self.check_scale_reference(scale_ref)
         if self.mode != "auto":
             return out
         hc = self.camera_height_m()

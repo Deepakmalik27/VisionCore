@@ -46,6 +46,7 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict
+from datetime import timedelta
 from pathlib import Path
 
 import cv2
@@ -75,11 +76,17 @@ from .phantoms import OnlineStaticSuppressor, in_phantom, phantom_regions
 from .profiling import Profile
 from .reid_calibration import LiveSeparability, describe_live
 from .tiled import cost_estimate, height_roi, tiled_predict
+from .validity import OK, SKIPPED_IDLE, ValidityLedger, frame_validity
+from .resilience import run_batched
+from . import observe
 from .helpers import (_safe_id, anchor_point, classify_zones, load_zone_config,
                       mmss, plot_reid_pair_audit, show_gallery,
                       uses_centre_anchor, wall, zone_color_map)
 
 # ── injected at runtime by the caller (not configuration) ───────────────────
+OBS_QUEUE = None               # observation EventQueue, injected by pipeline.py
+VIDEO_START_DT = None          # verified wall-clock start; None = never verified
+_OBS_POSE_WARNED = False       # one-shot flag so the pose warning prints once
 BASE = Path(".")               # working directory for the run
 INPUT_ROOT = None              # where the video chunks live
 OUTPUT_DIR = Path("output")    # where artefacts are written
@@ -957,6 +964,27 @@ def exposure_clip_limit(exp, base=2.0, max_clip=4.0):
                            / max(255.0 - EXPOSURE_BRIGHT_MEAN, 1e-6)))
     return float(base + (max_clip - base) * sev)
 
+def _ultralytics_gmc():
+    """GMC name for ultralytics' botsort yaml.
+
+    This line used to read `"sparseOptFlow" if ENABLE_GMC else "none"`, which
+    HARDCODED the method and ignored GMC_METHOD entirely — while the boxmot
+    path (build_online_tracker) read GMC_METHOD. Two tracker backends, two
+    different knobs, one of them unreachable. Setting analysis.gmc_method
+    therefore changed one path and silently not the other, so the "is GMC
+    helping on a fixed camera?" A/B could not be run honestly.
+
+    boxmot spells it 'sof'; ultralytics spells the same algorithm
+    'sparseOptFlow'. Translate rather than make the operator know both.
+    """
+    if not ENABLE_GMC:
+        return "none"
+    return {"sof": "sparseOptFlow", "sparseoptflow": "sparseOptFlow",
+            "ecc": "ecc", "orb": "orb", "sift": "sift",
+            "none": "none", None: "none"}.get(
+                str(GMC_METHOD).lower() if GMC_METHOD else None, "sparseOptFlow")
+
+
 def _botsort_yaml(track_buffer_frames):
     # model: auto — Ultralytics native with_reid does NOT accept torchreid/boxmot
     # OSNet .pt checkpoints (wrong format for its YOLO()-based .pt loader; confirmed
@@ -983,7 +1011,7 @@ new_track_thresh: {_hi}
 track_buffer: {int(track_buffer_frames)}
 match_thresh: {BOTSORT_MATCH_THRESH}
 fuse_score: True
-gmc_method: {"sparseOptFlow" if ENABLE_GMC else "none"}
+gmc_method: {_ultralytics_gmc()}
 proximity_thresh: 0.3
 appearance_thresh: 0.25
 with_reid: True
@@ -1042,7 +1070,10 @@ def build_online_tracker(fps, device=None):
         _log.info(f"✅ tracker: OccluBoost with REAL {method.upper()} embeddings "
               f"(occlusion-damped Kalman + GTA graveyard re-association)")
     else:
-        from boxmot.trackers.botsort.botsort import BotSort
+        try:
+            from boxmot.trackers.botsort.botsort import BotSort
+        except ImportError:          # boxmot >= 19 moved trackers under .bbox
+            from boxmot.trackers.bbox.botsort.botsort import BotSort
         tracker = BotSort(
             reid_model=backend,
             track_high_thresh=_hi,
@@ -1116,6 +1147,7 @@ class _PerspectiveModel:
         self.min_samples = (CARRIED_MIN_FIT_SAMPLES if min_samples is None
                             else min_samples)
         self.samples = []          # (foot_y, height)
+        self.boxes = []            # full xyxy, for the robust RANSAC fitter
         self._fit = None           # (a, b)  ->  h ~= a*foot_y + b
         self._n_at_fit = 0
 
@@ -1191,6 +1223,13 @@ def _feed_perspective(dets, model, min_conf=0.5):
         if any(_boxes_occluding(xy[i], xy[j]) for j in range(len(xy)) if j != i):
             continue
         model.add(xy[i][3], xy[i][3] - xy[i][1])
+        # Keep the full box too. fit_robust_ground_plane filters on ASPECT to
+        # select upright, fully-visible people, and (foot_y, height) alone
+        # cannot express aspect. Same sample set, one extra field.
+        _boxes = getattr(model, "boxes", None)
+        if _boxes is not None and len(_boxes) < 20000:
+            _boxes.append((float(xy[i][0]), float(xy[i][1]),
+                           float(xy[i][2]), float(xy[i][3])))
 
 
 def _suppress_carried(dets, persp=None, stats=None):
@@ -1302,6 +1341,34 @@ def _detector_has_head_class(model):
     except Exception:
         return False
     return names.get(0) == "person" and names.get(1) == "head" and len(names) == 2
+
+
+def _det_classes(has_head):
+    """Class ids to ASK the detector for.
+
+    #23 (2026-08-20). Measured on the p0verify run with stock yolo11x:
+
+        yolo raw            28888
+        person/head split   28888 -> 9955   dropped 18933 = 65.5%   emptied 101
+
+    and the funnel printed a WARNING that 66% of detections were being dropped
+    and no count downstream could be trusted. That warning was a FALSE ALARM,
+    and an expensive one -- it is the single largest stage in the funnel and it
+    invites exactly the kind of "fix" that deletes real people.
+
+    Stock yolo11x is COCO: 80 classes. Class 0 is person; 1-79 are bicycles,
+    chairs, potted plants, vases, dining tables. This reception has a large
+    plant and a display case full of bowls, so the detector was faithfully
+    reporting furniture and _split_person_head was faithfully discarding it.
+    Nothing was wrong except that 19,000 detections were made, NMS'd, and
+    thrown away every run, and the funnel's biggest number was noise.
+
+    Asking the detector for the classes we want removes the wasted work AND
+    makes the funnel readable. The 2-class fine-tune keeps class 1 because
+    there a head is a real occlusion signal -- see _detector_has_head_class,
+    which is hard-gated so COCO's 'bicycle' can never be mistaken for a head.
+    """
+    return [0, 1] if has_head else [0]
 
 
 def _split_person_head(dets, has_head):
@@ -1514,38 +1581,6 @@ def _frame_chroma(frame_bgr, small=None):
     return float((np.abs(r - g) + np.abs(g - b)).mean())
 
 
-def detection_sanity(video_path, label, n=3, device=None):
-    """Visual checkpoint BEFORE the long run: raw detections on sample frames."""
-    if not Path(video_path).exists():
-        _log.info(f"(skip sanity check — {video_path} missing)")
-        return
-    cap = cv2.VideoCapture(str(video_path))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or NATIVE_FPS_OVERRIDE or 25
-    device_str = str(device or globals().get('DEVICE', 'cuda'))
-    model = YOLO(DETECTOR_MODEL)
-    shots, n_found = [], 0
-    for frac in [0.1, 0.5, 0.85][:n]:
-        idx = max(0, int(total * frac))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, fr = cap.read()
-        if not ok:
-            continue
-        dets = sv.Detections.from_ultralytics(
-            model(fr, conf=CONF_THRESHOLD, iou=0.45, imgsz=YOLO_IMGSZ,
-                  verbose=False, device=device_str)[0])
-        dets = dets[dets.class_id == 0]
-        fr = sv.BoxAnnotator(thickness=2).annotate(fr, dets)
-        fr = cv2.resize(fr, (720, int(720 * fr.shape[0] / fr.shape[1])))
-        shots.append((idx / fps, cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)))
-        n_found = len(dets)
-    cap.release()
-    if not shots:
-        _log.info(f"❌ {label}: no frame could be read — re-download the file.")
-        return
-    show_gallery(shots, f"STEP CHECK · person detections · {label} "
-                        f"({n_found} people in last sample)", ncols=3)
-
 def _hex2bgr(h):
     h = h.lstrip("#")
     return (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))
@@ -1638,6 +1673,10 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                 "unknown": (150, 150, 150)}
     zone_bgr = {n: _hex2bgr(c) for n, c in zcolors.items()}
     trails = defaultdict(lambda: deque(maxlen=int(eff_fps * 2)))
+    # pose overlay state, per render pass: [saw_a_skeleton, logged_a_failure]
+    # so the log gets one line each way instead of one per frame.
+    _pose_seen = [False, False]
+    _pose_prev = {}          # cid -> last foot point, for standing vs walking
     _trail_gap = {}
 
     def _claim_label_spot(placed, x, y, w, h, step=22, tries=8):
@@ -1889,7 +1928,36 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
             zone_counts = defaultdict(int)
             n_role = {"customer": 0, "staff": 0}
             boxes = frames[frame_idx]
-            for tid, x1, y1, x2, y2 in boxes:
+            # ── POSE OVERLAY ────────────────────────────────────────────────
+            # Run on the RENDERED frames only. Renders are already subsampled,
+            # so this costs nothing on the analysis path and the skeleton is
+            # drawn on the same pixels the reviewer is looking at.
+            # It is deliberately downstream of everything: poses are matched to
+            # tracker boxes and can only ADD a label, never create a track,
+            # move a count or change an event.
+            _pose_kps = {}
+            if globals().get("ENABLE_POSE", False) and boxes:
+                try:
+                    from . import pose as _PZ
+                    _pm = _PZ.get_model(globals().get("POSE_MODEL",
+                                                      "yolo11n-pose.pt"),
+                                        globals().get("DEVICE"))
+                    if _pm is not None:
+                        _pp = _PZ.keypoints_for_frame(frame, _pm)
+                        _pose_kps = _PZ.match_to_boxes(
+                            _pp, [(b[1], b[2], b[3], b[4]) for b in boxes])
+                        if not _pose_seen[0] and _pose_kps:
+                            _pose_seen[0] = True
+                            _log.info(f"🧍 pose overlay live: "
+                                      f"{len(_pose_kps)} of {len(boxes)} box(es) "
+                                      f"matched a skeleton on the first frame "
+                                      f"that had one")
+                except Exception as _poe:
+                    if not _pose_seen[1]:
+                        _pose_seen[1] = True
+                        _log.error(f"!! pose overlay failed: {_poe} — boxes are "
+                                   f"drawn without skeletons")
+            for _bi, (tid, x1, y1, x2, y2) in enumerate(boxes):
                 cid = canon.get(tid, tid)
                 role = roles.get(cid, "customer")
                 n_role[role if role in n_role else "customer"] += 1
@@ -1903,6 +1971,17 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                         zone_counts[name] += 1
                 color = role_bgr.get(role, role_bgr["unknown"])
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                _act = None
+                if _bi in _pose_kps:
+                    from . import pose as _PZ2
+                    _kp = _pose_kps[_bi]
+                    _PZ2.draw(frame, _kp)
+                    _prev_bc = _pose_prev.get(cid)
+                    _mv = (0.0 if _prev_bc is None
+                           else float(((bc[0] - _prev_bc[0]) ** 2
+                                       + (bc[1] - _prev_bc[1]) ** 2) ** 0.5))
+                    _pose_prev[cid] = bc
+                    _act = _PZ2.classify(_kp, foot_move_px=_mv).get("activity")
                 if isinstance(cid, str) and not str(cid).isdigit():
                     lbl = f"{cid} {role}"          # enrolled staff keep their name
                 elif ENABLE_DISPLAY_RENUMBER and cid in _pnum:
@@ -1912,6 +1991,8 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                            else f"P{_pnum[cid]} {role}")
                 else:
                     lbl = f"#{cid} {role}"
+                if _act and _act != "unknown":
+                    lbl += f" {_act}"
                 wc = wait_clock(cid, t)
                 if wc is not None and role != "staff":
                     lbl += f" {mmss(wc)}"
@@ -1994,6 +2075,17 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                 hud2 += f"   {_label}: {'STAFFED' if staffed else 'AWAY'}"
             # A7: the build that made this video, burned in — we could not tell
             # which build a reviewed video came from, so fixes looked like no-ops
+            # TIME-LAPSE HONESTY. The ratio was logged at writer setup and
+            # nowhere else, so every reviewer of these renders -- including two
+            # written audits -- judged track stability, "lost" durations and
+            # event timing against playback seconds that are 8x compressed.
+            # It belongs ON the frame, because the frame is what gets reviewed.
+            try:
+                _sp_x = float(_play_fps) / float(eff_fps)
+                if _sp_x >= 1.05:
+                    hud2 += f"   [TIME-LAPSE {_sp_x:.1f}x]"
+            except Exception:
+                pass
             hud2 += f"   build {str(globals().get('_BUILD_ID', '?'))[:12]}"
             # v53: HUD lives on a band ADDED ABOVE the frame (letterbox), not
             # painted over the video — the full camera view stays visible
@@ -2423,6 +2515,11 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                    else sv.Position.BOTTOM_CENTER)
         line_zones[_lname] = sv.LineZone(
             start=sv.Point(x1, y1), end=sv.Point(x2, y2),
+            # D2 (2026-08-19): _band is LINE_CROSS_FRAMES, expressed in FRAMES
+            # while every neighbouring gate is in seconds. Its physical
+            # meaning therefore CHANGES with analysis.fps -- 2 frames is 0.25s
+            # at 8fps and 0.13s at 15fps -- so any fps A/B silently moves the
+            # crossing jitter guard too, which makes the A/B uninterpretable.
             minimum_crossing_threshold=_band,
             triggering_anchors=[_anchor])
         drawn_lines[_lname] = [[x1, y1], [x2, y2]]
@@ -2462,6 +2559,31 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     track_total_frames = defaultdict(int)   # v42: tid -> total frames seen
     track_time = {}                     # tid -> [first_t, last_t]  (ALL tracks, not just zone-event ones)
     frame_log = []                      # (frame_idx, t, [(tid,x1,y1,x2,y2)])
+
+    # OBSERVATION LAYER. OBS_QUEUE is injected by pipeline.py (same pattern as
+    # BASE/OUTPUT_DIR) so the engine never opens a file or a socket itself.
+    _obs_q = globals().get("OBS_QUEUE")
+    _obs_on = bool(globals().get("ENABLE_OBSERVATIONS", False)) and _obs_q is not None
+    _obs_hist = defaultdict(list)      # raw tid -> [(t, (x, y))], newest last
+    _obs_pose = {}                     # raw tid -> (t_sampled, activity)
+    # run_id must be DETERMINISTIC (re-running the SAME chunk must replace its
+    # own rows, never add a second copy) and UNIQUE per (camera, video, start
+    # offset). The observations PK is (run_id, frame_idx, raw_track_id) and the
+    # ingest tool does delete-then-insert per run_id, so two chunks sharing a
+    # run_id would make the second silently DELETE the first. That rules out a
+    # pid, a uuid or a timestamp: they break idempotent re-ingest.
+    _obs_run_id = (f"{camera_id}_{chunk_tag}" if chunk_tag else
+                   f"{camera_id}_{Path(video_path).stem}_{int(start_seconds)}")
+    _obs_emb_at = {}                   # raw tid -> frame_idx of last embedding
+
+    def _wall_ts(t_rel):
+        """Wall-clock for a row, or None when the clock was never verified.
+        Never guess a timestamp: clock.py exists because a run once stamped
+        19:30 onto 16:30 footage."""
+        _b = globals().get("VIDEO_START_DT")     # set by pipeline/provenance
+        if _b is None:
+            return None
+        return (_b + timedelta(seconds=float(t_rel))).isoformat()
 
     # ── LIVE IDENTITY MEMORY (v27) ──────────────────────────────────────────
     # Set up ONCE per video, before the frame loop. `_embed_one_live` reuses
@@ -2548,6 +2670,56 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         if _ground.ok and (_ground.mode == "exact" or _n < _ground_n[0] * 2):
             return _ground
         _ground_n[0] = _n
+        if globals().get("ENABLE_ROBUST_GROUND_PLANE") and getattr(_persp, "boxes", None):
+            # RANSAC over upright, fully-visible boxes. The bin-median fit this
+            # replaces reported a 4.04 m camera and a horizon at row -261 on
+            # this camera; measured against the floor tiles (128.6 px period ->
+            # 0.30 m edge, and the operator states 30 cm) the robust fit is the
+            # one that lands on reality.
+            from .geometry_calibration import fit_robust_ground_plane
+            _min_n = int(globals().get("ROBUST_PLANE_MIN_SAMPLES", 300))
+            if len(_persp.boxes) < _min_n:
+                _log.info(f"   robust plane: {len(_persp.boxes)} sample(s), "
+                          f"waiting for {_min_n} — a RANSAC line through a "
+                          f"handful of boxes fits anything")
+                return _ground
+            _rg = fit_robust_ground_plane(
+                list(_persp.boxes), (frame_w, frame_h),
+                person_h=VENUE_PROFILE["camera"]["person_height_m"])
+            # A plane that fails its OWN sanity check must not become the ruler
+            # for every metre-based gate. The old path logged the failure as an
+            # ERROR and then used the plane anyway -- which is how a run
+            # measured distances against a 9.0 m camera while printing that 9.0
+            # m was implausible.
+            _scale_ref = (_zone_cfg_raw or {}).get("scale_reference")
+            _bad = (_rg.sanity(frame_h, scale_ref=_scale_ref)
+                    if _rg.ok else ["fit refused"])
+            if _rg.ok and _bad:
+                _log.error(f"!! robust plane REJECTED: {_rg.describe()}")
+                for _w in _bad:
+                    _log.error(f"      !! {_w}")
+                _log.error("   keeping the previous plane; metre-based gates "
+                           "stay on whatever was last known sane.")
+                return _ground
+            if _rg.ok:
+                _ground = _rg
+                _log.info(f"\U0001f4d0 G1 ROBUST {_ground.describe()}")
+                if _scale_ref:
+                    _ok_m = _ground.dist_m((0.0, float(_scale_ref["row"])),
+                                           (float(_scale_ref["pixels"]),
+                                            float(_scale_ref["row"])))
+                    _log.info(f"      scale check: {_scale_ref['pixels']:.0f}px "
+                              f"at row {_scale_ref['row']} = {_ok_m:.3f} m "
+                              f"(known {float(_scale_ref['metres']):.3f} m)")
+                for _w in _ground.sanity(frame_h, scale_ref=_scale_ref):
+                    _log.error(f"      !! {_w}")
+                if _identity_memory is not None:
+                    _identity_memory.plane = _ground
+                return _ground
+            _log.error(f"!! robust ground plane REFUSED ({_rg.note}); falling "
+                       f"back to the bin-median fit, which is the one known to "
+                       f"drift on this camera. Treat metre-based gates as "
+                       f"unreliable for this run.")
         _ground = GroundPlane.from_zone_config(
             _zone_cfg_raw, (frame_w, frame_h), persp=_persp,
             person_h=VENUE_PROFILE["camera"]["person_height_m"],
@@ -2804,6 +2976,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         """
         def _predict(img):
             r = model(img, conf=det_conf, iou=0.45, imgsz=YOLO_IMGSZ,
+                      classes=_det_classes(_has_head),
                       verbose=False, device=device_str,
                       quantize=("fp16" if globals().get("DETECTOR_HALF", False)
                                 else None))[0]
@@ -2839,6 +3012,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             the GPU sees one batch of ~9 instead of nine batches of 1.
             """
             rs = model(imgs, conf=det_conf, iou=0.45, imgsz=YOLO_IMGSZ,
+                       classes=_det_classes(_has_head),
                        verbose=False, device=device_str,
                        quantize=("fp16" if globals().get("DETECTOR_HALF", False)
                                  else None))
@@ -2887,6 +3061,15 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     _last_det_t = -1e9
     _gate_since = None          # when the current gated silence began
     _n_skipped = _n_resets = 0
+    # Observed-vs-elapsed ledger. Costs one mean() and one std() per
+    # sampled frame and changes no decision -- see the FRAME VALIDITY
+    # block in _analysis_stream for why it only records.
+    _vledger = ValidityLedger(step_s=frame_step_s)
+    # Mutable so an OOM-driven shrink STICKS for the rest of the run: a
+    # scene that exhausted VRAM once will do it again a second later, and
+    # retrying at the original size turns one crowded minute into thousands
+    # of failed attempts. A list, not an int, because _flush() is a closure.
+    _det_batch = [int(DET_BATCH)]
     _face_state = {}            # raw tid -> [tries, last_try_t, has_face]
     t = 0.0
     _eval_dir = None
@@ -2929,6 +3112,15 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         nonlocal _prev_small, _gate_since, _n_skipped, _eval_dir
         buf, gaps = [], []
 
+        def _detect_chunk(_frames, _conf):
+            """One batched model() call. Split out so run_batched can retry
+            it at a smaller size after a CUDA OOM."""
+            return model(_frames, conf=_conf, iou=0.45, imgsz=YOLO_IMGSZ,
+                         classes=_det_classes(_has_head), verbose=False,
+                         device=device_str,
+                         quantize=("fp16" if globals().get("DETECTOR_HALF", False)
+                                   else None))
+
         def _flush():
             if not buf:
                 return []
@@ -2938,12 +3130,29 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             _bconf = (min(det_conf, IR_DETECT_CONF_FLOOR)
                       if any(_frame_ir.get(_i0) for _i0, _, _ in buf) else det_conf)
             if _batchable and DET_BATCH > 1:
+                # OOM-SURVIVABLE DETECT.
+                #
+                # DET_BATCH is chosen for the AVERAGE frame, but VRAM is
+                # consumed by the worst one: a crowded doorway with twenty
+                # bodies costs far more than an empty corridor. So a run
+                # survives seven hours of quiet footage and dies on the busiest
+                # minute of the night -- the minute the report exists to
+                # describe. There was no OOM handling anywhere in this pipeline.
+                #
+                # buf is already <= DET_BATCH, so on the happy path run_batched
+                # makes exactly ONE model() call and this is byte-identical to
+                # what it replaced. It only splits after an OOM, and the
+                # reduced size STICKS via _det_batch, because a scene that
+                # OOMed once will do it again a second later.
                 with _prof.stage("detect"):
-                 res = model([f for _, _, f in buf], conf=_bconf, iou=0.45,
-                            imgsz=YOLO_IMGSZ, verbose=False, device=device_str,
-                            quantize=("fp16" if globals().get("DETECTOR_HALF", False) else None))
+                    res = list(run_batched(
+                        [f for _, _, f in buf],
+                        lambda _chunk: _detect_chunk(_chunk, _bconf),
+                        batch=_det_batch[0],
+                        on_shrink=lambda b, _i: _det_batch.__setitem__(0, b)))
             elif _batchable:
                 res = [model(f, conf=_bconf, iou=0.45, imgsz=YOLO_IMGSZ,
+                             classes=_det_classes(_has_head),
                              verbose=False, device=device_str,
                              quantize=("fp16" if globals().get("DETECTOR_HALF", False) else None))[0]
                        for _, _, f in buf]
@@ -2974,6 +3183,27 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 max_seconds=max_seconds,
                 max_w=ANALYSIS_MAX_W,
                 start_seconds=start_seconds))):
+            # ── FRAME VALIDITY ─────────────────────────────────────────────
+            # OBSERVED time vs ELAPSED time. validity.py's argument is that
+            # "I did not observe" and "I observed nothing" must not look the
+            # same: a black camera, a dropped stream and an empty room all
+            # currently produce the same zero, and four of those have already
+            # shipped as wrong numbers.
+            #
+            # RECORD-ONLY, deliberately. That module's own header says it
+            # "never repairs anything and never drops a frame on its own",
+            # because a module that silently discards data is indistinguishable
+            # from the bugs it exists to catch. Nothing here changes which
+            # frames are analysed -- it only makes the denominator honest.
+            # Computed here, RECORDED at whichever exit this frame takes, so a
+            # frame that is then dropped by the motion gate is logged once as
+            # skipped_idle rather than twice.
+            _vv, _vd = OK, ""
+            if _vledger is not None:
+                try:
+                    _vv, _vd = frame_validity(_fr, expect_shape=(frame_h, frame_w))
+                except Exception:                        # pragma: no cover
+                    _vv, _vd = OK, ""   # a diagnostic must never abort a run
             # ── MOTION GATE ────────────────────────────────────────────────
             # A reception at 02:00 is empty most of the night and the detector
             # is the most expensive thing here. Skip it only when BOTH hold:
@@ -3036,8 +3266,17 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                                          PROXY_JPEG_QUALITY])
                         frame_log.append((_fi, _t, []))
                         _n_skipped += 1
+                        # skipped_idle is NOT observed-empty: the detector never
+                        # looked. Counting this time as "we watched and saw
+                        # nobody" is exactly the conflation validity.py exists
+                        # to stop.
+                        if _vledger is not None:
+                            _vledger.record(_t, SKIPPED_IDLE if _vv == OK else _vv,
+                                            _vd)
                         continue
                 _prev_small = _small
+            if _vledger is not None:
+                _vledger.record(_t, _vv, _vd)
 
             _gap = 0.0
             if _gate_since is not None:
@@ -3131,6 +3370,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         elif TRACKER_MODE == "botsort-reid":
             result = model.track(frame, persist=True, conf=det_conf,
                                  iou=0.45, imgsz=YOLO_IMGSZ,
+                                 classes=_det_classes(_has_head),
                                  tracker=tracker_yaml, verbose=False,
                                  device=device_str,
                                  quantize=("fp16" if globals().get("DETECTOR_HALF", False) else None))[0]
@@ -3163,6 +3403,10 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                     if _boxes_occluding(_bx[_a], _bx[_b]):
                         _occluded_idx.add(_a); _occluded_idx.add(_b)
 
+        # `_vecs` is assigned only inside the re-id branch below; the
+        # observation rows read it unconditionally, so a run with re-id off
+        # would raise NameError. One default per frame beats a guard per use.
+        _vecs = {}
         # ── LIVE IDENTITY MEMORY: resolve/remap BEFORE anything downstream
         # (positions, zones, crossings, crop banking, render log) ever sees
         # this frame's ids, so a corrected id is the ONLY id those consumers
@@ -3363,6 +3607,14 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 or (t - _last_det_t) <= globals().get("RENDER_COAST_S", 0.5)):
             cv2.imwrite(str(proxy_dir / f"{frame_idx:07d}.jpg"), frame,
                         [cv2.IMWRITE_JPEG_QUALITY, PROXY_JPEG_QUALITY])
+        if _obs_on:
+            # index/confidence by raw track id, for the observation rows.
+            # Built INSIDE the guard: with the flag off this is zero work.
+            _i_by_tid = {_safe_id(_tt): _ii
+                         for _ii, _tt in enumerate(dets.tracker_id)}
+            _conf_by_tid = {_safe_id(_tt): float(_cc) for _tt, _cc
+                            in zip(dets.tracker_id, dets.confidence
+                                   if dets.confidence is not None else [])}
         for (bx1, by1, bx2, by2), tid, cid_ in zip(dets.xyxy, dets.tracker_id,
                                                    dets.class_id):
             tid = _safe_id(tid)
@@ -3384,7 +3636,64 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 track_time[tid][1] = t
             role_vote = "staff" if (isinstance(tid, str) and not tid.isdigit()) else "customer"
             rec.vote_role(tid, role_vote)
+            if _obs_on:
+                _raw = tid
+                _h = _obs_hist[_raw]
+                _h.append((t, bc))
+                del _h[:-int(globals().get("OBS_MOTION_WINDOW", 4))]
+                # Feet are "visible" when the box bottom is inside the frame.
+                # The transcript's "only the head is visible, so he is behind
+                # the desk" case is what this flags.
+                _feet_vis = (by2 < frame_h - 2)
+                _emb_id = None
+                _vec = _vecs.get(_i_by_tid.get(_raw)) if _vecs else None
+                _stride_f = int(globals().get("OBS_EMB_STRIDE", 8))
+                if _vec is not None and (frame_idx - _obs_emb_at.get(_raw, -10**9)) >= _stride_f:
+                    _obs_emb_at[_raw] = frame_idx
+                    _emb_id = f"{_obs_run_id}_{_raw}_{frame_idx}"
+                    _obs_q.put(observe.emb_row(
+                        run_id=_obs_run_id, camera_id=camera_id,
+                        raw_track_id=_raw, frame_idx=frame_idx,
+                        emb_id=_emb_id, vec=_vec, blur_score=None))
+                _obs_q.put(observe.build_row(
+                    run_id=_obs_run_id, camera_id=camera_id,
+                    frame_idx=frame_idx, t_s=t, ts=_wall_ts(t),
+                    box=(bx1, by1, bx2, by2), det_conf=_conf_by_tid.get(_raw),
+                    raw_track_id=_raw,
+                    canon_id=(_identity_memory.raw_to_canon.get(_raw)
+                              if _identity_memory is not None else None),
+                    emb_id=_emb_id, polygons=polygons,
+                    staff_zones=staff_zones_here, feet_visible=_feet_vis,
+                    is_ir=bool(_frame_ir.get(frame_idx)),
+                    samples=list(_h), ground=_ground,
+                    pose_last=_obs_pose.get(_raw),
+                    stationary_px_s=float(globals().get("OBS_STATIONARY_PX_S", 8.0))))
         frame_log.append((frame_idx, t, boxes_this))
+        # Pose for the observation rows. Sampled AFTER the emit loop, so a row
+        # carries the PREVIOUS sample's activity — that is deliberate, and it
+        # is exactly what pose_age_s discloses.
+        if _obs_on and globals().get("ENABLE_POSE", False) and boxes_this and (
+                frame_idx % max(1, int(globals().get("POSE_STRIDE", 8))) == 0):
+            try:
+                from . import pose as _PZO
+                _pm = _PZO.get_model(globals().get("POSE_MODEL", "yolo11n-pose.pt"),
+                                     device)
+                if _pm is not None:
+                    _poses = _PZO.keypoints_for_frame(frame, _pm)
+                    _bx = [(b[1], b[2], b[3], b[4]) for b in boxes_this]
+                    for _bi, _kp in _PZO.match_to_boxes(_poses, _bx).items():
+                        _tid = boxes_this[_bi][0]
+                        _prev = _obs_hist.get(_tid) or []
+                        _mv = (math.hypot(_prev[-1][1][0] - _prev[-2][1][0],
+                                          _prev[-1][1][1] - _prev[-2][1][1])
+                               if len(_prev) >= 2 else 0.0)
+                        _obs_pose[_tid] = (t, _PZO.classify(_kp, foot_move_px=_mv)
+                                           .get("activity"))
+            except Exception as _pse:
+                if not globals().get("_OBS_POSE_WARNED"):
+                    globals()["_OBS_POSE_WARNED"] = True
+                    _log.error(f"!! observation pose sampling off ({_pse}) — rows "
+                               f"continue with pose_activity NULL")
 
         # Venue dataset (symptom 8). Sampled, and written from the FILTERED
         # detections — phantoms, merged boxes and masked areas are already
@@ -3416,10 +3725,26 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             # G3: record WHERE the crossing happened. Tier A de-duplicates
             # in space and time, so a crossing without a position is a crossing
             # that can only fall back to trusting the track id.
+            # D1 (2026-08-19): record the crossing at the SAME point that
+            # decided the crossing.
+            #
+            # This always stored (cx, y2) -- bottom-centre -- regardless of
+            # ENTRY_LINE_ANCHOR, while sv.LineZone was triggered on whichever
+            # anchor that setting names. So the point that DECIDES a crossing
+            # and the point tier_a_crossings uses to spatially dedupe
+            # crossings were different points on the body, by up to ~260px on
+            # this camera. tier-A's dedupe radius is 140px, so that mismatch
+            # is not a rounding error: it decides whether two events collapse
+            # into one person or stay two.
+            _use_centre = (str(globals().get("ENTRY_LINE_ANCHOR",
+                                             "bottom_center")).lower()
+                           == "center")
             _bc_of = {}
             for (_cx1, _cy1, _cx2, _cy2), _ctid in zip(dets.xyxy, dets.tracker_id):
-                _bc_of[_safe_id(_ctid)] = ((float(_cx1) + float(_cx2)) / 2.0,
-                                           float(_cy2))
+                _px = (float(_cx1) + float(_cx2)) / 2.0
+                _py = ((float(_cy1) + float(_cy2)) / 2.0 if _use_centre
+                       else float(_cy2))
+                _bc_of[_safe_id(_ctid)] = (_px, _py)
             for tid in dets.tracker_id[crossed_in]:
                 _sid = _safe_id(tid)
                 crossings.append({"t": round(t, 2), "track_id": _sid,
@@ -3436,7 +3761,18 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 if _bi in _occluded_idx:
                     continue  # v44: don't bank a crop contaminated by overlap
                 bx1, by1, bx2, by2 = [int(v) for v in box]
-                if conf >= 0.35 and (by2 - by1) >= REID_MIN_CROP_H:
+                # D3 (2026-08-19): this was a hardcoded 0.35, unrelated to
+                # CONF_THRESHOLD or DETECT_CONF_FLOOR. Lowering the detector
+                # floor from a venue yaml -- the whole point of the BYTE
+                # change, which took the dead band from 17.1% to 6.5% -- did
+                # NOT lower this, so the recovered low-confidence detections
+                # were tracked and then contributed no appearance evidence at
+                # all. Follow the configured floor instead, with 0.35 as the
+                # ceiling so this can only ever get looser, never stricter
+                # than it was.
+                _crop_conf = min(0.35, float(globals().get(
+                    "CONF_THRESHOLD", 0.35)))
+                if conf >= _crop_conf and (by2 - by1) >= REID_MIN_CROP_H:
                     # v43 aspect ratio gate
                     aspect = float(by2 - by1) / max(1, bx2 - bx1)
                     if MIN_BODY_ASPECT <= aspect <= MAX_BODY_ASPECT:
@@ -3578,6 +3914,27 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     for _lvl, _msg in _funnel.findings():
         (_log.warning if _lvl == "WARN" else _log.info)(f"   funnel: {_msg}")
 
+    # ── OBSERVED vs ELAPSED ─────────────────────────────────────────────────
+    # Printed beside the funnel because they answer adjacent questions: the
+    # funnel says which STAGE lost a detection, this says whether the time was
+    # ever LOOKED AT. A metric divided by elapsed time when a third of it was
+    # never observed is wrong in a way no funnel stage can show.
+    try:
+        _vs = _vledger.summary()
+        _share = _vs["observed_share"]
+        _log.info(f"\U0001f441 OBSERVED TIME   {_vs['observed_s']:.0f}s of "
+                  f"{_vs['elapsed_s']:.0f}s elapsed"
+                  + (f"  ({_share:.1%})" if _share is not None else "")
+                  + f"   ·  {_vs['frames']} frames")
+        for _vk, _vn in sorted(_vs["by_verdict"].items(),
+                               key=lambda kv: -kv[1]):
+            _log.info(f"     {_vn:>7}  {_vk}")
+        for _lvl, _msg in _vledger.findings():
+            (_log.warning if _lvl == "WARN" else _log.info)(
+                f"   validity: {_msg}")
+    except Exception as _ve:                          # pragma: no cover
+        _log.debug(f"validity summary skipped ({type(_ve).__name__}: {_ve})")
+
     # F1/F2/F3 run diagnostics — these were the silent failures.
     _n_ir = sum(1 for v in _frame_ir.values() if v)
     _log.info(f"\U0001f319 F1 infrared: {_n_ir}/{len(_frame_ir)} analysed frames "
@@ -3651,6 +4008,22 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         _log.info(f"\U0001f4cf D0 cap audit: dropped {_absurd[0]} box(es) — "
                   f"{_absurd_why[0]} on HEIGHT (> {_cap_px:.0f}px = "
                   f"{_hf:.2f} of frame), {_absurd_why[1]} on AREA")
+        # FULL-FRAME GUARD (2026-08-19): a stage that deletes most of its
+        # input is not a filter, it is a blindfold. D0 quietly removed 71% of
+        # every detection for a whole session at INFO level -- and because
+        # tall boxes are people CLOSE to the camera, it blinded the doorway
+        # specifically: 1.4% of all boxes landed in the two right-hand columns
+        # of the frame, which is where the entrance is.
+        _d0_seen = _absurd[0] + len(dets.xyxy) if 'dets' in dir() else _absurd[0]
+        if _absurd[0] and _d0_seen and _absurd[0] > 0.40 * _d0_seen:
+            _log.error(
+                f"!! D0 DELETED {_absurd[0]}/{_d0_seen} "
+                f"({_absurd[0]/max(_d0_seen,1):.0%}) OF ALL DETECTIONS on "
+                f"height alone. Tall boxes are people CLOSE to the camera, so "
+                f"this blinds whichever part of the room is nearest -- on "
+                f"CAM.112 that is the entrance. Raise "
+                f"analysis.max_box_height_frac or set "
+                f"analysis.enable_absurd_size_cap: false.")
         _exp_bottom = _persp.expected_h(float(frame_h)) if _persp.ready else None
         if _exp_bottom and _absurd_h:
             # expected_h returns None outside the fitted domain — treat that as
@@ -4034,7 +4407,57 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                     handoff_gap_s=REID_HANDOFF_GAP_S,
                     handoff_px=REID_HANDOFF_PX,
                     stationary_px=REID_STATIONARY_PX,
-                    role_hint=role_hint)
+                    role_hint=role_hint,
+                    # Do not build the same-person sample with a rule that
+                    # merges strangers at a desk -- see the note in
+                    # calibrate_appearance_threshold.
+                    stationary_max_gap_s=globals().get(
+                        "REID_STATIONARY_MAX_GAP_S", None))
+
+                # E2 (2026-08-19): report the CORRECTED number beside it.
+                #
+                # calibrate_appearance_threshold's same-person set is admitted
+                # only if the pair's appearance ALREADY agrees (it ends with
+                # `not _handoff_appearance_contradicts(...)`), so the low tail
+                # of same_sims is cut off by the very quantity being measured.
+                # Its stationary clause also has no gap bound: two tracks 30px
+                # apart an HOUR apart qualify as the same person, and a
+                # reception has a queue spot where different customers stand
+                # all evening.
+                #
+                # kevacv/reid_calibration.py was written to fix exactly that,
+                # excluding strangers on PHYSICS rather than on appearance.
+                # Line 2638 of this file already calls it "the authoritative
+                # same-person number" -- and then never calls it. The
+                # 0.658 balanced accuracy in config/cam112.yaml is the biased
+                # one, and it is labelled "# circular" there.
+                try:
+                    from .reid_calibration import compare_to_legacy
+                    _cmp = compare_to_legacy(
+                        windows, positions, anchor_embeddings,
+                        appearance_veto_sim=globals().get(
+                            'HANDOFF_VETO_SIM', 0.35),
+                        handoff_gap_s=REID_HANDOFF_GAP_S,
+                        handoff_px=REID_HANDOFF_PX,
+                        stationary_px=REID_STATIONARY_PX,
+                        role_hint=role_hint)
+                    _cor = (_cmp or {}).get("corrected") or {}
+                    _leg = (_cmp or {}).get("legacy") or {}
+                    if _cor.get("same_n"):
+                        _log.info(
+                            f"\U0001f4d0 calibration, CORRECTED (physics-only "
+                            f"admission): same-person p10="
+                            f"{_cor.get('same_p10')} p50={_cor.get('same_p50')} "
+                            f"(n={_cor.get('same_n')}) vs legacy p10="
+                            f"{_leg.get('same_p10')} (n={_leg.get('same_n')})")
+                        _log.info(
+                            f"   the legacy same-person set is filtered BY "
+                            f"appearance, so its low tail is cut off by the "
+                            f"thing being measured. Prefer the corrected "
+                            f"numbers when choosing a threshold.")
+                        calibration_corrected = _cmp
+                except Exception as _ce:
+                    _log.info(f"(corrected calibration unavailable: {_ce})")
                 if cal["same_n"] and cal["diff_n"]:
                     sep_ok = (cal["same_p10"] is not None and cal["diff_p90"] is not None
                              and cal["same_p10"] > cal["diff_p90"])
@@ -4136,10 +4559,97 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                         f"{camera_id}: certainly DIFFERENT people, "
                         f"HIGHEST appearance similarity (should be low)")
 
-            
+            # C13 (2026-08-19): ORDER. The static/phantom filters (D2/D3) run
+            # ~370 lines BELOW this, so furniture reaches the merge holding a
+            # canonical id. A plant that never moves is co-visible with every
+            # real person who walks past it, and the merge's co-visibility rule
+            # then blocks those people from resolving to each other -- the
+            # engine's own diagnostic counts this as `overlap_blocked_transitive`.
+            # By the time D2 removes the plant the id breaks it caused are
+            # already baked in.
+            #
+            # So: find the obviously-static ids FIRST and withhold them from the
+            # merge's candidate set. Cheap (geometry over frame_log, no
+            # embeddings), conservative (the same protected set as D2, so anyone
+            # who crossed the line or was face-recognised is never withheld),
+            # and it does NOT delete anything -- D2/D3 below still make the
+            # actual removal decision on the full evidence.
+            _premerge_static = {}
+            if ENABLE_STATIC_FILTER:
+                try:
+                    _pm_prot = protected_ids(crossings=crossings,
+                                             face_ids=_staff_seen_names)
+                    _premerge_static = static_track_ids(
+                        frame_log, canon=None, protected=_pm_prot,
+                        min_life_s=STATIC_MIN_LIFE_S,
+                        max_centre_jitter=STATIC_CENTRE_JITTER,
+                        max_size_jitter=STATIC_SIZE_JITTER)
+                except Exception as _pme:
+                    _log.error(f"!! pre-merge static scan failed: {_pme} — "
+                               f"merging with furniture still in the pool")
+                    _premerge_static = {}
+            if _premerge_static:
+                _keepset = set(_premerge_static)
+                windows = {k: v for k, v in windows.items() if k not in _keepset}
+                embeddings = {k: v for k, v in embeddings.items()
+                              if k not in _keepset}
+                positions = {k: v for k, v in (positions or {}).items()
+                             if k not in _keepset}
+                _log.info(
+                    f"\U0001fab4 pre-merge: withheld {len(_premerge_static)} "
+                    f"static track(s) from identity merging so furniture cannot "
+                    f"hold a canonical id and block real people (D2/D3 below "
+                    f"still decide removal)")
+
+            # C9 (2026-08-19): TOPOLOGY VETO, finally reaching the merge.
+            #
+            # kevacv/topology.py computes which fragment pairs are physically
+            # impossible -- a track that dies deep inside the room cannot
+            # reappear as one that is born at the door without passing through
+            # the wall between them. pipeline.resolve_identities applies it
+            # correctly and is referenced ONLY from kevacv/__init__.py: the
+            # production path calls merge_fragmented_tracks directly, so the
+            # veto has never run on a real chunk. The log line "topology veto
+            # removed N impossible pair(s)" could not appear.
+            #
+            # It matters most where this camera hurts most: the engine's own
+            # diagnostic reports merges blocked transitively because groups
+            # were co-visible, and config/cam112.yaml records 356 candidates
+            # starved that way against 69 accepted. Fewer wrong merges early
+            # means fewer starved right ones later.
+            _blocked = None
+            if ENABLE_REID_STITCH and positions:
+                try:
+                    from .topology import doors_from_zones, veto_pairs
+                    _doors = doors_from_zones(polygons or {}, zone_roles or {})
+                    if _doors:
+                        _cands = [{"a": _a, "b": _b,
+                                   "death_pos": positions[_a][1],
+                                   "birth_pos": positions[_b][0],
+                                   "gap_s": windows[_b][0] - windows[_a][1]}
+                                  for _a in windows for _b in windows
+                                  if _a != _b and _a in positions and _b in positions
+                                  and windows[_b][0] >= windows[_a][1]]
+                        _, _vetoed = veto_pairs(_cands, _doors,
+                                                (frame_w, frame_h))
+                        _blocked = {(_p["a"], _p["b"]) for _p in _vetoed}
+                        _log.info(
+                            f"\U0001f6ab topology veto removed {len(_blocked)} "
+                            f"physically impossible pair(s) from "
+                            f"{len(_cands)} candidate(s)")
+                except Exception as _tve:
+                    import traceback as _tvtb
+                    _log.error(f"!! topology veto failed: {_tve} — merging "
+                               f"without it (impossible pairs may be joined)")
+                    # The bare message named no line, so the 2026-08-20 numpy
+                    # failure could not be located from the log at all.
+                    _log.error(_tvtb.format_exc())
+                    _blocked = None
+
             mapping, merge_edges, merge_diagnostics = merge_fragmented_tracks(
                 windows, embeddings, thresh, REID_MAX_GAP_S,
                 positions=positions,
+                blocked_pairs=_blocked,
                 handoff_gap_s=REID_HANDOFF_GAP_S,
                 handoff_px=REID_HANDOFF_PX,
                 role_hint=role_hint,
@@ -4149,6 +4659,10 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 raw_crops=(raw_crops if _attire_on else None),
                 plane=_ground, handoff_m=REID_HANDOFF_M,
                 stationary_m=REID_STATIONARY_M,
+                # Cap how long a "they didn't move, so it's the same person"
+                # merge may bridge. None = no cap = behaviour before 2026-08-20.
+                stationary_max_gap_s=globals().get(
+                    "REID_STATIONARY_MAX_GAP_S", None),
                 hsv_sim_threshold=HSV_MERGE_SIM_THRESHOLD,
                 face_embeddings=(face_embeddings if ENABLE_FACE_MERGE_TIER else None),
                 face_sim_threshold=FACE_MERGE_SIM_THRESHOLD,
@@ -4529,7 +5043,19 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                     _log.info(f"      id {_cid} at {_d['at']} for {_d['seconds']:.0f}s, "
                           f"centre jitter {_d['centre_jitter']:.4f} of body height")
         except Exception as _sf:
-            _log.info(f"(static filter skipped: {_sf})")
+            # C6 (2026-08-19): this was _log.info -- one line among thousands.
+            # If D2 throws, furniture STAYS in the guest count wearing an id,
+            # and the staff spread-rule then reads a thing that never leaves
+            # the desk as a member of staff. A stage that silently does
+            # nothing is the documented failure mode of this codebase (a
+            # NameError once disabled Re-ID stitching for a whole run: 95
+            # "people" instead of 22). The Re-ID stitch failure two hundred
+            # lines up gets an ERROR, a banner and a traceback; these did not.
+            import traceback as _tb
+            _log.error(f"!! STATIC FILTER (D2) FAILED: {_sf}. Furniture is "
+                       f"still in the count and may be labelled staff. Every "
+                       f"headcount below is suspect.")
+            _log.error(_tb.format_exc())
     if _supp_stats.get("size_dropped"):
         _d1n, _d1s = _supp_stats["size_dropped"], _supp_stats.get("size_seen", 0)
         _d1pct = (100.0 * _d1n / _d1s) if _d1s else float("nan")
@@ -4588,7 +5114,11 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 for _r in _phantoms[:4]:
                     _log.info(f"      at {_r['centre']}: {_r['why']}")
         except Exception as _pf:
-            _log.info(f"(phantom filter skipped: {_pf})")
+            # C6: see the D2 handler above -- same reasoning, same cost.
+            import traceback as _tb
+            _log.error(f"!! PHANTOM FILTER (D3) FAILED: {_pf}. Static phantoms "
+                       f"whose ids churn are still in the count.")
+            _log.error(_tb.format_exc())
 
     event_ids = {e["track_id"] for e in events}
     # a genuinely-tracked person whose only zone presence was a sub-threshold
@@ -4659,20 +5189,46 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     if crossings:
         _staff_c = [c for c in crossings
                     if roles.get(c["track_id"]) == "staff"]
-        # spans: co-visibility evidence. Two tracks alive at the same instant
-        # cannot be one person, so a GROUP arriving together must not collapse
-        # into one arrival. track_time is already {tid: [first_t, last_t]}.
-        _spans = {k: (v[0], v[1]) for k, v in track_time.items()
-                  if isinstance(v, (list, tuple)) and len(v) >= 2}
+        # C1 (2026-08-18): tier_a_crossings filters INTERNALLY to venue entry
+        # lines. Rebuilding `crossings` from its output therefore DELETED every
+        # customer crossing of an interior door (on CAM.112: 'dining entry' and
+        # 'staff entry') from the run entirely -- not merely from the arrival
+        # count. Per-door counts, minute summaries, id_confidence's "crossed
+        # the door" bonus and pipeline's line_n all lost them, and the log
+        # blamed it on id churn, which made the funnel unreadable.
+        # Tier A stays a VENUE-DOOR guest counter; the interior events are
+        # carried through untouched.
+        from .analytics import venue_entry_lines
+        _venue_lines = venue_entry_lines({c.get("line") for c in crossings
+                                          if c.get("line")})
+        _other = [c for c in crossings
+                  if c.get("line") and _venue_lines
+                  and c["line"] not in _venue_lines
+                  and roles.get(c["track_id"]) != "staff"]
+        # C2 (2026-08-18): remap_events has already rewritten crossings to
+        # CANONICAL ids, but track_time/frame_log are keyed by PRE-MERGE
+        # fragment ids. A canonical id IS one of its fragments, so the lookup
+        # silently SUCCEEDED and returned one fragment's window instead of the
+        # merged identity's -- two co-visible identities looked disjoint and
+        # the guard never fired. Fold through the mapping first.
+        _spans = {}
+        for _tid, _v in track_time.items():
+            if not (isinstance(_v, (list, tuple)) and len(_v) >= 2):
+                continue
+            _c = (mapping or {}).get(_tid, _tid)
+            _prev = _spans.get(_c)
+            _spans[_c] = ((min(_prev[0], _v[0]), max(_prev[1], _v[1]))
+                          if _prev else (_v[0], _v[1]))
         _, _in_k = tier_a_crossings(crossings, plane=_ground,
                                     direction="in", roles=roles, spans=_spans)
         _, _out_k = tier_a_crossings(crossings, plane=_ground,
                                      direction="out", roles=roles, spans=_spans)
-        _deduped = sorted(_staff_c + _in_k + _out_k, key=lambda c: c["t"])
+        _deduped = sorted(_staff_c + _in_k + _out_k + _other, key=lambda c: c["t"])
         if len(_deduped) < len(crossings):
             _log.info(f"tier-A crossing dedupe: {len(crossings)} raw crossing "
-                      f"event(s) -> {len(_deduped)} (id churn at the line "
-                      f"collapsed before counting)")
+                      f"event(s) -> {len(_deduped)} at the VENUE door "
+                      f"(id churn collapsed; {len(_other)} interior-door "
+                      f"crossing(s) carried through, not deleted)")
         crossings = _deduped
 
     # CONFIRMATION WAIT / U-TURN FILTER. Runs AFTER the tier-A dedupe because
@@ -4778,6 +5334,16 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         "static_dropped": len(_static),
         "ir_frames": sum(1 for v in _frame_ir.values() if v),
         "ir_frames_total": len(_frame_ir),
+        # E4 (2026-08-19): the PER-FRAME modality, not just the totals.
+        #
+        # _frame_ir is maintained per frame and correctly drives the per-batch
+        # IR confidence floor and CLAHE -- then only three summary numbers were
+        # returned, all with zero consumers. eval_harness.score_conditions
+        # exists specifically because "our night path disables colour evidence
+        # entirely and has never been measured", and it can never be given a
+        # day/night split without this. On CAM.112 the camera flips 96 times in
+        # 20 minutes, so "the score" is an average over two different systems.
+        "frame_ir": dict(_frame_ir),
         "ir_switches": [(round(s, 1), bool(v)) for s, v in _ir_switches],
         "perspective_fit": _persp.describe(),
         "ground_plane": _ground.describe(),

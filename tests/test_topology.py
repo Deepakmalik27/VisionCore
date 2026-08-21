@@ -133,10 +133,41 @@ check(doors_from_endpoints(None) == [], "...or nothing at all")
 
 print()
 print("=" * 74)
-if FAILED:
-    print(f"  {len(FAILED)} FAILED:")
-    for f in FAILED:
-        print(f"    - {f}")
-    sys.exit(1)
+# PYTEST VISIBILITY. This file's checks run at IMPORT and reported only via
+# an exit code. A module-level sys.exit aborts pytest COLLECTION, which hid
+# 59 of 74 test files -- and simply guarding the exit would have hidden the
+# FAILURES instead. So the same condition is also asserted as a real test.
+def test_script_level_checks_passed():
+    assert not (FAILED), "module-level checks in this file failed"
+
+
+if __name__ == "__main__":
+    if FAILED:
+        print(f"  {len(FAILED)} FAILED:")
+        for f in FAILED:
+            print(f"    - {f}")
+        sys.exit(1)
 print("  ALL PASS")
 print("=" * 74)
+
+
+def test_doors_from_zones_accepts_numpy_polygons():
+    """engine.py stores polygons as numpy arrays. `not poly` raises on those,
+    so doors_from_zones threw "truth value of an array is ambiguous" on EVERY
+    real run -- the veto died while building the doors, never evaluated a
+    single pair, and the engine's handler failed OPEN, letting physically
+    impossible merges through. Caught 2026-08-21 only after a traceback was
+    added to that handler; the bare message had named no line."""
+    import numpy as np
+    from kevacv.topology import doors_from_zones
+    polys = {"main_entrance": np.array([[0, 0], [10, 0], [10, 10], [0, 10]]),
+             "dining": np.array([[50, 50], [60, 50], [60, 60]])}
+    roles = {"main_entrance": ["entry"], "dining": ["seating"]}
+    assert doors_from_zones(polys, roles) == [(5.0, 5.0)]
+
+
+def test_doors_from_zones_skips_empty_numpy_polygon():
+    import numpy as np
+    from kevacv.topology import doors_from_zones
+    assert doors_from_zones({"main_entrance": np.array([])},
+                            {"main_entrance": ["entry"]}) == []

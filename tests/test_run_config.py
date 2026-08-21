@@ -41,8 +41,8 @@ def _stub():
     return m
 
 
-def _write(tmp, text):
-    p = tmp / "run.yaml"
+def _write(tmp_path, text):
+    p = tmp_path / "run.yaml"
     p.write_text(text, encoding="utf-8")
     return p
 
@@ -68,9 +68,9 @@ def test_caller_owned_keys_are_not_unknown():
           str(r["unknown"]))
 
 
-def test_unknown_key_is_reported_not_dropped(tmp):
+def test_unknown_key_is_reported_not_dropped(tmp_path):
     stub = _stub()
-    p = _write(tmp, "analysis:\n  fps: 5\n  bogus_setting: 99\n")
+    p = _write(tmp_path, "analysis:\n  fps: 5\n  bogus_setting: 99\n")
     r = apply_run_config(p, target=stub)
     check("analysis.bogus_setting" in r["unknown"],
           "an unrecognised key is reported", str(r["unknown"]))
@@ -79,19 +79,19 @@ def test_unknown_key_is_reported_not_dropped(tmp):
           "and it is visible in the printed block")
 
 
-def test_missing_file_is_reported_not_silent(tmp):
+def test_missing_file_is_reported_not_silent(tmp_path):
     stub = _stub()
-    r = apply_run_config(tmp / "nope.yaml", target=stub)
+    r = apply_run_config(tmp_path / "nope.yaml", target=stub)
     check(stub.FPS_TARGET == 15, "defaults survive a missing config")
     check(r["unknown"] and "not found" in r["unknown"][0],
           "and the absence is reported", str(r["unknown"]))
 
 
-def test_only_analysis_is_applied(tmp):
+def test_only_analysis_is_applied(tmp_path):
     """measured_baseline records a PAST run. Applying it would silently
     reconfigure this one from a historical observation."""
     stub = _stub()
-    p = _write(tmp, "analysis:\n  fps: 6\n"
+    p = _write(tmp_path, "analysis:\n  fps: 6\n"
                     "measured_baseline:\n  fps: 999\n"
                     "targets:\n  hota_floor: 0.4\n")
     r = apply_run_config(p, target=stub)
@@ -101,9 +101,9 @@ def test_only_analysis_is_applied(tmp):
           str(r["unknown"]))
 
 
-def test_empty_config_changes_nothing(tmp):
+def test_empty_config_changes_nothing(tmp_path):
     stub = _stub()
-    p = _write(tmp, "camera:\n  id: CAM.112\n")
+    p = _write(tmp_path, "camera:\n  id: CAM.112\n")
     r = apply_run_config(p, target=stub)
     check(r["applied"] == {}, "nothing applied from a config with no analysis block")
     check(stub.FPS_TARGET == 15, "module defaults untouched")
@@ -115,7 +115,7 @@ def main():
     import tempfile
     print(__doc__.strip().splitlines()[0])
     with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
+        tmp_path = Path(td)
         for fn in (test_shipped_config_sets_fps,
                    test_caller_owned_keys_are_not_unknown,
                    test_unknown_key_is_reported_not_dropped,
@@ -123,7 +123,7 @@ def main():
                    test_only_analysis_is_applied,
                    test_empty_config_changes_nothing):
             print(f"\n{fn.__name__}")
-            fn(tmp) if fn.__code__.co_argcount else fn()
+            fn(tmp_path) if fn.__code__.co_argcount else fn()
     print()
     if FAILED:
         print(f"FAILED ({len(FAILED)}): " + ", ".join(FAILED))
