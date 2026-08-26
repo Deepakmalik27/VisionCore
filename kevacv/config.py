@@ -17,12 +17,18 @@ WHY THIS EXISTS
     the difference stays visible instead of being folded away silently.
 
 HOW TO CHANGE A VALUE
-    Not by editing this file for one run. Use tools/run_night.py:
+    Not by editing this file for one run. Put it in the run config:
 
-        KV_REID_MAX_GAP_S=1200 python tools/run_night.py
+        # config/cam112.yaml
+        analysis:
+          reid_max_gap_s: 1200
 
-    which injects an override cell after the config cell — so a run's settings
-    are recorded in that run's own log rather than in an edit nobody sees.
+        python tools/run_pipeline.py --config config/cam112.yaml ...
+
+    apply_run_config prints every value it moved and on whose authority, so a
+    run's settings are recorded in that run's own log rather than in an edit
+    nobody sees. Any scalar constant in this file is reachable by convention
+    (see _implicit_key) -- it does not need an entry in RUN_CONFIG_KEYS.
 """
 from __future__ import annotations
 
@@ -150,6 +156,14 @@ class TrackingConfig:
 
 
 DEFAULT = TrackingConfig()
+
+# WHICH yaml produced this run. Declared here (not only set at runtime) because
+# test_config_completeness enforces that no setting exists solely as an inline
+# globals().get() default -- a name that only ever appears inside a fallback is
+# invisible to the config audit, which is how three constants once diverged
+# from what the log claimed. apply_run_config overwrites this with the real
+# path; None means "no run config was applied".
+RUN_CONFIG_PATH = None
 
 
 # ============================================================================
@@ -520,6 +534,32 @@ STAFF_OVERRIDE_SHARE_MIN_S = 60
 # staff each individual makes fewer visits than a lone receptionist would —
 # hence min_visits stays low. These are starting points chosen to be tuned
 # against the evidence table (describe_staff_decision), not measured values.
+# ZONE-DWELL STAFF PROMOTION — OFF from 2026-08-26, on measurement.
+#
+# WHAT IT DID: any track that dwelt long enough in a staff zone was RELABELLED
+# staff. On the full 19:30-20:30 Delilah hour that promoted SEVEN numeric ids,
+# giving twelve "staff" in one hour against five real enrolled faces. One of
+# them, P5, was called staff while standing in the WAITING AREA.
+#
+# WHAT IT COST, all from the same rule:
+#     desk_covered   97.0%   inflated -- 12 "staff" means the desk is never empty
+#     guests             8   deflated -- "STAFF FILTER DROPPED 8 ARRIVALS:
+#                                        16 people entered, 8 counted as guests"
+#     greet_latency    3.4s  meaningless -- if the waiting guest IS staff, every
+#                            guest is greeted instantly
+#
+# WHY NO THRESHOLD FIXES IT: a guest waiting ten minutes at reception and a
+# receptionist working produce the SAME dwell signal. They are not separable in
+# that signal, so no value of STAFF_OVERRIDE_MIN_S separates them. The 2026-08-20
+# design call reached the same conclusion -- do not decide staff in the CV layer.
+#
+# The dwell is still RECORDED, as `staff_zone_s` on every observation row, so the
+# intelligence layer can weigh it against face evidence. What is removed is its
+# authority to relabel somebody on its own.
+#
+# Set True only to reproduce a pre-2026-08-26 run.
+ENABLE_STAFF_ZONE_PROMOTION = False
+
 STAFF_MIN_VISITS = 2      # separate returns to a staff zone
 STAFF_MIN_SPREAD = 0.25   # those visits must span >=25% of the analysed window
 # The backstop for a window too short for spread to have evidence. Deliberately
@@ -1349,6 +1389,14 @@ def apply_run_config(path, target=None):
 
     if target is None:
         from . import engine as target
+
+    # Which yaml produced this run? Needed by build_id.make_run_id so two
+    # configs over the same chunk get DIFFERENT run_ids instead of silently
+    # overwriting each other in the database.
+    try:
+        setattr(target, "RUN_CONFIG_PATH", str(path))
+    except Exception:
+        pass
 
     flat = _flatten({"analysis": cfg.get("analysis") or {}})
     for key, value in flat.items():

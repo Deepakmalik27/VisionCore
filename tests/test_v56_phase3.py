@@ -23,10 +23,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from kevacv.ground_plane import GroundPlane, synth_camera
 
-NB = Path(__file__).resolve().parent.parent / "notebooks" / "pipeline.ipynb"
-nb = json.loads(NB.read_text(encoding="utf-8"))
-CODE = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
-SRC = "\n".join(CODE)
 
 FAILED = []
 
@@ -37,23 +33,24 @@ def check(cond, label, detail=""):
         FAILED.append(label)
 
 
-def grab(start, end):
-    i = SRC.index(start)
-    return SRC[i:SRC.index(end, i)]
 
+# ---- the real functions, imported from the CODEBASE -------------------------
+#
+# Until 2026-08-24 this block exec()'d four functions out of
+# notebooks/pipeline.ipynb by slicing its source text. That tested the
+# NOTEBOOK's copy of the logic, not kevacv's -- so this file could pass while
+# the code that actually runs was broken, which is the exact failure the
+# package was extracted to end. All four live in kevacv.analytics; import them.
+from kevacv.analytics import (_cosine, _dynamic_accept_thresh,   # noqa: E402
+                              _IdentityMemory, tier_a_crossings,
+                              detect_groups)
 
-# ---- pull the real functions out of the notebook ---------------------------
-ns = {"math": math, "np": np, "numpy": np}
-for k, v in [("NEAR_GAP_S", 15.0), ("FAR_GAP_S", 180.0), ("NEAR_GAP_BONUS", 0.04),
-             ("FAR_GAP_PENALTY", 0.05), ("MAX_PLAUSIBLE_SPEED_PX", 220.0),
-             ("SPATIAL_PENALTY_SCALE", 0.15), ("MAX_SPATIAL_PENALTY", 0.30),
-             ("OCCLUSION_IOU", 0.30), ("OCCLUSION_CONTAIN", 0.60)]:
-    ns[k] = v
-exec(grab("def _cosine(a, b):", "\n# ------"), ns)
-exec(grab("def _dynamic_accept_thresh", "\ndef _boxes_occluding"), ns)
-ns["_NOVEC"] = object()   # sentinel the class closes over
-exec(grab("class _IdentityMemory:", "\ndef _hsv_embed_single"), ns)
-exec(grab("def tier_a_crossings", "\ndef remap_events"), ns)
+ns = {"math": math, "np": np, "numpy": np,
+      "_cosine": _cosine,
+      "_dynamic_accept_thresh": _dynamic_accept_thresh,
+      "_IdentityMemory": _IdentityMemory,
+      "tier_a_crossings": tier_a_crossings,
+      "detect_groups": detect_groups}
 
 # a real ground plane from a synthetic level camera
 FRAME, CAM_H, FOCAL = (1920, 1080), 3.0, 1200.0
@@ -201,55 +198,12 @@ check(r == "H", "no plane -> pixel gate still refuses an 800 px jump")
 
 print()
 print("=" * 74)
-print("  wiring, config and notebook integrity")
+print("  (notebook wiring section removed 2026-08-24 -- it asserted that\n   literal strings appear in notebooks/pipeline.ipynb, which is archived.\n   The behaviour above is tested against kevacv.ground_plane directly.)")
 print("=" * 74)
-for needle, why in [
-    ("[KEVACV_BOOTSTRAP]", "kevacv bootstrap provides the ground plane"),
-    ("plane=_ground, handoff_m=REID_HANDOFF_M", "stitcher receives the plane"),
-    ('"pos": _bc_of.get(_sid)', "crossings carry a position"),
-    ("_refresh_ground()", "plane is (re)built during the run"),
-    ("MAX_WALK_SPEED_MPS", "metric walking speed in config"),
-    ("GREET_PROXIMITY_M", "metric greet distance in config"),
-    ("TIER A · geometry", "Tier A appears in the answers table"),
-    ("TIER B · identity", "Tier B is reported beside it, not instead of it"),
-    ("Tier A vs Tier B disagree", "a disagreement between the two is flagged"),
-    ("Arriving parties (groups)", "parties are reported"),
-    ("staff_contacts(run.get(\"frame_log\", []), roles, plane=_plane)",
-     "greet proximity uses the plane"),
-]:
-    check(needle in SRC, why)
-
-check("ground_points" in SRC, "the exact 4-point upgrade path is documented in config")
-check(SRC.count("def tier_a_crossings") == 1, "tier_a_crossings defined once")
-check(SRC.count("class GroundPlane") == 1, "GroundPlane defined once (no duplication)")
-
-syn = []
-for i, c in enumerate(nb["cells"]):
-    if c["cell_type"] != "code":
-        continue
-    s = "".join(c["source"])
-    if s.strip().startswith(("!", "%")):
-        continue
-    try:
-        ast.parse(s)
-    except SyntaxError as e:
-        syn.append((i, e))
-check(not syn, "every code cell still parses", f"{len(syn)} error(s)")
-for i, e in syn:
-    print(f"      cell {i}: {e}")
-# Phase 6 REMOVES cells on purpose (4 embedded copies -> 1 bootstrap), so an
-# ever-growing cell count is the wrong invariant. What matters is that every
-# pipeline cell is still there.
-for _m in ("def process_video", "def render_annotated", "def answer_for_run",
-           "def reception_report", "def build_report"):
-    check(_m in SRC, f"pipeline cell still present: {_m}")
-
-print()
+print("  ALL PASS" if not FAILED else f"  {len(FAILED)} FAILED")
 print("=" * 74)
-# PYTEST VISIBILITY. This file's checks run at IMPORT and reported only via
-# an exit code. A module-level sys.exit aborts pytest COLLECTION, which hid
-# 59 of 74 test files -- and simply guarding the exit would have hidden the
-# FAILURES instead. So the same condition is also asserted as a real test.
+
+
 def test_script_level_checks_passed():
     assert not (FAILED), "module-level checks in this file failed"
 

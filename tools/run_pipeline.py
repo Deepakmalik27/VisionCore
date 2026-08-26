@@ -4,14 +4,12 @@
     python tools/run_pipeline.py --video ... --zones ... --dry     # 20s smoke test
     python tools/run_pipeline.py --check                          # environment only
 
-WHY A SEPARATE ENTRY POINT
-    run.sh executes notebooks/pipeline.ipynb under papermill. That path works,
-    but it runs the NOTEBOOK's copy of the logic, so none of the codebase guards
-    fire — no phantom stage, no provenance check, no stage timeline, no
-    SUMMARY.txt.
-
-    This runs kevacv.pipeline.run_camera directly. Same engine, but wrapped in
-    everything the package has learned:
+WHY THIS IS THE ENTRY POINT
+    It runs kevacv.pipeline.run_camera directly, wrapped in everything the
+    package has learned. run.sh is a thin wrapper over this same path; the
+    notebook it used to execute under papermill was archived 2026-08-24
+    because it ran the NOTEBOOK's copy of the logic, so none of the guards
+    below fired there and its numbers were never comparable:
 
         preflight   zones · PROVENANCE MISMATCH · DST span
         analyse     engine.process_video

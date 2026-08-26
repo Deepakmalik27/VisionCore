@@ -138,7 +138,7 @@ def _run_config_keys():
 NOT_PIPELINE = {
     "merge_ab": "BY DESIGN — measurement harness; its own docstring forbids "
                 "becoming the production path. tests/test_merge_ab.py holds the "
-                "staleness guard against notebooks/pipeline.ipynb.",
+                "drift guard for the union loop it replays.",
     "seams": "BLOCKED — nothing to bridge. No caller ever passes chunk_tag or "
              "start_seconds (always \"\" and 0.0), and run_pipeline.py calls "
              "run_camera exactly once. A multi-chunk driver must exist first.",

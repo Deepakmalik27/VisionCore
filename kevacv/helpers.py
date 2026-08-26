@@ -149,7 +149,7 @@ def load_zone_config(path, frame_size=None):
     # collide across venues by design ("reception", "dining", "queue"), and
     # roles decide which zone counts as entry, interior and staff -- so the
     # wrong role map silently changes who is a guest and where an arrival is.
-    # run_night.py and any multi-camera loop hit this.
+    # any multi-camera loop hits this.
     ZONE_AI_OVERRIDES.clear()
     for zname, rs in (cfg.get("roles") or {}).items():
         ZONE_AI_OVERRIDES[zname] = list(rs) if isinstance(rs, (list, tuple)) else [rs]

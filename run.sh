@@ -1,26 +1,19 @@
 #!/usr/bin/env bash
-# run.sh — execute the pipeline notebook headlessly, with real logs.
-#
-# WHY papermill AND NOT A REWRITE
-#   kevacv/__init__.py: the analytics (Cell 5) and video engine (Cell 7) come
-#   out of the notebook AFTER the first HOTA number, not before — moving 260 KB
-#   of logic with no measured baseline makes any later regression
-#   unattributable. papermill gives us headless execution, no session cap and
-#   proper logs while running the exact notebook we already trust.
+# run.sh — execute the pipeline headlessly, with real logs.
 #
 # USAGE
-#   ./run.sh --video V --zones Z  run THE CODEBASE (default)
+#   ./run.sh --video V --zones Z          run THE CODEBASE (default)
 #   ./run.sh --dry --video V --zones Z    20s smoke test, proves the whole path
-#   ./run.sh --check              verify the environment, run nothing
-#   ./run.sh --tests              run the test suite only
-#   ./run.sh --notebook           run the NOTEBOOK under papermill instead
+#   ./run.sh --check                      verify the environment, run nothing
+#   ./run.sh --tests                      run the test suite only
 #
-# CODEBASE vs NOTEBOOK
-#   The codebase path (default) runs kevacv.pipeline.run_camera, so every guard
-#   the package has fires: preflight, provenance, DST, the phantom stage
-#   (static/rigid/mirrored), the arrival cross-check, and SUMMARY.txt.
-#   The notebook path runs the notebook's own copy of the logic and none of
-#   those guards exist there. Keep it only for comparing the two.
+# THE ONLY PATH
+#   kevacv.pipeline.run_camera, so every guard the package has fires:
+#   preflight, provenance, DST, the phantom stage (static/rigid/mirrored),
+#   the arrival cross-check, the run scorecard and SUMMARY.txt.
+#   The notebook path was removed 2026-08-24 -> archive/. It ran the
+#   notebook's own frozen copy of the logic and NONE of those guards existed
+#   there, so its numbers were never comparable to the codebase's.
 
 set -Eeuo pipefail
 
@@ -33,11 +26,10 @@ export PYTHONIOENCODING=utf-8
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${ROOT}/config/cam112.yaml"
-NB="${ROOT}/notebooks/pipeline.ipynb"
 LOGDIR="${ROOT}/logs"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-usage() { sed -n '2,20p' "$0"; exit 0; }
+usage() { sed -n '2,16p' "$0"; exit 0; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,7 +40,6 @@ while [[ $# -gt 0 ]]; do
     --dry)    DRY=--dry; shift ;;
     --check)  MODE=check; shift ;;
     --tests)  MODE=tests; shift ;;
-    --notebook) MODE=notebook; shift ;;
     -h|--help|--usage) usage ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -68,7 +59,6 @@ exec > >(tee -a "$LOG") 2>&1
 echo "=============================================================="
 echo " reception analytics · ${MODE} · ${STAMP}"
 echo " config   ${CONFIG}"
-echo " notebook ${NB}"
 echo " log      ${LOG}"
 echo "=============================================================="
 
@@ -96,27 +86,6 @@ PY
 echo "--- config ---"
 sed 's/^/  /' "$CONFIG"
 
-echo "--- kevacv / notebook drift check ---"
-# The package exists twice: kevacv/*.py and a frozen copy inside the notebook.
-# They drifted once already and it cost a NameError an hour into a run.
-#
-# The check is FATAL only on the notebook path, because only that path loads
-# the frozen copy. Under `set -Eeuo pipefail` an unconditional check made a
-# stale notebook abort run.sh before the MODE dispatch — so --check, --tests
-# and the default codebase run were all dead, none of which read the notebook
-# at all. And it IS stale: the bootstrap embeds none of pipeline, config,
-# engine, analytics, derive, answers, drive, clock, validity, seams or
-# resilience. Fixing the pipeline in kevacv/ is supposed to be possible
-# without re-freezing a notebook nobody is running.
-if ! python3 "${ROOT}/tools/embed_kevacv.py" --check; then
-  if [[ "${MODE}" == "notebook" ]]; then
-    echo "  the notebook path RUNS the frozen copy — refusing a stale run." >&2
-    echo "  run: python tools/embed_kevacv.py" >&2
-    exit 1
-  fi
-  echo "  (stale, but this path runs kevacv/ directly — continuing)"
-fi
-
 if [[ "$MODE" == "check" ]]; then
   echo "--- check complete, nothing executed ---"
   exit 0
@@ -140,26 +109,17 @@ if [[ "$MODE" == "codebase" ]]; then
   echo "--- executing THE CODEBASE (kevacv.pipeline.run_camera) ---"
   if [[ -z "${VIDEO:-}" || -z "${ZONES:-}" ]]; then
     echo "  --video and --zones are required for the codebase path" >&2
-    echo "  (or use --notebook to run the notebook instead)" >&2
     exit 2
   fi
   python3 "${ROOT}/tools/run_pipeline.py" --video "$VIDEO" --zones "$ZONES"       --camera-id "$CAMERA" --out "${ROOT}/output" ${DRY}
   echo "  log  : ${LOG}"
+  echo
+  echo "  READ THESE THREE FIRST:"
+  echo "    1. SOURCE crop height   (V76)  <100px -> resolution is the ceiling"
+  echo "    2. ENTRY ZONE MISPLACED (V74)  fires? -> zones, not counting, are wrong"
+  echo "    3. RUN SCORECARD                the run's own verdict"
   exit $?
 fi
 
-OUT="${ROOT}/output/pipeline_${STAMP}.ipynb"
-echo "--- executing notebook (LEGACY path — codebase guards do NOT run) ---"
-# --log-output puts every cell's stdout into THIS log as it happens, instead of
-# burying it in the output notebook where nobody reads it.
-papermill "$NB" "$OUT" --log-output --no-progress-bar
-
-echo "--- done ---"
-echo "  executed notebook : ${OUT}"
-echo "  artefacts         : ${ROOT}/output/"
-echo "  log               : ${LOG}"
-echo
-echo "  READ THESE THREE FIRST:"
-echo "    1. SOURCE crop height   (V76)  <100px -> resolution is the ceiling"
-echo "    2. ENTRY ZONE MISPLACED (V74)  fires? -> zones, not counting, are wrong"
-echo "    3. calibration same/diff        vs the circular 0.658 baseline"
+echo "unreachable: MODE=${MODE} has no handler" >&2
+exit 2

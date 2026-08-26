@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
-NB = HERE / "notebooks" / "pipeline.ipynb"
 sys.path.insert(0, str(HERE))
 
 _pass = _fail = 0
@@ -33,22 +32,11 @@ def check(cond, label, detail=None):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Load the notebook
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-nb = json.loads(NB.read_text(encoding="utf-8"))
-cells = nb["cells"]
-CODE = ["".join(c["source"]) for c in cells if c["cell_type"] == "code"]
-CELLS = [(s, i) for i, s in enumerate(CODE)]
-SRC = "\n".join(CODE)
 
 print("=" * 74)
-print("  T1-T3 — Triage config and imports in notebook")
-print("=" * 74)
-check("ENABLE_TRIAGE" in SRC, "T1 ENABLE_TRIAGE config is present")
-check("TRIAGE_SCAN_EVERY_S" in SRC, "T2 TRIAGE_SCAN_EVERY_S is present")
-check("TRIAGE_PAD_S" in SRC, "T2 TRIAGE_PAD_S is present")
-check("plan_segments" in SRC, "T3 plan_segments is present in notebook namespace/code")
-check("PATCH_V56_PHASE5A" in SRC, "T1 phase 5a marker is present")
-
-print()
+# T1-T3 and T5 removed 2026-08-24: they checked that "ENABLE_TRIAGE",
+# "TRIAGE_SCAN_EVERY_S" etc. appear as STRINGS in notebooks/pipeline.ipynb,
+# which is archived. T4 below is the only one that ran the real code.
 print("=" * 74)
 print("  T4 — Functional verification of kevacv.triage")
 print("=" * 74)
@@ -79,20 +67,6 @@ check("TRIAGE" in desc_str and "ANALYSED" in desc_str, "describe formatting prod
 
 print()
 print("=" * 74)
-print("  T5 — Notebook integrity & syntax check")
-print("=" * 74)
-syn = []
-for i, s in enumerate(CODE):
-    try:
-        ast.parse(s)
-    except SyntaxError as e:
-        syn.append((i, e))
-check(not syn, "every code cell parses", f"{len(syn)} error(s)")
-for i, e in syn:
-    print(f"      cell {i}: {e}")
-
-check(len(nb["cells"]) >= 30, "notebook intact", f"{len(nb['cells'])} cells")
-
 print()
 print("=" * 74)
 summary = f"  TOTAL: {_pass + _fail} checks — {_pass} pass, {_fail} fail"

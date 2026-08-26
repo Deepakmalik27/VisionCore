@@ -128,17 +128,55 @@ def _presence(events, zones, roles=None, want_role=None):
 # ── Q1 ─────────────────────────────────────────────────────────────────────
 def desk_coverage(events, staff_zones, observed_windows, roles=None,
                   target=0.90):
-    """Was the desk covered? EXACT — this is the metric that needs no identity.
+    """Was the desk covered? -- and it DOES need identity, despite old claims.
 
-    SUCCESS_CRITERIA calls this CRITICAL and >=90%, and says why it is
-    achievable: "Zone dwell is the strongest signal we have — identity doesn't
-    even need to be perfect." Only presence is required.
+    CORRECTED 2026-08-26. This docstring used to say "the metric that needs no
+    identity... only presence is required", and the caveat printed "counts the
+    STATION, not any one person". Both were false: the body filters events to
+    role == "staff", so a guest standing at reception is (correctly) not
+    coverage, and therefore the number is only ever as good as the staff
+    decision.
+
+    That mattered. On one hour of CAM.112 the SAME footage produced 97.0% with
+    zone-dwell staff promotion on and 0.0% with it off. The metric never moved
+    -- the roles under it did.
+
+    Returns UNKNOWN when no staff identity exists at all, because a missing
+    numerator is not a zero.
     """
     a = Answer("desk_covered_pct", "Was the desk covered?", unit="%",
                denominator="observed footage", tier=EXACT)
     obs = _total(observed_windows or [])
     if obs <= 0:
         return a.unknown("no observed footage — the denominator would be zero")
+    # THIS METRIC IS HOSTAGE TO ROLE ASSIGNMENT, WHICH ITS OWN DOCSTRING USED
+    # TO DENY. `_presence(..., roles, "staff")` filters to tracks labelled
+    # staff, so the number is only as good as the staff decision -- and on
+    # 2026-08-26 that showed up as a swing from 97.0% to 0.0% on the SAME
+    # footage, purely from turning the zone-dwell promotion off:
+    #
+    #   zone promotion ON   12 "staff" (7 fabricated)  -> 97.0%
+    #   zone promotion OFF  no face matched in 60s     ->  0.0%
+    #
+    # 0.0% there does not mean "the desk was abandoned". It means NO STAFF
+    # IDENTITY WAS EVER ESTABLISHED, so the question could not be answered.
+    # Reporting that as zero is exactly the conflation validity.py exists to
+    # stop -- and it is worse than a missing number, because a GM acts on it.
+    # TWO DIFFERENT ZEROES, and only one of them is a real answer:
+    #   no events at all            -> the venue WAS empty. 0% is correct and
+    #                                  must be scored as failing the bar.
+    #   people seen, none are staff -> the question is UNANSWERABLE. Reporting
+    #                                  0% here invents a service failure.
+    # An earlier version of this guard collapsed both and broke the "an empty
+    # desk is scored as FAILING the bar" check in tests/test_answers.py, which
+    # is exactly the case it exists to protect.
+    _staff_ids = {t for t, r in (roles or {}).items() if r == "staff"}
+    if events and not _staff_ids:
+        return a.unknown(
+            "no track was identified as staff anywhere in this run, so "
+            "'was the desk covered' has no numerator. This is NOT 0% -- it is "
+            "unmeasured. Check the staff gallery matched anybody at all "
+            "(look for 'ROLE LOCK' in the log) before reading anything into it.")
     covered = _clip(_presence(events, staff_zones, roles, "staff"),
                     observed_windows)
     pct = _total(covered) / obs * 100.0
@@ -147,6 +185,9 @@ def desk_coverage(events, staff_zones, observed_windows, roles=None,
                 "target_pct": target * 100, "meets_target": pct >= target * 100}
     a.caveats.append("counts the STATION, not any one person — a different "
                      "staff member at the desk is still covered")
+    a.caveats.append(f"depends entirely on the staff decision: "
+                     f"{len(_staff_ids)} identity(ies) were called staff. If "
+                     f"that is wrong, this number is wrong by the same amount")
     if not a.detail["meets_target"]:
         a.caveats.append(f"below the ratified {target*100:.0f}% bar")
     return a

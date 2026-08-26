@@ -48,26 +48,21 @@ RUN python3 -m pip install \
       opencv-python-headless \
       pandas openpyxl jinja2 matplotlib tqdm scikit-learn \
       gdown \
-      papermill jupyter nbformat ipykernel \
       pyyaml \
       "psycopg[binary]==3.3.4"
 
 WORKDIR /app
 
-# Source of truth. kevacv is copied so tests run in-container; the notebook
-# still carries its own embedded copy for Kaggle — tools/embed_kevacv.py keeps
-# the two identical and `--check` fails the build if they drift.
+# Source of truth. kevacv/ IS the pipeline; tests are copied so they run
+# in-container. The notebook and its embed/drift tooling moved to archive/
+# on 2026-08-24 — there is no second copy of the logic to keep in sync.
 COPY kevacv/   /app/kevacv/
 COPY tests/    /app/tests/
 COPY tools/    /app/tools/
-COPY notebooks/ /app/notebooks/
 COPY zones/    /app/zones/
 COPY config/   /app/config/
 COPY run.sh    /app/run.sh
 RUN chmod +x /app/run.sh
-
-# Fail the build rather than discover the drift an hour into a run.
-RUN python3 tools/embed_kevacv.py --check
 
 # data/ output/ models/ are volumes: the 3.2 GB chunk is pulled ONCE onto a
 # persistent disk, not re-downloaded every run the way Kaggle forces.

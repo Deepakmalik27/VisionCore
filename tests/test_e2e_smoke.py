@@ -28,7 +28,6 @@ import cv2
 import numpy as np
 
 HERE = Path(__file__).resolve().parent.parent
-NB = HERE / "notebooks" / "pipeline.ipynb"
 
 _pass = _fail = 0
 
@@ -147,20 +146,11 @@ try:
     check(cov["accounted"], "triage coverage report is accounted")
 
     print()
-    print("=" * 74)
-    print("  4. Notebook execution integrity test")
-    print("=" * 74)
-
-    nb = json.loads(NB.read_text(encoding="utf-8"))
-    code_cells = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
-    syn_errors = []
-    for i, s in enumerate(code_cells):
-        try:
-            ast.parse(s)
-        except SyntaxError as err:
-            syn_errors.append((i, err))
-
-    check(len(syn_errors) == 0, "all notebook cells parse without syntax errors", f"{len(syn_errors)} errors")
+    # 4. "Notebook execution integrity" removed 2026-08-24: it parsed every
+    #    cell of notebooks/pipeline.ipynb, which is archived and frozen. A
+    #    green check on a file that can no longer change is not a test.
+    #    The codebase equivalent is that this file IMPORTS kevacv and runs
+    #    it end to end -- which is what everything above does.
 
 finally:
     shutil.rmtree(temp_dir, ignore_errors=True)

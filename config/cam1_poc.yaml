@@ -92,6 +92,16 @@ analysis:
   tracker: botsort-reid
   reid_weights: clip_market1501.pt
 
+  # SMOKE-TEST SWITCHES (added 2026-08-25). This clip is a generic corner shop,
+  # NOT Delilah -- its numbers say nothing about the venue and must never be
+  # quoted as accuracy. It is here to prove the machinery runs end to end on
+  # the GPU and emits every artefact: observation rows, the pose skeleton, the
+  # coverage map, the detector canary and the night report.
+  enable_observations: true
+  enable_pose: true
+  pose_model: yolo11x-pose.pt
+  pose_stride: 4
+
   # ── THE A/B KNOBS ──────────────────────────────────────────────────────
   # Set to TODAY'S DEFAULTS, so writing them here changes nothing. They are
   # here to be turned, ONE AT A TIME, against the run ledger — which now

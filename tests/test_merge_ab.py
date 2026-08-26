@@ -141,18 +141,15 @@ check(ab_still["n_vetoed"] == 0,
 
 print()
 print("=" * 74)
-print("  the copied loop cannot silently drift from the notebook")
+print("  the drift guard itself still works")
 print("=" * 74)
-nb = Path("notebooks/pipeline.ipynb")
-if nb.exists():
-    import json
-    src = "".join("".join(c["source"]) for c in json.loads(
-        nb.read_text(encoding="utf-8"))["cells"])
-    ok, notes = assert_matches(src)
-    check(ok, "the notebook's union loop still matches this copy",
-          "; ".join(notes) if notes else "4/4 anchors present")
-else:
-    print("  SKIP  notebook not found — staleness guard not checked")
+# The half of this that replayed notebooks/pipeline.ipynb was removed
+# 2026-08-24. It compared merge_ab's copy of the union loop against the
+# notebook's -- and the notebook is now archived and frozen, so that check
+# could never fail again. A guard that cannot fail is not a guard.
+#
+# What is still worth asserting is that assert_matches DETECTS drift, which is
+# the property the guard was made of. kevacv.analytics is the original now.
 
 ok, notes = assert_matches("nothing like the real loop")
 check(not ok and len(notes) == 4, "and the guard fails loudly when it drifts",

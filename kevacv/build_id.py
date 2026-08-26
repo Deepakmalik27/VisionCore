@@ -104,3 +104,40 @@ if __name__ == "__main__":
         print(compute())
     else:
         print(describe())
+
+
+def make_run_id(camera_id, video_path, start_seconds=0.0, chunk_tag="",
+                config_path=None, zones_path=None, build=None):
+    """A run identity that is deterministic AND discriminating.
+
+    THE BUG THIS FIXES (measured 2026-08-26)
+        The old formula was `{camera}_{video stem}_{start}`. Three runs over the
+        same Delilah chunk -- baseline, entry-line fix, and the tracker A/B --
+        produced the BYTE-IDENTICAL run_id. tools/ingest_obs.py does
+        delete-then-insert keyed on run_id, so ingesting the second would have
+        silently DELETED the first. Two configs could never coexist in the
+        database, which is precisely what A/B work needs.
+
+    WHY NOT A UUID OR A TIMESTAMP
+        Because the original comment was right about the other half: re-running
+        the SAME chunk with the SAME settings must REPLACE its own rows, never
+        accumulate a second copy. A uuid breaks that.
+
+    SO: deterministic in the inputs that define a run.
+        same chunk + same config + same zones + same code  -> same id
+        change any one of them                             -> different id
+
+    The suffix is a short hash rather than the full names because run_id is a
+    foreign key on every observation row; the readable parts stay in
+    vision_runs.config_name / zones_name, which is where you would look anyway.
+    """
+    import hashlib
+    from pathlib import Path as _P
+    base = (f"{camera_id}_{chunk_tag}" if chunk_tag
+            else f"{camera_id}_{_P(str(video_path)).stem}_{int(start_seconds)}")
+    cfg = _P(str(config_path)).stem if config_path else ""
+    zon = _P(str(zones_path)).stem if zones_path else ""
+    sig = hashlib.sha256("|".join((cfg, zon, str(build or ""))).encode()
+                         ).hexdigest()[:8]
+    return f"{base}__{sig}", {"config_name": cfg, "zones_name": zon,
+                              "build": str(build or ""), "sig": sig}

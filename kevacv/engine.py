@@ -1035,7 +1035,7 @@ def build_online_tracker(fps, device=None):
     _lo = KEEP_TRACK_CONF if ENABLE_CONF_HYSTERESIS else 0.1
     _cmc = GMC_METHOD if ENABLE_GMC else None
     if TRACKER_MODE == "boosttrack":
-        from boxmot.trackers.boosttrack.boosttrack import BoostTrack
+        BoostTrack = _import_tracker("boosttrack", "BoostTrack")
         tracker = BoostTrack(
             reid_model=backend,
             device=_boxmot_dev(device),
@@ -1054,10 +1054,9 @@ def build_online_tracker(fps, device=None):
         # never silently fall back. Constructor args are signature-filtered so
         # minor upstream API drift doesn't crash the run.
         import inspect as _insp
-        try:
-            from boxmot import OccluBoost as _OB
-        except ImportError:
-            from boxmot.trackers.occluboost.occluboost import OccluBoost as _OB
+        # the resolver already tries every known layout, so the old
+        # try/except around two hard-coded import paths is now redundant
+        _OB = _import_tracker("occluboost", "OccluBoost")
         _want = dict(reid_model=backend, device=_boxmot_dev(device), half=globals().get("REID_HALF", False),
                      track_high_thresh=_hi, track_low_thresh=_lo,
                      new_track_thresh=_hi,
@@ -1070,10 +1069,7 @@ def build_online_tracker(fps, device=None):
         _log.info(f"✅ tracker: OccluBoost with REAL {method.upper()} embeddings "
               f"(occlusion-damped Kalman + GTA graveyard re-association)")
     else:
-        try:
-            from boxmot.trackers.botsort.botsort import BotSort
-        except ImportError:          # boxmot >= 19 moved trackers under .bbox
-            from boxmot.trackers.bbox.botsort.botsort import BotSort
+        BotSort = _import_tracker("botsort", "BotSort")
         tracker = BotSort(
             reid_model=backend,
             track_high_thresh=_hi,
@@ -1089,6 +1085,84 @@ def build_online_tracker(fps, device=None):
         )
         _log.info(f"✅ tracker: BotSORT with REAL {method.upper()} embeddings driving live association")
     return tracker
+
+def _import_tracker(module_leaf, class_name):
+    """Find a boxmot tracker class across boxmot's shifting module layout.
+
+    boxmot has moved its trackers at least twice:
+
+        <=18   boxmot.trackers.<leaf>.<leaf>          module inside a package
+        >=19   boxmot.trackers.bbox.<leaf>            FLAT module, no inner file
+
+    engine.py already tried to handle this and guessed the >=19 path one level
+    too deep (`...bbox.botsort.botsort`), so every run on boxmot 19 died at
+    tracker construction -- after the model had loaded and the video had been
+    fetched, which is the most expensive place to fail.
+
+    Tries each known layout, returns the class, and LOGS which layout matched
+    so the next version bump is a one-line diagnosis instead of a mystery.
+    """
+    from importlib import import_module
+    candidates = (
+        f"boxmot.trackers.bbox.{module_leaf}",              # >= 19, flat
+        f"boxmot.trackers.{module_leaf}.{module_leaf}",     # <= 18, nested
+        f"boxmot.trackers.bbox.{module_leaf}.{module_leaf}",
+        "boxmot",                                           # re-exported at top
+    )
+    tried = []
+    for path in candidates:
+        try:
+            mod = import_module(path)
+        except ImportError as e:
+            tried.append(f"{path}: {e}")
+            continue
+        cls = getattr(mod, class_name, None)
+        if cls is not None:
+            _log.info(f"   boxmot layout: {class_name} <- {path}")
+            return cls
+        tried.append(f"{path}: imported but has no {class_name}")
+    raise ImportError(
+        f"cannot locate {class_name} in boxmot "
+        f"(version {getattr(__import__('boxmot'), '__version__', '?')}). Tried:\n  "
+        + "\n  ".join(tried))
+
+
+def _numeric_tracker_ids(dets, alias, nxt):
+    """A view of `dets` whose tracker_id is guaranteed integer.
+
+    Returns `dets` untouched when every id is already numeric, so the common
+    path costs nothing. Otherwise a SHALLOW COPY with an aliased id array --
+    the original is never mutated, because everything downstream of the
+    trigger call still wants the real (possibly named) ids.
+
+    trigger() returns POSITIONAL boolean masks, so the caller indexes the
+    ORIGINAL dets with them and gets the real ids back. Nothing needs mapping
+    in reverse.
+    """
+    import copy as _copy
+    tids = getattr(dets, "tracker_id", None)
+    if tids is None or len(tids) == 0:
+        return dets
+    if all(isinstance(t, (int, np.integer)) or
+           (isinstance(t, str) and t.isdigit()) or
+           isinstance(t, (float, np.floating)) for t in tids):
+        return dets
+    out = []
+    for t in tids:
+        if isinstance(t, (int, np.integer, float, np.floating)):
+            out.append(int(t))
+        elif isinstance(t, str) and t.isdigit():
+            out.append(int(t))
+        else:
+            key = str(t)
+            if key not in alias:
+                alias[key] = nxt[0]
+                nxt[0] -= 1
+            out.append(alias[key])
+    view = _copy.copy(dets)
+    view.tracker_id = np.asarray(out, dtype=int)
+    return view
+
 
 def _dets_to_boxmot(dets):
     """sv.Detections -> boxmot's expected (N,6) x1,y1,x2,y2,conf,cls array."""
@@ -1621,7 +1695,7 @@ def _in_poly(poly, pt):
 def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                      crossings, polygons, zcolors, entry_line, eff_fps, step,
                      native_fps, zone_roles=None, proxy_dir=None, duration_s=None,
-                     phantoms=None):
+                     phantoms=None, frame_ir=None, killed_boxes=None):
     """PASS 2: draw everything from FINAL identities. Returns snapshots."""
     # role-based zone lookup — NOT hardcoded zone names, so this works on any
     # venue (cafe wait_zone, store queue_zone, restaurant waiting, ...).
@@ -1957,6 +2031,17 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                         _pose_seen[1] = True
                         _log.error(f"!! pose overlay failed: {_poe} — boxes are "
                                    f"drawn without skeletons")
+            # GHOSTS FIRST — a killed box must never paint over a live person.
+            # Thin, dashed, desaturated: present enough to see a pattern
+            # (a whole band of the frame dying), quiet enough to ignore.
+            if killed_boxes:
+                for _gx1, _gy1, _gx2, _gy2 in killed_boxes.get(round(float(t), 3), ()):
+                    _g = (int(_gx1), int(_gy1), int(_gx2), int(_gy2))
+                    _dashed_poly(frame,
+                                 [(_g[0], _g[1]), (_g[2], _g[1]),
+                                  (_g[2], _g[3]), (_g[0], _g[3])],
+                                 (120, 120, 130), dash=9, gap=7, thick=1)
+
             for _bi, (tid, x1, y1, x2, y2) in enumerate(boxes):
                 cid = canon.get(tid, tid)
                 role = roles.get(cid, "customer")
@@ -1971,6 +2056,38 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                         zone_counts[name] += 1
                 color = role_bgr.get(role, role_bgr["unknown"])
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+
+                # ── THE ANCHOR. This single point decides which zone this body
+                # is counted in, and it was measured 350 px wrong in the
+                # 2026-08-19 audit while being invisible in every frame anyone
+                # reviewed. Drawn as a crosshair so it can be judged against
+                # the actual feet by eye, which is the only check that would
+                # have caught that bug.
+                _ax, _ay = int(bc[0]), int(bc[1])
+                cv2.line(frame, (_ax - 9, _ay), (_ax + 9, _ay), (255, 255, 255), 3,
+                         cv2.LINE_AA)
+                cv2.line(frame, (_ax, _ay - 9), (_ax, _ay + 9), (255, 255, 255), 3,
+                         cv2.LINE_AA)
+                cv2.line(frame, (_ax - 9, _ay), (_ax + 9, _ay), color, 1, cv2.LINE_AA)
+                cv2.line(frame, (_ax, _ay - 9), (_ax, _ay + 9), color, 1, cv2.LINE_AA)
+
+                # ── WHICH ZONE, AND HOW SURE. Same function the observation
+                # rows use, so the video can never disagree with the JSONL.
+                _zname = _zconf = None
+                try:
+                    from .observe import zone_and_confidence as _zac
+                    _zname, _zconf = _zac((x1, y1, x2, y2), polygons,
+                                          STAFF_ANCHOR_ZONES, True)
+                except Exception:
+                    pass
+
+                # ── WHY THIS IS "staff". A gallery match and a zone-dwell
+                # guess look identical on screen today, and only one of them is
+                # evidence. A non-numeric id came from the face gallery.
+                _why = None
+                if role == "staff":
+                    _why = ("face" if isinstance(cid, str) and not str(cid).isdigit()
+                            else "zone")
                 _act = None
                 if _bi in _pose_kps:
                     from . import pose as _PZ2
@@ -1993,6 +2110,10 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                     lbl = f"#{cid} {role}"
                 if _act and _act != "unknown":
                     lbl += f" {_act}"
+                if _why:
+                    lbl += f" [{_why}]"
+                if _zname:
+                    lbl += f" {_zname}:{_zconf:.2f}"
                 wc = wait_clock(cid, t)
                 if wc is not None and role != "staff":
                     lbl += f" {mmss(wc)}"
@@ -2062,9 +2183,17 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
             # from the same list. The smoothed series stays for the zone
             # occupancy line below, where a rolling median is the right thing.
             _hud_total = n_role["customer"] + n_role["staff"]
-            hud = (f"t={mmss(t)}  people in frame: {_hud_total}"
+            # MODALITY, ON THE FACE OF THE FRAME. This camera flips colour<->IR
+            # 96 times in 20 minutes, and under IR the HSV/colour half of the
+            # re-id evidence is switched off for ~46% of tracks. A reviewer
+            # judging "why did the id change here" cannot see that today.
+            _ir_now = bool((frame_ir or {}).get(frame_idx))
+            _ir_chip = "IR" if _ir_now else "COLOUR"
+            _n_ghost = len((killed_boxes or {}).get(round(float(t), 3), ()))
+            hud = (f"t={mmss(t)}  [{_ir_chip}]  people in frame: {_hud_total}"
                    f" ({n_role['staff']} staff)  "
-                   f"entered={n_in} exited={n_out} (unique)")
+                   f"entered={n_in} exited={n_out} (unique)"
+                   + (f"  killed={_n_ghost}" if _n_ghost else ""))
             wait_now = sum(smooth_zone[frame_idx].get(z, 0) for z in WAIT_ZONES)
             hud2 = f"waiting now: {wait_now}"
             if _prev_rendered_t is not None and (t - _prev_rendered_t) > 30:
@@ -2572,9 +2701,31 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     # ingest tool does delete-then-insert per run_id, so two chunks sharing a
     # run_id would make the second silently DELETE the first. That rules out a
     # pid, a uuid or a timestamp: they break idempotent re-ingest.
-    _obs_run_id = (f"{camera_id}_{chunk_tag}" if chunk_tag else
-                   f"{camera_id}_{Path(video_path).stem}_{int(start_seconds)}")
+    # 2026-08-26: the old formula collided. Three runs over the SAME Delilah
+    # chunk -- baseline, entry-line fix, tracker A/B -- produced the identical
+    # run_id, and ingest_obs does delete-then-insert on it, so the second would
+    # have silently DELETED the first. Two configs could never coexist in the
+    # database, which is exactly what A/B work needs.
+    #
+    # make_run_id keeps the idempotence the comment above rightly demanded
+    # (same chunk + same config + same zones + same code -> same id) while
+    # discriminating on the things that actually define a run. It lives in
+    # build_id.py so this site and pipeline.py cannot drift apart -- the old
+    # code hand-mirrored the formula in two files and told the reader to keep
+    # them in sync by hand.
+    from .build_id import make_run_id as _mk_run_id
+    _obs_run_id, _obs_run_meta = _mk_run_id(
+        camera_id, video_path, start_seconds, chunk_tag,
+        config_path=globals().get("RUN_CONFIG_PATH"),
+        zones_path=zones_path,
+        build=globals().get("_BUILD_ID"))
     _obs_emb_at = {}                   # raw tid -> frame_idx of last embedding
+    # STAFF EVIDENCE, accumulated live. The face-gallery sweep runs AFTER this
+    # loop, so face_sim/face_name cannot be filled here and are backfilled by
+    # tools/backfill_face_evidence.py. What IS knowable per frame is how long
+    # this track has stood in a staff zone -- which is the evidence the
+    # zone-dwell rule was silently converting into a verdict.
+    _obs_staff_s = {}                  # raw tid -> cumulative s in a staff zone
 
     def _wall_ts(t_rel):
         """Wall-clock for a row, or None when the clock was never verified.
@@ -2775,6 +2926,51 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     _prev_small = None          # motion gate state
     # F1 per-frame IR state / F2 scene geometry / F3 head accounting
     _frame_ir = {}              # frame_idx -> bool
+    # P2 OVERLAY: what the filter chain KILLED, so the annotated video can show
+    # it. The funnel already says HOW MANY died at each stage; it cannot say
+    # WHERE. D0 alone removes ~26% of every detection, and until you can see
+    # which boxes those were you cannot tell frame-wide garbage (a good kill)
+    # from the near-field guests F2 measures at 804 px (a bad one).
+    # Keyed by round(t, 3) because both this loop and render_annotated have t.
+    # Capped: this is a diagnostic, and it must never be the reason a long run
+    # runs out of memory.
+    # P3: WHERE does the model see, and where is it blind? The funnel counts
+    # detections; it has no idea where they were. A cell that never produced a
+    # box is either an area nobody walks through or an area we cannot see, and
+    # those two are indistinguishable in every number this pipeline prints.
+    from .coverage import CoverageGrid as _CoverageGrid
+    _coverage = _CoverageGrid(an_w, an_h)
+    # KARPATHY'S INPUT-INDEPENDENT BASELINE, which validity.py already built
+    # and nothing ever called: motion and the detector are independent, so
+    # sustained disagreement means one of them is broken -- not that the venue
+    # was empty. A model that silently fails to load its weights otherwise
+    # produces a perfectly quiet, perfectly wrong report.
+    from .validity import DetectorCanary as _DetectorCanary
+    _canary = _DetectorCanary()
+    _motion_by_fi = {}          # frame_idx -> was there motion in this frame
+    # SUPERVISION ONLY EVER SEES INTEGER TRACK IDS.
+    #
+    # The moment the face gallery matches somebody, that track's id becomes a
+    # STRING ("staff2", "sarah") so the report can name them. sv.LineZone.trigger
+    # then does `int(tracker_id)` internally and the run dies -- on 2026-08-25
+    # 18% into the first Delilah chunk where a face actually matched.
+    #
+    # This is the THIRD appearance of the same bug: analytics.events() carries a
+    # comment about it killing a run 1h58m in on 2026-08-14, and derive.py notes
+    # it too. Short smoke tests never reach it because the gallery never matches
+    # in them -- camera1.mp4 (a UK shop scored against Delilah faces) sailed
+    # straight through.
+    #
+    # Fix the CLASS, not the call site: names are OUR layer's concern, so give
+    # supervision a numeric alias and keep the names on our side. Aliases are
+    # NEGATIVE so they can never collide with a real tracker id, and STABLE for
+    # the whole run because LineZone keeps per-id state across frames -- a
+    # per-frame alias would make one person look like a new crosser every frame.
+    _id_alias = {}
+    _id_alias_next = [-1]
+    _killed_boxes = {}          # round(t,3) -> [(x1,y1,x2,y2), ...]
+    _KILLED_CAP_FRAMES = 20000
+    _KILLED_CAP_PER_FRAME = 40
     _ir_state = [None]          # last seen IR state, for switch logging
     _ir_prev_main = [None]      # C4: last modality the MAIN loop acted on
     _ir_cut_last = [-1e9]       # C4: debounce clock for the hard cut
@@ -2851,6 +3047,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         """Raw detector output -> what the tracker is allowed to see."""
         nonlocal _n_head_only
         _funnel.record_first("yolo raw", len(dets))
+        _raw_for_ghost = (dets.xyxy.copy() if len(dets) else None)
 
         # D0 ABSURD-SIZE CAP — runs FIRST, and the D1 guard cannot relax it.
         #
@@ -2935,6 +3132,26 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             _keep = _live_phantoms.filter_boxes(t, dets.xyxy)
             dets = dets[np.array(_keep, dtype=bool)]
             _funnel.record("live phantom suppress", _n, len(dets))
+        # GHOSTS = raw minus survivors. Matched by exact corner equality, which
+        # is safe here: nothing in the chain MOVES a box, it only drops or adds
+        # them. (Added boxes -- head recovery, merged split -- are simply not in
+        # `raw`, so they can never be mistaken for a kill.)
+        if _raw_for_ghost is not None and len(_killed_boxes) < _KILLED_CAP_FRAMES:
+            _surv = set()
+            if len(dets):
+                for _b in dets.xyxy:
+                    _surv.add((round(float(_b[0]), 1), round(float(_b[1]), 1),
+                               round(float(_b[2]), 1), round(float(_b[3]), 1)))
+            _dead = []
+            for _b in _raw_for_ghost:
+                _k = (round(float(_b[0]), 1), round(float(_b[1]), 1),
+                      round(float(_b[2]), 1), round(float(_b[3]), 1))
+                if _k not in _surv:
+                    _dead.append(_k)
+                    if len(_dead) >= _KILLED_CAP_PER_FRAME:
+                        break
+            if _dead:
+                _killed_boxes[round(float(t), 3)] = _dead
         return dets
 
     if ENABLE_TILED_DETECT:
@@ -3251,6 +3468,15 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
 
             if MOTION_GATE:
                 _small = cv2.cvtColor(_smallc, cv2.COLOR_BGR2GRAY)
+                # MEASURED EVERY FRAME, GATED ON THE SAME CONDITION AS BEFORE.
+                # The canary needs to know whether the scene moved even on
+                # frames the gate does not evaluate; computing absdiff on a
+                # 160x90 thumbnail is free next to a YOLO call. Gating
+                # behaviour is deliberately untouched.
+                if _prev_small is not None:
+                    _motion_by_fi[_fi] = bool(
+                        float((cv2.absdiff(_small, _prev_small) > 18).mean())
+                        >= MOTION_MIN_FRAC)
                 if _prev_small is not None and (_t - _last_det_t) > MOTION_IDLE_S:
                     _chg = float((cv2.absdiff(_small, _prev_small) > 18).mean())
                     if _chg < MOTION_MIN_FRAC:
@@ -3407,6 +3633,12 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         # observation rows read it unconditionally, so a run with re-id off
         # would raise NameError. One default per frame beats a guard per use.
         _vecs = {}
+        # BUG FIX (observation layer raw/canon split): dets.tracker_id gets
+        # overwritten with canonical ids a few lines below (`dets.tracker_id
+        # = np.array(remapped, ...)`). The observation emit loop needs the
+        # PRE-merge (raw BotSort) id for raw_track_id, so capture it here,
+        # positionally, before that reassignment can touch it.
+        _pre_merge_tids = [_safe_id(_t) for _t in dets.tracker_id]
         # ── LIVE IDENTITY MEMORY: resolve/remap BEFORE anything downstream
         # (positions, zones, crossings, crop banking, render log) ever sees
         # this frame's ids, so a corrected id is the ONLY id those consumers
@@ -3607,16 +3839,15 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 or (t - _last_det_t) <= globals().get("RENDER_COAST_S", 0.5)):
             cv2.imwrite(str(proxy_dir / f"{frame_idx:07d}.jpg"), frame,
                         [cv2.IMWRITE_JPEG_QUALITY, PROXY_JPEG_QUALITY])
-        if _obs_on:
-            # index/confidence by raw track id, for the observation rows.
-            # Built INSIDE the guard: with the flag off this is zero work.
-            _i_by_tid = {_safe_id(_tt): _ii
-                         for _ii, _tt in enumerate(dets.tracker_id)}
-            _conf_by_tid = {_safe_id(_tt): float(_cc) for _tt, _cc
-                            in zip(dets.tracker_id, dets.confidence
-                                   if dets.confidence is not None else [])}
-        for (bx1, by1, bx2, by2), tid, cid_ in zip(dets.xyxy, dets.tracker_id,
-                                                   dets.class_id):
+        _coverage.add_frame()
+        # The canary compares MOTION against DETECTIONS. Fed with the count the
+        # tracker actually received, so "the filters ate everything" also trips
+        # it -- that is a real blindness even though the detector fired.
+        _canary.observe(t, _motion_by_fi.get(frame_idx, True), len(dets))
+        for _gx1, _gy1, _gx2, _gy2 in _killed_boxes.get(round(float(t), 3), ()):
+            _coverage.add_kill(((_gx1 + _gx2) / 2.0, float(_gy2)))
+        for _pos, ((bx1, by1, bx2, by2), tid, cid_) in enumerate(
+                zip(dets.xyxy, dets.tracker_id, dets.class_id)):
             tid = _safe_id(tid)
             bx1, by1, bx2, by2 = int(bx1), int(by1), int(bx2), int(by2)
             boxes_this.append((tid, bx1, by1, bx2, by2))
@@ -3628,6 +3859,11 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             if _bw / _bh > 0.45:  # seated people have wider/shorter bboxes
                 track_seated_frames[tid] += 1
             bc = ((bx1 + bx2) / 2.0, float(by2))
+            # keyed on the anchor, not the box centre: this map must answer
+            # "where do we COUNT people", not "where do boxes float".
+            _coverage.add_detection(bc, conf=float(dets.confidence[_pos])
+                                    if dets.confidence is not None else None,
+                                    height_px=float(by2 - by1))
             if tid not in track_pos:
                 track_pos[tid] = [bc, bc]
                 track_time[tid] = [t, t]
@@ -3637,7 +3873,10 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             role_vote = "staff" if (isinstance(tid, str) and not tid.isdigit()) else "customer"
             rec.vote_role(tid, role_vote)
             if _obs_on:
-                _raw = tid
+                # Raw (pre-merge) id, captured positionally before the
+                # canonical remap above overwrote dets.tracker_id. `tid`
+                # here is already canonical -- do not use it for _raw.
+                _raw = _pre_merge_tids[_pos]
                 _h = _obs_hist[_raw]
                 _h.append((t, bc))
                 del _h[:-int(globals().get("OBS_MOTION_WINDOW", 4))]
@@ -3646,19 +3885,39 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 # the desk" case is what this flags.
                 _feet_vis = (by2 < frame_h - 2)
                 _emb_id = None
-                _vec = _vecs.get(_i_by_tid.get(_raw)) if _vecs else None
+                # _vecs is keyed by the same positional index used in PASS A/D
+                # above (both iterate dets.xyxy in the same untouched order).
+                _vec = _vecs.get(_pos) if _vecs else None
                 _stride_f = int(globals().get("OBS_EMB_STRIDE", 8))
                 if _vec is not None and (frame_idx - _obs_emb_at.get(_raw, -10**9)) >= _stride_f:
                     _obs_emb_at[_raw] = frame_idx
-                    _emb_id = f"{_obs_run_id}_{_raw}_{frame_idx}"
+                    # short + stable; the old form embedded the whole
+                    # source filename in every row and every foreign key
+                    _emb_id = observe.short_emb_id(_obs_run_id, _raw, frame_idx)
                     _obs_q.put(observe.emb_row(
                         run_id=_obs_run_id, camera_id=camera_id,
                         raw_track_id=_raw, frame_idx=frame_idx,
                         emb_id=_emb_id, vec=_vec, blur_score=None))
+                # cumulative staff-zone dwell for THIS track, before the row
+                # is built, so the row reports the evidence as of its own frame.
+                _zn_now, _ = observe.zone_and_confidence(
+                    (bx1, by1, bx2, by2), polygons, staff_zones_here, _feet_vis)
+                if _zn_now in staff_zones_here:
+                    _obs_staff_s[_raw] = _obs_staff_s.get(_raw, 0.0) + frame_step_s
+                _sz = _obs_staff_s.get(_raw)
                 _obs_q.put(observe.build_row(
                     run_id=_obs_run_id, camera_id=camera_id,
+                    staff_zone_s=_sz,
+                    # A HINT, never a verdict. role_source says which kind of
+                    # evidence it rests on, so a zone guess can never be
+                    # mistaken downstream for a face match.
+                    role_hint=("staff" if (_sz or 0) >= float(globals().get(
+                        "STAFF_OVERRIDE_MIN_S", 60)) else "customer"),
+                    role_source=("zone" if (_sz or 0) > 0 else None),
                     frame_idx=frame_idx, t_s=t, ts=_wall_ts(t),
-                    box=(bx1, by1, bx2, by2), det_conf=_conf_by_tid.get(_raw),
+                    box=(bx1, by1, bx2, by2),
+                    det_conf=(float(dets.confidence[_pos])
+                              if dets.confidence is not None else None),
                     raw_track_id=_raw,
                     canon_id=(_identity_memory.raw_to_canon.get(_raw)
                               if _identity_memory is not None else None),
@@ -3717,11 +3976,15 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                            f"--dataset-export to collect a training set.")
                 _dataset = None
 
+        # ONE aliased view per frame, shared by both supervision calls. Masks
+        # come back positional, so `dets` (with the real names) is what gets
+        # indexed -- the alias never leaks past this line.
+        _sv_dets = _numeric_tracker_ids(dets, _id_alias, _id_alias_next)
         for name, zone in zones.items():
-            for tid in dets.tracker_id[zone.trigger(dets)]:
+            for tid in dets.tracker_id[zone.trigger(_sv_dets)]:
                 rec.add(t, name, _safe_id(tid))
         for _lname, line_zone in line_zones.items():
-            crossed_in, crossed_out = line_zone.trigger(dets)
+            crossed_in, crossed_out = line_zone.trigger(_sv_dets)
             # G3: record WHERE the crossing happened. Tier A de-duplicates
             # in space and time, so a crossing without a position is a crossing
             # that can only fall back to trusting the track id.
@@ -3914,6 +4177,47 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     for _lvl, _msg in _funnel.findings():
         (_log.warning if _lvl == "WARN" else _log.info)(f"   funnel: {_msg}")
 
+    # ── COVERAGE MAP: WHERE the detector saw, and where it is blind ─────────
+    # The funnel says which STAGE lost a detection. This says WHERE. A cell
+    # that never produced a box is either somewhere nobody walks or somewhere
+    # we cannot see -- identical zeroes, different money. Only the zone map can
+    # separate them, so the zone map is what it is given.
+    _coverage_findings = []
+    try:
+        _zone_cells, _mask_cells = set(), set()
+        for _zn, _zp in (polygons or {}).items():
+            _cells = _coverage.cells_for_polygon(_zp)
+            # a dead-area mask is a zone we deliberately do NOT count, so a
+            # blind cell under one is correct, not a bug
+            if "mask" in str(_zn).lower():
+                _mask_cells |= _cells
+            else:
+                _zone_cells |= _cells
+        _coverage_findings = _coverage.findings(zone_cells=_zone_cells,
+                                                mask_cells=_mask_cells)
+        for _lvl, _msg in _coverage_findings:
+            (_log.error if _lvl == "ERROR" else
+             _log.warning if _lvl == "WARN" else _log.info)(f"   coverage: {_msg}")
+    except Exception as _cve:
+        _log.error(f"!! coverage map failed: {_cve}. The run is unaffected; "
+                   f"only this diagnostic is missing.")
+
+    # ── THE CANARY: motion said yes, the detector said nobody ───────────────
+    # Independent signals. Sustained disagreement means one of them is broken,
+    # and a broken detector is otherwise indistinguishable from a quiet venue.
+    _canary_findings = []
+    try:
+        _canary.close(frame_log[-1][1] if frame_log else None)
+        _canary_findings = _canary.findings()
+        for _lvl, _msg in _canary_findings:
+            _log.error(f"   canary: {_msg}")
+        if not _canary_findings:
+            _log.info(f"   canary: no sustained motion-without-detection "
+                      f"({_canary.total} isolated frame(s)) — the detector and "
+                      f"the frame differencer agree")
+    except Exception as _cae:
+        _log.error(f"!! detector canary failed: {_cae}")
+
     # ── OBSERVED vs ELAPSED ─────────────────────────────────────────────────
     # Printed beside the funnel because they answer adjacent questions: the
     # funnel says which STAGE lost a detection, this says whether the time was
@@ -4081,7 +4385,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     events = rec.events(min_event_by_zone={z: 0.5 for z, rs in zone_roles.items()
                                            if "entry" in rs})
     _staff_ev_pre = {}          # never unbound: the post-merge re-run reads it
-    if staff_zones_here:
+    if staff_zones_here and globals().get("ENABLE_STAFF_ZONE_PROMOTION", False):
         events, _staff_ev = apply_staff_zone_override(
             events, staff_zones_here, STAFF_OVERRIDE_MIN_S,
             min_share_dwell_s=STAFF_OVERRIDE_SHARE_MIN_S,
@@ -4865,7 +5169,8 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                               if e["track_id"] in _pinned else e
                               for e in events]
                 # roles may change after merge (fragments pool their dwell)
-                if staff_zones_here:
+                if staff_zones_here and globals().get(
+                        "ENABLE_STAFF_ZONE_PROMOTION", False):
                     # Re-run AFTER the merge: fragments pool their dwell, and
                     # more importantly their VISITS — two fragments of one
                     # receptionist are two visits only once they are known to
@@ -5177,6 +5482,48 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     roles = {**rec.final_roles(),
              **{e["track_id"]: e["role"] for e in events}}
 
+    # A FACE MATCH IS EVIDENCE. A ZONE VOTE IS AN INFERENCE. EVIDENCE WINS.
+    #
+    # role_votes are cast INSIDE the frame loop, where every id is still
+    # numeric -- so every vote a future staff member casts is "customer". The
+    # gallery sweep runs AFTER the loop, renames the chain to "staff3", and the
+    # customer majority came along with the name.
+    #
+    # Measured on the 19:30-19:50 Delilah chunk, 2026-08-25:
+    #
+    #   person   role      role_from       minutes  waited_s  greeted
+    #   staff3   customer  zone-inferred      19.8       136       no
+    #   staff2   customer  zone-inferred      17.0        29       no
+    #   staff1   customer  zone-inferred       8.5        10       no
+    #
+    # staff3 was on camera for 19.8 of 20 minutes -- plainly the receptionist --
+    # and was reported as a guest who waited 2m16s and was never greeted. That
+    # one inversion is enough to explain desk_covered=30.5%, an inflated guest
+    # count AND a fabricated service anomaly, all from the same row.
+    #
+    # THE CONVENTION, used already by derive.py and render_annotated: a
+    # NON-NUMERIC id can only have come from the face gallery. Nothing else in
+    # this pipeline mints a named id. So a named id is staff, full stop, and no
+    # amount of standing in a customer zone may downgrade it.
+    _face_named = [t for t in roles
+                   if isinstance(t, str) and not str(t).isdigit()]
+    if _face_named:
+        for _t in _face_named:
+            roles[_t] = "staff"
+        # events carry their OWN role copy, and downstream desk-coverage reads
+        # events, not roles. Fixing one and not the other is how this bug hid.
+        _n_ev = 0
+        for _e in events:
+            if _e.get("track_id") in set(_face_named) and _e.get("role") != "staff":
+                _e["role"] = "staff"
+                _n_ev += 1
+        _log.warning(
+            f"\U0001f512 ROLE LOCK: {len(_face_named)} face-matched "
+            f"identity(ies) forced to staff ({', '.join(map(str, sorted(_face_named)))}) "
+            f"— {_n_ev} zone event(s) corrected. A gallery match is evidence; a "
+            f"zone vote is an inference, and the votes were cast before the "
+            f"match existed.")
+
     # A5: TIER-A crossing dedupe — one person crossing once, wearing several
     # ids while doing it, collapses to ONE event BEFORE anything counts it.
     # tier_a_crossings existed for exactly this and was wired into nothing the
@@ -5293,7 +5640,8 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         polygons, zcolors,
         (drawn_lines or None),      # ALL doors, not just the first
         eff_fps, step, native_fps, zone_roles=zone_roles,
-        proxy_dir=proxy_dir, duration_s=duration_s, phantoms=_phantoms)
+        proxy_dir=proxy_dir, duration_s=duration_s, phantoms=_phantoms,
+        frame_ir=_frame_ir, killed_boxes=_killed_boxes)
     if proxy_dir is not None:
         shutil.rmtree(proxy_dir, ignore_errors=True)   # ~1 GB per chunk
     # RENDER_DIRECT_H264 renames the file to *_annotated_h264.mp4 INSIDE
@@ -5316,6 +5664,9 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         "is_ir": _is_ir, "duration_s": duration_s,
         "staff_matched_names": sorted(_staff_seen_names),
         "frames_skipped_idle": _n_skipped, "tracker_resets": _n_resets,
+        "coverage": _coverage.as_dict(),
+        "coverage_findings": _coverage_findings,
+        "canary_findings": _canary_findings,
         # B1: the labelling export re-decodes at THIS rate. Falling back to
         # FPS_TARGET (8) while analysis ran at eff_fps (7.5) drifted 6.7% and
         # tripped the 5% alignment guard, so no package was ever built.

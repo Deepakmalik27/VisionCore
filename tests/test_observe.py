@@ -116,6 +116,27 @@ def test_row_is_json_serialisable():
     json.dumps(_row(det_conf=np.float32(0.94)))   # numpy scalars must not leak
     check(True, "numpy scalars are cast before they reach the JSONL")
 
+def test_raw_id_survives_a_post_merge_canon_lookup():
+    # Regression for the engine.py bug where dets.tracker_id was reassigned
+    # to canonical ids BEFORE the emit loop read it, so raw_track_id and
+    # canon_id were both looked up from the SAME already-canonical value
+    # (1039/1039 rows collapsed raw==canon on a real acceptance run).
+    # Mimic the emit loop's real sequence here: capture the raw id first,
+    # THEN look its canon up from a merge memory -- the two must stay
+    # independent all the way into the row.
+    raw_to_canon = {"103": "guest_7"}   # a merge HAS happened for raw 103
+    raw_tid = "103"                     # captured pre-merge, positionally
+    canon_id = raw_to_canon.get(raw_tid)
+    r = _row(raw_track_id=raw_tid, canon_id=canon_id)
+    check(r["raw_track_id"] == "103" and r["canon_id"] == "guest_7",
+          "merged track: raw_track_id is the pre-merge id, canon_id the post-merge id")
+    check(r["raw_track_id"] != r["canon_id"],
+          "raw and canon differ once a merge has actually happened")
+
+    # No merge on record for this raw id -> they legitimately match.
+    r2 = _row(raw_track_id="55", canon_id=raw_to_canon.get("55"))
+    check(r2["canon_id"] is None, "unmerged raw id has no canonical mapping yet")
+
 def test_emb_row_carries_a_real_vector():
     e = observe.emb_row(run_id="r1", camera_id="cam01", raw_track_id=103,
                         frame_idx=10, emb_id="r1_103_10", vec=np.zeros(512, dtype=np.float32),
@@ -132,6 +153,7 @@ def main():
                test_pose_never_sampled_is_null_not_unknown, test_pose_fresh_sample_has_zero_age,
                test_pose_carry_forward_states_its_age,
                test_row_has_exactly_the_declared_columns, test_row_keeps_both_ids,
+               test_raw_id_survives_a_post_merge_canon_lookup,
                test_row_is_json_serialisable, test_emb_row_carries_a_real_vector):
         print(f"\n{fn.__name__}")
         fn()

@@ -80,6 +80,38 @@ VALID_X_MAX = 181
 BAND = 3
 ABS_THRESHOLD = 26        # measured; sigma-scaling made no difference
 MIN_AREA = 260   # 500 DELETED REAL GUESTS -- see below
+
+# ── SHAPE GATE (added 2026-08-26, from measurement) ─────────────────────────
+# A blob has to look like a BODY CROSSING, not like a sliver that lingers.
+#
+# HOW THESE NUMBERS WERE FOUND (not chosen):
+#   The 20-min Delilah chunk was scored against an INDEPENDENT signal -- YOLO
+#   run on the doorway crop alone at 2 fps, which shares no code with the slit.
+#   An event was called true if a person was present within +-3 s.
+#
+#     feature   TRUE min/med/max      FALSE min/med/max
+#     area      261 /  501 / 3955     296 /  604 / 16596   <- useless, overlaps
+#     h          19 /   76 /  257      74 /  180 /  1264
+#     w           3 /   18 /   57       3 /    4 /    19   <- the separator
+#
+#     rule                TP    FP   recall  prec    F1
+#     none (before)       20    21    1.00   0.49   0.66
+#     w>=8 and h<=300     18     1    0.90   0.95   0.92   <- shipped
+#
+# WHY THESE TWO, PHYSICALLY:
+#   MIN_WIDTH  a real body occupies a span of the sampled line. A 3-4 px sliver
+#              is an edge or a light gradient, not a person.
+#   MAX_ROWS   300 rows at 30 fps is 10 seconds. A blob that owns the doorway
+#              for longer than that is somebody LOITERING in it, which is not a
+#              crossing and must not be counted as one.
+#
+# THE COST, STATED: this drops 2 of 20 real crossings. That is the same trade
+# that went wrong when min_area was raised 260 -> 500 and quietly deleted four
+# of six real guests, so both gates report every drop to the funnel. If recall
+# matters more than precision for a given venue, lower MIN_WIDTH first -- it is
+# the gate doing nearly all the work.
+MIN_WIDTH = 8     # px along the door line
+MAX_ROWS  = 300   # slit rows (~10 s at 30 fps)
 # MIN_AREA 260 -> 500 was made to kill the 19 sub-500 events the operator
 # flagged in new.txt. It also deleted four REAL arrivals from the hand-labelled
 # six-person group at 305-318s:
@@ -180,7 +212,8 @@ def foreground(sl, fps, abs_threshold=ABS_THRESHOLD):
     return m
 
 
-def split_blobs(m, min_area=MIN_AREA, funnel=None, t0=0.0, fps=1.0):
+def split_blobs(m, min_area=MIN_AREA, funnel=None, t0=0.0, fps=1.0,
+                min_width=MIN_WIDTH, max_rows=MAX_ROWS):
     """Plain connected components. Watershed was tried and REMOVED: it split
     single crossings instead of separating merged neighbours, taking the busy
     window from 2 to 1 and the tuned window from 6 to 3.
@@ -196,12 +229,21 @@ def split_blobs(m, min_area=MIN_AREA, funnel=None, t0=0.0, fps=1.0):
     kept = []
     for i in range(1, n):
         area = stats[i, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            kept.append((stats[i], cent[i]))
-        else:
-            _drop(funnel, "under_min_area",
-                  round(t0 + cent[i][1] / max(fps, 1e-9), 1),
-                  area, stats[i, cv2.CC_STAT_WIDTH], float(cent[i][0]))
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        t_at = round(t0 + cent[i][1] / max(fps, 1e-9), 1)
+        if area < min_area:
+            _drop(funnel, "under_min_area", t_at, area, w, float(cent[i][0]))
+            continue
+        # SHAPE GATE. Both report a receipt: this file has eaten real guests
+        # silently before and is not allowed to do it again.
+        if w < min_width:
+            _drop(funnel, "too_narrow", t_at, area, w, float(cent[i][0]))
+            continue
+        if h > max_rows:
+            _drop(funnel, "lingers_too_long", t_at, area, w, float(cent[i][0]))
+            continue
+        kept.append((stats[i], cent[i]))
     return kept, lab
 
 

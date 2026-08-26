@@ -270,6 +270,37 @@ analysis:
   #   deleting one — a different bug in a different place.
   dedup_nms_iou: 0.55
 
+  # ── OBSERVATION LAYER + POSE ──────────────────────────────────────────
+  # Turned on 2026-08-24. Both were BUILT and dormant: observe.py,
+  # event_queue.py, pose.py and tools/ingest_obs.py all shipped and tested,
+  # defaulted off, so nothing downstream of "detection is correct" had any
+  # data to stand on. The 2026-08-20 design discussion draws the line here --
+  # this repo stops at correct detection and hands rows to the intelligence
+  # layer -- and the rows were never being written.
+  #
+  # observations -> output/observations.jsonl, one row per person per frame:
+  #   zone + zone_conf · speed_px_s · speed_mps · heading_deg · stationary
+  #   foot_x/foot_y · feet_visible · is_ir · pose_activity · pose_age_s
+  # then: python tools/ingest_obs.py output/observations.jsonl
+  #   -> vision_observations / vision_embeddings / vision_runs
+  enable_observations: true
+  obs_queue_maxsize: 20000        # bounded; a full queue DROPS and says so
+  obs_stationary_px_s: 8.0        # ~1 px/frame at 8 fps
+  obs_motion_window: 4            # anchors kept per track for the median
+  obs_emb_stride: 8               # embeddings 1/s, not 8/s
+
+  # pose — 17 COCO keypoints -> standing / sitting / bending / walking, each
+  #   with a `why` string. EVIDENCE ONLY: pose can add a label, never create a
+  #   track, move a count or change an event (kevacv/pose.py header). It also
+  #   turns on the skeleton overlay in render_annotated, which is what makes
+  #   the annotated video show a PERSON rather than a rectangle.
+  #   Cost is bounded by stride x max_tracks, not by crowd size.
+  enable_pose: true
+  pose_model: yolo11n-pose.pt
+  pose_stride: 8                  # sample 1 frame in 8
+  pose_max_tracks: 8              # busiest N tracks only
+  pose_min_track_s: 2.0           # ignore flicker
+
 # Everything below was measured on run 68b97311f9 and is NOT yet acted upon.
 # Recorded so the next run can be compared against it rather than guessed at.
 measured_baseline:

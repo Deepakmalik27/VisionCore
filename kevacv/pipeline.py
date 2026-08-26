@@ -550,8 +550,16 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                 # formula differently; mirror it.
                 _chunk_tag = analyse_kw.get("chunk_tag") or ""
                 _start_seconds = analyse_kw.get("start_seconds") or 0.0
-                _run_id = (f"{camera_id}_{_chunk_tag}" if _chunk_tag else
-                           f"{camera_id}_{Path(video_path).stem}_{int(_start_seconds)}")
+                # ONE implementation, in build_id.py. This used to be a
+                # hand-copied duplicate of the engine's formula with a comment
+                # asking the reader to keep them identical; that is a drift
+                # hazard, and the formula it duplicated was wrong anyway.
+                from .build_id import make_run_id as _mk_run_id
+                _run_id, _run_meta = _mk_run_id(
+                    camera_id, video_path, _start_seconds, _chunk_tag,
+                    config_path=getattr(_Eg_obs, "RUN_CONFIG_PATH", None),
+                    zones_path=zones_path,
+                    build=getattr(_Eg_obs, "_BUILD_ID", None))
                 from .build_id import compute as _build_compute
                 _obs_eq.put({"kind": "run", "run_id": _run_id,
                              "camera_id": camera_id,
@@ -559,7 +567,9 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                              "fps_analysed": float(getattr(_Eg_obs, "FPS_TARGET", 0) or 0),
                              "started_at": _clock_start,
                              "frames_analysed": None,
-                             "zones_cfg_hash": None,
+                             "zones_cfg_hash": _run_meta.get("sig"),
+                             "config_name": _run_meta.get("config_name"),
+                             "zones_name": _run_meta.get("zones_name"),
                              "git_sha": _build_compute()})
                 _Eg_obs.OBS_QUEUE = _obs_eq
                 # the datetime parse_start already returned, not a re-parse
@@ -595,6 +605,16 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
             # the engine returns tracks; the answers need arrivals, contacts
             # and observed windows. Derive them ONCE, here, so what was
             # measured and what was inferred is visible in one place.
+            # P3: the coverage map and the detector canary produce FINDINGS, and
+            # a finding nobody merges into result["findings"] never reaches the
+            # scorecard, the SUMMARY or the night report. That is precisely how
+            # preflight, topology and report_slim all ended up built-and-unwired
+            # -- so wire them at the moment they are produced.
+            for _k in ("coverage_findings", "canary_findings"):
+                for _lvl, _msg in (run.get(_k) or []):
+                    result["findings"].append((_lvl, _msg))
+                    if _lvl == "ERROR":
+                        st.count(_k, "ERROR")
             enrich(run)
             if frame_wh is None and run.get("frame_size_analysed"):
                 frame_wh = tuple(run["frame_size_analysed"])
@@ -644,14 +664,67 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                 _log.warning(f"track {tid} looks rigid — {ev['why']}")
             for (a, b), ev in list(mirror.items())[:3]:
                 _log.warning(f"tracks {a}/{b} may be a reflection — {ev['why']}")
+            # THE GEOMETRY THIS STAGE "DOES NOT HAVE" NOW EXISTS.
+            #
+            # mirrored pairs were flagged and never removed, and the reason
+            # given was exactly right: you cannot tell WHICH half of a lockstep
+            # pair is the reflection, and deleting the real person is worse
+            # than counting both. On the 19:30-20:30 Delilah hour that left 55
+            # pairs in the headcount every single run.
+            #
+            # `mirror_regions` closes it: a polygon drawn over the glass or
+            # mirror, in CVAT, against the real footage
+            # (tools/cvat_to_calibration.py). If ONE of the pair lives inside a
+            # mirror region and its twin does not, the ambiguity is gone -- the
+            # one in the glass is the reflection.
+            #
+            # STILL CONSERVATIVE, deliberately: if BOTH or NEITHER are inside a
+            # mirror region we are back to not knowing, and the pair is kept and
+            # warned about exactly as before. This can only ever resolve pairs
+            # where the geometry is unambiguous.
+            _mirror_regions = (zones or {}).get("mirror_regions") or []
+            _mirror_drop = set()
+            if mirror and _mirror_regions:
+                from .coverage import _point_in_poly as _pip
+                _pos = {}
+                for _fi, _t, _bx in fl:
+                    for _b in (_bx or ()):
+                        _tid = _b[0]
+                        _bc = ((_b[1] + _b[3]) / 2.0, float(_b[4]))
+                        _pos.setdefault(_tid, []).append(_bc)
+
+                def _in_mirror_frac(tid):
+                    pts = _pos.get(tid) or []
+                    if not pts:
+                        return 0.0
+                    n = sum(1 for q in pts
+                            if any(_pip(mp, q) for mp in _mirror_regions))
+                    return n / len(pts)
+
+                for (a_id, b_id) in list(mirror):
+                    fa, fb = _in_mirror_frac(a_id), _in_mirror_frac(b_id)
+                    # one clearly in the glass, the other clearly not
+                    if fa >= 0.6 and fb <= 0.2:
+                        _mirror_drop.add(a_id)
+                    elif fb >= 0.6 and fa <= 0.2:
+                        _mirror_drop.add(b_id)
+                if _mirror_drop:
+                    _log.warning(
+                        f"\U0001fa9e resolved {len(_mirror_drop)} of "
+                        f"{len(mirror)} lockstep pair(s) using mirror_regions — "
+                        f"the half INSIDE the glass is the reflection and is "
+                        f"removed. Pairs with both or neither inside stay "
+                        f"counted, as before.")
             if mirror:
-                # Flagged, never deleted: which of the pair is the reflection
-                # needs the zone map, and removing the wrong one is worse than
-                # counting both.
-                result["findings"].append(
-                    ("WARN", f"{len(mirror)} track pair(s) moved in lockstep — "
-                             f"possible reflections, review before trusting the "
-                             f"headcount"))
+                _unresolved = len(mirror) - len(_mirror_drop)
+                if _unresolved:
+                    result["findings"].append(
+                        ("WARN", f"{_unresolved} track pair(s) moved in lockstep "
+                                 f"and could NOT be resolved — possible "
+                                 f"reflections, review before trusting the "
+                                 f"headcount. Draw the glass as a `mirror` "
+                                 f"polygon (CVAT -> cvat_to_calibration) to "
+                                 f"resolve them."))
 
             # DETECTING A PHANTOM AND STILL COUNTING IT IS WORSE THAN NOT
             # DETECTING IT. Until now this stage logged "static=3 rigid=4
@@ -664,7 +737,7 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
             # the pair is the reflection needs geometry this stage does not
             # have, and deleting the real person is worse than counting both.
             # They widen the uncertainty instead of silently biasing it.
-            drop = set(still) | set(rigid)
+            drop = set(still) | set(rigid) | _mirror_drop
             if drop:
                 before = len(run.get("guest_ids") or [])
                 # C12 (2026-08-19): this hand-rolled loop filtered events,
@@ -937,10 +1010,34 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
             # self-reported. _write_tracks even prints the command a human
             # should type. Nobody typed it.
             try:
-                _gt = next((g for g in (Path("gt.txt"),
-                                        out / "gt.txt",
-                                        Path(zones_path).parent / "gt.txt")
-                            if g.exists()), None)
+                # GROUND TRUTH MUST BELONG TO *THIS* RUN.
+                #
+                # This used to take Path("gt.txt") -- whatever gt.txt happened
+                # to be in the working directory. On 2026-08-25 that scored a
+                # UK corner-shop clip against Delilah's CAM.112 ground truth and
+                # printed "HOTA 0.0057" as if it were a measurement. A number
+                # that low reads as a broken model; it was two unrelated videos
+                # being compared. That is worse than no score, because a missing
+                # score prompts a question and a wrong one ends the enquiry.
+                #
+                # So: the file must be CAMERA-SCOPED (gt_<camera>.txt) or sit
+                # beside this run's own output. A bare repo-root gt.txt is
+                # never used, and the run says why.
+                _cam_tag = str(camera_id).replace(".", "_")
+                _gt_candidates = (
+                    out / "gt.txt",                                  # this run's own
+                    out / f"gt_{_cam_tag}.txt",
+                    Path(zones_path).parent / f"gt_{_cam_tag}.txt",  # camera-scoped
+                    Path(f"gt_{_cam_tag}.txt"),
+                )
+                _gt = next((g for g in _gt_candidates if g.exists()), None)
+                if _gt is None and Path("gt.txt").exists():
+                    _log.info(
+                        f"(not scored: gt.txt exists but is not scoped to "
+                        f"{camera_id}. Ground truth is tied to ONE video's "
+                        f"frames — scoring against another camera's file "
+                        f"produces a confident, meaningless number. Rename it "
+                        f"gt_{_cam_tag}.txt, or drop it in {out}, to use it.)")
                 _pred = next((Path(w) for w in written
                               if str(w).endswith("_predictions.txt")), None)
                 if _gt and _pred:
@@ -964,6 +1061,28 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                             f"use tools/score_by_time.py instead.")
             except Exception as _ee:
                 _log.info(f"(run not scored: {_ee})")
+
+            # THE PAGE A NON-TECHNICAL PERSON READS.
+            #
+            # Written LAST in this stage, after the gt score, so the report can
+            # state whether the run was verified at all -- an unscored run says
+            # so on its own face instead of looking identical to a passing one.
+            #
+            # It computes nothing: every value is read out of `result`, which
+            # is already assembled above, so the page and SUMMARY.txt cannot
+            # disagree. Fails open -- a broken chart must never cost a run that
+            # already produced its numbers.
+            try:
+                from .report_html import write as _write_html
+                _hp = _write_html(result, out, camera_id=camera_id)
+                written.append(_hp)
+                result["written"] = [str(x) for x in written]
+                result["html_report"] = str(_hp)
+                _log.info(f"\U0001f4c4 night report -> {_hp.name} "
+                          f"(open in any browser, no server needed)")
+            except Exception as _he:
+                _log.error(f"!! night report NOT written: {_he}. The numbers "
+                           f"are still in SUMMARY.txt and the scorecard.")
 
         # RUN SCORECARD — the run states its own case.
         #

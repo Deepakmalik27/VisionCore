@@ -19,7 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from kevacv.observe import OBS_COLUMNS, EMB_COLUMNS      # noqa: E402
 
 RUN_COLUMNS = ("run_id", "camera_id", "video_sha", "fps_analysed",
-               "started_at", "frames_analysed", "zones_cfg_hash", "git_sha")
+               "started_at", "frames_analysed", "zones_cfg_hash", "git_sha", "config_name", "zones_name")
 # git_sha is build_id.compute() — a hash of package file contents, not a git commit SHA
 
 TYPES_PG = {"frame_idx": "integer", "x1": "integer", "y1": "integer",
@@ -68,7 +68,27 @@ def _pack(vec, vec_type):
     return struct.pack(f"<{len(vec)}f", *[float(v) for v in vec])
 
 
-def ingest(conn, jsonl, dialect="pg", vec_type="bytea"):
+def ingest(conn, jsonl, dialect="pg", vec_type="bytea", embeddings=False):
+    """Load a run into the database.
+
+    EMBEDDINGS ARE OFF BY DEFAULT (2026-08-26). They are the one field here
+    that is genuinely large, and Supabase is the wrong place for large.
+
+    MEASURED on 39,086 real rows from the 19:30 Delilah chunk:
+        postgres + indexes   402 bytes/row
+        parquet + zstd        25 bytes/row      16x smaller
+    and an embedding vector is ~2 KB on its own -- two orders of magnitude more
+    than the row that references it. A busy camera-year of per-frame data is
+    ~138 GB in postgres against ~9 GB in parquet.
+
+    So the split is by SIZE and by USE:
+        /data (EBS on the instance)  parquet  the per-frame history, forever
+        supabase                     rows     the run being analysed now, KB-MB
+
+    Pass embeddings=True only when a specific task needs vector search in the
+    database -- vision.vision_embeddings.vec is pgvector, so that is a real
+    option, it is just not the default.
+    """
     obs, emb, run_rows, runs = [], [], [], set()
     with open(jsonl) as fh:
         for line in fh:
@@ -108,9 +128,14 @@ def ingest(conn, jsonl, dialect="pg", vec_type="bytea"):
             "runs": sorted(r for r in runs if r)}
 
 
-def _pg_connect(url):
+def _pg_connect(url, schema="vision"):
     import psycopg
     conn = psycopg.connect(url)
+    # Tables live in their own schema, not public (which holds 529 unrelated
+    # restaurant tables) -- unqualified CREATE/INSERT would otherwise make a
+    # second copy of every table there.
+    conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+    conn.execute(f"SET search_path TO {schema}")
     # pgvector turns Deepak's re-match into one SQL query instead of a full
     # pull into Python. Use it when the project has it; never CREATE EXTENSION
     # from here -- that is a database owner's decision, not an ingest tool's.
@@ -158,6 +183,7 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--jsonl")
     p.add_argument("--sqlite")
+    p.add_argument("--schema", default="vision")
     p.add_argument("--selftest", action="store_true")
     a = p.parse_args(argv)
     if a.selftest:
@@ -173,7 +199,7 @@ def main(argv=None):
             print("SUPABASE_DB_URL is not set. Export it in this shell "
                   "(this tool never reads .env).", file=sys.stderr)
             return 2
-        conn, vec_type = _pg_connect(url)
+        conn, vec_type = _pg_connect(url, schema=a.schema)
         dialect = "pg"
     create_tables(conn, dialect=dialect, vec_type=vec_type)
     n = ingest(conn, a.jsonl, dialect=dialect, vec_type=vec_type)

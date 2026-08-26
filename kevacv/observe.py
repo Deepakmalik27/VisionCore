@@ -125,6 +125,8 @@ OBS_COLUMNS = (
     "zone", "zone_conf",
     "speed_px_s", "speed_mps", "heading_deg", "stationary",
     "emb_id", "pose_activity", "pose_age_s",
+    # staff EVIDENCE (see build_row) -- never a verdict
+    "face_sim", "face_name", "staff_zone_s", "role_hint", "role_source",
 )
 
 EMB_COLUMNS = ("emb_id", "run_id", "camera_id", "raw_track_id", "frame_idx",
@@ -141,7 +143,9 @@ def _f(v):
 def build_row(*, run_id, camera_id, frame_idx, t_s, ts, box, det_conf,
               raw_track_id, canon_id, emb_id, polygons, staff_zones,
               feet_visible, is_ir, samples, ground, pose_last,
-              stationary_px_s=8.0):
+              stationary_px_s=8.0,
+              face_sim=None, face_name=None, staff_zone_s=None,
+              role_hint=None, role_source=None):
     x1, y1, x2, y2 = (float(v) for v in box)
     zone, zconf = zone_and_confidence(box, polygons, staff_zones, feet_visible)
     mv = motion(samples, ground=ground, stationary_px_s=stationary_px_s)
@@ -163,7 +167,47 @@ def build_row(*, run_id, camera_id, frame_idx, t_s, ts, box, det_conf,
         "heading_deg": _f(mv["heading_deg"]), "stationary": mv["stationary"],
         "emb_id": (None if emb_id is None else str(emb_id)),
         "pose_activity": po["activity"], "pose_age_s": _f(po["age_s"]),
+        # ── STAFF EVIDENCE, NOT A STAFF VERDICT ─────────────────────────────
+        # The 2026-08-20 design call was explicit: "हम starting में ही detect
+        # नहीं करेंगे... हम confidence डालने की कोशिश करेंगे" -- do not decide
+        # staff in the CV layer, emit confidence and let the intelligence layer
+        # decide.
+        #
+        # WHY THAT IS RIGHT, MEASURED. On the 19:30 Delilah chunk FOUR separate
+        # mechanisms fought over this one boolean: the face-gallery sweep, the
+        # zone-dwell override, an anti-manufacture guard that reverts staff to
+        # customer below 2 visits, and a role lock added to undo the damage.
+        # The result was staff3 -- on camera 19.8 of 20 minutes, plainly the
+        # receptionist -- filed as a GUEST who waited 2m16s and was never
+        # greeted. One wrong boolean produced three wrong headline numbers:
+        # desk coverage, guest count, and a fabricated service anomaly.
+        #
+        # These columns keep the EVIDENCE so the decision is reproducible
+        # downstream and retunable WITHOUT re-running 20 minutes of 4K. A
+        # verdict destroys information; evidence does not.
+        "face_sim": _f(face_sim),        # best gallery cosine, None if never embedded
+        "face_name": (None if face_name is None else str(face_name)),
+        "staff_zone_s": _f(staff_zone_s),  # cumulative s in a staff zone so far
+        "role_hint": (None if role_hint is None else str(role_hint)),
+        "role_source": (None if role_source is None else str(role_source)),
     }
+
+
+def short_emb_id(run_id, raw_track_id, frame_idx):
+    """A stable, SHORT embedding id.
+
+    The old form was f"{run_id}_{raw}_{frame}", and run_id contains the entire
+    source filename -- so every embedding_id was ~90 characters of
+    "CAM.112 (PP.09_12) 7-28-2026, 7.30.00pm CDT - ...", repeated in the
+    observation row AND used as a foreign key. The 2026-08-20 design spec asks
+    for "emb_8831".
+
+    Deterministic: the same (run, track, frame) always yields the same id, so
+    re-ingesting a run does not orphan the rows that reference it.
+    """
+    import hashlib
+    h = hashlib.sha1(f"{run_id}|{raw_track_id}|{frame_idx}".encode()).hexdigest()
+    return "emb_" + h[:10]
 
 
 def emb_row(*, run_id, camera_id, raw_track_id, frame_idx, emb_id, vec,
