@@ -1,0 +1,46 @@
+{
+  "_what": "HAND-VERIFIED arrival ground truth for CAM.112, 2026-07-28 19:30:00 -> 19:50:00.",
+  "_how": "Every IN event the slit counter reported was checked by extracting the doorway crop (SOURCE x2300-3840, y1250-2160) at t-2,-1,0,+1,+2 seconds and looking at it. A verdict of 'empty' means no body is present in ANY of the five frames, so it cannot be a timing artefact.",
+  "_why_this_exists": "Before this file, every accuracy claim in the project was self-graded: HOTA was never measured and the three arrival estimators disagreed 6 / 6 / 21 with no way to adjudicate. This is the first externally-checkable number the project has.",
+  "_limits": [
+    "ONE 20-minute window on ONE camera. Not a HOTA ground truth, not a tracking ground truth -- arrivals only.",
+    "Verified by reading frames, not by being present at the venue. A person fully occluded by the door frame for all 5 samples would be missed.",
+    "Only the slit's candidate times were checked. A crossing that NO estimator proposed would not appear here, so the true count is a LOWER bound.",
+    "OUT events were not verified."
+  ],
+  "camera_id": "CAM.112",
+  "video": "CAM.112 (PP.09_12) 7-28-2026, 7.30.00pm CDT - 7-28-2026, 8.30.00pm CDT.mp4",
+  "window_s": [0, 1200],
+  "wall_start": "2026-07-28T19:30:00",
+  "entry_line_source_px": [[2560, 1484], [3838, 2158]],
+  "verified_arrivals_in": [
+    {"t_s": 477,  "mmss": "07:57", "verdict": "person",    "note": "blonde, upper right"},
+    {"t_s": 491,  "mmss": "08:11", "verdict": "person",    "note": "blonde, left"},
+    {"t_s": 647,  "mmss": "10:47", "verdict": "person",    "note": "man, dark jacket, mid-stride"},
+    {"t_s": 679,  "mmss": "11:19", "verdict": "person",    "note": "partial body at right edge"},
+    {"t_s": 959,  "mmss": "15:59", "verdict": "person",    "note": "dark hair, lower frame"},
+    {"t_s": 962,  "mmss": "16:02", "verdict": "person",    "note": "foot/leg entering"},
+    {"t_s": 966,  "mmss": "16:06", "verdict": "person",    "note": "appears at t+1/+2 -- event fired EARLY"},
+    {"t_s": 1000, "mmss": "16:40", "verdict": "person",    "note": "lower right"},
+    {"t_s": 1032, "mmss": "17:12", "verdict": "person",    "note": "dark figure, lower right"}
+  ],
+  "ambiguous": [
+    {"t_s": 685,  "mmss": "11:25", "verdict": "unclear", "note": "colour frame, possible movement lower left"},
+    {"t_s": 946,  "mmss": "15:46", "verdict": "unclear", "note": "bright patch moves; reads as light/reflection, no body"}
+  ],
+  "false_positives": [
+    {"t_s": 241,  "mmss": "04:01"}, {"t_s": 408, "mmss": "06:48"},
+    {"t_s": 417,  "mmss": "06:57"}, {"t_s": 442, "mmss": "07:22"},
+    {"t_s": 628,  "mmss": "10:28"}, {"t_s": 663, "mmss": "11:03"},
+    {"t_s": 700,  "mmss": "11:40"}, {"t_s": 719, "mmss": "11:59"},
+    {"t_s": 740,  "mmss": "12:20"}, {"t_s": 1044, "mmss": "17:24"}
+  ],
+  "truth": {"arrivals_in_min": 9, "arrivals_in_max": 11},
+  "estimator_scores": {
+    "_note": "scored against arrivals_in = 9..11",
+    "slit":   {"reported": 21, "true_positives": 9, "false_positives": 10, "precision": 0.45, "verdict": "OVER-counts ~2x; fires on an empty doorway"},
+    "line":   {"reported": 6,  "verdict": "UNDER-counts"},
+    "region": {"reported": 6,  "verdict": "UNDER-counts"},
+    "customer_registry": {"reported": 10, "verdict": "CLOSEST of anything the run produces, and it is not headlined"}
+  }
+}

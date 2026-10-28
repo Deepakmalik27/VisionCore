@@ -1,0 +1,110 @@
+# P0 — 2026-08-19. Built from the video audit + follow_up.txt + probe.txt.
+#
+# EVERY value here is a HYPOTHESIS with a named measurement to run, not a
+# shipped claim. This file exists because the last three times a constant was
+# changed on reasoning alone it had to be reverted (see cam112_fullframe.yaml,
+# which is a graveyard of exactly that).
+#
+# Inherit everything from cam112_fullframe.yaml; only the deltas live here.
+
+camera:
+  id: CAM.112
+  venue: delilah_dallas
+  source_resolution: [3840, 2160]
+  generation: G6
+
+analysis:
+  # CLAHE, built and switched off since it was written. The doorway measures
+  # grey 119-134 against 55-65 for the rest of the frame, so the people there
+  # are backlit silhouettes at conf 0.34-0.46 while the room detects at 0.80.
+  # exposure_clip_limit() already scales the clip with severity and caps at
+  # 4.0 so it cannot amplify noise into phantom people.
+  enable_clahe: true
+  # P2 — RANSAC ground plane instead of bin-median least squares.
+  # in use:  camera 4.04 m, horizon row -261   (impossible)
+  # robust:  camera 2.50 m, horizon row  +32   (and the floor tiles measure
+  #          0.30 m through it, which the operator confirms as 30 cm)
+  enable_robust_ground_plane: true
+  fps: 8
+  detector: yolo11x.pt
+  tracker: botsort-reid
+  reid_weights: clip_market1501.pt
+  max_box_height_frac: 0.95
+  max_box_area_frac: 0.30
+  new_track_conf: 0.25
+  detect_conf_floor: 0.20
+  keep_track_conf: 0.15
+  size_filter_tol: 4.0
+  enable_head_recovery: false
+  enable_merged_split: false
+  conf: 0.35
+  dedup_nms_iou: 0.55
+  proxy_render: false
+  profiling: true
+
+  # ── P0-1 · THE DOOR ────────────────────────────────────────────────────
+  # MEASURED 2026-08-19: 93% of the 'entry line' lies inside 'plant area mask'
+  # (186 of 201 sampled points; the other two lines are at 0%). _drop_masked
+  # deletes every detection whose feet land in a mask, so the main entrance
+  # could never produce a crossing. It read IN 0 | OUT 0 for all 300s of the
+  # 5-minute run while people were visibly walking through the door.
+  #
+  # This turns the mask from "delete everything here" into "require motion
+  # here". A plant never moves and stays suppressed; a guest walking to the
+  # door survives. The mechanism already existed in engine.py _drop_masked and
+  # has been OFF (0.0) since it was written.
+  #
+  # 12.0 px of spread within the motion window is a STARTING POINT, not a
+  # measurement — phantoms.py separates a statue (size cv ~0.004) from a
+  # standing person (~0.080) by 19x, so there is real margin, but the pixel
+  # spread equivalent has not been measured on this camera. A/B it alone:
+  #   expect  entry line crossings 0 -> non-zero
+  #   watch   guests, false events, and whether the plant re-appears as a track
+  mask_require_motion: 12.0
+  mask_motion_window_s: 60.0
+  mask_static_s: 30.0
+
+  # ── P0-6 · STOP TRUSTING METRES ────────────────────────────────────────
+  # The ground plane fit reports a camera 4-5.5m up with the horizon at a
+  # NEGATIVE row. A restaurant ceiling is ~3m. ENABLE_LIVE_IDENTITY_MEMORY is
+  # the ONLY consumer of MAX_WALK_SPEED_MPS, so this single flag is what
+  # follow_up.txt means by "disable every metre-based rule". Turn it back on
+  # the day tools/calibrate_plane.py has actually been run.
+  # NOTE this also disables the live re-id memory itself, which is NOT free —
+  # expect id churn to change. That is why it is a measured A/B, not a fix.
+  enable_live_identity_memory: false
+
+  # ── P0-5 · GMC ON A BOLTED-DOWN CAMERA ─────────────────────────────────
+  # Global motion compensation estimates how the CAMERA moved between frames.
+  # This is a G6 turret screwed to a ceiling. Until 2026-08-19 this A/B could
+  # not be run at all: ENABLE_GMC had no yaml key, and the ultralytics tracker
+  # yaml hardcoded "sparseOptFlow" while the boxmot path read GMC_METHOD — two
+  # backends, two knobs, one unreachable. Both now honour these keys.
+  # Flip to false and compare: track survival, fragments, id switches, FPS.
+  enable_gmc: true
+  gmc_method: sof
+
+  # ── P0-4 · RESOLUTION STARVATION ───────────────────────────────────────
+  # NOT changed here, but recorded so the experiment is run correctly.
+  #
+  # The chain is TWO downscales, not one:
+  #     source 3840 wide
+  #       -> frame_source(max_w=ANALYSIS_MAX_W=1920)   2.0x  <- happens FIRST
+  #       -> model(imgsz=YOLO_IMGSZ=1280)              1.5x
+  #     = 3x linear, 9x pixels, before the detector sees anything.
+  #
+  # probe.txt proposes sweeping imgsz 1280/1920/2560. That experiment would be
+  # MEANINGLESS above 1920: the frame handed to the detector is already only
+  # 1920 wide, so 2560 merely upsamples destroyed detail and the sweep would
+  # "prove" resolution does not help.
+  #
+  # Evidence it does help: on f2139 a large, unoccluded woman in a white dress
+  # is missed at full frame, and RECOVERED (conf 0.34) from a 2x-upscaled crop.
+  # Same model, same frame, only the pixels-on-target changed.
+  #
+  # So sweep max_width FIRST, with imgsz following it:
+  #     max_width 1920 / imgsz 1280   <- today's baseline
+  #     max_width 2560 / imgsz 1600
+  #     max_width 3840 / imgsz 1920   <- 4x the pixels; measure the cost
+  max_width: 1920
+  imgsz: 1280

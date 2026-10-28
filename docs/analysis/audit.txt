@@ -1,0 +1,2273 @@
+Yes. I went through the uploaded **75.08-second / 4,505-frame video** and analyzed the actual pipeline output, including the overlays, tracking boxes, zone/line counters, temporal behavior, and the major frame-to-frame mode transitions.
+
+One very important discovery first:
+
+> **Your 75-second video represents ~10 minutes of real camera time.**
+
+The embedded camera timestamp goes from approximately **06:29:58 PM → 06:39:57 PM**, while the video is 75.08 seconds. So this clip is approximately **8× accelerated**. That matters enormously when evaluating tracking, velocity, lost-track duration, and event timing.
+
+---
+
+# My overall verdict
+
+Your current pipeline is **a good prototype/demo**, but I would **not trust it yet for production-grade unique-person counting or persistent identity**.
+
+The biggest problem is **not YOLO detection**.
+
+The biggest problems are:
+
+1. **Identity management**
+2. **Staff identification**
+3. **Count/occupancy reconciliation**
+4. **Camera day/night/IR transitions**
+5. **Occlusion handling**
+6. **Zone/event semantics**
+7. **Temporal state management**
+8. **No clear uncertainty layer**
+9. **No evidence/replay layer**
+10. **Track ID ≠ global identity**
+
+And there are several things visible directly in this video that I would classify as **red flags**.
+
+---
+
+# 🔴 RED FLAG #1 — Your camera mode is changing violently
+
+This is the biggest issue I saw.
+
+Your video switches between:
+
+```text
+IR / monochrome
+        ↓
+color
+        ↓
+IR / monochrome
+        ↓
+color
+        ↓
+IR
+        ↓
+color
+```
+
+The transitions are not gradual.
+
+I found major transitions around approximately:
+
+```text
+19.0 sec
+40.5 sec
+41.6 sec
+42.5 sec
+68.6 sec
+71.6 sec
+```
+
+And some transitions are extremely abrupt.
+
+For example, around ~40–42 seconds:
+
+```text
+COLOR
+   ↓
+MONOCHROME / IR
+   ↓
+VERY DARK
+   ↓
+COLOR
+   ↓
+MONOCHROME
+```
+
+That is **terrible for appearance-based Re-ID if you haven't explicitly designed for it.**
+
+![Image](https://images.openai.com/static-rsc-4/glhT49lKsLHH9v3Rukzlv5Qw5UjTmifoCnxw-EzBaT8QIgLb6ths0ZzPVXO7w_VbPXT9sYdEeEtBAC2zELVWLl77WHJsO1a3T-RX2tUCid01lAjWjeANsDn_qh8oJptzfxsVr_LBFF9PM5kEbM-Fnd2hqc5rOSRtVhBmfLGr7nsa3qemw-ljxwFBrZOdbbpz?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/W46Mt7wUfJF8yIRFxhnf4Qr91M13yZICH9G27PMcJjih5O0h-yOLPuQdzclsgglTDXKhqxerVaoRy3AVny0heJWnA5FYk9TYnz32QCRCDL80vJoU0CJaXeyn6w8jDAfgYBESizK1_dVKmx-cgwNaFptX3yHKAAllRe_6hW-W2JLYVN062y7ON0PezEd0IrSo?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/2yAzfFOvh9fkrCQsxXA0NaymmTMlOL-URgNGxixUaUMVoLj5miOA3jkDAfSTiVeQnIPErEIBeFNYeS6I_7Io-PmSqx1iHHDAVBFHTY6wJpfL7LQKXpNH7YO2fbfTEgelmoZv4E8_zFqpCmT7VksXlL7HNpRX1bBUU6GZNaXxY3XtDdYo6g3yKwT3pH17jA11?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/2ptRt4yI-PaDin9AsZ44KPdKizf80kK_6DbleWIJ7LDuCliC85eYeF-6wwKSlA7qob0fdK0cNGfTRIlp8FQzx2ArxJ_dV_Svm6bWJnZEQmJOLpO7iZKUs58IEg_AzTKtAylhLPRo28vErlgJAQXbESMsR0dQBjCaKLSaTXf4SYXMVafJQ-XWZ5NaNcjNeOnZ?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/65PM6wO9VVQL6dv7LAgQZECClHx7bXYluOXsx2N9Bidd2hKhv6PwIWvau2RaEgIW64on-bBP95ZPhuyTLo2FD6hhSUSUdqlmRWrGZDoKJ8dxJDng7gX93R_nyYeeb1PqfF9aOmOnIeg0Pgj_TNUjysn_rfhY589YZTpeWIwckA7QVUXNLnnBJYqe_gtAehX1?purpose=fullsize)
+
+### Why this matters
+
+Imagine:
+
+```text
+P001
+
+RGB:
+black shirt
+skin tone
+brown hair
+```
+
+Then:
+
+```text
+IR:
+everything becomes grayscale
+```
+
+Then:
+
+```text
+RGB again:
+different exposure/color
+```
+
+A naive Re-ID model can think:
+
+```text
+P001 → P017
+```
+
+even though it's the same person.
+
+### Fix
+
+Your Re-ID architecture needs **modality awareness**:
+
+```text
+                FRAME
+                  │
+                  ▼
+          DAY / NIGHT / IR
+                  │
+       ┌──────────┼──────────┐
+       ▼          ▼          ▼
+      RGB        IR       TRANSITION
+       │          │          │
+       └──────────┼──────────┘
+                  ▼
+           modality-aware
+                Re-ID
+```
+
+Even better:
+
+**Never rely heavily on RGB color as identity evidence.**
+
+---
+
+# 🔴 RED FLAG #2 — Staff detection is currently not actually solved
+
+This is extremely obvious from your overlay.
+
+At ~1:59:
+
+```text
+people in frame: 2
+(0 staff)
+```
+
+Yet there are clearly two people visible, including the person operating/standing behind the reception area.
+
+At ~6:23:
+
+```text
+people in frame: 4
+(0 staff)
+```
+
+At ~9:19:
+
+```text
+people in frame: 5
+(0 staff)
+```
+
+At ~9:51:
+
+```text
+people in frame: 5
+(0 staff)
+```
+
+But visually, there are people who should be candidates for your staff population.
+
+So:
+
+> **Your current system is detecting people, but it is not reliably identifying staff.**
+
+And this is critical because you told me you want:
+
+```text
+STAFF
+ ↓
+persistent identity
+ ↓
+activity
+ ↓
+movement
+ ↓
+exclude from customer counts
+```
+
+You're not there yet.
+
+### You need
+
+```text
+Person Detection
+       ↓
+Tracking
+       ↓
+Re-ID
+       ↓
+Staff Gallery
+       ↓
+Staff Identity
+```
+
+For example:
+
+```text
+Staff S001
+Staff S002
+Staff S003
+```
+
+Each needs multiple reference embeddings:
+
+```text
+S001
+ ├── front
+ ├── side
+ ├── back
+ ├── RGB
+ ├── IR
+ ├── different clothing/lighting
+ └── multiple days
+```
+
+---
+
+# 🔴 RED FLAG #3 — Your "people in frame" and IN/OUT numbers aren't reconciling
+
+This is probably the biggest **logic-engineering** problem.
+
+For example, around **9:51** your overlay says approximately:
+
+```text
+people in frame = 5
+
+entered = 8
+exited = 6
+```
+
+If the initial frame had 1 person:
+
+```text
+initial = 1
+
+1 + 8 - 6 = 3
+```
+
+But:
+
+```text
+observed = 5
+```
+
+There is a discrepancy.
+
+At ~5:19:
+
+```text
+people in frame = 5
+entered = 6
+exited = 4
+```
+
+Starting from 1:
+
+```text
+1 + 6 - 4 = 3
+```
+
+But:
+
+```text
+5 people visible
+```
+
+Again, mismatch.
+
+At ~3:59:
+
+```text
+people = 3
+entered = 3
+exited = 2
+```
+
+Starting from 1:
+
+```text
+1 + 3 - 2 = 2
+```
+
+Observed:
+
+```text
+3
+```
+
+### This means you don't have a proper occupancy conservation model yet.
+
+Your system needs:
+
+```text
+Occupancy(t)
+=
+InitialOccupancy
++
+ValidEntries(t)
+-
+ValidExits(t)
+```
+
+And then:
+
+```text
+ObservedTracks
+       vs
+ExpectedOccupancy
+```
+
+must continuously reconcile.
+
+If they disagree:
+
+```text
+⚠ OCCUPANCY MISMATCH
+```
+
+That becomes an anomaly.
+
+---
+
+# 🔴 RED FLAG #4 — Your line counters are not necessarily semantically correct
+
+At ~6:23:
+
+```text
+entry line      IN 6 | OUT 1
+dining entry    IN 6 | OUT 7
+```
+
+At ~9:19:
+
+```text
+entry line      IN 6 | OUT 2
+dining entry    IN 10 | OUT 9
+```
+
+At ~9:51:
+
+```text
+entry line      IN 7 | OUT 2
+dining entry    IN 10 | OUT 9
+```
+
+These aren't inherently mathematically wrong because different lines can represent different flows.
+
+But your pipeline needs to clearly define:
+
+```text
+What population does this counter represent?
+```
+
+For example:
+
+```text
+MAIN_ENTRANCE_IN
+MAIN_ENTRANCE_OUT
+
+RECEPTION_TO_DINING
+DINING_TO_RECEPTION
+
+STAFF_ENTRY
+STAFF_EXIT
+```
+
+These cannot just be generic "IN/OUT".
+
+---
+
+# 🔴 RED FLAG #5 — Your "staff entry" line appears to be a geometric line, not staff intelligence
+
+I see:
+
+```text
+staff entry IN 10 | OUT 14
+```
+
+But the system simultaneously says:
+
+```text
+0 staff
+```
+
+That tells me something very important.
+
+Your current implementation probably has:
+
+```text
+STAFF_ENTRY_LINE
+```
+
+but the line itself doesn't necessarily know:
+
+> "This is a staff member."
+
+It is likely doing:
+
+```text
+Person crosses line
+→ increment staff-entry counter
+```
+
+That is **not staff tracking**.
+
+You need:
+
+```text
+Person
+ ↓
+Global Identity
+ ↓
+Staff classifier
+ ↓
+IF staff:
+      apply staff event rules
+ELSE:
+      customer event rules
+```
+
+---
+
+# 🔴 RED FLAG #6 — The reception desk causes severe occlusion
+
+Look carefully at the ~8-second frame.
+
+There are visibly multiple people, but the system reports:
+
+```text
+people in frame: 1
+```
+
+The foreground person is detected, but another person behind/around the reception area isn't reliably represented as a track.
+
+This is exactly the type of scene that will destroy naive MOT.
+
+Your environment has:
+
+* reception desk
+* plant
+* shelves
+* doorway
+* people crossing each other
+* people standing behind the desk
+* partial body visibility
+
+So you need **occlusion-aware tracking**.
+
+---
+
+# 🔴 RED FLAG #7 — The plant is a serious occlusion obstacle
+
+The huge plant in the middle-right isn't just visual decoration.
+
+It creates a tracking problem.
+
+A person can go:
+
+```text
+VISIBLE
+   ↓
+PARTIALLY OCCLUDED BY PLANT
+   ↓
+DISAPPEAR
+   ↓
+REAPPEAR
+```
+
+A normal tracker can create:
+
+```text
+P004
+   ↓
+lost
+   ↓
+P011
+```
+
+Your solution needs:
+
+```text
+Track memory
++
+Kalman prediction
++
+trajectory
++
+Re-ID
++
+zone constraints
+```
+
+---
+
+# 🔴 RED FLAG #8 — Door region has extreme brightness
+
+The right-hand entrance is very bright.
+
+You have:
+
+```text
+dark interior
+        +
+bright outside
+        +
+glass/reflection
+```
+
+That is a terrible Re-ID environment.
+
+A person entering from outside can be:
+
+```text
+silhouette
+```
+
+for several frames.
+
+So you should have a dedicated:
+
+```text
+ENTRANCE ROI
+```
+
+with different:
+
+* exposure handling
+* detection threshold
+* confidence threshold
+* tracking behavior
+
+---
+
+# 🔴 RED FLAG #9 — Your camera is very perspective-heavy
+
+This is not a normal front-facing CCTV.
+
+It is a high/overhead-ish view.
+
+Therefore:
+
+```text
+person near camera
+```
+
+and
+
+```text
+person far away
+```
+
+have dramatically different pixel sizes.
+
+Your detector must handle:
+
+```text
+small person
+medium person
+large person
+partial person
+```
+
+with different confidence characteristics.
+
+Don't use one global threshold blindly.
+
+---
+
+# 🔴 RED FLAG #10 — You have small/partial detections that should not immediately become identities
+
+Near the entrance, I can see people where only a portion of the body is visible.
+
+This is dangerous.
+
+A partial detection should be:
+
+```text
+candidate track
+```
+
+not immediately:
+
+```text
+confirmed global person
+```
+
+You need:
+
+```text
+NEW
+ ↓
+TENTATIVE
+ ↓
+CONFIRMED
+```
+
+---
+
+# 🔴 RED FLAG #11 — Your track IDs need to be separated from Global Person IDs
+
+I see IDs such as:
+
+```text
+P1
+P3
+P4
+P5
+P6
+P7
+P10
+```
+
+This is okay as a **local tracking ID**.
+
+But don't use that as the permanent identity.
+
+You need:
+
+```text
+Camera Track:
+P7
+
+        ↓
+
+Global Identity:
+PERSON_000127
+```
+
+If P7 disappears and tracker later assigns P13:
+
+```text
+P7
+ ↓
+lost
+ ↓
+P13
+```
+
+your Global Identity Engine decides:
+
+```text
+P13 = PERSON_000127
+```
+
+if evidence supports it.
+
+---
+
+# 🔴 RED FLAG #12 — Track duration is useful, but you're missing a proper lifecycle
+
+I can see labels such as:
+
+```text
+P5 00:58
+P4 01:10
+P7 00:44
+```
+
+That's good.
+
+But you need a proper state machine:
+
+```text
+NEW
+ ↓
+TENTATIVE
+ ↓
+CONFIRMED
+ ↓
+ACTIVE
+ ↓
+OCCLUDED
+ ↓
+LOST
+ ↓
+RECOVERED
+ ↓
+EXITED
+ ↓
+CLOSED
+```
+
+Not:
+
+```text
+detected → exists → disappears
+```
+
+---
+
+# 🔴 RED FLAG #13 — You need a "lost track" state
+
+Suppose:
+
+```text
+P001
+```
+
+walks behind the plant.
+
+You should NOT immediately delete P001.
+
+Instead:
+
+```text
+P001
+ACTIVE
+ ↓
+OCCLUDED
+ ↓
+PREDICTING
+ ↓
+RE-ID SEARCH
+ ↓
+RECOVERED
+```
+
+Only after a time/trajectory threshold:
+
+```text
+LOST → CLOSED
+```
+
+---
+
+# 🔴 RED FLAG #14 — Your pipeline doesn't appear to have uncertainty exposed
+
+Your UI mostly says:
+
+```text
+P1
+P3
+P4
+...
+```
+
+But it doesn't show:
+
+```text
+Identity confidence
+Track confidence
+Re-ID confidence
+Event confidence
+```
+
+That's dangerous.
+
+You want:
+
+```text
+P0042
+
+Detection      0.97
+Tracking       0.93
+Re-ID          0.89
+Zone           0.98
+Event          0.94
+```
+
+Then:
+
+```text
+EVENT = CONFIRMED
+```
+
+---
+
+# 🔴 RED FLAG #15 — No evidence trail visible
+
+Suppose your system says:
+
+```text
+PERSON_0042 ENTERED
+```
+
+You need to be able to ask:
+
+> Why?
+
+And get:
+
+```text
+Frame -2 sec
+Frame crossing
+Frame +2 sec
+trajectory
+Re-ID candidates
+zone
+direction
+confidence
+```
+
+Without that, debugging will be painful.
+
+---
+
+# 🟠 The day/night problem is more serious than it looks
+
+Your system needs a dedicated **camera modality manager**.
+
+I'd implement:
+
+```text
+CAMERA
+  │
+  ▼
+MODE DETECTOR
+  │
+  ├── RGB
+  ├── IR
+  ├── LOW LIGHT
+  └── TRANSITION
+```
+
+During transition:
+
+```text
+DO NOT aggressively change identity
+```
+
+Instead:
+
+```text
+identity matching weight:
+trajectory ↑
+motion ↑
+geometry ↑
+ReID ↓ temporarily
+color ↓
+```
+
+---
+
+# 🟠 Another major issue: your video is accelerated
+
+This is extremely important for your engineering.
+
+Your 75-second file represents ~10 minutes.
+
+Therefore:
+
+```text
+Video FPS = 60
+```
+
+does **not** mean:
+
+```text
+real-world temporal sampling = 60 FPS
+```
+
+Approximately:
+
+```text
+60 / 7.98 ≈ 7.5 real-time frames/sec
+```
+
+So when you're tuning:
+
+```text
+lost_track_timeout
+velocity
+max_age
+line_crossing_window
+loitering
+action duration
+```
+
+you need to distinguish:
+
+### Video time
+
+from
+
+### Real camera time.
+
+Otherwise your thresholds will be wrong by approximately **8×**.
+
+---
+
+# 🟠 Your action/pose layer should NOT be added yet
+
+You asked earlier about skeleton tracking.
+
+I would **not add pose/action recognition right now**.
+
+Your current fundamental problem is:
+
+```text
+Who is this?
+Where are they?
+Did they actually enter?
+Did they actually leave?
+```
+
+Until those are reliable, adding:
+
+```text
+pose
+action
+fall detection
+activity recognition
+```
+
+will just create more complexity.
+
+First stabilize:
+
+**Identity → trajectory → zones → events.**
+
+Then add pose.
+
+---
+
+# 🟠 You also need a "physical world model"
+
+Your zones are currently mostly 2D polygons.
+
+I'd make the venue a small spatial graph:
+
+```text
+             OUTSIDE
+                │
+                ▼
+          MAIN ENTRANCE
+                │
+                ▼
+           RECEPTION
+           /        \
+          /          \
+         ▼            ▼
+   WAITING AREA      DINING
+         │
+         ▼
+      OTHER
+```
+
+Now your event engine knows:
+
+```text
+Reception → Dining
+```
+
+is possible.
+
+But:
+
+```text
+Reception → Outside
+```
+
+must cross a particular exit boundary.
+
+And if someone appears to jump:
+
+```text
+Reception → Dining
+```
+
+without a plausible trajectory:
+
+```text
+ANOMALY
+```
+
+---
+
+# 🟠 You need identity "gates"
+
+Don't allow arbitrary Re-ID matching.
+
+For example:
+
+```text
+Candidate A
+Candidate B
+Candidate C
+```
+
+must pass:
+
+```text
+1. spatial distance
+2. temporal gap
+3. velocity feasibility
+4. zone compatibility
+5. Re-ID similarity
+6. appearance consistency
+```
+
+Then:
+
+```text
+MATCH
+```
+
+or:
+
+```text
+NO MATCH
+```
+
+This will dramatically reduce ID switches.
+
+---
+
+# 🟠 Your database needs two different concepts
+
+Don't store only:
+
+```text
+Person P1
+```
+
+You need:
+
+### Identity
+
+```text
+PERSON_0001
+```
+
+and:
+
+### Visit
+
+```text
+VISIT_0001
+```
+
+Example:
+
+```text
+PERSON_0001
+
+Visit #1
+10:02 → 10:43
+
+Visit #2
+11:17 → 12:05
+```
+
+Therefore:
+
+```text
+Unique people = 1
+Visits = 2
+```
+
+This directly solves your earlier requirement.
+
+---
+
+# 🟢 Things that are actually good in your current pipeline
+
+I don't want to only criticize it.
+
+There are several things you've already done correctly.
+
+### ✅ 1. You have persistent-looking track IDs
+
+Good foundation.
+
+### ✅ 2. You have track duration
+
+Very useful.
+
+### ✅ 3. You have zone definitions
+
+I can see:
+
+```text
+reception
+waiting area
+main entrance
+dining
+```
+
+This is exactly the right direction.
+
+### ✅ 4. You have directional lines
+
+Good.
+
+### ✅ 5. You have IN/OUT counters
+
+Good concept, but event semantics need strengthening.
+
+### ✅ 6. You have camera timestamps
+
+Excellent.
+
+### ✅ 7. You have a build identifier
+
+I can see:
+
+```text
+build 436f47b1b377
+```
+
+Keep doing this.
+
+### ✅ 8. You have a real-time/processed-time display
+
+Good for debugging.
+
+### ✅ 9. You have occupancy information
+
+Useful, but it needs reconciliation.
+
+---
+
+# What I would remove/rethink
+
+Some parts aren't worth spending engineering time on **yet**.
+
+### ❌ Don't obsess over YOLO model selection yet
+
+Your current problems aren't primarily:
+
+> YOLOv11 vs YOLOv12 vs another detector.
+
+You have architectural problems first.
+
+---
+
+### ❌ Don't run Re-ID on every frame
+
+Waste of GPU.
+
+Use:
+
+```text
+Normal track
+→ cheap tracking
+
+Uncertain track
+→ Re-ID
+```
+
+---
+
+### ❌ Don't run pose on everyone
+
+Later:
+
+```text
+only staff
++
+only relevant tracks
++
+only action windows
+```
+
+---
+
+### ❌ Don't make the database part of the frame loop
+
+Use:
+
+```text
+CV → Event Queue → DB
+```
+
+---
+
+### ❌ Don't make line crossing the final truth
+
+Line crossing is only **evidence**.
+
+Final event should be:
+
+```text
+line crossing
++
+direction
++
+identity
++
+trajectory
++
+zone
++
+temporal validation
+```
+
+---
+
+# Your improved pipeline
+
+I would now change your architecture to this:
+
+```text
+                    VIDEO
+                      │
+                      ▼
+              VIDEO DECODER
+                      │
+                      ▼
+             CAMERA HEALTH
+                      │
+                      ▼
+              CALIBRATION
+                      │
+                      ▼
+          DAY/NIGHT/IR DETECTOR
+                      │
+                      ▼
+              PREPROCESSING
+                      │
+                      ▼
+                MOTION
+                      │
+                      ▼
+             PERSON DETECTOR
+                      │
+                      ▼
+             LOCAL TRACKER
+                      │
+              ┌───────┴───────┐
+              ▼               ▼
+        TRACK MEMORY        RE-ID
+              │               │
+              └───────┬───────┘
+                      ▼
+            GLOBAL ID MANAGER
+                      │
+             ┌────────┴────────┐
+             ▼                 ▼
+           STAFF             CUSTOMER
+             │                 │
+             └────────┬────────┘
+                      ▼
+             TRAJECTORY ENGINE
+                      │
+                      ▼
+                ZONE ENGINE
+                      │
+                      ▼
+             STATE MACHINE
+                      │
+                      ▼
+              EVENT ENGINE
+                      │
+       ┌──────────────┼──────────────┐
+       ▼              ▼              ▼
+      ENTRY          EXIT          MOVEMENT
+       │              │              │
+       └──────────────┼──────────────┘
+                      ▼
+             OCCUPANCY ENGINE
+                      │
+                      ▼
+             RECONCILIATION
+                      │
+              ┌───────┴───────┐
+              ▼               ▼
+          CONFIRMED        UNCERTAIN
+              │               │
+              ▼               ▼
+          DATABASE         REVIEW
+              │
+              ▼
+          ANALYTICS
+```
+
+---
+
+# And THEN add these
+
+After the above is stable:
+
+```text
+GLOBAL ID
+    │
+    ├── Pose
+    │
+    ├── Activity recognition
+    │
+    ├── Loitering
+    │
+    ├── Restricted-zone anomaly
+    │
+    ├── Fall detection
+    │
+    └── Staff activity
+```
+
+---
+
+# My priority ranking for YOUR current pipeline
+
+| Priority | Problem                           | Severity    |
+| -------- | --------------------------------- | ----------- |
+| 1        | Global identity management        | 🔴 Critical |
+| 2        | Staff identification              | 🔴 Critical |
+| 3        | Occupancy/count reconciliation    | 🔴 Critical |
+| 4        | IR/RGB mode transitions           | 🔴 Critical |
+| 5        | Occlusion recovery                | 🔴 Critical |
+| 6        | Track lifecycle/state machine     | 🔴 Critical |
+| 7        | Re-ID gating                      | 🔴 Critical |
+| 8        | Entrance/zone event semantics     | 🔴 Critical |
+| 9        | Uncertainty/confidence engine     | 🔴 High     |
+| 10       | Evidence/replay                   | 🔴 High     |
+| 11       | Camera health                     | 🟠 High     |
+| 12       | Perspective/small-object handling | 🟠 High     |
+| 13       | Adaptive inference                | 🟠 High     |
+| 14       | Crowd handling                    | 🟠 High     |
+| 15       | Pose                              | 🟡 Later    |
+| 16       | Action recognition                | 🟡 Later    |
+| 17       | Fancy anomaly AI                  | 🟡 Later    |
+
+---
+
+# The biggest architectural change I'd make
+
+Your current mental model is roughly:
+
+```text
+Detector
+ ↓
+Tracker
+ ↓
+Count
+```
+
+I would change it to:
+
+```text
+                  DETECTION
+                     ↓
+                  TRACKING
+                     ↓
+                  RE-ID
+                     ↓
+             GLOBAL IDENTITY
+                     ↓
+                 TRAJECTORY
+                     ↓
+                   ZONES
+                     ↓
+               STATE MACHINE
+                     ↓
+              EVENT REASONING
+                     ↓
+             OCCUPANCY CHECK
+                     ↓
+              CONFIDENCE GATE
+                     ↓
+               FINAL EVENT
+```
+
+**That is the direction I would take this project.**
+
+And based specifically on this video, **I would not spend your next week trying to improve YOLO accuracy by 2–3%.** I'd spend it fixing the **identity + temporal + event + modality + reconciliation architecture**, because those are currently much bigger sources of failure than the detector itself.
+
+If you give me the **actual source code/notebook for this `ALLWIRED` pipeline**, I can go one level deeper and audit it **module-by-module** — calibration, fusion, tracker, Re-ID, counting, anomaly logic, database, thresholds, frame skipping, and identify exactly which code/logic should be removed, rewritten, or added.
+
+
+
+
+Yes — **this is the key point I would change in your thinking.**
+
+After looking through the video sequence-by-sequence, I don't think the solution is simply "use a better YOLO." The system needs a mechanism that can say:
+
+> **"I don't trust what I just detected because the surrounding frames contradict it."**
+
+A normal detector does **not** know that by itself. It sees one frame, produces boxes, and moves on.
+
+Your system needs to become **self-checking**.
+
+## What I can actually see in your video
+
+I went through the video across the full timeline, including the difficult sections around **6–12s, 17–21s, 38–43s, 45–67s and 68–74s**, and the major RGB/IR transitions.
+
+There are several recurring failure patterns:
+
+### 1. A person is clearly visible, but there is no box
+
+For example around **8 seconds**, the person behind the reception desk is visually obvious, but the overlay reports only one person. In the surrounding frames, that person appears/disappears from detection depending on position/occlusion.
+
+That isn't necessarily a "bad YOLO model."
+
+The scene is telling us:
+
+```text
+Frame t-2: person
+Frame t-1: person
+Frame t:   MISSING
+Frame t+1: person
+Frame t+2: person
+```
+
+Your system should automatically conclude:
+
+> **Detection at t is probably a miss.**
+
+It shouldn't create a new identity or alter the count.
+
+---
+
+# This is the architecture you're missing
+
+Currently you are approximately:
+
+```text
+FRAME
+  ↓
+DETECT
+  ↓
+TRACK
+  ↓
+COUNT
+```
+
+I want you to move to:
+
+```text
+FRAME
+  ↓
+DETECT
+  ↓
+TRACK
+  ↓
+TEMPORAL CHECK
+  ↓
+IDENTITY CHECK
+  ↓
+PHYSICAL/ZONE CHECK
+  ↓
+OCCUPANCY CHECK
+  ↓
+EVENT CHECK
+  ↓
+TRUST / REJECT / UNCERTAIN
+```
+
+That middle section is what makes the system intelligent.
+
+---
+
+# 🔥 The biggest recommendation: build a "Vision Validator"
+
+This should be an actual module in your pipeline.
+
+Call it something like:
+
+**Track & Event Validator**
+
+For every track, it asks:
+
+### Question 1
+
+> Was this person present in previous frames?
+
+```text
+P0042
+
+t-5  ✓
+t-4  ✓
+t-3  ✓
+t-2  ✓
+t-1  ✓
+t    ✗
+t+1  ✓
+t+2  ✓
+```
+
+Then:
+
+**Do NOT terminate P0042.**
+
+Mark:
+
+```text
+P0042 = temporary detection miss
+```
+
+---
+
+# Question 2
+
+Can the person's motion explain where they went?
+
+Suppose:
+
+```text
+Frame 100
+P0042 = x=500,y=600
+
+Frame 101
+P0042 = missing
+
+Frame 102
+P0042 = x=515,y=603
+```
+
+Obviously:
+
+**same person.**
+
+But if the new detection is:
+
+```text
+x=1300,y=300
+```
+
+that's physically suspicious.
+
+So:
+
+```text
+motion prediction
++
+distance
++
+velocity
+```
+
+should be checked.
+
+---
+
+# Question 3
+
+Does Re-ID agree?
+
+```text
+Previous P0042 embedding
+             ↓
+New detection embedding
+             ↓
+similarity
+```
+
+But don't let Re-ID make the decision alone.
+
+Use:
+
+```text
+Motion          30%
+Re-ID           30%
+Trajectory      20%
+Zone            10%
+Appearance      10%
+```
+
+The exact weights need calibration, but the **principle** is important.
+
+---
+
+# Question 4
+
+Does the person's movement make physical sense?
+
+Your venue gives you a huge advantage.
+
+You know:
+
+```text
+OUTSIDE
+   ↓
+MAIN ENTRANCE
+   ↓
+RECEPTION
+   ↓
+DINING
+```
+
+Therefore if the system says:
+
+```text
+P0042
+
+18:32:01 Reception
+
+18:32:01.1 Dining
+```
+
+but that movement is physically impossible:
+
+**reject the association.**
+
+---
+
+# Question 5
+
+Does the occupancy math agree?
+
+This is particularly important because I found discrepancies in your current overlay.
+
+Your system needs:
+
+```text
+Expected occupancy
+=
+initial occupancy
++
+validated IN
+-
+validated OUT
+```
+
+Then compare it with:
+
+```text
+Observed occupancy
+=
+confirmed global tracks currently inside
+```
+
+If:
+
+```text
+Expected = 4
+Observed = 3
+```
+
+don't silently accept it.
+
+Generate:
+
+> ⚠ Occupancy reconciliation failure
+
+Then investigate:
+
+```text
+missing track?
+false exit?
+false entry?
+staff incorrectly classified?
+ID switch?
+camera occlusion?
+```
+
+**This is how your system starts detecting its own mistakes.**
+
+---
+
+# 🔥 Even better: use the fact that your video is prerecorded
+
+This is actually a huge advantage for your project.
+
+You are not necessarily building a live-only system.
+
+You said:
+
+> "I have yesterday's 24-hour video and I don't want to watch it."
+
+That means you can use **future frames**.
+
+A live tracker cannot know:
+
+> "This person will reappear 2 seconds later."
+
+But your offline analyzer CAN.
+
+So don't process the video purely left-to-right.
+
+Instead:
+
+```text
+24-hour video
+      ↓
+Pass 1
+Forward tracking
+      ↓
+Tracklets
+      ↓
+Pass 2
+Backward tracking
+      ↓
+Tracklet stitching
+      ↓
+Re-ID
+      ↓
+Temporal reconciliation
+      ↓
+Final identities
+      ↓
+Events
+```
+
+This can be **much more accurate** than a live tracker.
+
+---
+
+# This is something I strongly recommend for your project
+
+Have two modes:
+
+### Live mode
+
+```text
+Camera
+ ↓
+Detection
+ ↓
+Tracking
+ ↓
+Events
+```
+
+Fast, but limited because future information doesn't exist.
+
+### Offline analysis mode
+
+```text
+Recorded video
+ ↓
+Detection
+ ↓
+Forward tracking
+ ↓
+Backward tracking
+ ↓
+Tracklet stitching
+ ↓
+Re-ID
+ ↓
+Temporal correction
+ ↓
+Event correction
+ ↓
+Final database
+```
+
+For your **24-hour historical video**, use the second one.
+
+That is a major opportunity.
+
+---
+
+# Another thing I noticed: your camera is extremely difficult for Re-ID
+
+The RGB ↔ IR transitions are severe.
+
+You have sections like:
+
+```text
+RGB
+ ↓
+IR
+ ↓
+very dark
+ ↓
+RGB
+ ↓
+IR
+```
+
+The model should know:
+
+```text
+MODE = RGB
+MODE = IR
+MODE = TRANSITION
+```
+
+Don't give those frames identical treatment.
+
+During transition:
+
+```text
+Re-ID confidence ↓
+Color importance ↓
+Motion importance ↑
+Trajectory importance ↑
+Geometry importance ↑
+```
+
+And maintain existing identities rather than aggressively creating new ones.
+
+---
+
+# 🔥 You should add a "missing person hypothesis"
+
+This is different from normal tracking.
+
+Suppose:
+
+```text
+P0042
+```
+
+exists for 100 frames.
+
+Then:
+
+```text
+frame 101 → no detection
+frame 102 → no detection
+frame 103 → no detection
+frame 104 → detection
+```
+
+Don't say:
+
+> P0042 disappeared.
+
+Create:
+
+```text
+P0042
+status = OCCLUDED
+```
+
+Then:
+
+```text
+predict trajectory
+search expected area
+search nearby detections
+compare Re-ID
+check zone
+```
+
+If found:
+
+```text
+RECOVERED
+```
+
+If not:
+
+```text
+LOST
+```
+
+This is dramatically better than deleting the ID.
+
+---
+
+# 🔥 Add a "phantom detection" detector too
+
+The opposite problem exists.
+
+Sometimes the model may produce:
+
+```text
+person
+```
+
+but it's actually:
+
+* reflection
+* poster
+* object
+* partial body
+* plant
+* furniture
+* image on screen
+
+Don't immediately create a track.
+
+Require:
+
+```text
+Detection
+ ↓
+temporal confirmation
+ ↓
+motion consistency
+ ↓
+person-shape consistency
+ ↓
+track confirmation
+```
+
+So:
+
+```text
+1-frame person = candidate
+
+3–5 frame consistent person = confirmed
+```
+
+---
+
+# Your plant is a perfect example
+
+Your large plant creates repeated occlusion.
+
+So define an explicit:
+
+```text
+OCCLUSION MASK
+```
+
+around problematic objects.
+
+Not to ignore the region completely.
+
+Instead:
+
+> "Expect tracking uncertainty here."
+
+Then increase track memory around that area.
+
+```text
+Normal area:
+max lost = 0.8 sec
+
+Plant/desk occlusion:
+max lost = 2–3 sec
+```
+
+The exact numbers need to be based on your real-time conversion.
+
+---
+
+# Another major recommendation: use foot-point, not box center
+
+For people counting and zone crossing, don't use:
+
+```text
+bounding_box.center
+```
+
+Use approximately:
+
+```text
+bottom-center of bounding box
+```
+
+because that represents where the person's feet are.
+
+Especially with your camera angle.
+
+Otherwise someone can visually enter a zone while the center of their bounding box hasn't crossed the boundary.
+
+This can create incorrect IN/OUT events.
+
+---
+
+# Add a "zone hysteresis"
+
+Suppose someone stands exactly on your line.
+
+Current logic can become:
+
+```text
+IN
+OUT
+IN
+OUT
+IN
+OUT
+```
+
+Instead:
+
+```text
+approaching line
+ ↓
+crossing candidate
+ ↓
+must remain on new side for N frames
+ ↓
+confirmed crossing
+```
+
+And use separate entry/exit margins:
+
+```text
+             EXIT
+              │
+      ┌───────┴───────┐
+      │   DEAD BAND   │
+      └───────┬───────┘
+              │
+             ENTRY
+```
+
+This eliminates boundary jitter.
+
+---
+
+# 🔥 You also need a "second look" system
+
+This is how I'd make it intelligent without killing speed.
+
+Normal:
+
+```text
+YOLO → Tracker
+```
+
+Suspicious:
+
+```text
+YOLO → Tracker
+             ↓
+        consistency test
+             ↓
+           FAILED
+             ↓
+       SECOND LOOK
+```
+
+Second look could involve:
+
+* higher-resolution crop
+* stronger detector
+* Re-ID
+* pose
+* optical flow
+* neighboring frames
+
+So you don't spend expensive compute on every person.
+
+---
+
+# Example
+
+Normal person:
+
+```text
+P0042
+confidence 96%
+trajectory valid
+Re-ID valid
+zone valid
+
+→ ACCEPT
+```
+
+Suspicious person:
+
+```text
+P0042
+confidence 54%
+trajectory questionable
+partially occluded
+IR transition
+
+→ SECOND LOOK
+```
+
+Then:
+
+```text
+Re-ID = 91%
+trajectory = valid
+neighboring frames = valid
+
+→ RECOVER P0042
+```
+
+That's much smarter.
+
+---
+
+# 🔥 Your model should have "reasons for rejection"
+
+This is another thing I strongly recommend.
+
+Instead of:
+
+```text
+Rejected
+```
+
+store:
+
+```text
+REJECT_REASON =
+
+LOW_DETECTION_CONFIDENCE
+
+or
+
+IMPOSSIBLE_MOTION
+
+or
+
+ZONE_INCONSISTENCY
+
+or
+
+DUPLICATE_TRACK
+
+or
+
+REID_CONFLICT
+
+or
+
+OCCLUSION
+
+or
+
+CAMERA_MODE_TRANSITION
+```
+
+Then after processing 24 hours you can see:
+
+```text
+Detection failures       127
+Re-ID conflicts            34
+Occlusion events          218
+Zone conflicts             11
+Camera transitions         42
+```
+
+Now you know **what to improve**.
+
+That's extremely valuable.
+
+---
+
+# And this is how I'd train the system
+
+Don't collect random people datasets first.
+
+Collect **your failure cases**.
+
+From this exact venue:
+
+```text
+RGB → IR
+IR → RGB
+person behind desk
+person behind plant
+two people crossing
+person entering door
+person partially visible
+small person far away
+bright doorway
+dark room
+person standing on line
+staff behind reception
+crowd
+```
+
+Create a dataset specifically around these.
+
+Then fine-tune.
+
+Your own venue footage is much more valuable than generic benchmark footage for this application.
+
+---
+
+# One thing I would NOT do
+
+Don't simply lower YOLO confidence.
+
+For example:
+
+```text
+0.5 → 0.25
+```
+
+might give you more people.
+
+But it can also give you:
+
+```text
+false positives ↑
+track fragmentation ↑
+Re-ID workload ↑
+false counts ↑
+```
+
+Instead:
+
+> **Fix the temporal system before changing the detector threshold.**
+
+---
+
+# The system I want you to build
+
+Ultimately:
+
+```text
+                  DETECTOR
+                     │
+                     ▼
+                   TRACK
+                     │
+                     ▼
+              TRACK MEMORY
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+      DETECTION OK          DETECTION MISSING
+          │                     │
+          │                PREDICT PERSON
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+                 RE-ID
+                     │
+                     ▼
+               TRAJECTORY
+                     │
+                     ▼
+                  ZONES
+                     │
+                     ▼
+              PHYSICAL RULES
+                     │
+                     ▼
+            OCCUPANCY CHECK
+                     │
+                     ▼
+             TEMPORAL CHECK
+                     │
+                     ▼
+             CONFIDENCE GATE
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+       ACCEPT     SECOND LOOK  REJECT
+          │          │
+          │          ▼
+          │       EXPENSIVE
+          │       ANALYSIS
+          │          │
+          └──────────┴──────────┐
+                                ▼
+                          FINAL EVENT
+                                │
+                                ▼
+                             DATABASE
+```
+
+## So, to answer your exact question:
+
+**Yes, we need to do something.**
+
+The model itself won't reliably say:
+
+> "I missed that person."
+
+But **your pipeline can know that it probably missed them** by looking at the frames before and after.
+
+That's the major upgrade I'd make.
+
+And because this is **recorded 24-hour video**, I would go even further: **use offline bidirectional tracking + tracklet stitching + retrospective event correction.** You have information from the future that a live system doesn't have. That is probably the single biggest opportunity in your architecture for getting both **high accuracy and fast 24-hour analysis**.
+
+Your current detector is not the thing I'd throw away. **Your temporal reasoning layer needs to become much smarter.**

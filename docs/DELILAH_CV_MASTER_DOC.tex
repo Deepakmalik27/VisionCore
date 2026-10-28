@@ -1,0 +1,798 @@
+% =====================================================================
+%  Delilah LA — Camera Analytics: Access, Architecture & Roadmap
+%  Compile on Overleaf: pdfLaTeX.  No exotic packages.
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tcolorbox}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{longtable}
+\usepackage[hidelinks]{hyperref}
+
+% ---------- palette ----------
+\definecolor{ink}{HTML}{1A1A1A}
+\definecolor{brass}{HTML}{9A7B4F}
+\definecolor{ok}{HTML}{2E7D32}
+\definecolor{bad}{HTML}{C62828}
+\definecolor{warn}{HTML}{E88B00}
+\definecolor{cool}{HTML}{1565C0}
+\definecolor{soft}{HTML}{F5F2ED}
+
+\color{ink}
+
+% ---------- headings ----------
+\titleformat{\section}{\Large\bfseries\color{brass}}{\thesection.}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{18pt}{8pt}
+
+\pagestyle{fancy}\fancyhf{}
+\lhead{\small\color{brass}Delilah LA — Camera Analytics}
+\rhead{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ---------- shorthands ----------
+\newcommand{\YES}{\textcolor{ok}{\textbf{YES}}}
+\newcommand{\NO}{\textcolor{bad}{\textbf{NO}}}
+\newcommand{\MAYBE}{\textcolor{warn}{\textbf{UNTESTED}}}
+\newcommand{\tick}{\textcolor{ok}{$\checkmark$}}
+\newcommand{\cross}{\textcolor{bad}{$\times$}}
+\newcommand{\qmark}{\textcolor{warn}{?}}
+
+\newtcolorbox{note}[1]{colback=soft,colframe=brass,title=#1,
+  fonttitle=\bfseries,boxrule=0.6pt,arc=2pt,left=6pt,right=6pt}
+\newtcolorbox{alert}[1]{colback=bad!5,colframe=bad,title=#1,
+  fonttitle=\bfseries,boxrule=0.6pt,arc=2pt,left=6pt,right=6pt}
+\newtcolorbox{good}[1]{colback=ok!5,colframe=ok,title=#1,
+  fonttitle=\bfseries,boxrule=0.6pt,arc=2pt,left=6pt,right=6pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+
+% =====================================================================
+\begin{document}
+
+\begin{center}
+{\Huge\bfseries\color{brass} Delilah LA — Camera Analytics}\\[6pt]
+{\large Access Investigation, System Architecture \& Roadmap}\\[10pt]
+{\small Aurika $\cdot$ H.Wood Group $\cdot$ 30 July 2026}\\[4pt]
+{\small\itshape How we get the video, what we can build, and what is genuinely impossible}
+\end{center}
+
+\vspace{6pt}\hrule\vspace{14pt}
+
+\begin{note}{How to read this document}
+Every claim carries a status label. Nothing is presented as an option unless
+it was actually tested.
+
+\vspace{4pt}
+\begin{tabular}{ll}
+\textcolor{ok}{\textbf{PROVEN}}      & we ran it, it worked \\
+\textcolor{bad}{\textbf{DISPROVEN}}  & we ran it, it failed, and we know why \\
+\textcolor{warn}{\textbf{UNTESTED}}  & plausible, not yet attempted --- treat as unknown \\
+\end{tabular}
+\end{note}
+
+% =====================================================================
+\section{The one-page summary}
+
+We want to count guests, measure staff time, and feed that into forecasting
+and labour scheduling. The cameras exist and record 24/7. The obstacle was
+never the cameras --- it was \textbf{getting the pictures out of the building}.
+
+\begin{verbatim}
+   THE PROBLEM IN ONE PICTURE
+
+   INDIA                    INTERNET               DELILAH LA
+   +---------+                                  +--------------+
+   |  You    | --- can you get in? --->  [X]    |  NVR         |
+   |         |                                  |  42 cameras  |
+   | script  | <-- nothing listens ----         |  47 days     |
+   +---------+                                  +--------------+
+
+   The venue has no door open to the internet, and nothing inside
+   dials out. A network like that cannot be reached. This is
+   physics, not permissions -- no password fixes it.
+\end{verbatim}
+
+\textbf{The breakthrough:} stop trying to pull data \emph{in}. Let the
+recorder push data \emph{out}. Outgoing connections always work --- that is
+how any computer loads a web page.
+
+\begin{center}
+\begin{tabular}{@{}p{5.4cm}ll@{}}
+\toprule
+\textbf{Route} & \textbf{Status} & \textbf{Gives us} \\
+\midrule
+Alarm Manager webhook   & \textcolor{ok}{PROVEN available}  & live events + snapshots \\
+Archive to Google Drive & \textcolor{ok}{PROVEN available}  & full video, any night \\
+Web relay frame polling & \textcolor{warn}{UNTESTED}        & $\sim$1 picture/second \\
+Direct connection       & \textcolor{bad}{DISPROVEN}        & --- \\
+Company VPN             & \textcolor{bad}{DISPROVEN}        & --- \\
+Cloud API for video     & \textcolor{bad}{DISPROVEN}        & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{good}{Bottom line}
+Everything in the original brief --- guest counting, staff minutes, idle
+time, service speed --- is achievable \textbf{with no hardware purchase and
+nobody visiting the venue}. Only \emph{real-time} alerting during service
+requires a small computer on site, and that decision can wait until the
+numbers justify it.
+\end{good}
+
+% =====================================================================
+\section{First: what the cameras already do by themselves}
+
+Before building anything, understand what Ubiquiti already gives us for free.
+
+\subsection{The AI runs inside the camera}
+
+\begin{verbatim}
+   +----------------------------------------------------------+
+   |  G4 / G5 / AI-series CAMERA                              |
+   |                                                          |
+   |   lens --> video chip --> [ AI chip inside the camera ]  |
+   |                                    |                     |
+   |                                    v                     |
+   |                        "that shape is a PERSON"          |
+   |                        "that shape is a VEHICLE"         |
+   |                        "someone crossed the line"        |
+   +----------------------------------------------------------+
+                                |
+                                |  sends the ANSWER, not the video
+                                v
+                        +---------------+
+                        |   NVR         |  stores video + the labels
+                        +---------------+
+\end{verbatim}
+
+\textbf{Every G4 and G5 camera classifies people and vehicles on the camera
+itself}, in real time, all day, on hardware H.Wood already paid for. The
+recorder just stores the verdict alongside the footage.
+
+This matters enormously: it means \textbf{a professional-grade detection
+system is already running at Delilah.} We do not need to build one to start.
+
+\begin{alert}{Important limitation --- older cameras cannot do this}
+Delilah has a \textbf{mixed fleet}. G3-generation cameras only detect
+\emph{motion} --- they cannot tell a person from a swinging door. Only
+G4, G5 and AI models do person detection.
+
+\vspace{4pt}
+Delilah LA has 42 cameras: \textbf{27 HD} (mostly G3), \textbf{11 at 2K},
+\textbf{4 at 4K/5K}, plus an AI~360.
+
+\vspace{4pt}
+\textbf{Action:} the door camera we choose \emph{must} be a G4, G5 or AI
+model. Choosing a G3 silently halves the system's capability.
+\end{alert}
+
+\subsection{The optional upgrades (we do not need them)}
+
+\begin{center}
+\begin{tabular}{@{}llp{7.4cm}@{}}
+\toprule
+\textbf{Product} & \textbf{What it is} & \textbf{What it adds} \\
+\midrule
+AI Key  & 45\,W appliance & Central AI for many cameras. Arm Cortex-A78AE,
+16\,GB RAM, 256\,GB SSD. Up to \textbf{1{,}800 smart detections/hour}.
+Adds natural-language search, speech transcription, image enhancement \\
+AI Port & PoE adapter & Brings smart detection to non-Ubiquiti cameras \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Neither is required for our plan. They are listed so nobody buys hardware
+believing it is a prerequisite.
+
+\subsection{Where Ubiquiti stops --- and why our project exists}
+
+\begin{center}
+\begin{tabular}{@{}p{6.6cm}cc@{}}
+\toprule
+\textbf{Question a manager actually asks} & \textbf{Ubiquiti} & \textbf{Our system} \\
+\midrule
+Was a person there?                        & \tick & \tick \\
+How many people came in tonight?           & \cross & \tick \\
+How many were \emph{staff} vs \emph{guests}? & \cross & \tick \\
+How long did staff work?                   & \cross & \tick \\
+How long did staff stand idle?             & \cross & \tick \\
+How long from arrival to being greeted?    & \cross & \tick \\
+Does it match the POS covers?              & \cross & \tick \\
+Should we schedule 6 or 9 staff Friday?    & \cross & \tick \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}{The distinction in one line}
+Ubiquiti answers \textbf{``what happened?''} --- a security question.
+We answer \textbf{``what does it mean for the business?''} --- an
+operations question. We are not rebuilding their detector. We are
+\emph{consuming} it and adding identity, time, and money on top.
+\end{note}
+
+% =====================================================================
+\section{What we tried, and exactly why each failed}
+
+Eleven approaches were tested over one working session. This section exists
+so nobody repeats them.
+
+\begin{center}
+\small
+\begin{longtable}{@{}clp{6.9cm}c@{}}
+\toprule
+\textbf{\#} & \textbf{Attempt} & \textbf{Why it failed} & \textbf{Status} \\
+\midrule
+\endhead
+1  & Cloud API for video      & The video-download function does not exist. Checked
+                                every page of the official manual and all 73 official
+                                examples: zero results & \textcolor{bad}{DISPROVEN} \\
+2  & Cloud ``connector'' proxy & Refused: \emph{``user is not the owner''}. Our
+                                account is Super Admin, not Owner & \textcolor{bad}{DISPROVEN} \\
+3  & Camera key on cloud      & Refused. That key is created \emph{inside} the venue
+                                and the cloud has never heard of it & \textcolor{bad}{DISPROVEN} \\
+4  & Connect to 10.0.14.10    & That is a private house-number, meaningless on the
+                                open internet & \textcolor{bad}{DISPROVEN} \\
+5  & Venue's public address   & Silent on every port. That address belongs to the
+                                venue's internet router, not the recorder & \textcolor{bad}{DISPROVEN} \\
+6  & Direct Remote Connection & \textbf{The switch does not exist on recorders.} Only
+                                4 of 13 sites have it --- see below & \textcolor{bad}{DISPROVEN} \\
+7  & Head-office VPN          & Connected successfully --- to the \emph{wrong} building.
+                                See the address-clash box & \textcolor{bad}{DISPROVEN} \\
+8  & Office-to-venue tunnels  & The list is empty. None exist & \textcolor{bad}{DISPROVEN} \\
+9  & Take ownership           & Only the current Owner can transfer it. Owner is a
+                                shared account, inactive one month & \textcolor{bad}{DISPROVEN} \\
+10 & Remote shell (SSH)       & Only works from inside the building. Same wall & \textcolor{bad}{DISPROVEN} \\
+11 & Run our own server       & Ubiquiti does not permit self-hosting the camera
+                                software & \textcolor{bad}{DISPROVEN} \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\subsection{Why the ``direct connection'' switch is missing}
+
+We first assumed it needed permission. It does not --- it is a hardware fact.
+
+\begin{verbatim}
+   RULE:  the switch appears ONLY if the device owns a public address.
+
+   OFFICE gateway    public address on itself      -> switch present  [ok]
+   MIAMI  gateway    sits behind another router    -> switch absent   [X]
+   DELILAH recorder  private address on a LAN      -> switch absent   [X]
+   (all 9 recorders)
+
+   Why: the feature works by opening a door in your own front wall.
+        A device that does not own the wall cannot open a door in it.
+\end{verbatim}
+
+\subsection{Why the office VPN reached the wrong building}
+
+\begin{alert}{The address clash --- the single most dangerous finding}
+Every H.Wood site numbers its cameras \textbf{identically}. CCTV is always
+VLAN 14, always \texttt{10.0.14.x}.
+
+\begin{verbatim}
+   Delilah LA  camera 104  =  10.0.14.104
+   Head office camera 104  =  10.0.14.104     <- same number!
+\end{verbatim}
+
+Connected to the office VPN, we asked for Delilah's camera 104 and
+\textbf{the office's camera 104 answered.} It looked like success.
+
+\vspace{4pt}
+Had we not checked, we would have analysed the wrong venue's footage and
+reported the results as Delilah's. \textbf{Any future VPN work must verify
+which building answered before trusting a single frame.}
+\end{alert}
+
+% =====================================================================
+\section{The principle that unlocked everything}
+
+\begin{verbatim}
+   WRONG QUESTION            "How do we get INTO the venue?"
+                             -> 11 attempts, 11 failures
+
+   RIGHT QUESTION            "How do we get the venue to send data OUT?"
+                             -> works immediately, no permission needed
+
+
+   Why outgoing always works:
+
+   +----------+                              +----------+
+   |  VENUE   | ---- outgoing request -----> | INTERNET |
+   |          | <--- reply allowed back ---- |          |
+   +----------+                              +----------+
+
+   Same reason a laptop with no public address can still browse
+   the web. Firewalls block strangers knocking; they do not block
+   you making a call.
+\end{verbatim}
+
+\begin{note}{Second principle: move meaning, not pixels}
+One camera-day of video is \textbf{73 GB}. The same day expressed as
+events is about \textbf{200 KB}. That is roughly \textbf{350{,}000 times
+smaller} and contains everything the forecasting model actually consumes.
+
+\vspace{4pt}
+Video is the raw material. It is not the product. We process it and
+throw it away.
+\end{note}
+
+% =====================================================================
+\section{The three working routes}
+
+\subsection{Route A --- Live events (the spine)}
+
+\begin{verbatim}
+   +----------------------------------------------------------------+
+   |  ROUTE A   LIVE EVENTS VIA WEBHOOK          no hardware        |
+   +----------------------------------------------------------------+
+
+    guest walks through door
+            |
+            v
+   +-----------------+   AI chip inside the camera decides: PERSON
+   |  DOOR CAMERA    |   and notices it crossed the counting line
+   +--------+--------+
+            v
+   +-----------------+   Alarm Manager rule fires
+   |      NVR        |   "line crossed -> send a message"
+   +--------+--------+
+            |  OUTGOING . ~30 KB . leaves the building freely
+            v
+   +---------------------------------------------+
+   |  KevaOS  /api/cv/ingest        (Railway)    |
+   |  . check secret token                       |
+   |  . classify snapshot: staff or guest?       |
+   |  . write one row                            |
+   +--------------------+------------------------+
+                        v
+              +----------------------+
+              | cv_arrivals          |
+              | time . camera . type |
+              +----------------------+
+
+   MESSAGE CONTENTS:  time, camera, what was detected,
+                      and one small still photo. NO video.
+\end{verbatim}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Needs hardware & \NO \\
+Needs a person at the venue & \NO \\
+Needs owner permission & \NO --- Super Admin is enough \\
+Delay & 1--2 seconds \\
+Data leaving the venue & $\sim$30 KB per guest \\
+Can it send video? & \NO --- \emph{one still photo only} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Route B --- Archive a night, analyse it, delete it}
+
+\begin{verbatim}
+   +----------------------------------------------------------------+
+   |  ROUTE B   FULL VIDEO, AFTER THE FACT       no hardware        |
+   +----------------------------------------------------------------+
+
+   (1) In the browser (from India):  pick camera, pick 5pm-2am,
+                                   press "Archive"
+
+   (2) NVR uploads OUTGOING to Google Drive        ~27 GB, ~1.7 hrs
+      (run it at 3 AM so it never touches service hours)
+
+   (3) Worker downloads it and steps through the video
+
+         video --> 5 pictures/sec --> find people --> follow each
+                                                        person
+                                                          |
+              +-------------------------------------------+
+              v
+         Who is staff? Where did they stand? For how long?
+
+   (4) Write the NUMBERS to the database
+   (5) DELETE THE VIDEO
+
+      27 GB in  ----->  ~2 MB kept.  Nothing stored long-term.
+\end{verbatim}
+
+\begin{good}{This is the one that delivers the labour goals}
+Route B gives \textbf{full-quality video at full speed}, so it answers
+every question in the original brief: minutes worked, idle time, dwell by
+area, greeting speed. It can be re-run fifty times while tuning, on a night
+whose real sales figures we already have.
+\end{good}
+
+\subsection{Route C --- Live pictures through the website (unverified)}
+
+\begin{verbatim}
+   +----------------------------------------------------------------+
+   |  ROUTE C   LIVE FRAMES VIA THE WEBSITE      *** UNTESTED ***   |
+   +----------------------------------------------------------------+
+
+   Live video already reaches India whenever the site is opened
+   in a browser. So the pictures CAN travel. The open question is
+   whether a program can request them the same way a browser does.
+
+   browser --> Ubiquiti relay --> venue        (works, seen daily)
+   program --> Ubiquiti relay --> venue        (never attempted)
+
+   TEST: open the live view, record what the browser requests,
+         and try replaying that request from a script.
+         Five minutes. Needs nobody's permission.
+\end{verbatim}
+
+\begin{alert}{Do not plan around Route C}
+This is the only unverified item in the document. It is undocumented and
+Ubiquiti may change it without notice. If it works it is a bonus, never a
+foundation. \textbf{Nothing that matters may depend on it.}
+\end{alert}
+
+% =====================================================================
+\section{What each route can and cannot deliver}
+
+\begin{center}
+\begin{tabular}{@{}p{5.6cm}cccc@{}}
+\toprule
+\textbf{Capability} & \textbf{A} & \textbf{B} & \textbf{C} & \textbf{Mini PC} \\
+                    & \small events & \small archive & \small \qmark & \small on site \\
+\midrule
+Count guests entering            & \tick & \tick & \tick & \tick \\
+Arrival curve through the night  & \tick & \tick & \tick & \tick \\
+Staff vs guest                   & \qmark\small\,photo & \tick & \tick & \tick \\
+Minutes each person was present  & \cross & \tick & \tick & \tick \\
+Idle vs active time              & \cross & \tick & \tick & \tick \\
+Occupancy by area over time      & \cross & \tick & \tick & \tick \\
+Arrival $\rightarrow$ greeted    & \cross & \tick & \tick & \tick \\
+Queue length at the door         & \cross & \tick & \tick & \tick \\
+\midrule
+Works with zero hardware         & \tick & \tick & \tick & \cross \\
+Works with nobody on site        & \tick & \tick & \tick & \cross \\
+Runs unattended forever          & \tick & \qmark & \qmark & \tick \\
+\textbf{Alerts during service}   & \cross & \cross & \cross & \tick \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}{The honest summary of that table}
+\textbf{Routes A + B together cover every analytical goal in the brief.}
+The only column the mini PC uniquely owns is \emph{acting while it is still
+happening} --- telling a manager mid-service that a table has waited nine
+minutes.
+
+\vspace{4pt}
+That is a genuinely valuable feature. It is not a prerequisite, and it
+should be bought \emph{after} the numbers prove their worth, not before.
+\end{note}
+
+% =====================================================================
+\section{The complete target system}
+
+\begin{verbatim}
+ +-------------------- DELILAH LA -- nothing installed -------------------+
+ |                                                                        |
+ |   42 cameras --> NVR (47 days of recordings, 65 TB used)               |
+ |        |            |                                                  |
+ |   AI in camera      |                                                  |
+ +--------+------------+--------------------------------------------------+
+          |            |
+     ROUTE A      ROUTE B                 both OUTGOING . no doors opened
+     events       nightly archive
+          |            |
+          v            v
+ +------------------------------------------------------------------------+
+ |  RAILWAY  (already in use)                                             |
+ |                                                                        |
+ |   /api/cv/ingest -- verify token -- classify -- store                  |
+ |   batch-worker   -- download -- sample 5 fps -- detect -- track --     |
+ |                     zones -- dwell -- DELETE VIDEO                     |
+ +--------------------------------+---------------------------------------+
+                                  v
+ +------------------------------------------------------------------------+
+ |  SUPABASE                                                              |
+ |   cv_arrivals        every entry, staff or guest                       |
+ |   cv_zone_occupancy  people per area per 5 minutes                     |
+ |   cv_staff_presence  active and idle minutes per person                |
+ |   cv_daily_reconcile camera vs POS vs reservations                     |
+ +--------------------------------+---------------------------------------+
+                                  v
+ +------------------------------------------------------------------------+
+ |  WHAT THE BUSINESS SEES                                                |
+ |   forecasting  .  labour scheduling  .  /forecasting dashboard         |
+ +------------------------------------------------------------------------+
+
+ STORAGE HELD PERMANENTLY:  under 1 GB.   VIDEO HELD:  none.
+\end{verbatim}
+
+\subsection{Storage, in plain numbers}
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Approach} & \textbf{Per camera-day} & \textbf{Per year} \\
+\midrule
+Keep the raw video          & 73 GB   & 26 TB \phantom{aa}\cross \\
+Keep it at low quality      & 5 GB    & 1.8 TB \phantom{a}\cross \\
+Keep 1 picture per second   & 3.5 GB  & 1.3 TB \phantom{a}\cross \\
+\textbf{Keep only the meaning} & \textbf{200 KB} & \textbf{73 MB} \phantom{aa}\tick \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+We deliberately keep a little more than the minimum:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{What} & \textbf{Kept for} & \textbf{Size} \\
+\midrule
+Raw video / frames                  & deleted at once & 0 \\
+Cut-outs of detected people         & 30 days & $\sim$50 MB/month \\
+One picture per minute (for checking) & 7 days & $\sim$400 MB \\
+Events and measurements             & forever & $\sim$73 MB/year \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}{Why keep the one-picture-a-minute sample}
+When the camera count disagrees with the till by 22\%, somebody must be
+able to \emph{look} at 6:15 PM and see the propped-open door, the delivery
+crew, the crowd of smokers. Without that sample you are debugging blind.
+400 MB is a bargain for that.
+\end{note}
+
+% =====================================================================
+\section{Serious edge cases}
+
+These are the failures that quietly corrupt results. Each has a planned
+answer.
+
+\begin{center}
+\small
+\begin{longtable}{@{}p{4.5cm}p{5.0cm}p{5.2cm}@{}}
+\toprule
+\textbf{Edge case} & \textbf{What goes wrong} & \textbf{Answer} \\
+\midrule
+\endhead
+\textbf{Wrong building answers} & Address clash: office camera 104 replies
+instead of Delilah's & Never trust a private address. Verify the venue
+before trusting any frame \\
+\addlinespace
+\textbf{Same guest counted twice} & Steps out to smoke, comes back &
+Count line crossings by direction; re-identify within a short window \\
+\addlinespace
+\textbf{Staff counted as guests} & Inflates covers badly --- staff cross the
+door constantly & Dedicated staff/guest classifier; staff cross far more
+often, which is itself a signal \\
+\addlinespace
+\textbf{Door propped open} & Detection collapses or explodes &
+Daily sanity bounds; flag any night outside them for human review \\
+\addlinespace
+\textbf{Groups arriving together} & 6 people in one doorway, occlusion &
+Known weakness of angled cameras. Measure it on the ground-truth night
+and publish the error \\
+\addlinespace
+\textbf{Buyouts and private events} & POS covers are already corrupted on
+these nights & Already documented in the forecasting work. Exclude, do not
+average them in \\
+\addlinespace
+\textbf{Camera moved or re-aimed} & Counting line now points at a wall &
+Compare a reference frame weekly; alarm on large change \\
+\addlinespace
+\textbf{Night-time / low light} & Accuracy falls exactly when the venue is
+busiest & Test on the real 5pm--2am window, never on daytime footage \\
+\addlinespace
+\textbf{Webhook silently lost} & Missing guests, no error anywhere &
+Nightly reconciliation against POS catches gaps \\
+\addlinespace
+\textbf{Website changes (Route C)} & Frame polling stops &
+Accepted. Nothing important may depend on Route C \\
+\addlinespace
+\textbf{Archive upload saturates the line} & Slow internet during service &
+Schedule after close; two nights a week, not seven \\
+\addlinespace
+\textbf{POS is wrong, not the camera} & We ``fix'' a correct system &
+Treat disagreement as a finding. Blank guest counts are coerced to 1 in
+the POS --- a known defect \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\begin{alert}{Privacy --- a real constraint, not paperwork}
+California \textbf{AB 1221} took effect January 2026, and CCPA treats
+biometric data as sensitive personal information.
+
+\vspace{4pt}
+\textbf{Decisions taken:}
+\begin{itemize}[leftmargin=14pt,itemsep=1pt]
+  \item \textbf{No facial recognition.} Not identity --- only ``a person'',
+        ``staff or guest''.
+  \item Images of people kept 30 days maximum, as a configurable setting.
+  \item Sending footage to Google Drive is H.Wood's decision, taken
+        knowingly, not ours to assume.
+\end{itemize}
+\end{alert}
+
+% =====================================================================
+\section{How this compares to the industry}
+
+\subsection{The standard architecture, and where we sit}
+
+\begin{verbatim}
+   WHAT THE INDUSTRY DOES                    WHAT WE DO
+
+   1. Camera / edge box detects       ->   Ubiquiti's in-camera AI
+      (you buy and install it)            (already there, already paid for)
+
+   2. On-site computer collects       ->   Ubiquiti's own relay
+      (you buy and install it)            (already there)
+
+   3. Cloud analyses and reports      ->   Railway + Supabase
+                                          (already ours)
+
+   Nobody sends raw video to the cloud. Everyone converts pictures
+   into facts as early as possible. We arrived at the same design
+   -- because we were locked out rather than because we paid for it.
+\end{verbatim}
+
+\subsection{The methods in use today}
+
+\begin{center}
+\begin{tabular}{@{}p{4.3cm}p{4.0cm}p{5.4cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Used by} & \textbf{Notes} \\
+\midrule
+Overhead 3D sensors & Xovis, Brickstream, retail & The accuracy standard,
+98\%+, counts only \\
+Camera-native AI & Verkada, Rhombus, \textbf{Ubiquiti} & Camera detects,
+cloud receives. No customer hardware --- \textbf{our pattern} \\
+Edge box + video feed & most integrators & Small computer per site \\
+Restaurant SaaS & VuFindr, Isarsoft & Pre-built kitchen / drive-thru models \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Accuracy we should honestly expect}
+
+\begin{center}
+\begin{tabular}{@{}lc@{}}
+\toprule
+\textbf{Method} & \textbf{Typical accuracy} \\
+\midrule
+Overhead 3D stereo & 98\%+ \\
+Overhead ordinary camera & 92--96\% \\
+\textbf{Angled camera + AI (ours)} & \textbf{85--95\%} \\
+POS covers used as ``truth'' & \textcolor{warn}{itself unreliable} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}{Where we can genuinely beat the market}
+We will not beat a dedicated 3D door sensor at counting. We are not trying to.
+
+\vspace{4pt}
+What no counting vendor has is \textbf{the rest of the business}: the till,
+the reservation book, the staff rota, and a working forecasting model. A
+counting company sells a number. We can say \emph{``walk-ins ran 18\% above
+forecast from 9 PM; you were two servers short; here is Friday's
+recommendation.''}
+
+\vspace{4pt}
+The advantage is not the vision model. It is that the vision output lands
+next to sales, reservations and labour in the same database.
+\end{note}
+
+\subsection{Tools and prior work worth knowing}
+
+\begin{center}
+\begin{tabular}{@{}lp{9.2cm}@{}}
+\toprule
+\textbf{Project} & \textbf{Relevance} \\
+\midrule
+Frigate NVR & Open-source recorder with detection; large UniFi community.
+Reference for zone and event design \\
+Roboflow Inference & Video stream $\rightarrow$ model $\rightarrow$ events;
+runs on small devices \\
+OpenFilter (Plainsight) & Modular video pipelines, open-sourced 2025 \\
+YOLO + ByteTrack / BotSORT & Detection and tracking. \textbf{Already what
+our notebook uses} \\
+\emph{People counting for retail analytics using edge AI} (arXiv 2205.13020)
+& Peer-reviewed treatment of exactly this problem \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Our existing notebook already uses the same stack the field converged on.
+That is confirmation, not coincidence.
+
+% =====================================================================
+\section{The plan}
+
+\subsection{Phases and the gates between them}
+
+\begin{center}
+\begin{tabular}{@{}clp{6.0cm}p{3.8cm}@{}}
+\toprule
+\textbf{Ph} & \textbf{Build} & \textbf{Done when} & \textbf{Needs} \\
+\midrule
+0 & Receiving endpoint + tables & A test message is stored & nothing \\
+1 & One door-camera rule & 24 h of entries, plausible totals & nothing \\
+2 & Staff vs guest classifier & $\geq$85\% on 200 checked photos & nothing \\
+3 & \textbf{Ground-truth night} & \textbf{within $\pm$10\% of POS covers} & Jacob's OK \\
+4 & Staff time from the archive & Correlates with clock-in data & Phase 3 \\
+5 & Feed the forecast & Forecast improves, or feature dropped & Phase 4 \\
+6 & \emph{(optional)} live alerts & Manager acts on it during service & \$150 PC \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{alert}{Phase 3 is the honest gate}
+If camera counts cannot land within $\pm$10\% of the till on a known night,
+\textbf{nothing after it is worth building}. Better to discover that in week
+one than after six weeks of dashboards.
+
+\vspace{4pt}
+And if they disagree, check the till before blaming the camera --- blank
+guest counts are already known to be recorded as~1.
+\end{alert}
+
+\subsection{When the mini PC becomes justified}
+
+\begin{verbatim}
+   BUY IT WHEN -- not before:
+
+     [ok] someone asks "can it tell the manager DURING service?"
+     [ok] or we want many cameras every night without pressing buttons
+     [ok] or we no longer want gigabytes leaving the building
+
+   AT THAT POINT ONE $150 BOX DOES THREE JOBS:
+
+     +------------------------------------------+
+     |  1  remote access to the recorder        |
+     |  2  live analysis, full speed            |
+     |  3  sends facts, not video -> tiny data   |
+     +------------------------------------------+
+
+   Most teams buy this on day one. That is the common mistake:
+   hardware bought before a single number has proven useful.
+\end{verbatim}
+
+% =====================================================================
+\section{Closing}
+
+\begin{good}{What is true}
+\begin{itemize}[leftmargin=14pt,itemsep=2pt]
+  \item Reaching \emph{into} the venue is closed. Eleven routes, all tested.
+  \item Data flowing \emph{out} of the venue is open, today, permission-free.
+  \item Ubiquiti's cameras already run professional AI we can consume free.
+  \item Every analytical goal in the brief is reachable with no hardware.
+  \item Only live alerting needs a small computer --- and that can wait.
+  \item 47 days of history remain, so there is no deadline pressure.
+\end{itemize}
+\end{good}
+
+\begin{alert}{What is not true, and must not be repeated}
+\begin{itemize}[leftmargin=14pt,itemsep=2pt]
+  \item ``The cloud service can download video.'' It cannot. Verified.
+  \item ``Ownership would fix it.'' It would not. There is no such function.
+  \item ``The office VPN reaches the venues.'' It does not --- and worse, it
+        quietly answers with the \emph{wrong} building.
+  \item ``Route C works.'' Unknown. Untested. Not a plan.
+\end{itemize}
+\end{alert}
+
+\vspace{10pt}\hrule\vspace{6pt}
+{\small\itshape Prepared for H.Wood Group. All findings above were tested
+directly; anything untested is labelled as such.}
+
+\end{document}

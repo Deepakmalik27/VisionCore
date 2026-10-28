@@ -1,0 +1,390 @@
+<!--
+  label_tool.html — correct the pipeline's boxes, locally.
+
+  WHY THIS EXISTS
+      Every SUMMARY.txt this project has produced carries the line
+          "HOTA NOT MEASURED — every accuracy claim below is an estimate"
+      so the 95% target is not something we are failing to hit, it is something
+      nothing here can measure. Fixing that needs GROUND TRUTH, and ground truth
+      is the one artefact a computer cannot produce: if the pipeline generated
+      it, we would be grading the pipeline against itself and it would score
+      100% while missing half the room.
+
+      The usual answer is cvat.ai — an account, an upload, and venue CCTV
+      leaving the building. None of that is necessary. This is the same idea as
+      tools/zone_mapper_v2.html: one file, opened from disk, no server, no
+      dependency, no upload. The footage never moves.
+
+  WHAT IT PRODUCES
+      gt.txt in MOT 1.1 — exactly what kevacv/eval_harness.py already scores
+      (verified against planted errors in tests/test_eval_scorer.py).
+
+  HOW TO USE
+      1. open this file in a browser
+      2. pick the package folder  (label_pkg/quick100)
+      3. correct: delete what is not a person, add who was missed
+      4. Export -> gt.txt
+-->
+<meta charset="utf-8">
+<title>Label Tool — keva_vision</title>
+<style>
+  :root { --bg:#12100e; --ink:#f3ede4; --dim:#8a8178; --hot:#e0533d; --ok:#5fa88a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-monospace,Menlo,Consolas,monospace; }
+  header { padding:10px 14px; border-bottom:1px solid #2e2a26; display:flex;
+           gap:18px; align-items:center; flex-wrap:wrap; }
+  h1 { font:600 15px/1 ui-monospace,monospace; margin:0; letter-spacing:.04em; }
+  .sp { flex:1 }
+  button { background:#23201d; color:var(--ink); border:1px solid #3a352f;
+           padding:6px 12px; border-radius:3px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--hot); }
+  button.primary { background:var(--hot); border-color:var(--hot); color:#fff; }
+  #wrap { position:relative; margin:12px auto; width:fit-content; }
+  canvas { display:block; cursor:crosshair; background:#000; max-width:98vw; }
+  #bar { padding:8px 14px; border-top:1px solid #2e2a26; display:flex; gap:20px;
+         flex-wrap:wrap; align-items:center; }
+  .k { color:var(--dim); }
+  .v { color:var(--ok); font-weight:600; }
+  #help { padding:6px 14px 12px; color:var(--dim); font-size:12px; }
+  #drop { margin:40px auto; max-width:640px; border:1px dashed #3a352f;
+          padding:34px; text-align:center; border-radius:4px; }
+</style>
+
+<header>
+  <h1>LABEL TOOL</h1>
+  <input type="file" id="pick" webkitdirectory directory multiple hidden>
+  <button onclick="pick.click()">Open package folder…</button>
+  <span class="sp"></span>
+  <span class="k">frame</span> <span class="v" id="fno">–</span>
+  <span class="k">boxes</span> <span class="v" id="bno">–</span>
+  <span class="k">id</span> <span class="v" id="curid">1</span>
+  <button id="modebtn" onclick="toggleMode()">mode: POINT (fast)</button>
+  <span class="k">edited</span> <span class="v" id="ed">0</span>
+  <span class="k">key</span> <span class="v" id="kf">–</span>
+  <span class="v" id="saved" style="color:#5fa88a"></span>
+  <button onclick="exportGt()" class="primary">Export gt.txt</button>
+</header>
+
+<div id="drop">
+  Choose <b>label_pkg/quick100</b> — the folder with <code>images/</code> and
+  <code>predictions.txt</code>.<br><br>
+  <span style="color:#8a8178">Nothing is uploaded. Everything stays on this machine.</span>
+</div>
+
+<div id="wrap"><canvas id="cv"></canvas></div>
+
+<div id="bar">
+  <span><span class="k">D</span> / <span class="k">F</span> prev / next frame</span>
+  <span><span class="k">drag</span> add box</span>
+  <span><span class="k">click box</span> select</span>
+  <span><span class="k">Del</span> delete selected</span>
+  <span><span class="k">1-9</span> set id for new boxes</span>
+  <span><span class="k">C</span> copy previous frame's boxes</span>
+  <span><span class="k">K</span> mark keyframe</span>
+  <span><span class="k">I</span> interpolate between keyframes</span>
+</div>
+<div id="help">
+  <b>POINT MODE (default, fast)</b> — just CLICK once on every person you can
+  see. One dot per human. That is enough to measure what the pipeline misses:
+  a dot with no box around it is a MISSED PERSON, a box with no dot in it is a
+  FALSE POSITIVE. No dragging, no precision, no ids.
+  <br>
+  <b>BOX MODE</b> — only needed later, if we fine-tune the detector on this
+  camera. Drag boxes, press 1-9 for ids.
+</div>
+
+<script>
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let imgs = [], boxes = {}, idx = 0, curId = 1, sel = null, img = new Image();
+let drag = null;
+const COLORS = ['#e0533d','#5fa88a','#d9a441','#7a9cc6','#b57edc','#d97ea1',
+                '#6fbf73','#c98a5b','#8fb8de'];
+
+document.getElementById('pick').onchange = async e => {
+  const files = [...e.target.files];
+  const jpgs = files.filter(f => /\.jpg$/i.test(f.name))
+                    .sort((a,b) => a.name.localeCompare(b.name));
+  const pred = files.find(f => f.name === 'predictions.txt');
+  if (!jpgs.length) { alert('No jpgs found under images/'); return; }
+  imgs = jpgs;
+  boxes = {};
+  if (pred) {
+    const txt = await pred.text();
+    // MOT 1.1: frame,id,x,y,w,h,...   frames are 1-indexed
+    for (const line of txt.split('\n')) {
+      const p = line.split(',');
+      if (p.length < 6) continue;
+      const f = +p[0];
+      (boxes[f] ||= []).push({id:+p[1], x:+p[2], y:+p[3], w:+p[4], h:+p[5]});
+    }
+  }
+  restore();                       // offer to bring back an unfinished session
+  document.getElementById('drop').style.display = 'none';
+  idx = 0; show();
+};
+
+function show() {
+  const f = imgs[idx];
+  if (!f) return;
+  img = new Image();
+  img.onload = () => {
+    cv.width = img.width; cv.height = img.height;
+    draw();
+  };
+  img.src = URL.createObjectURL(f);
+  document.getElementById('fno').textContent = `${idx+1} / ${imgs.length}`;
+}
+
+function draw() {
+  ctx.drawImage(img, 0, 0);
+  const bs = boxes[idx+1] || [];
+  bs.forEach((b, i) => {
+    const c = COLORS[b.id % COLORS.length];
+    ctx.lineWidth = (b === sel) ? 4 : 2;
+    ctx.strokeStyle = (b === sel) ? '#fff' : c;
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+    ctx.fillStyle = c;
+    ctx.fillRect(b.x, b.y - 20, 42, 20);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px monospace';
+    ctx.fillText('P' + b.id, b.x + 5, b.y - 5);
+  });
+  for (const pt of (points[idx+1] || [])) {
+    // a dot INSIDE a box = the pipeline found this person
+    // a dot with no box  = a MISS, which is the number we are after
+    const covered = bs.some(b => pt.x>=b.x && pt.x<=b.x+b.w &&
+                                 pt.y>=b.y && pt.y<=b.y+b.h);
+    ctx.beginPath(); ctx.arc(pt.x, pt.y, 13, 0, 7);
+    ctx.fillStyle = covered ? 'rgba(95,168,138,.85)' : 'rgba(224,83,61,.95)';
+    ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = '#fff'; ctx.stroke();
+  }
+  if (drag) {
+    ctx.strokeStyle = '#fff'; ctx.setLineDash([5,4]); ctx.lineWidth = 2;
+    ctx.strokeRect(drag.x, drag.y, drag.w, drag.h);
+    ctx.setLineDash([]);
+  }
+  document.getElementById('bno').textContent = bs.length;
+  document.getElementById('curid').textContent = curId;
+  document.getElementById('ed').textContent =
+      `${edited.size}/${imgs.length}` + (edited.size < imgs.length*0.3 ? ' LOW' : '');
+  // Loud, on the image, when this frame is identical to the one before it.
+  const prevB = boxes[idx] || [], curB = boxes[idx+1] || [];
+  const identical = idx > 0 && curB.length && prevB.length === curB.length &&
+      curB.every((b,i) => prevB[i] && prevB[i].x===b.x && prevB[i].y===b.y &&
+                          prevB[i].w===b.w && prevB[i].h===b.h);
+  if (identical && !edited.has(idx+1)) {
+    ctx.fillStyle = 'rgba(224,83,61,.92)';
+    ctx.fillRect(0, 0, cv.width, 46);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 26px monospace';
+    ctx.fillText('CARRIED FORWARD — nudge the boxes or this frame teaches nothing',
+                 16, 33);
+  }
+  const isKey = keyframes.has(idx+1);
+  document.getElementById('kf').textContent =
+      (isKey ? 'YES' : 'no') + ` (${keyframes.size})`;
+  if (isKey) {                       // unmistakable border on a keyframe
+    ctx.strokeStyle = '#d9a441'; ctx.lineWidth = 8;
+    ctx.strokeRect(4, 4, cv.width-8, cv.height-8);
+  }
+}
+
+function at(e) {
+  const r = cv.getBoundingClientRect();
+  return { x:(e.clientX-r.left) * cv.width / r.width,
+           y:(e.clientY-r.top)  * cv.height / r.height };
+}
+
+cv.onmousedown = e => {
+  const p = at(e), bs = boxes[idx+1] || [];
+  if (mode === 'point') {
+    const near = (points[idx+1] || []).find(
+        q => Math.hypot(q.x-p.x, q.y-p.y) < 18);
+    if (near) { points[idx+1] = points[idx+1].filter(q => q !== near); edited.add(idx+1); }
+    else (points[idx+1] ||= []).push({x:p.x, y:p.y});
+    edited.add(idx+1); save(); draw();
+    return;
+  }
+  const hit = bs.find(b => p.x>=b.x && p.x<=b.x+b.w && p.y>=b.y && p.y<=b.y+b.h);
+  if (hit) { sel = hit; draw(); return; }
+  drag = { x:p.x, y:p.y, w:0, h:0, ox:p.x, oy:p.y };
+};
+cv.onmousemove = e => {
+  if (!drag) return;
+  const p = at(e);
+  drag.x = Math.min(p.x, drag.ox); drag.y = Math.min(p.y, drag.oy);
+  drag.w = Math.abs(p.x - drag.ox); drag.h = Math.abs(p.y - drag.oy);
+  draw();
+};
+cv.onmouseup = () => {
+  if (drag && drag.w > 8 && drag.h > 8) {
+    (boxes[idx+1] ||= []).push({id:curId, x:drag.x, y:drag.y, w:drag.w, h:drag.h});
+    edited.add(idx+1); save();
+  }
+  drag = null; draw();
+};
+
+// ── KEYFRAMES + INTERPOLATION ───────────────────────────────────────────────
+// The single feature that decides whether a certification-grade sample is
+// affordable. At +/-6.5% (100 frames) this tool can only catch regressions; the
+// 95% number needs ~1,350 frames, which is an evening of clicking WITHOUT this
+// and about an hour WITH it.
+//
+// A person walks in a straight-ish line over a second or two, so their box
+// moves nearly linearly. Mark the box on frame 10 and again on frame 40, and
+// the 29 frames between are arithmetic, not labour. That is exactly what CVAT's
+// keyframe interpolation does, and it is ~20 lines here.
+let keyframes = new Set();
+let mode = 'point';          // 'point' = count people | 'box' = draw boxes
+let points = {};             // frame -> [{x,y}]
+// WHICH FRAMES DID A HUMAN ACTUALLY EDIT?
+//
+// The first gt.txt collected with this tool was 99% copy-forward: 6 boxes drawn
+// on frame 1, then C pressed ninety-nine times. The labels had a median step of
+// 0.0px while the people underneath moved a median 5.3px per frame and up to
+// 255px overall. Every number calibrated on that file — recall, the foot
+// anchor, the zone audit — had to be retracted.
+//
+// Nothing warned. The file looked complete: 600 boxes, 100 frames, six people
+// throughout. "Has boxes" and "was labelled" are different facts and only one
+// of them was being counted.
+let edited = new Set();
+
+function toggleMode() {
+  mode = (mode === 'point') ? 'box' : 'point';
+  document.getElementById('modebtn').textContent =
+      'mode: ' + (mode === 'point' ? 'POINT (fast)' : 'BOX (detailed)');
+  cv.style.cursor = (mode === 'point') ? 'pointer' : 'crosshair';
+  draw();
+}
+
+function interpolate() {
+  const ks = [...keyframes].sort((a, b) => a - b);
+  if (ks.length < 2) { alert('Mark at least two keyframes with K first.'); return; }
+  let filled = 0;
+  for (let i = 0; i < ks.length - 1; i++) {
+    const [a, b] = [ks[i], ks[i + 1]];
+    const A = boxes[a] || [], B = boxes[b] || [];
+    for (const ba of A) {
+      const bb = B.find(x => x.id === ba.id);      // same person at both ends
+      if (!bb) continue;                            // appeared/left — leave alone
+      for (let f = a + 1; f < b; f++) {
+        const r = (f - a) / (b - a);
+        const box = {
+          id: ba.id,
+          x: ba.x + (bb.x - ba.x) * r, y: ba.y + (bb.y - ba.y) * r,
+          w: ba.w + (bb.w - ba.w) * r, h: ba.h + (bb.h - ba.h) * r,
+        };
+        // Never overwrite a box a human placed on this frame.
+        const cur = (boxes[f] ||= []);
+        if (!cur.some(x => x.id === ba.id)) { cur.push(box); filled++; }
+      }
+    }
+  }
+  save(); draw();
+  alert(`Interpolated ${filled} box(es) across ${ks.length} keyframes.`);
+}
+
+// ── AUTOSAVE ────────────────────────────────────────────────────────────────
+// Everything lived in memory, so a stray Ctrl-R threw the session away. An hour
+// of labelling is the one artefact in this project that cannot be regenerated
+// by re-running anything, and it was one refresh from gone.
+const KEY = 'keva_label_tool_v1';
+let saveTimer = null;
+function save() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(KEY, JSON.stringify(
+        {boxes, points, edited:[...edited], keyframes:[...keyframes], n: imgs.length}));
+      const s = document.getElementById('saved');
+      if (s) { s.textContent = 'saved'; setTimeout(() => s.textContent = '', 1200); }
+    } catch (_) {}
+  }, 400);
+}
+function restore() {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return false;
+    const d = JSON.parse(raw);
+    if (d.n !== imgs.length) return false;          // different package
+    if (!confirm('Restore your previous unfinished labelling?')) return false;
+    boxes = d.boxes; points = d.points || {};
+    edited = new Set(d.edited || []);
+    keyframes = new Set(d.keyframes || []);
+    return true;
+  } catch (_) { return false; }
+}
+
+addEventListener('keydown', e => {
+  if (e.key === 'f' || e.key === 'ArrowRight') { idx = Math.min(idx+1, imgs.length-1); sel=null; show(); }
+  else if (e.key === 'd' || e.key === 'ArrowLeft') { idx = Math.max(idx-1, 0); sel=null; show(); }
+  else if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (sel) { boxes[idx+1] = (boxes[idx+1]||[]).filter(b => b !== sel); sel=null; edited.add(idx+1); save(); draw(); }
+  }
+  else if (e.key >= '1' && e.key <= '9') {
+    curId = +e.key;
+    if (sel) { sel.id = curId; }   // retag the selected box
+    save(); draw();
+  }
+  else if (e.key === 'c') {        // carry the previous frame forward
+    // Deliberately does NOT mark the frame as edited. A carried frame is a
+    // STARTING POINT, not a label — the people underneath have moved. Nudging
+    // any box (or clicking any point) is what makes it count.
+    const prev = boxes[idx] || [];
+    boxes[idx+1] = prev.map(b => ({...b}));
+    save(); draw();
+  }
+  else if (e.key === 'k') {        // mark / unmark this frame as a keyframe
+    const f = idx + 1;
+    keyframes.has(f) ? keyframes.delete(f) : keyframes.add(f);
+    save(); draw();
+  }
+  else if (e.key === 'i') { interpolate(); }
+});
+
+function exportGt() {
+  // REFUSE a file that is mostly carried forward. The retracted gt.txt was
+  // exported without complaint and cost a day of conclusions.
+  const frac = edited.size / Math.max(1, imgs.length);
+  if (frac < 0.30) {
+    alert(`Only ${edited.size} of ${imgs.length} frames were actually edited ` +
+          `(${(100*frac).toFixed(0)}%).\n\n` +
+          `The rest are carried forward, so the people in them have moved but ` +
+          `the labels have not. A file like this produced measurements that ` +
+          `all had to be retracted.\n\n` +
+          `Go through the frames and click/nudge each one. Point mode is ~10x ` +
+          `faster than boxes for this.`);
+    return;
+  }
+  // POINT MODE exports points.txt — "frame,x,y", one line per human seen.
+  // That is all recall needs: a point with no box around it is a person the
+  // pipeline missed. Boxes are only required later, for fine-tuning.
+  const npts = Object.values(points).reduce((a, v) => a + v.length, 0);
+  if (mode === 'point' || npts > 0) {
+    const prows = [];
+    for (let f = 1; f <= imgs.length; f++)
+      for (const q of (points[f] || []))
+        prows.push(`${f},${q.x.toFixed(1)},${q.y.toFixed(1)}`);
+    const pb = new Blob([prows.join('\n') + '\n'], {type:'text/plain'});
+    const pa = document.createElement('a');
+    pa.href = URL.createObjectURL(pb); pa.download = 'points.txt'; pa.click();
+    if (mode === 'point') {
+      alert(`Exported points.txt — ${npts} people marked across ` +
+            `${Object.keys(points).length} frames.`);
+      return;
+    }
+  }
+  const rows = [];
+  for (let f = 1; f <= imgs.length; f++)
+    for (const b of (boxes[f] || []))
+      rows.push(`${f},${b.id},${b.x.toFixed(2)},${b.y.toFixed(2)},` +
+                `${b.w.toFixed(2)},${b.h.toFixed(2)},1,1,1`);
+  const blob = new Blob([rows.join('\n') + '\n'], {type:'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'gt.txt';
+  a.click();
+}
+</script>

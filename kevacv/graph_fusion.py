@@ -1,0 +1,287 @@
+"""graph_fusion.py -- multi-evidence tracklet fusion. NEVER CALLED IN PRODUCTION.
+
+STATUS 2026-08-26: 263 LOC, imported only by __init__.py, executed by nothing.
+Flagged by tools/wiring_audit.py.
+
+THE NAME WAS WRONG, AND THAT IS WHY IT WAS TRUSTED WITHOUT BEING READ
+    This file used to be titled "Min-Cost Flow / Global Optimization" and
+    claimed to "solve global minimum-cost assignment using SciPy Linear Sum
+    Assignment (Hungarian)". It does not. solve_graph_fusion() performs greedy
+    cheapest-edge-first agglomeration over a union-find, and
+    scipy.optimize.linear_sum_assignment is imported at the top and never
+    called -- a fact recorded in that function's own docstring while the title
+    still advertised the opposite.
+
+    Agglomeration is arguably the RIGHT shape: one person may own many
+    tracklets, which a 1-to-1 assignment forbids. The problem was never the
+    algorithm, only the claim.
+
+WHAT IT MIGHT ACTUALLY BE WORTH
+    Its real difference from the shipped 6-tier cascade is not global vs
+    greedy -- both are greedy. It is that evidence is scored JOINTLY
+    (appearance + colour histogram + spatial feasibility + face, weighted)
+    rather than in a fixed tier order where the first tier to fire wins.
+
+    That remains a plausible lever. Measured 2026-08-26, the ReID embeddings
+    separate identities well (intra 0.83 / inter 0.69, margin +0.14,
+    nearest-neighbour wrong 0-12%), so the AssA shortfall is in GATING, not in
+    appearance -- and gating is exactly what this replaces.
+
+BEFORE WIRING IT
+    Nothing currently assembles the tracklet dicts it wants (reid_emb,
+    hsv_hist, face_id, entry/exit positions), and it has never executed. It
+    needs that plumbing plus an A/B against the hand-labelled ground truth,
+    like every other change in this project.
+
+ORIGINAL DESIGN NOTES (intent, kept; behaviour corrected above)
+    1. Construct a global association graph where nodes are tracklets.
+    2. Compute pairwise transition costs from all evidence channels at once:
+       deep appearance distance, HSV colour similarity, ground-plane distance
+       and walk-speed feasibility, face biometrics, temporal gap/overlap.
+    3. Resolve the association (greedy agglomeration, see above).
+"""
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import numpy as np
+
+try:
+    from scipy.optimize import linear_sum_assignment
+    _HAVE_SCIPY = True
+except ImportError:
+    _HAVE_SCIPY = False
+
+
+class FusionWeights:
+    """Configurable weights for the multi-evidence identity graph edge costs."""
+    def __init__(self,
+                 w_reid: float = 0.45,
+                 w_hsv: float = 0.15,
+                 w_spatial: float = 0.25,
+                 w_face: float = 0.15,
+                 max_walk_speed_mps: float = 2.5,
+                 max_temporal_gap_s: float = 300.0,
+                 reid_threshold: float = 0.35):
+        self.w_reid = w_reid
+        self.w_hsv = w_hsv
+        self.w_spatial = w_spatial
+        self.w_face = w_face
+        self.max_walk_speed_mps = max_walk_speed_mps
+        self.max_temporal_gap_s = max_temporal_gap_s
+        self.reid_threshold = reid_threshold
+
+
+def compute_pairwise_cost(track_a: Dict[str, Any],
+                          track_b: Dict[str, Any],
+                          weights: FusionWeights,
+                          ground_plane: Optional[Any] = None) -> float:
+    """Compute total fusion edge cost between track_a and track_b (lower = more likely same person).
+    Returns float('inf') if physically impossible (e.g. temporal overlap or unphysical speed).
+    """
+    # 1. Temporal feasibility check (cannot overlap in time)
+    t_a_span = track_a.get("t_span")
+    t_b_span = track_b.get("t_span")
+    if t_a_span is None or t_b_span is None:
+        return float('inf')
+    t_a_start, t_a_end = t_a_span
+    t_b_start, t_b_end = t_b_span
+
+    # Overlap check with 1s tolerance
+    if max(t_a_start, t_b_start) < min(t_a_end, t_b_end) - 1.0:
+        return float('inf')
+
+    # Determine direction (A before B or B before A)
+    if t_a_end <= t_b_start:
+        t_gap = t_b_start - t_a_end
+        pos_exit = track_a.get("exit_pos", (0, 0))
+        pos_entry = track_b.get("entry_pos", (0, 0))
+    else:
+        t_gap = t_a_start - t_b_end
+        pos_exit = track_b.get("exit_pos", (0, 0))
+        pos_entry = track_a.get("entry_pos", (0, 0))
+
+    if t_gap > weights.max_temporal_gap_s:
+        return float('inf')
+
+    # 2. Motion / Speed Feasibility Check
+    #
+    # THE VETO IS ONLY AS GOOD AS THE PLANE. `speed > max_walk_speed -> inf` is
+    # a HARD refusal: it forbids a merge outright, and nothing downstream can
+    # appeal it. On CAM.112 the automatic perspective fit produced eight
+    # different camera heights inside one hour (1.12m to 3.26m), so dist_m can
+    # be wrong by ~2.9x -- and a veto wrong by 2.9x forbids real merges and
+    # permits impossible ones, roughly at random. That is worse than no veto,
+    # because it is confident.
+    #
+    # So the metric branch is taken ONLY for an EXACT plane -- a homography fit
+    # to measured ground_points (see tools/calibrate_plane.py). An auto-fit
+    # falls through to the pixel branch, which has no hard veto and can only
+    # nudge the cost. Trust the geometry exactly as far as it was measured and
+    # not one step further; this is what makes the module safe to wire in
+    # BEFORE the room has been measured.
+    _exact = getattr(ground_plane, "mode", None) == "exact"
+    if ground_plane and getattr(ground_plane, "ok", False) and _exact:
+        dist_m = ground_plane.dist_m(pos_exit, pos_entry)
+        if dist_m is not None:
+            speed = dist_m / max(t_gap, 0.5)
+            if speed > weights.max_walk_speed_mps:
+                return float('inf')  # Faster than humanly possible
+            spatial_cost = min(1.0, dist_m / 10.0)
+        else:
+            spatial_cost = 0.5
+    else:
+        # Fallback to pixel distance normalized
+        px_dist = math.hypot(pos_exit[0] - pos_entry[0], pos_exit[1] - pos_entry[1])
+        spatial_cost = min(1.0, px_dist / 800.0)
+
+    # 3. Deep Re-ID Embedding Distance (Cosine)
+    emb_a = track_a.get("reid_emb")
+    emb_b = track_b.get("reid_emb")
+    if emb_a is not None and emb_b is not None:
+        dot = np.dot(emb_a, emb_b)
+        norm = (np.linalg.norm(emb_a) * np.linalg.norm(emb_b))
+        sim = dot / max(norm, 1e-9)
+        reid_dist = max(0.0, 1.0 - float(sim))
+    else:
+        reid_dist = 0.5
+
+    # 4. Color HSV Histogram Distance
+    hsv_a = track_a.get("hsv_hist")
+    hsv_b = track_b.get("hsv_hist")
+    if hsv_a is not None and hsv_b is not None:
+        # Bhattacharyya / correlation distance
+        hsv_dist = max(0.0, 1.0 - float(np.sum(np.minimum(hsv_a, hsv_b))))
+    else:
+        hsv_dist = 0.5
+
+    # 5. Face Biometric Match
+    face_a = track_a.get("face_id")
+    face_b = track_b.get("face_id")
+    if face_a and face_b:
+        if face_a == face_b:
+            face_dist = 0.0  # Strong positive
+        else:
+            return float('inf')  # Contradictory faces -> impossible merge
+    else:
+        face_dist = 0.5
+
+    # Weighted composite cost calculation
+    total_cost = (
+        weights.w_reid * reid_dist +
+        weights.w_hsv * hsv_dist +
+        weights.w_spatial * spatial_cost +
+        weights.w_face * face_dist
+    )
+
+    return total_cost
+
+
+def solve_graph_fusion(tracklets: List[Dict[str, Any]],
+                       weights: Optional[FusionWeights] = None,
+                       ground_plane: Optional[Any] = None,
+                       cost_cutoff: float = 0.45) -> Dict[int, int]:
+    """Solve global tracklet identity association graph.
+
+    NOTE: this is greedy cheapest-edge-first agglomeration over a union-find,
+    NOT the Hungarian assignment the module docstring advertises. scipy's
+    linear_sum_assignment is imported at the top of this file and never
+    called. Agglomeration is the right shape here anyway (one person may own
+    many tracklets, which a 1-to-1 assignment forbids) -- but the name was
+    wrong, and a wrong name is how this module got trusted without reading.
+    
+    tracklets: List of dicts, each containing:
+               - id: int
+               - t_span: (t_start, t_end)
+               - entry_pos: (x, y)
+               - exit_pos: (x, y)
+               - reid_emb: np.ndarray (optional)
+               - hsv_hist: np.ndarray (optional)
+               - face_id: str/int (optional)
+    
+    Returns: Mapping {raw_track_id: canonical_track_id}
+    """
+    if not tracklets:
+        return {}
+
+    if weights is None:
+        weights = FusionWeights()
+
+    n = len(tracklets)
+    raw_ids = [t["id"] for t in tracklets]
+    
+    # Cost Matrix Construction
+    cost_matrix = np.full((n, n), fill_value=np.inf)
+
+    # VETOED pairs are remembered separately. cost_matrix cannot carry this:
+    # it stores inf for "impossible" AND for "merely too expensive", and those
+    # two must not be confused when the transitive check below runs.
+    forbidden: Set[Tuple[int, int]] = set()
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            c = compute_pairwise_cost(tracklets[i], tracklets[j], weights, ground_plane)
+            if c == float('inf'):
+                forbidden.add((raw_ids[i], raw_ids[j]))
+                forbidden.add((raw_ids[j], raw_ids[i]))
+            elif c <= cost_cutoff:
+                cost_matrix[i, j] = c
+
+    # Linear Sum Assignment / Hungarian matching
+    canon_map: Dict[int, int] = {tid: tid for tid in raw_ids}
+
+    # Find valid candidate edges
+    valid_pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cost_matrix[i, j] < cost_cutoff:
+                valid_pairs.append((cost_matrix[i, j], i, j))
+
+    # Sort edges by cost and merge disjoint sets using Union-Find
+    valid_pairs.sort(key=lambda x: x[0])
+
+    parent = {tid: tid for tid in raw_ids}
+
+    def find(i):
+        """Iterative path-compression find — safe for >1000 tracklets."""
+        root = i
+        while parent[root] != root:
+            root = parent[root]
+        # Path compression
+        while parent[i] != root:
+            parent[i], i = root, parent[i]
+        return root
+
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            parent[root_j] = root_i
+
+    # Members of each component, so a merge can be checked against EVERY pair it
+    # would create -- not just the one edge that triggered it.
+    members: Dict[int, Set[int]] = {tid: {tid} for tid in raw_ids}
+
+    for cost, i, j in valid_pairs:
+        root_i = find(raw_ids[i])
+        root_j = find(raw_ids[j])
+        if root_i == root_j:
+            continue
+        # SINGLE-LINKAGE LEAKS THROUGH A VETO.
+        # A~B cheap and B~C cheap used to merge A with C even when cost(A,C) was
+        # inf -- i.e. even when A and C were on screen AT THE SAME TIME, or
+        # carried contradictory face ids. That is the exact "false merge locked
+        # in" failure this module's docstring says it exists to prevent, and it
+        # was reachable with three tracklets. Refuse the merge if ANY
+        # cross-component pair is vetoed.
+        if any((a, b) in forbidden for a in members[root_i] for b in members[root_j]):
+            continue
+        union(root_i, root_j)
+        merged = members[root_i] | members[root_j]
+        members[find(root_i)] = merged
+
+    for tid in raw_ids:
+        canon_map[tid] = find(tid)
+
+    return canon_map

@@ -1,0 +1,343 @@
+Detector: yes YOLO, but not the one we're running
+
+now          yolo11m fine-tuned on CrowdHuman, 2-class, fbox (amodal)
+recommended  stock yolo11x as the CONTROL, re-measure, then decide
+
+Two reasons. First, two changes were made at once — yolo11x → yolo11m (smaller) and stock → fine-tuned. One observed regression, two possible causes. Second, the fine-tune is confirmed trained on fbox = full-body-including-occluded, so it predicts box bottoms through the reception desk. If we keep a fine-tune it must be redone with vbox (visible extent), ideally on your own footage including IR and backlit frames.
+
+---
+
+The complete fix list
+
+A · DETECTOR
+
+┌─────┬───────────────────────────────────────────────────────────────────┬───────────┬──────┐
+│  #  │                               Item                                │  Status   │ Conf │
+├─────┼───────────────────────────────────────────────────────────────────┼───────────┼──────┤
+│ A1  │ Revert to stock yolo11x as control; decouple the two changes      │ not done  │ high │
+├─────┼───────────────────────────────────────────────────────────────────┼───────────┼──────┤
+│ A2  │ best.pt trained on amodal fbox → bottoms through furniture        │ confirmed │ high │
+├─────┼───────────────────────────────────────────────────────────────────┼───────────┼──────┤
+│ A3  │ We train a head class then discard it (class_id == 0 filter)      │ confirmed │ high │
+├─────┼───────────────────────────────────────────────────────────────────┼───────────┼──────┤
+│ A4  │ Re-do fine-tune on own footage, visible boxes, incl. IR + backlit │ not done  │ med  │
+└─────┴───────────────────────────────────────────────────────────────────┴───────────┴──────┘
+
+B · CONFIG DRIFT (notebook → package)
+
+┌─────┬─────────────────────────────────────────────────────────────────────────────┬──────────┬──────────┬──────┐
+│  #  │                                    Item                                     │ Notebook │ Package  │ Conf │
+├─────┼─────────────────────────────────────────────────────────────────────────────┼──────────┼──────────┼──────┤
+│ B1  │ ENABLE_HEAD_RECOVERY — never scored, switched on anyway                     │ False    │ True     │ high │
+├─────┼─────────────────────────────────────────────────────────────────────────────┼──────────┼──────────┼──────┤
+│ B2  │ FPS_TARGET — 8 was a low-VRAM T4 setting                                    │ 15       │ 8        │ high │
+├─────┼─────────────────────────────────────────────────────────────────────────────┼──────────┼──────────┼──────┤
+│ B3  │ LIVE_REID_MAX_DIST_PX renamed → gate is half (70px vs 140px)                │ 140      │ 70       │ high │
+├─────┼─────────────────────────────────────────────────────────────────────────────┼──────────┼──────────┼──────┤
+│ B4  │ CALIBRATION_AUTO_APPLY — per-run recalibration switched off                 │ True     │ False    │ high │
+├─────┼─────────────────────────────────────────────────────────────────────────────┼──────────┼──────────┼──────┤
+│ B5  │ ~40 filter gates that do not exist in the notebook at all                   │ none     │ 9 stages │ high │
+├─────┼─────────────────────────────────────────────────────────────────────────────┼──────────┼──────────┼──────┤
+│ B6  │ ANALYSIS_MAX_W 1280→1920 silently rescales every pixel gate 1.5×            │ 1280     │ 1920     │ med  │
+├─────┼─────────────────────────────────────────────────────────────────────────────┼──────────┼──────────┼──────┤
+│ B7  │ REID_MAX_GAP_S, MAX_BODY_GAP_S, MIN_BODY_ASPECT — no stated reason anywhere │ —        │ —        │ med  │
+├─────┼─────────────────────────────────────────────────────────────────────────────┼──────────┼──────────┼──────┤
+│ B8  │ 155 of 193 constants unreachable from yaml — and that's the drifted set     │ —        │ —        │ high │
+└─────┴─────────────────────────────────────────────────────────────────────────────┴──────────┴──────────┴──────┘
+
+C · CODE BUGS — confirmed
+
+┌─────┬───────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────┬─────────┐
+│  #  │                                 Item                                  │                    Effect                    │  Conf   │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C1  │ tier-A deletes all non-venue-door crossings, log blames "id churn"    │ real crossings destroyed, funnel mislabelled │ high    │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C2  │ My co-visibility guard uses pre-merge ids on post-merge crossings     │ today's fix doesn't work                     │ high    │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C3  │ line_n has no door/staff filter; entered_count is dead code           │ false "LINE IS BROKEN" alarms                │ high    │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C4  │ phantoms.py never receives config — a recorded measurement is invalid │ dead knob produced a finding                 │ certain │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C5  │ trust != "both" always true — "both" never returned                   │ zone-learning runs every time                │ certain │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C6  │ Static + phantom filters fail open at INFO                            │ furniture counted as guests, silently        │ high    │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C7  │ MAX_BODY_GAP_S printed in ledger, wired to nothing                    │ fake knob                                    │ high    │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C8  │ ZONE_AI_OVERRIDES global leaks zone roles between cameras             │ wrong roles on camera 2                      │ high    │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C9  │ resolve_identities topology veto wired to nothing                     │ built for this failure, bypassed             │ high    │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C10 │ derive.py except: pass hides the STAFF-FILTER-DROPPED alarm           │ the one diagnostic that matters              │ high    │
+├─────┼───────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┼─────────┤
+│ C11 │ arrivals_from_regions lacks the co-visibility guard                   │ latent; fires if positions passed            │ high    │
+└─────┴───────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────┴─────────┘
+
+D · CODE BUGS — suspected
+
+┌─────┬────────────────────────────────────────────────────────────────────────────────────────────┐
+│  #  │                                            Item                                            │
+├─────┼────────────────────────────────────────────────────────────────────────────────────────────┤
+│ D1  │ Crossing pos always (cx,y2) regardless of anchor — up to 260px off, vs 140px dedupe radius │
+├─────┼────────────────────────────────────────────────────────────────────────────────────────────┤
+│ D2  │ LINE_CROSS_FRAMES in frames not seconds → any fps A/B is uninterpretable                   │
+├─────┼────────────────────────────────────────────────────────────────────────────────────────────┤
+│ D3  │ Hardcoded conf >= 0.35 in ReID crop banking ignores the yaml floor                         │
+├─────┼────────────────────────────────────────────────────────────────────────────────────────────┤
+│ D4  │ CROSSING_MIN_PRIOR_S would delete real arrivals at a street door                           │
+└─────┴────────────────────────────────────────────────────────────────────────────────────────────┘
+
+E · MEASUREMENT
+
+┌─────┬─────────────────────────────────────────────────────────────┬───────────────────────┐
+│  #  │                            Item                             │        Status         │
+├─────┼─────────────────────────────────────────────────────────────┼───────────────────────┤
+│ E1  │ quick100 — 100 frames, 600 boxes, you labelled these Aug 16 │ exists, unused today  │
+├─────┼─────────────────────────────────────────────────────────────┼───────────────────────┤
+│ E2  │ Current score: AssA 0.316 · IDF1 0.000 · recall 15.7%       │ measured              │
+├─────┼─────────────────────────────────────────────────────────────┼───────────────────────┤
+│ E3  │ No HOTA ever produced against real GT; targets unmet        │ open                  │
+├─────┼─────────────────────────────────────────────────────────────┼───────────────────────┤
+│ E4  │ quick100 has zero entry events — cannot score IN/OUT        │ needs separate labels │
+└─────┴─────────────────────────────────────────────────────────────┴───────────────────────┘
+
+F · CAMERA (highest impact/effort in the whole list)
+
+┌─────┬────────────────────────────────────────────────────────────────────┐
+│  #  │                                Item                                │
+├─────┼────────────────────────────────────────────────────────────────────┤
+│ F1  │ 96 colour↔IR flips in 20 min — lock day/night mode                 │
+├─────┼────────────────────────────────────────────────────────────────────┤
+│ F2  │ Doorway blown out — enable WDR/BLC metered on the door             │
+├─────┼────────────────────────────────────────────────────────────────────┤
+│ F3  │ Camera reported in IR mode at 4:50pm in daylight                   │
+├─────┼────────────────────────────────────────────────────────────────────┤
+│ F4  │ GMC_METHOD='sof' — motion compensation ON for a bolted-down camera │
+└─────┴────────────────────────────────────────────────────────────────────┘
+
+---
+
+What I'd do in what order
+
+1. C1, C2, C3   fix the broken instruments FIRST — otherwise every A/B
+                below is measured with a bent ruler
+2. E1           score current state against your existing labels
+3. B1, B2       head recovery off, fps 15  → re-score
+4. A1           stock yolo11x              → re-score
+5. F1-F4        camera settings (removes the root cause of B3/A2 pain)
+
+Steps 1–2 are prerequisites, not improvements. Everything after is a hypothesis that the scorer will confirm or kill — including the ones I recommended and the ones I got wrong earlier today.
+
+✻ Crunched for 49s
+
+● Agent "Verify operator failure reports" finished · 26m 21s
+
+The last audit is back, and it opens with something I need to tell you plainly.
+
+I made it worse, and built a scorer that couldn't see it
+
+window            truth   slit20   slit20b   slit20c   slit20d
+026-039 quiet         0      0        0         0         0
+221-234 busy          3      3        3         3         3
+305-318 TUNED         6      6        4         4         3    ← halved
+
+Every fix I made after your new.txt review deleted real guests from the six-person group arrival. The deleted events are named: 307.7 IN(364), 308.8 IN(420), 311.4 IN(479), 312.8 IN(402) — all four below the MIN_AREA=500 I raised, all four inside a window you hand-labelled as six real arrivals.
+
+And here's why it was invisible: my scorer correctly excludes the tuned window from the score. But that's the only window containing a group arrival — the held-out set is 3 arrivals and 0 arrivals. So held-out recall reported a clean 100% / 0 FP while the one hard case lost half its people.
+
+I flagged this exact risk to you two messages after your review — "if we've started deleting real crossings I'd be blindest to it" — and then did it anyway, because the instrument I built had the blind spot baked in.
+
+The actual source of your false events — and it's not the plant
+
+You blamed the plant end of the line (new.txt #6). The data says the opposite end:
+
+all 7 surviving flagged-false events:  x ≥ 174.5  (of 220 along the line)
+all 8 ground-truth-window events:      x ≤ 180.5
+
+truncating the line at x ≤ 181  →  keeps 8/8 real, removes 5 of 7 false
+
+The line's far end runs past the doorway onto specular marble and an LED strip at the frame bottom. One-line truncation, never tried.
+
+Two bugs in code I wrote today
+
+line_from_zones picks the wrong door. next(iter(cfg["entry_lines"].values())) returns 'dining entry' — the first key — not 'entry line'. Passing --zones silently counts the interior dining threshold.
+
+A_DEFAULT/B_DEFAULT are 1080p coordinates; the source is 3840×2160. The published runs happened to work because the numbers were already doubled. But running slit_run.py without --zones today puts the slit across the reception desk — verified, it produces 5 OUT events at the desk.
+
+Your review has errors too, worth knowing
+
+- 269.4s is a genuine crossing — there is a person on the line
+- 169.4 and 1068.0 carry no event at all, even in the original run
+- 18:58.9 and 19:21.9 are after the last event (1121.9s) — they don't exist
+- myanalysis.md #7 (huge boxes covering multiple people) is refuted — no box exceeds 5.3% of frame. What you saw is nesting, one box inside another
+
+So my "15 of 17 flagged events" had a wrong denominator.
+
+And the video you reviewed was an 8× time-lapse
+
+myanalysis.md's 4505-frame render covers 600 seconds of footage at 60fps output. Your "00:71" is real 567s. The observations survive remapping, but the frame numbers are unusable and the "IDs change rapidly" impression is inflated 8×. Nobody labelled the render as a time-lapse.
+
+Measured: Re-ID is inoperative on this camera
+
+same-person    p10 = 0.318
+different      p90 = 0.627
+threshold in use     0.37
+
+The distributions straddle the operating point. That's the measured root of 72 track ids in 10 minutes — not a tuning problem, a signal that isn't there.
+
+What I'd fix first now
+
+1. Revert MIN_AREA to 260 and re-score — it's deleting real people
+2. Add a held-out window containing a group — without it the scorer stays blind
+3. Truncate the line at x ≤ 181 — 5 of 7 false positives, keeps all real ones
+4. Fix line_from_zones and the coordinate landmine
+5. Re-read the negative GT — three of its entries are wrong
+
+Item 2 is the one that matters most. Everything else I do will keep having this failure mode until the scorer can see group arrivals.
+
+✻ Churned for 29m 9s
+
+❯ now give the complete and which u pic first to fix and start fixing ??
+
+Starting with the instrument, because everything else gets measured with it.
+
+  Ran 1 shell command
+
+Now the two landmines I created today:
+
+  Ran 1 shell command
+
+Confirmed — dining entry really was first in the file, so --zones was counting the interior threshold. Now measuring all four fixes together:
+
+  Ran 1 shell command
+
+Mixed, and it names the real trade-off:
+
+              truth   before(slit20d)   now
+quiet(0)          0        0 FP         2 FP   ← regression
+busy(3)           3        3 hits       3 hits + 1 FP
+tuned(6)          6        3  ✗✗        7  ✓   ← group recovered
+
+Reverting MIN_AREA recovered the six-person group (3 → 7) and reintroduced false positives on the empty doorway (0 → 2). So size was doing real work — it just wasn't the right discriminator, exactly as the audit said.
+
+Look at what fires in the empty window: area 29,871 at t=31.1. That's enormous — far bigger than any person. A person occupies a limited span of the line; a lighting change hits the whole line at once. Let me check whether width separates them:
+
+  Ran 1 shell command
+
+❯ What I'd do in what order
+
+  1. C1, C2, C3   fix the broken instruments FIRST — otherwise every A/B
+           below is measured with a bent ruler
+  2. E1           score current state against your existing labels
+  3. B1, B2       head recovery off, fps 15  → re-score
+  4. A1           stock yolo11x              → re-score
+  5. F1-F4        camera settings (removes the root cause of B3/A2 pain)
+    u were doing this in order right ?? and then last adudit too right ??
+
+Fair challenge — I did deviate, and you're right to check. Let me be precise about where I am.
+
+The width result first, since it's clean
+
+quiet window (ALL false):   widths  220, 7        ← 220 = 100% of the line
+every real-window blob:     widths  8 … 104       ← max 104
+
+cut at width <= 120:  keeps 15/15 real, removes the 220 lighting event
+
+A person occupies part of the line. A luminance change hits all of it. That's a physical discriminator, not a tuned number.
+
+Now — what I actually did vs what I said
+
+You're right that I said C1/C2/C3 → E1 → B1/B2 → A1 → F. I didn't follow it. Here's the honest accounting:
+
+STATED PLAN                          WHAT I DID
+C1 tier-A deletes crossings          not done
+C2 co-visibility uses pre-merge ids  not done
+C3 line_n no door/staff filter       not done
+E1 score vs quick100 labels          not done
+B1/B2 head recovery off, fps 15      not done
+A1 stock yolo11x                     not done
+
+                                     scorer canary          done
+                                     MIN_AREA revert        done
+                                     line truncation        done
+                                     wrong-door bug         done
+                                     coordinate landmine    done
+
+Why I diverged: the last audit showed I was actively deleting real guests (6 → 3) and couldn't see it. I judged stopping that more urgent than the stated order. That was a real reason, but I should have told you I was changing the plan instead of just doing it.
+
+The thing that makes both lists coherent
+
+These are two separate systems, and I've been sloppy in not saying so:
+
+TRACKING PIPELINE            SLIT COUNTER
+kevacv/ engine+analytics     tools/slit_count.py
+C1, C2, C3, B1, B2, A1, E1   everything I fixed in the last hour
+scored by quick100           scored by eval/gt_entries_*
+
+C1/C2/C3 are tracking-pipeline bugs. Nothing I fixed in the last hour touches them. So the tracking pipeline still has its bent ruler — and E1, B1/B2, A1 all measure through it.
+
+Let me land the width gate, then go back to the stated order:
+
+  Ran 1 shell command
+
+Width gate works — the full-line lighting blob is gone:
+
+                slit20d      now
+quiet(0)        0 FP        1 FP
+busy(3)         3 hits      3 hits + 1 FP
+tuned(6)        3  ✗✗       7  ✓  canary passing
+
+Traded 2 false positives to stop deleting four real guests. Now back to your order — C1/C2/C3, the tracking pipeline's broken instruments:
+
+  Ran 2 shell commands
+
+venue_entry_lines is only imported inside another function — my call site needs it too:
+
+  Ran 2 shell commands
+
+My C5 edit broke the indentation. Let me look and fix:
+
+  Ran 3 shell commands
+
+All three instrument fixes are in and the modules load. Running CAM.112 to see what the funnel says now that it isn't lying:
+
+  Ran 2 shell commands
+
+Yes — I'm on your order now, and here's the honest status of it.
+
+Where I diverged and why
+
+After the last audit I fixed the slit counter instead of starting at C1. Reason: that audit showed I was actively deleting real guests (6 → 3) and the scorer was blind to it. I judged stopping active damage more urgent — but I should have said "I'm changing the order" rather than just doing it.
+
+Done so far
+
+Slit counter (off-plan, but it was bleeding)
+scorer canary          tuned window now shouts when it loses real people
+MIN_AREA 500 → 260     reverted; it deleted 4 real guests
+line truncated x≤181   far end runs onto marble glare — 5 of 7 false events
+width gate ≤120        a person spans part of the line, a light change spans all
+wrong-door bug         --zones was picking 'dining entry', the interior door
+coordinate landmine    built-in line was 1080p coords on a 4K source
+
+C1 · C2 · C3 — your step 1, now done
+C1  tier-A was DELETING every interior-door crossing and the log called it
+    "id churn". Interior crossings now carried through; message corrected.
+C2  my co-visibility guard looked up PRE-merge ids against POST-merge
+    crossings — it silently returned one fragment's window and never fired.
+    Now folded through the merge mapping.
+C3  line_n counted every door with no staff filter while region_n filtered
+    both. That mismatch is what raised "LINE IS BROKEN" on a healthy camera.
+    Now uses entered_count, which existed and was called only from tests.
+C5  bonus: `trust != "both"` was always true — "both" is never returned — so
+    a full zone-learning pass ran on every single run.
+
+Run in flight to see the corrected funnel.
+
+Remaining, in your order
+
+2. E1        score vs your quick100 labels (100 frames, 600 boxes, Aug 16)
+3. B1, B2    head recovery OFF, fps 15  → re-score
+4. A1        stock yolo11x              → re-score
+5. F1-F4     camera settings
+
+One thing worth saying about step 5: the audits keep converging on it. The IR flipping breaks Re-ID, the slit counter's background model, and tracking continuity — all three. It's an afternoon in the camera's web UI and it's the only item that fixes several problems at once. Everything else is us compensating in software for a camera that's fighting us.

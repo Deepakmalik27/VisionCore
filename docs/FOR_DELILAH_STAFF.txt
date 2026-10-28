@@ -1,0 +1,68 @@
+HOW TO EXPORT CAMERA FOOTAGE — Delilah LA
+==========================================
+Takes about 10 minutes. No software to install.
+
+WHAT WE NEED
+------------
+Date:    Monday, July 27, 2026
+Time:    5:00 PM to 7:00 PM
+Camera:  the one covering the FRONT DOOR / host stand
+         (likely CAM.101, CAM.104, or CAM.115 — whichever shows the entrance)
+
+
+STEPS
+-----
+1. Open  https://unifi.ui.com  and sign in
+   (or open the UniFi Protect app)
+
+2. Choose the console:  H.WOOD DLH LA - NVR.100.001
+
+3. Click  Protect
+
+4. In the left icon strip, click the  ▶  (play) icon — this is Live / Playback
+
+5. Pick the front-door camera from the list
+
+6. Scrub the timeline back to  July 27,  5:00 PM
+
+7. Select a 10-MINUTE range first  (5:00 PM to 5:10 PM)
+
+8. Click  Download / Export
+   -> it saves an .mp4 to your computer
+
+9. IF THAT WORKED, repeat for the rest:
+      5:10-5:20,  5:20-5:30,  5:30-5:40 ... up to 7:00 PM
+   (12 clips total)
+
+   Please keep 10-minute pieces. Longer exports often fail partway
+   and we end up with a corrupt file.
+
+10. Upload the .mp4 files to Google Drive and share the link
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+"No footage at that time"
+    -> the camera may not have been recording. Try a different camera,
+       or tell us and we'll pick another date.
+
+Export starts but never finishes
+    -> the range is too long. Try 5 minutes instead of 10.
+
+Cannot find the Download / Export button
+    -> your account may be view-only. Ask whoever manages the
+       UniFi system for export rights.
+
+
+ONE MORE THING (10 seconds, very helpful)
+-----------------------------------------
+In Protect, go to:   Settings -> On-Site Retention
+
+Tell us the number of days shown. We need to know how far back the
+recordings go, so we know whether the July 27 footage is about to be
+overwritten.
+
+
+QUESTIONS
+---------
+Reply to Prabh.

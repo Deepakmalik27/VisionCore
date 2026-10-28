@@ -1,0 +1,244 @@
+{
+  "frame_size": [
+    3840,
+    2160
+  ],
+  "polygons": {
+    "reception": [
+      [
+        224,
+        1212
+      ],
+      [
+        8,
+        864
+      ],
+      [
+        4,
+        100
+      ],
+      [
+        1424,
+        100
+      ],
+      [
+        1572,
+        736
+      ],
+      [
+        864,
+        836
+      ],
+      [
+        776,
+        1072
+      ],
+      [
+        212,
+        1220
+      ],
+      [
+        212,
+        1220
+      ]
+    ],
+    "plant area mask": [
+      [
+        1990,
+        380
+      ],
+      [
+        2860,
+        380
+      ],
+      [
+        2860,
+        1700
+      ],
+      [
+        2760,
+        2159
+      ],
+      [
+        2060,
+        2159
+      ],
+      [
+        1990,
+        1700
+      ]
+    ],
+    "waiting area": [
+      [
+        1032,
+        1536
+      ],
+      [
+        496,
+        1564
+      ],
+      [
+        1012,
+        2136
+      ],
+      [
+        2716,
+        2152
+      ],
+      [
+        2608,
+        1844
+      ],
+      [
+        2100,
+        1836
+      ],
+      [
+        2008,
+        1196
+      ],
+      [
+        1676,
+        1260
+      ],
+      [
+        1668,
+        1496
+      ],
+      [
+        1044,
+        1540
+      ],
+      [
+        1044,
+        1540
+      ]
+    ],
+    "main_entrance": [
+      [
+        2600,
+        900
+      ],
+      [
+        3838,
+        900
+      ],
+      [
+        3838,
+        2159
+      ],
+      [
+        2600,
+        2159
+      ]
+    ],
+    "dining": [
+      [
+        0,
+        1180
+      ],
+      [
+        700,
+        1560
+      ],
+      [
+        1150,
+        2158
+      ],
+      [
+        0,
+        2158
+      ]
+    ]
+  },
+  "roles": {
+    "reception": [
+      "staff",
+      "seating"
+    ],
+    "waiting area": [
+      "wait"
+    ],
+    "plant area mask": [
+      "mask"
+    ],
+    "main_entrance": [
+      "entry"
+    ],
+    "dining": [
+      "seating"
+    ]
+  },
+  "entry_lines": {
+    "dining entry": [
+      [
+        500,
+        1676
+      ],
+      [
+        948,
+        2144
+      ]
+    ],
+    "staff entry": [
+      [
+        784,
+        1104
+      ],
+      [
+        184,
+        1232
+      ]
+    ],
+    "entry line": [
+      [
+        3000,
+        0
+      ],
+      [
+        3000,
+        2159
+      ]
+    ]
+  },
+  "_source_note": "Drawn by the operator in tools/zone_mapper_v2.html on output/_ref.png at 960x540, scaled x4 to this file's canonical 3840x2160. Labels kept verbatim except 'plant area' -> 'plant area mask' (see _roles_note). The calib_row_* shapes were moved to CAM.112_calib_lines.json: they are calibration scaffolding, and as zones they were 7 role-'other' polygons carried through every frame for nothing.",
+  "_roles_note": "Explicit, so renaming a zone later cannot silently change what it measures. 'reception' carries seating too: this venue has no separate seating area, and without it the zone-completeness guard reports a missing role every run -- a warning that is always wrong gets ignored. 'plant area mask' MUST keep the word mask: _drop_masked deletes detections whose feet land inside a mask zone, and that is the only thing stopping the plant becoming 'P13 staff'.",
+  "_ground_points_TEMPLATE": {
+    "_how": [
+      "RENAME to 'ground_points' once real. Needs >=5 ADJACENT floor-tile corners (no skips, no duplicates) plus the tile edge in cm. 4 points fit ANY labelling with zero error -- see tools/calibrate_plane.py enough_evidence()."
+    ],
+    "points": []
+  },
+  "_main_entrance_note": "EXTENDED TO THE FRAME BOTTOM 2026-08-15, from measurement not opinion.\nAcross 8,219 recorded boxes in a 10-minute run, main_entrance scored ZERO hits while reception scored 460, dining 660 and waiting 305. The 284 foot-points on the entrance side sat at y p10 1078 / p50 1079 / max 1084 (analysis space, frame is 1080 tall) \u2014 i.e. ON THE FRAME BOTTOM, because a person at that door is in the extreme foreground and their box is clipped by the frame edge. The old polygon stopped at y1072. Seven pixels was the whole difference between 0 hits and 284.\nx also pulled from 1354 to 1300 (file 2600): observed foot x had p10 1326, so the left edge was clipping the approach as well.\nGENERAL LESSON for any camera: an ENTRY zone must reach the frame edge. People arrive from off-camera, so their first frames are always clipped, and a zone that stops short of the border can never see an arrival.",
+  "_geometry_note": "NAMES SWAPPED 2026-08-14 on operator correction. The polygon on the RIGHT (x2708-3828) is the STREET ENTRANCE \u2014 that is where in/out happens. The bottom-left region is the DINING area, not an entrance; learn_zones clustered 12 births and 12 deaths there because guests LEAVE frame toward dining, which looks identical to arriving unless you know the room.\nConsequence of the old naming: the region arrival method counted anyone walking into DINING as a venue arrival, and 'entry' role on both sides meant there was no cross-check at all \u2014 just the same error twice.\nThe LINES were already correct: 'entry line' is on the right, 'dining entry' bottom-left. Only the polygons were mislabelled.",
+  "_plant_mask_note": "EXTENDED TO THE FLOOR AGAIN 2026-08-14. y stopped at 1824; the plant's detection box has its feet near y2320, and _drop_masked tests the box's BOTTOM edge \u2014 so the plant escaped its own mask and came back as a tracked person (P8, blue, 06:33 PM). A mask that triggers on feet has to reach the floor. Wide across the foliage, narrowing to the pot, so it does not eat the walkable floor either side.",
+  "entry_lines_flip": {
+    "entry line": true,
+    "dining entry": true,
+    "staff entry": true
+  },
+  "_entry_lines_flip_note": "WHICH SIDE IS 'IN', PER DOOR. A LineZone's direction comes from the ORDER of its two points \u2014 i.e. from the direction the mouse was dragged. One global ENTRY_LINE_FLIP for three hand-drawn doors cannot be right for all three: flipping it to fix the entrance inverts dining and the staff gate.\nThese start at the old global value (True) so this run reproduces the last one exactly. Then check the annotated video, which now labels EACH door with its OWN count, and flip the ones that read backwards. A door where people obviously walked in but OUT went up is inverted \u2014 flip that one only.",
+  "entry_lines_confirm_s": {
+    "entry line": 6.0,
+    "dining entry": 3.0,
+    "staff entry": 2.0
+  },
+  "_entry_lines_confirm_note": "CONFIRMATION WAIT per door, seconds. A crossing counts only if the person was still on the far side after this long; cross back sooner and BOTH events are cancelled, because nobody arrived or left.\nPer door because the doors do not behave alike: the street ENTRY LINE sits exactly where guests pause to be greeted, so it needs the longest wait (6s). Dining is a walk-through (3s). The staff gate is used constantly and a long wait there would erase real movement (2s).\nRaise a door's value if its count is too high; lower it if real crossings are being dropped. The run logs how many were cancelled per door.",
+  "_entry_line_note": "MEASURED REPLACEMENT 2026-08-20. Was [[2560,1484],[2792,2136]] and it counted ZERO. Two independent faults, both measured on output/p0verify (600s, 62 tracks):\n  1. 93% of the old segment lay inside 'plant area mask', which DELETES detections. Nobody could be seen crossing it.\n  2. Geometry. The old line was a DIAGONAL ending at y=2136 of a 2160-row frame. Door traffic walks HORIZONTALLY along the frame bottom: measured foot y = 2148..2156 while passing the line's x-band, i.e. UNDER the segment's low end and under most of its length. Tracks 55/57/108 each run from the door (x~3640) to the far wall (x~450) and cross the old line's x-band entirely beneath it. Segment crossings: 0 of 62 tracks.\nSwept candidate vertical lines against the real tracks:\n     x(analysis)  door tracks hit (of 19)  false hits on non-door tracks\n     1280-1396 (old, diagonal)   0                    -\n     1400                        6                    0\n     1500                       12                    0   <- chosen\n     1700                       12                    0\n     1850                        1                    0\nx=1500 analysis = 3000 source. The plant mask ends at x=2860 source, so this line is clear of the mask entirely -- fault 1 is fixed by geometry, not by relying on mask_require_motion.\nFULL HEIGHT (y 0..2159) so both ends terminate on a frame edge: the preflight open-ends check measured the old line's start 676px (31% of frame) from the nearest edge. Sweeping y=600..1080 vs y=0..1080 gave IDENTICAL hit counts, so the extra height costs nothing and removes the walk-around.\nCAUTION: fitted to ONE 600s window whose 62 'tracks' are fragments of far fewer people. Validate on the 7.30pm chunk before believing the counts.",
+  "scale_reference": {
+    "analysis_frame": [
+      1920,
+      1080
+    ],
+    "row": 780,
+    "pixels": 128.6,
+    "metres": 0.4243,
+    "tolerance": 0.1,
+    "_how": "ONE known real distance in this scene, so a fitted ground plane can be ACCEPTED OR REJECTED against reality instead of against an opinion.\nOperator measured the floor tile edge at Delilah Dallas: 30 cm (consistent with the 12x12 in / 30.48 cm checkerboard standard).\nMeasured from the video: an FFT of a horizontal strip across the checkerboard gives a period of 128.6 px, stable over analysis rows 700-860. The floor is laid at 45 degrees, so that period is the tile DIAGONAL = 0.30 * sqrt(2) = 0.4243 m.\nA plane is acceptable if dist_m over 128.6 px at row 780 lands within `tolerance` of that. The fit currently in use implies ~0.49 m per tile EDGE, i.e. a tile size nobody sells.\nTolerance is wide (35%) on purpose: this is a blunt instrument for catching a plane that is WRONG, not a precision calibration. Replace it with real ground_points when someone can mark tile corners.",
+    "_tolerance_note": "0.35 -> 0.10 on 2026-08-20. The wide band was a guess made before any fit had been scored against the floor. Measured on m_plane3, four candidate planes in one run: 0.532 m (25% off), REJECTED-on-height, 0.334 m (21% off), and 0.417 m (1.6% off, camera 3.22 m). A 35% band accepted three of them. 1.6% is demonstrably achievable, so anything past 10% is a bad fit, not measurement noise."
+  },
+  "entry_lines_band": {
+    "entry line": 1
+  },
+  "_entry_lines_band_note": "minimum_crossing_threshold per door, in FRAMES on the far side, default LINE_CROSS_FRAMES=2.\nMEASURED on the held-out busy window (221-234s, truth 3, scored 0). Four tracks belong to those guests and the chain linker says they are four DIFFERENT people, not one re-acquired:\n    id 35   11 pts  x 1833->1598   R=11 L=0   never crosses, dies right of the line\n    id 33    8 pts  x 1798->1469   R=7  L=1   CROSSES, one frame short of the band\n    id 37   53 pts  born x=1195               already left of the line\n    id 38  138 pts  born x=1158               already left of the line\nid 33 is a real transit rejected by an off-by-one: the default band wants 2 consecutive frames past the line and it has 1.\nWHY 1 IS RIGHT *HERE*: the band exists to stop 'a person shifting their weight on the line' being counted. That is a HOST STAND problem. This is a street door people walk briskly through, and at fps 8 a band of 2 demands 0.25s of dwell past the threshold. The interior doors keep the default: they are where people genuinely pause.\nCOST: a lower band admits more marginal crossings. Watch the QUIET window (26-39s, truth 0) -- if it stops reading 0, this is too low."
+}

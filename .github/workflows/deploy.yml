@@ -1,0 +1,53 @@
+# Push to main -> the EC2 box gets exactly this code.
+#
+# It runs tools/deploy.sh, the script that already exists: rsync --delete
+# (so a deleted file disappears there too), caches wiped both sides, and the
+# build id compared on both machines. If the ids differ the job FAILS, which
+# is the whole point -- a green tick that did not actually land the code is
+# worse than a red one.
+#
+# It deliberately does NOT run the pipeline. Deploy and run stay separate so
+# a failed sync can never look like a bad run.
+#
+# SECRETS (Settings -> Secrets and variables -> Actions):
+#   EC2_SSH_KEY   full contents of yolo-surveillance-key.pem
+#   EC2_HOST      ubuntu@ec2-54-81-52-35.compute-1.amazonaws.com
+# VARIABLE (optional):
+#   REMOTE_DIR    default /home/ubuntu/keva_vision
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false      # never let a half-finished rsync be killed
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: write ssh key
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy.pem
+          # A .pem copied on Windows carries CRLF. ssh then rejects the key
+          # with "invalid format", which reads like a wrong key, not a wrong
+          # line ending, and costs an hour.
+          sed -i 's/\r$//' ~/.ssh/deploy.pem
+          chmod 600 ~/.ssh/deploy.pem
+          ssh-keygen -l -f ~/.ssh/deploy.pem      # fails loudly if the paste is truncated
+
+      - name: sync + verify build id
+        env:
+          KEY: ~/.ssh/deploy.pem
+          # The runner is ephemeral, so there is no known_hosts to trust from.
+          SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20
+        run: |
+          chmod +x tools/deploy.sh
+          tools/deploy.sh "${{ secrets.EC2_HOST }}" "${{ vars.REMOTE_DIR || '/home/ubuntu/keva_vision' }}"

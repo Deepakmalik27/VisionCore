@@ -1,0 +1,131 @@
+<title>Delilah Reception · 28 July</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+:root{--fog:#FAF8F5;--paper:#FFFEFB;--slate:#1C1917;--copper:#D4622B;
+ --sage:#8B7E6F;--hair:#DDD5CB;--tint:#FDF5EF;--olive:#5C6B4F;
+ --slatelt:#F5F1EB;--copperdk:#7C2D12;--copperlt:#FCEADB}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+ --fog:#1C1917;--paper:#22201D;--slate:#F5F1EB;
+ --copper:#E8844A;--sage:#B5ADA1;--hair:#35312D;
+ --tint:#2A1D17;--slatelt:#2A2724;
+ --copperdk:#E8844A;--copperlt:#2A1D17}}
+:root[data-theme="dark"]{--fog:#1C1917;--paper:#22201D;
+ --slate:#F5F1EB;--copper:#E8844A;--sage:#B5ADA1;
+ --hair:#35312D;--tint:#2A1D17;--slatelt:#2A2724;
+ --copperdk:#E8844A;--copperlt:#2A1D17}
+*{box-sizing:border-box}
+body{margin:0;background:var(--fog);color:var(--slate);
+ font-family:'Space Grotesk',-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:clamp(24px,4vw,52px)}
+.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
+header{border-bottom:2px solid var(--copper);padding-bottom:18px;
+ margin-bottom:26px}
+.brandline{display:flex;justify-content:space-between;align-items:baseline;
+ gap:16px;flex-wrap:wrap}
+h1{font-size:clamp(1.5rem,3vw,2.1rem);margin:0;font-weight:700;
+ letter-spacing:-.02em}
+.sub{color:var(--sage);font-size:.92rem;margin-top:.35em}
+.stamp{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.7rem;letter-spacing:.16em;
+ color:var(--copper);text-transform:uppercase}
+h2{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.7rem;letter-spacing:.18em;
+ text-transform:uppercase;color:var(--copper);margin:34px 0 14px;
+ padding-bottom:8px;border-bottom:1px solid var(--hair)}
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.tile{background:var(--paper);border:1px solid var(--hair);
+ border-radius:8px;padding:18px 18px 16px}
+.tile.miss{border-color:var(--copperdk);background:var(--copperlt)}
+.tile .v{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:clamp(1.7rem,3.4vw,2.5rem);
+ font-weight:600;line-height:1;font-variant-numeric:tabular-nums}
+.tile.miss .v{color:var(--copperdk)}
+.tile .k{font-size:.9rem;color:var(--sage);margin-top:.5em}
+.tier{display:inline-block;font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.58rem;
+ letter-spacing:.14em;padding:.25em .6em;border-radius:3px;margin-top:.9em;
+ background:var(--tint);color:var(--copper);border:1px solid var(--copper)}
+.tier.exact{background:transparent;color:var(--olive);border-color:var(--olive)}
+.meter{background:var(--paper);border:1px solid var(--hair);
+ border-radius:8px;padding:20px}
+.meterbar{height:34px;border-radius:5px;overflow:hidden;display:flex;
+ background:var(--slatelt);gap:2px}
+.meterbar i{display:block;height:100%}
+.meterkey{display:flex;gap:22px;margin-top:12px;font-size:.84rem;
+ color:var(--sage);flex-wrap:wrap}
+.meterkey b{color:var(--slate);font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-weight:600}
+.swatch{display:inline-block;width:11px;height:11px;border-radius:2px;
+ margin-right:7px;vertical-align:baseline}
+.rows{display:flex;flex-direction:column;gap:9px}
+.row{display:grid;grid-template-columns:150px 1fr 74px;align-items:center;
+ gap:14px}
+.row .nm{font-size:.9rem;overflow:hidden;text-overflow:ellipsis;
+ white-space:nowrap}
+.row .nm small{color:var(--sage);font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.62rem;
+ letter-spacing:.1em;margin-left:.5em}
+.track{background:var(--slatelt);border-radius:4px;height:22px}
+.track i{display:block;height:100%;background:var(--copper);
+ border-radius:0 4px 4px 0}
+.row .val{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.86rem;text-align:right;
+ font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:.88rem}
+th{text-align:left;font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.62rem;
+ letter-spacing:.14em;text-transform:uppercase;color:var(--sage);
+ padding:0 10px 9px 0;border-bottom:1px solid var(--hair);font-weight:500}
+td{padding:10px 10px 10px 0;border-bottom:1px solid var(--hair)}
+td.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
+.callout{background:var(--paper);border:1px solid var(--hair);
+ border-left:3px solid var(--copper);border-radius:6px;
+ padding:16px 20px;font-size:.9rem;color:var(--sage);line-height:1.6}
+.callout.warn{border-left-color:var(--copperdk);background:var(--copperlt)}
+.callout b{color:var(--slate)}
+ul.caveats{margin:0;padding-left:1.1em;color:var(--sage);font-size:.88rem;
+ line-height:1.65;display:flex;flex-direction:column;gap:.6em}
+footer{margin-top:38px;padding-top:16px;border-top:1px solid var(--hair);
+ color:var(--sage);font-size:.78rem}
+@media(max-width:760px){.tiles{grid-template-columns:repeat(2,1fr)}
+ .row{grid-template-columns:110px 1fr 60px}}
+</style>
+<div class="wrap">
+<header><div class="brandline"><div>
+<h1>Delilah — Reception</h1>
+<div class="sub">CAM.112 · 2026-07-28 · 20:10–20:30 · 20 minutes of evening service</div></div>
+<div class="stamp">Keva Vision · morning report</div>
+</div></header>
+<div class="tiles">
+<div class="tile"><div class="v">61.1%</div><div class="k">desk covered<br><span style="opacity:.75">target is 90%</span></div><span class="tier exact">EXACT</span></div>
+<div class="tile miss"><div class="v">3</div><div class="k">gaps of a minute or more<br><span style="opacity:.75">longest 3.4 min</span></div><span class="tier">EXACT</span></div>
+<div class="tile miss"><div class="v">5</div><div class="k">guests waited through a gap<br><span style="opacity:.75">nobody at the desk</span></div><span class="tier">EXACT</span></div>
+<div class="tile"><div class="v">8</div><div class="k">most people in the room at once<br><span style="opacity:.75">needs no identity</span></div><span class="tier exact">EXACT</span></div>
+</div>
+<div class="callout warn" style="margin-top:16px"><b>This is the finding.</b> The desk was unstaffed three times for a minute or more, the longest for 3.4 minutes, and 5 guests stood waiting through one of them. Coverage came to 61.1% against a 90% target. Nobody had to watch twenty minutes of footage to learn that.</div>
+<h2>Was the desk covered?</h2>
+<div class="meter"><div class="meterbar"><i style="width:61.1%;background:var(--copper)"></i><i style="width:38.9%;background:var(--slatelt);border:1px dashed var(--hair)"></i></div><div class="meterkey"><span><span class="swatch" style="background:var(--copper)"></span>staffed <b>61.1%</b></span><span><span class="swatch" style="background:var(--slatelt);border:1px solid var(--hair)"></span>nobody at the desk <b>38.9%</b></span><span style="margin-left:auto">target <b>90%</b></span></div></div>
+<h2>Who worked the desk, and for how long</h2>
+<div class="rows">
+<div class="row"><div class="nm">staff7<small>face 100%</small></div><div class="track"><i style="width:100.0%"></i></div><div class="val">7.8 min</div></div>
+<div class="row"><div class="nm">staff2<small>face 95%</small></div><div class="track"><i style="width:35.8974358974359%"></i></div><div class="val">2.8 min</div></div>
+<div class="row"><div class="nm">sarah<small>face 100%</small></div><div class="track"><i style="width:28.20512820512821%"></i></div><div class="val">2.2 min</div></div>
+<div class="row"><div class="nm">staff4<small>face 100%</small></div><div class="track"><i style="width:20.512820512820515%"></i></div><div class="val">1.6 min</div></div>
+<div class="row"><div class="nm">staff6<small>face 100%</small></div><div class="track"><i style="width:14.102564102564106%"></i></div><div class="val">1.1 min</div></div>
+<div class="row"><div class="nm">staff1<small>face 85%</small></div><div class="track"><i style="width:10.256410256410257%"></i></div><div class="val">0.8 min</div></div>
+</div>
+<div class="callout" style="margin-top:14px"><b>All six were matched by face</b>, at 85–100% confidence, against staff photographs. Between them they held the desk for 16.3 of the 20 minutes — which is the other way of reading the 61% above.</div>
+<h2>Where the twenty minutes were spent</h2>
+<div class="rows">
+<div class="row"><div class="nm">Reception</div><div class="track"><i style="width:100.0%"></i></div><div class="val">66 min</div></div>
+<div class="row"><div class="nm">Waiting area</div><div class="track"><i style="width:40.909090909090914%"></i></div><div class="val">27 min</div></div>
+<div class="row"><div class="nm">Main entrance</div><div class="track"><i style="width:13.636363636363635%"></i></div><div class="val">9 min</div></div>
+</div>
+<h2>Every answer, with its tier</h2>
+<table><tr><th>question</th><th>answer</th><th>tier</th><th>what would make it wrong</th></tr>
+<tr><td>Was the desk covered?</td><td class="mono">61.1%</td><td class="mono">EXACT</td><td style="color:var(--sage)">counts the station, not a person</td></tr>
+<tr><td>Desk unstaffed for 60s or more?</td><td class="mono">3</td><td class="mono">EXACT</td><td style="color:var(--sage)">longest 3.4 min, 5 guests waiting</td></tr>
+<tr><td>How fast were guests greeted?</td><td class="mono">1.2 s</td><td class="mono">PROXY</td><td style="color:var(--sage)">proximity is not conversation · 9 never approached</td></tr>
+<tr><td>How many guests?</td><td class="mono">168</td><td class="mono">WEAK</td><td style="color:var(--sage)">implausible — identity is fragmenting, do not use</td></tr>
+<tr><td>Most people in the room at once</td><td class="mono">8</td><td class="mono">EXACT</td><td style="color:var(--sage)">needs no identity, so it is the reliable headcount</td></tr>
+</table>
+<h2>What needs a human eye</h2>
+<div class="callout">Nothing was flagged by a rule. <b>That is not the same as nothing happening</b> — the three desk gaps above were measured, not flagged, because the anomaly baseline has not yet seen enough nights of this room to know what normal looks like.</div>
+<h2>How much to trust this</h2>
+<ul class="caveats"><li>The guest count of 168 is wrong and the system says so itself: at most 8 people were ever in the room, so 168 identities means one person is being split into several. Read the occupancy figure instead.</li><li>167 cells inside a counted zone never produced a single detection — either nobody stood there, or we are blind there, and those two are worth different money.</li><li>21 track pairs moved in lockstep and could not be resolved. Measured on a later run: these were duplicate tracks at the reception desk, not reflections.</li><li>Desk coverage counts the station, not a person — a different staff member at the desk still counts as covered. It also rests entirely on the six identities called staff; if that call is wrong, so is the percentage.</li><li>Accuracy is self-graded. HOTA is not measured, because no hand-labelled footage exists yet.</li></ul>
+<footer>Generated from the run artefacts of <span class="mono">DEMO_FINAL</span> — SUMMARY.txt, CAM.112_scorecard.json and people.csv. EXACT = measured directly. PROXY = a stand-in signal. WEAK = may over-count; never act on it alone. A number without a tier does not go on this page.</footer>
+</div>

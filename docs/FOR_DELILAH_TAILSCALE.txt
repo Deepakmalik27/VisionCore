@@ -1,0 +1,66 @@
+GIVE THE CAMERA SYSTEM REMOTE ACCESS — Delilah LA
+==================================================
+One-time setup. About 5 minutes. Done once, never again.
+No sign-in needed. No account needed.
+
+WHAT THIS IS
+------------
+It lets our analytics team read camera recordings remotely, the same way
+you already can from the UniFi app. It does NOT open anything to the
+internet -- the software only makes OUTGOING connections, like a web
+browser does. No firewall changes. No ports opened.
+
+
+WHICH COMPUTER
+--------------
+Any Windows PC at the venue that:
+  - stays powered on  (office / back-office / POS back-end machine)
+  - is plugged into the venue network
+
+
+STEPS
+-----
+1. Go to        https://tailscale.com/download/windows
+   Download and run the installer. Accept all the defaults.
+
+2. Open Command Prompt AS ADMINISTRATOR
+      press Start  ->  type  cmd  ->  right-click "Command Prompt"
+      ->  choose "Run as administrator"
+
+3. Paste this ONE line exactly as given, then press Enter.
+   (Prabh will send you the line with the real key in it.)
+
+      tailscale up --authkey=PASTE_KEY_HERE --advertise-routes=10.0.14.0/24 --hostname=delilah-la
+
+   You should see it finish with no error and return to the prompt.
+
+4. Check the Tailscale icon in the system tray (bottom-right, near the
+   clock). Hover it -- it should say "Connected".
+
+5. Tell Prabh it's done. Nothing else to do, ever.
+
+
+PLEASE ALSO SET THIS
+--------------------
+Stop the PC from sleeping, or remote access drops when it does:
+
+   Settings -> System -> Power & battery -> Screen and sleep
+   -> "When plugged in, put my device to sleep after"  =  Never
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+"tailscale is not recognized"
+    -> close Command Prompt, reopen it as administrator, try again
+    -> if it still fails, restart the PC first (installer needs it)
+
+"Access denied"
+    -> Command Prompt was not opened as administrator
+
+"invalid key" / "key expired"
+    -> tell Prabh, he will send a fresh line
+
+
+QUESTIONS
+---------
+Reply to Prabh.

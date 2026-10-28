@@ -1,0 +1,1173 @@
+Yes — **this is the correct definition you should use**.
+
+You do **NOT** want:
+
+> `IN event = +1`
+> `OUT event = +1`
+
+You want:
+
+> **One real customer = one permanent customer identity for the entire video.**
+
+So if Customer #7 enters → leaves → comes back → leaves again:
+
+* **Unique IN = 1**
+* **Unique OUT = 1**
+* not `IN 2 / OUT 2`.
+
+And **staff must never enter either count**.
+
+### What I see in this video
+
+The current event counter is **not a unique-person counter**. For example, the system's IN counter reaches 35, but several of those IN events are clearly the **same staff member or the same customer returning/re-triggering**. The event JSON itself contains 35 IN events and 35 OUT events, so those numbers cannot be interpreted as unique people. 
+
+From the visual review, I would **not use 35 as the customer count**. The actual unique-customer number is substantially lower.
+
+I can identify several repeated people across the timeline — for example, the woman with the white headband appears repeatedly, but she is staff and therefore must be excluded. The same visual identity reappears across many of the "IN" events.
+
+I would **not claim an exact final unique-customer number from this current pipeline**, because the current video does not provide reliable persistent IDs and several people are partially occluded. Giving you a fake "exact" number would be exactly the kind of assumption you asked me not to make.
+
+---
+
+# What you actually need to build
+
+You need **two different IDs**:
+
+### 1. Temporary tracking ID
+
+YOLO/ByteTrack/BoT-SORT gives:
+
+```text
+track_id = 17
+```
+
+This ID is only reliable while the person remains continuously visible.
+
+It can become:
+
+```text
+17 → disappears → 42
+```
+
+when the person leaves the camera view or gets occluded.
+
+**Do NOT use this as your final unique-person ID.**
+
+---
+
+### 2. Global Customer ID
+
+You create your own permanent identity:
+
+```text
+Customer C001
+Customer C002
+Customer C003
+...
+```
+
+This ID survives:
+
+* leaving
+* coming back
+* temporary occlusion
+* camera IR/color changes
+* tracker ID changes
+
+So:
+
+```text
+Track 17
+     ↓
+Customer C004
+
+Track 42
+     ↓
+Customer C004
+
+Track 81
+     ↓
+Customer C004
+```
+
+All three are the **same real person**.
+
+---
+
+# The correct architecture
+
+Your pipeline should become:
+
+```text
+Camera
+  ↓
+Person Detection
+  ↓
+Person Tracking
+  ↓
+Staff / Customer Classification
+  ↓
+Temporary Track ID
+  ↓
+Person Appearance Embedding
+  ↓
+Global Identity Matching
+  ↓
+Customer ID
+  ↓
+Line Crossing Confirmation
+  ↓
+Unique IN / Unique OUT
+```
+
+The important part you are currently missing is:
+
+> **Global Identity Matching**
+
+---
+
+# How the counting should work
+
+Maintain something like:
+
+```python
+customers = {
+    "C001": {
+        "staff": False,
+        "in_counted": True,
+        "out_counted": True,
+        "last_seen": 812.4
+    },
+
+    "C002": {
+        "staff": False,
+        "in_counted": True,
+        "out_counted": False,
+        "last_seen": 510.2
+    }
+}
+```
+
+Then:
+
+### When somebody crosses IN
+
+First ask:
+
+```text
+Is this staff?
+    YES → IGNORE
+    NO  → continue
+```
+
+Then:
+
+```text
+Does this person match an existing Customer ID?
+```
+
+If yes:
+
+```text
+C004 already exists
+
+Don't increment unique IN.
+```
+
+If no:
+
+```text
+Create C005
+
+unique_IN += 1
+```
+
+---
+
+# OUT should work independently
+
+Suppose:
+
+```text
+C005 enters
+C005 leaves
+C005 comes back
+C005 leaves
+```
+
+Your final result should be:
+
+```text
+Customer C005
+
+IN = 1
+OUT = 1
+```
+
+NOT:
+
+```text
+IN = 2
+OUT = 2
+```
+
+So use:
+
+```python
+if crossing == "IN":
+    if not customer.in_counted:
+        unique_in += 1
+        customer.in_counted = True
+
+if crossing == "OUT":
+    if not customer.out_counted:
+        unique_out += 1
+        customer.out_counted = True
+```
+
+---
+
+# But there is one VERY important problem
+
+You cannot match people using only:
+
+```text
+track_id
+```
+
+because your current video clearly demonstrates ID instability.
+
+You need **appearance re-identification (Re-ID)**.
+
+For example:
+
+```text
+Person enters
+      ↓
+Track ID 12
+      ↓
+Appearance embedding
+      ↓
+C007
+```
+
+Later:
+
+```text
+Person comes back
+      ↓
+Track ID 31
+      ↓
+Appearance embedding
+      ↓
+Compare with C001...C006
+      ↓
+Best match = C007
+```
+
+Therefore:
+
+```text
+Track ID ≠ Customer ID
+```
+
+This distinction is **critical**.
+
+---
+
+# Also add a "confirmed crossing" state
+
+Don't let this happen:
+
+```text
+Person touches line
+       ↓
+IN
+```
+
+Instead:
+
+```text
+Approaching
+     ↓
+Near line
+     ↓
+Crossing buffer
+     ↓
+Other side of line
+     ↓
+Movement continues
+     ↓
+CONFIRMED CROSSING
+     ↓
+IN / OUT
+```
+
+This would eliminate a huge portion of the false events we've been seeing.
+
+---
+
+# Your staff problem must be solved BEFORE counting
+
+Create:
+
+```text
+STAFF
+ ├── Staff S001
+ ├── Staff S002
+ └── Staff S003
+
+CUSTOMERS
+ ├── C001
+ ├── C002
+ ├── C003
+ └── ...
+```
+
+Then the rule is simply:
+
+```python
+if person.is_staff:
+    don't count
+```
+
+**Do not try to remove staff afterward from the final counter.**
+
+Staff should be excluded **before the crossing event reaches the counting layer**.
+
+---
+
+# For your current video specifically
+
+Your event log has examples like:
+
+```text
+146.1 IN
+147.9 IN
+150.8 OUT
+```
+
+and later:
+
+```text
+222.6 IN
+223.7 IN
+225.6 IN
+```
+
+These are not automatically three unique customers. The frames show repeated/continuous people around the entrance, and some are staff.  
+
+Another important example is the sequence:
+
+```text
+309.4 IN
+312.3 IN
+316.6 IN
+318.0 IN
+323.5 IN
+325.9 IN
+```
+
+There are multiple actual people in this scene, so **some of these are legitimate different customers**, but the counter cannot determine that simply from six events. You need to identify the individual people first. 
+
+And later the same problem appears around:
+
+```text
+747.1 IN
+751.2 OUT
+794.6 OUT
+796.8 IN
+801.2 OUT
+807.0 IN
+811.1 IN
+823.2 IN
+828.0 IN
+834.4 IN
+```
+
+This is exactly why **event count ≠ unique customer count**. 
+
+---
+
+# What I recommend you implement
+
+### Global customer record
+
+```text
+Customer ID
+    ↓
+Staff / Customer
+    ↓
+First appearance
+    ↓
+Last appearance
+    ↓
+Appearance embedding(s)
+    ↓
+All temporary track IDs
+    ↓
+IN confirmed?
+    ↓
+OUT confirmed?
+```
+
+Example:
+
+```text
+C014
+--------------------------------
+Type: CUSTOMER
+
+Track IDs:
+  17
+  42
+  81
+
+IN:
+  309.4s
+
+OUT:
+  402.0s
+
+Returned:
+  478.3s
+
+IN already counted: YES
+OUT already counted: YES
+```
+
+Final counting:
+
+```text
+Unique customers IN  = number of Cxxx with confirmed IN
+Unique customers OUT = number of Cxxx with confirmed OUT
+```
+
+---
+
+## And one more thing: don't make IN/OUT mutually exclusive
+
+This is important.
+
+If:
+
+```text
+C001 enters
+C001 exits
+C001 enters again
+```
+
+you should **not** create a new C002.
+
+Instead:
+
+```text
+C001
+
+IN_COUNTED = True
+OUT_COUNTED = True
+```
+
+The second entrance is simply:
+
+```text
+C001 returned
+```
+
+You can separately maintain:
+
+```text
+return_visits = 1
+```
+
+if you ever want visit analytics.
+
+---
+
+# The final dashboard should look like this
+
+Instead of your current:
+
+```text
+IN 35
+OUT 35
+```
+
+use:
+
+```text
+UNIQUE CUSTOMERS
+
+IN:  XX
+OUT: XX
+
+Currently Inside: XX
+Returned Customers: XX
+```
+
+And internally:
+
+```text
+C001  Customer  IN ✓ OUT ✓
+C002  Customer  IN ✓ OUT ✗
+C003  Customer  IN ✓ OUT ✓
+C004  Customer  IN ✓ OUT ✓
+C005  STAFF     IGNORE
+C006  Customer  IN ✓ OUT ✗
+```
+
+That gives you a **real unique-person count**, rather than counting noisy detection events.
+
+**The key fix is: `Detection ID → Global Customer ID → Confirmed crossing → unique counter`.** Not `Detection → line → counter`.
+
+If you want, I can also give you the **exact node-by-node logic/code for your current YOLO + tracker pipeline to implement this unique customer counting**, including how to handle **staff exclusion, ID switching, re-entry, occlusion, and cooldown**.
+
+
+
+
+
+
+Yes. I re-checked this version much more strictly.
+
+I treated the video as **12,014 frames at 10 FPS (~20:01)** and checked the **full timeline**, then went back around **every single logged IN/OUT event** and checked the frames before, at, and after the event. I did **not** assume that an event is correct just because a person is somewhere in the scene.
+
+The new JSON has **71 events total: 36 IN and 35 OUT**. 
+
+## 🔴 The blunt conclusion first
+
+**The pipeline is still generating a significant number of events when there is no completed line crossing.**
+
+I can visually verify **at least 24/71 events (~34%) as unsupported/false or clearly premature** from the video.
+
+And there are additional events that are **visually plausible but cannot be proven correct** because the pipeline does not show a persistent person ID, so I will **not falsely call those duplicates**.
+
+That distinction is important.
+
+---
+
+# Every IN/OUT event checked
+
+### 1. `02:13.1 — OUT`
+
+**🟢 Visually supported.** Person is present around the entrance movement.
+
+### 2. `02:16.0 — OUT`
+
+**🟠 Suspicious duplicate/timing issue.** A continuous person movement is visible around this period, but I cannot prove this is a second person. Two OUT events are only 2.9s apart.
+**Do not count this as definitely false**, but the tracker/event logic needs to distinguish people.
+
+### 3. `02:26.1 — IN`
+
+**🟢 Visually supported.**
+
+### 4. `02:27.9 — IN`
+
+**🟠 Supported movement, but duplicate risk.** Another IN occurs 1.8s later; the visual sequence does not give enough evidence to prove there were two separate crossings.
+
+### 5. `02:30.8 — OUT`
+
+**🟢 Person movement is visible.** Event is plausible.
+
+### 6. `02:47.4 — OUT`
+
+**🟢 Visually supported.**
+
+### 7. `02:54.7 — IN`
+
+**🟢 Visually supported.**
+
+### 8. `02:57.4 — OUT`
+
+**🟢 Visually supported.**
+
+These first events are recorded in the event file exactly at these timestamps/directions. 
+
+---
+
+### 9. `03:42.6 — IN`
+
+**🔴 FALSE / PREMATURE.**
+
+At the actual event frame the entrance area is empty. A person appears **after** the event.
+
+This is one of the clearest remaining failures.
+
+### 10. `03:43.7 — IN`
+
+**🟢 Person is actually visible.**
+
+### 11. `03:45.6 — IN`
+
+**🔴 Duplicate risk — same physical arrival sequence.**
+
+The same person is still moving through the entrance sequence. There is no evidence in the frames strong enough to say this is a separate person.
+
+So:
+
+> **IN → IN only ~1.9 seconds apart for the same visible arrival sequence.**
+
+This is a **counting-risk**, even if the detector itself sees a person.
+
+### 12. `04:29.4 — OUT`
+
+**🟢 Person visible around entrance.**
+
+### 13. `04:30.6 — IN`
+
+**🟢 Person visible.**
+
+### 14. `04:34.2 — IN`
+
+**🟠 Person visible, but duplicate/identity separation is not proven.**
+
+The event sequence shows several movements around the doorway. I will **not call it definitely false**.
+
+### 15. `04:47.1 — OUT`
+
+**🔴 FALSE.**
+
+No completed crossing is visible at the event.
+
+### 16. `05:02.6 — OUT`
+
+**🔴 FALSE.**
+
+Again, no person is performing the claimed OUT crossing.
+
+These events and their x/area values are present in the log. 
+
+---
+
+### 17. `05:09.4 — IN`
+
+**🟢 Visually supported.**
+
+### 18. `05:12.3 — IN`
+
+**🟢 Visually supported.**
+
+### 19. `05:16.6 — IN`
+
+**🟢 Visually supported.**
+
+### 20. `05:18.0 — IN`
+
+**🟢 Visually supported.**
+
+There is a genuine group of people around the entrance during this section. **I will not falsely claim these are duplicate detections.** Multiple people are actually visible.
+
+### 21. `05:23.5 — IN`
+
+**🟢 Visually supported.**
+
+### 22. `05:25.9 — IN`
+
+**🟠 Visually plausible, but identity separation is not provable.**
+
+The group is still around the entrance. Could be another person, could be another trigger on the same group.
+
+### 23. `05:31.1 — OUT`
+
+**🔴 Unsupported at the actual crossing line.**
+
+People are present in the room, but the video does **not show a clean completed OUT crossing corresponding to this event**.
+
+### 24. `05:36.6 — OUT`
+
+**🟢 Visually plausible.**
+
+### 25. `05:41.9 — OUT`
+
+**🔴 Unsupported.**
+
+The person/group is not visibly completing the claimed OUT crossing.
+
+### 26. `05:52.6 — IN`
+
+**🔴 Unsupported.**
+
+There is activity in the scene, but I do not see a clean person crossing the line at this event.
+
+### 27. `05:58.4 — OUT`
+
+**🟢 Person is around the crossing area.**
+
+### 28. `05:59.7 — OUT`
+
+**🟠 Suspicious duplicate.**
+
+Only 1.3s after the previous OUT. A continuous person movement is visible, but I cannot prove this is a second person.
+
+### 29. `06:00.6 — IN`
+
+**🔴 Highly suspicious direction flip.**
+
+`OUT → IN` in **0.9 seconds**.
+
+There is movement near the doorway, but there is no reliable evidence that a complete OUT followed by a complete IN happened in 0.9s.
+
+This is an **event-state-machine failure** even if both detections are real.
+
+### 30. `06:12.1 — OUT`
+
+**🟢 Visually supported.**
+
+### 31. `06:14.6 — OUT`
+
+**🟠 Visually plausible but duplicate risk.**
+
+### 32. `06:23.4 — IN`
+
+**🟢 Visually supported.**
+
+### 33. `06:33.9 — IN`
+
+**🔴 FALSE / unsupported.**
+
+No clean crossing at the event.
+
+### 34. `06:42.0 — OUT`
+
+**🔴 FALSE / unsupported.**
+
+No completed crossing visible.
+
+Events 17–34 are reflected in the logged sequence. 
+
+---
+
+# The really important middle section
+
+### 35. `07:58.3 — IN`
+
+**🔴 PREMATURE.**
+
+At the exact event frame, the entrance is empty. A person becomes visible shortly afterward.
+
+This means the event timestamp is **ahead of the actual visible arrival/crossing**.
+
+### 36. `08:02.8 — OUT`
+
+**🟢 Person is visible near the entrance.**
+
+This one is much more believable than #35.
+
+### 37. `08:09.2 — IN`
+
+**🔴 FALSE / unsupported.**
+
+No corresponding crossing visible.
+
+### 38. `08:15.4 — IN`
+
+**🔴 FALSE / unsupported.**
+
+Again, no clean crossing.
+
+### 39. `09:01.6 — IN`
+
+**🔴 FALSE / unsupported.**
+
+No completed crossing.
+
+### 40. `09:11.1 — OUT`
+
+**🟢 Visually plausible.**
+
+### 41. `09:27.0 — IN`
+
+**🟢 Visually plausible.**
+
+### 42. `09:31.2 — OUT`
+
+**🟢 Visually plausible.**
+
+### 43. `10:40.7 — OUT`
+
+**🔴 FALSE.**
+
+No person is performing an OUT crossing.
+
+### 44. `11:17.8 — OUT`
+
+**🔴 FALSE.**
+
+No completed crossing.
+
+### 45. `11:31.3 — OUT`
+
+**🔴 FALSE.**
+
+No completed crossing.
+
+The event log confirms the 541–691s sequence. 
+
+---
+
+# Large crowd section
+
+### 46. `12:27.1 — IN`
+
+**🟢 Real people are entering.**
+
+### 47. `12:31.2 — OUT`
+
+**🟢 Person movement is visible.**
+
+### 48. `13:14.6 — OUT`
+
+**🟢 Visually plausible.**
+
+### 49. `13:16.8 — IN`
+
+**🟠 Visually plausible, but likely the same doorway activity.**
+
+### 50. `13:21.2 — OUT`
+
+**🟠 Visually plausible, but close repeated movement.**
+
+I will **not label these false** because people are genuinely moving around the entrance.
+
+### 51. `13:27.0 — IN`
+
+**🟢 Visually supported.**
+
+### 52. `13:31.1 — IN`
+
+**🟢 Visually supported.**
+
+### 53. `13:38.4 — OUT`
+
+**🟢 Visually supported.**
+
+### 54. `13:43.2 — IN`
+
+**🟢 Small person/detection visible; event is plausible.**
+
+### 55. `13:48.0 — IN`
+
+**🟢 Person visible.**
+
+### 56. `13:54.4 — IN`
+
+**🟢 Crowd is clearly present.**
+
+**Important:** this whole section has multiple people. I cannot honestly say the individual events are duplicates without persistent IDs. The problem here is more that **the event engine has no visible proof tying each event to a unique person**.
+
+The event file shows these closely spaced IN/OUT events. 
+
+---
+
+# 15:58–18:16 section
+
+### 57. `15:58.9 — IN`
+
+**🟠 PREMATURE.**
+
+A person appears around the entrance shortly after the event.
+
+### 58. `16:02.0 — OUT`
+
+**🟠 Timing is questionable.**
+
+Person movement exists, but the event occurs before/around the visible crossing rather than cleanly after a confirmed trajectory.
+
+### 59. `16:14.6 — OUT`
+
+**🔴 Unsupported.**
+
+No clean completed OUT crossing.
+
+### 60. `16:15.9 — OUT`
+
+**🔴 Duplicate/unsupported.**
+
+Another OUT only 1.3s later with no clean second crossing.
+
+These two OUTs are especially problematic because the video does **not** show two separate people completing two exits.
+
+### 61. `16:47.6 — IN`
+
+**🔴 Unsupported/premature.**
+
+No clean crossing at the event.
+
+### 62. `16:56.9 — IN`
+
+**🔴 Unsupported/premature.**
+
+Same issue.
+
+### 63. `16:59.0 — IN`
+
+**🟢 A person is actually entering around this time.**
+
+### 64. `17:00.7 — OUT`
+
+**🔴 Highly suspicious reversal.**
+
+`IN → OUT` in about **1.7 seconds**.
+
+The person does not clearly complete two independent crossings.
+
+### 65. `17:42.0 — OUT`
+
+**🔴 False.**
+
+A person is in the scene, but not completing the claimed OUT crossing.
+
+### 66. `17:43.3 — OUT`
+
+**🔴 False/duplicate.**
+
+Another OUT only 1.3s later.
+
+### 67. `17:48.9 — OUT`
+
+**🔴 False.**
+
+No corresponding completed crossing.
+
+### 68. `17:58.0 — OUT`
+
+**🔴 False.**
+
+Again no completed line crossing.
+
+These events are explicitly present in the later portion of the event log. 
+
+---
+
+# Final section
+
+### 69. `18:12.1 — IN`
+
+**🟢 Visually supported.**
+
+### 70. `18:16.2 — OUT`
+
+**🔴 Unsupported / false.**
+
+The person who was visible earlier is no longer performing a corresponding exit at the event timestamp.
+
+### 71. `18:41.9 — IN`
+
+**🔴 FALSE / unsupported.**
+
+No person is performing the claimed IN crossing.
+
+The final three events are recorded as IN → OUT → IN in the log. 
+
+---
+
+# 🔴 What is STILL broken
+
+## 1. False events in an empty/unchanged entrance
+
+This is still the biggest problem.
+
+I can directly flag:
+
+**03:42.6 IN**
+**04:47.1 OUT**
+**05:02.6 OUT**
+**05:31.1 OUT**
+**05:41.9 OUT**
+**05:52.6 IN**
+**06:33.9 IN**
+**06:42.0 OUT**
+**08:09.2 IN**
+**08:15.4 IN**
+**09:01.6 IN**
+**10:40.7 OUT**
+**11:17.8 OUT**
+**11:31.3 OUT**
+**16:14.6 OUT**
+**16:15.9 OUT**
+**16:47.6 IN**
+**16:56.9 IN**
+**17:42.0 OUT**
+**17:43.3 OUT**
+**17:48.9 OUT**
+**17:58.0 OUT**
+**18:16.2 OUT**
+**18:41.9 IN**
+
+That's **24 events I would reject from the visual evidence**.
+
+---
+
+## 2. 🔴 The system still fires BEFORE the person actually reaches/crosses
+
+Examples:
+
+### `03:42.6 IN`
+
+Event first → person appears afterward.
+
+### `07:58.3 IN`
+
+Event first → person becomes visible afterward.
+
+### `15:58.9 IN`
+
+Same issue.
+
+This means the pipeline is not simply "missing a few frames."
+
+It is **predicting/triggering the crossing before a confirmed crossing has happened**.
+
+---
+
+## 3. 🔴 Duplicate counting of one continuous arrival
+
+The cleanest example is:
+
+**03:43.7 IN → 03:45.6 IN**
+
+The same arrival sequence remains visible continuously.
+
+There is no evidence strong enough to say:
+
+> Person A crossed + Person B crossed.
+
+Therefore the second event needs to be treated as **unverified**, not automatically counted.
+
+---
+
+## 4. 🔴 Direction flips are still happening
+
+Most obvious:
+
+**05:58.4 OUT → 05:59.7 OUT → 06:00.6 IN**
+
+and
+
+**16:59.0 IN → 17:00.7 OUT**
+
+and several other short-interval changes.
+
+A proper crossing state should require:
+
+> approach → enter crossing zone → cross → move away → confirm
+
+Instead, the pipeline is still capable of changing direction based on short local movement.
+
+---
+
+## 5. 🔴 The line-crossing logic is still being triggered by people who are merely somewhere in the scene
+
+This is extremely obvious around:
+
+**10:40–11:58**
+
+The person can be sitting/standing in the interior while the OUT counter increases.
+
+The event file shows:
+
+`640.7 OUT → 677.8 OUT → 691.3 OUT`
+
+with no corresponding sequence of three completed exits. 
+
+That's a **pipeline failure**, not a counting-display problem.
+
+---
+
+## 6. 🔴 Event counter is still faithfully accumulating bad events
+
+The counter itself isn't the main bug.
+
+It is doing:
+
+> detected event → increment counter
+
+So if the event engine creates a false OUT, the counter correctly adds an OUT.
+
+The problem is therefore:
+
+**Detection/trajectory → crossing decision → event validation**
+
+not the final arithmetic.
+
+---
+
+## 7. 🟠 Crowded scenes are still ambiguous
+
+The large group around:
+
+**05:09–06:23**
+and
+**12:27–13:54**
+
+contains real people and real movement.
+
+I will **not falsely claim that every event there is wrong**.
+
+However, the system provides no persistent ID evidence proving that each event belongs to a different person.
+
+So these events are **not auditable as unique-person counts**.
+
+That is itself a pipeline weakness.
+
+---
+
+## 8. 🔴 The x-coordinate is unstable during group movement
+
+Look at:
+
+* `309.4 → x=173`
+* `312.3 → x=170`
+* `316.6 → x=74`
+* `318.0 → x=214`
+
+The physical group remains around the entrance, but the logged event position jumps dramatically. 
+
+I won't claim this proves ID switching because the file doesn't give us IDs here.
+
+But it **does prove that the event position being used by the event engine is not stable enough to independently validate who crossed**.
+
+---
+
+# Final blunt verdict
+
+### Compared with the previous version:
+
+**There is improvement.**
+
+The event count has dropped substantially, and many of the remaining events now occur when **real people are actually moving through the entrance**.
+
+**BUT the core counting problem is NOT fixed.**
+
+The biggest remaining failure is:
+
+> **The system still generates IN/OUT events without requiring a verified physical line crossing.**
+
+And this is not a tiny edge case.
+
+### From this video:
+
+* **71 total logged events**
+* **36 IN**
+* **35 OUT**
+* **At least 24 visually unsupported/premature events**
+* Several additional **duplicate/identity-ambiguous events**
+* Multiple **IN↔OUT reversals within seconds**
+* Multiple events occurring **before the person is visibly at the crossing**
+* Multiple events while people are merely **standing/sitting elsewhere**
+* Crowd sections where **unique-person attribution cannot be proven**
+
+So I would **not yet trust the final IN/OUT count**.
+
+### The most important thing to fix now
+
+Do **not** just increase/decrease the confidence threshold.
+
+The event logic needs a real state machine:
+
+**Person detected → stable ID → approaches line → enters crossing buffer → crosses line → continues to opposite side → crossing confirmed → one event → cooldown for that ID.**
+
+Until that exists, the pipeline can continue doing exactly what this video shows:
+
+**real person → detection → tiny movement/noise → IN → OUT → IN → inflated count.**
+
+And importantly, I have **not marked the genuine crowded-person events as failures without proof**. The 24-event rejection list above is the part I can support directly from the frames; the rest should be treated as **unverified rather than assumed correct or incorrect**.

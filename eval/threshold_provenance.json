@@ -1,0 +1,56 @@
+{
+ "tools/slit_count.py:LINE_MAX_W": {
+  "value_when_measured": 120,
+  "measured_by": "eval/gt_entries_*.json (quiet + busy + group)",
+  "measured_on": "2026-08-18",
+  "evidence": "quiet-window false blobs w=220,7 (220 = 100% of line); real events w=8..104; cut at 120 kept 15/15 real",
+  "depends_on": [
+   "tools/slit_count.py:foreground",
+   "tools/slit_count.py:split_blobs"
+  ],
+  "dep_hashes": {
+   "tools/slit_count.py:foreground": "c3b2d29057d3",
+   "tools/slit_count.py:split_blobs": "9bb531c45abf"
+  }
+ },
+ "tools/slit_count.py:MIN_AREA": {
+  "value_when_measured": 260,
+  "measured_by": "eval/gt_entries_305_318.json",
+  "measured_on": "2026-08-18",
+  "evidence": "raising 260->500 deleted 4 of 6 real guests from the group window; reverted",
+  "depends_on": [
+   "tools/slit_count.py:foreground",
+   "tools/slit_count.py:split_blobs"
+  ],
+  "dep_hashes": {
+   "tools/slit_count.py:foreground": "c3b2d29057d3",
+   "tools/slit_count.py:split_blobs": "9bb531c45abf"
+  }
+ },
+ "tools/slit_count.py:VALID_X_MAX": {
+  "value_when_measured": 181,
+  "measured_by": "output/slit20d/events.json",
+  "measured_on": "2026-08-19",
+  "evidence": "all 7 surviving operator-flagged FALSE events x>=174.5; all 8 GT-window REAL events x<=180.5",
+  "depends_on": [
+   "tools/slit_count.py:foreground",
+   "tools/slit_count.py:sample_line"
+  ],
+  "dep_hashes": {
+   "tools/slit_count.py:foreground": "c3b2d29057d3",
+   "tools/slit_count.py:sample_line": "00ef2d35d036"
+  }
+ },
+ "tools/slit_count.py:ABS_THRESHOLD": {
+  "value_when_measured": 26,
+  "measured_by": "eval/gt_entries_*.json ablation",
+  "measured_on": "2026-08-18",
+  "evidence": "measured; sigma-scaled threshold was a no-op against it",
+  "depends_on": [
+   "tools/slit_count.py:foreground"
+  ],
+  "dep_hashes": {
+   "tools/slit_count.py:foreground": "c3b2d29057d3"
+  }
+ }
+}

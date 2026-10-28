@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1640 1140" width="1640" height="1140" font-family="'Space Grotesk','Segoe UI',sans-serif">
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#8B7E6F"/></marker>
+<marker id="arD" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#D4622B"/></marker>
+</defs>
+<rect width="1640" height="1140" fill="#FAF8F5"/>
+<rect x="24" y="96" width="1592" height="164" rx="10" fill="#F5F1EB" stroke="#DDD5CB"/>
+<text x="44" y="122" font-size="15" letter-spacing="2.5" fill="#D4622B" font-family="'JetBrains Mono',Consolas,monospace">THE VENUE</text>
+<text x="191.5" y="122" font-size="14" fill="#8B7E6F" font-style="italic">hardware that is already in the ceiling</text>
+<rect x="24" y="296" width="1592" height="480" rx="10" fill="#F5F1EB" stroke="#DDD5CB"/>
+<text x="44" y="322" font-size="15" letter-spacing="2.5" fill="#D4622B" font-family="'JetBrains Mono',Consolas,monospace">KEVA VISION</text>
+<text x="218.5" y="322" font-size="14" fill="#8B7E6F" font-style="italic">the automated pass · kevacv/pipeline.py</text>
+<rect x="24" y="812" width="1592" height="300" rx="10" fill="#F5F1EB" stroke="#DDD5CB"/>
+<text x="44" y="838" font-size="15" letter-spacing="2.5" fill="#D4622B" font-family="'JetBrains Mono',Consolas,monospace">WHAT A HUMAN SEES</text>
+<text x="299.5" y="838" font-size="14" fill="#8B7E6F" font-style="italic">the whole point</text>
+<path d="M370 176.0 L440 176.0" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M690 176.0 L760 176.0" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M920.0 224 L920.0 280.0 L215.0 280.0 L215.0 336" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="519.9" y="267.0" width="95.2" height="22" rx="4" fill="#FAF8F5"/>
+<text x="567.5" y="283.0" font-size="13" fill="#8B7E6F" text-anchor="middle" font-style="italic">every night</text>
+<path d="M360 388.0 L420 388.0" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M710 388.0 L770 388.0" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M1060 388.0 L1120 388.0" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M1265.0 440 L1265.0 530" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M1120 582.0 L950 582.0" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M780.0 640 L780.0 652.0 L1250.0 652.0 L1250.0 664" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="996.2" y="639.0" width="37.6" height="22" rx="4" fill="#FAF8F5"/>
+<text x="1015.0" y="655.0" font-size="13" fill="#8B7E6F" text-anchor="middle" font-style="italic">YES</text>
+<path d="M610 582.0 L360 582.0" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="469.8" y="569.0" width="30.4" height="22" rx="4" fill="#FAF8F5"/>
+<text x="485.0" y="585.0" font-size="13" fill="#8B7E6F" text-anchor="middle" font-style="italic">NO</text>
+<path d="M215.0 634 L215.0 743.0 L230.0 743.0 L230.0 852" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M215.0 634 L215.0 743.0 L620.0 743.0 L620.0 852" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M215.0 634 L215.0 743.0 L1010.0 743.0 L1010.0 852" fill="none" stroke="#8B7E6F" stroke-width="2" marker-end="url(#ar)"/>
+<path d="M810.0 1000 L810.0 980.0 L620.0 980.0 L620.0 960" fill="none" stroke="#D4622B" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arD)"/>
+<rect x="548.6" y="967.0" width="332.8" height="22" rx="4" fill="#FAF8F5"/>
+<text x="715.0" y="983.0" font-size="13" fill="#D4622B" text-anchor="middle" font-style="italic">scores tonight against every night before it</text>
+<rect x="70" y="128" width="300" height="96" rx="8" fill="#FFFFFF" stroke="#DDD5CB" stroke-width="1.5"/>
+<text x="88" y="168" font-size="19" fill="#1C1917" font-family="'Space Grotesk','Segoe UI',sans-serif" letter-spacing="0">39 cameras + 3 door readers</text>
+<text x="88" y="196" font-size="14" fill="#8B7E6F" font-style="italic">UniFi Protect · 44 devices · all online</text>
+<rect x="440" y="128" width="250" height="96" rx="8" fill="#FFFFFF" stroke="#DDD5CB" stroke-width="1.5"/>
+<text x="458" y="168" font-size="19" fill="#1C1917" font-family="'Space Grotesk','Segoe UI',sans-serif" letter-spacing="0">UNVR Pro recorder</text>
+<text x="458" y="196" font-size="14" fill="#8B7E6F" font-style="italic">10.0.14.10 · already installed</text>
+<rect x="760" y="128" width="320" height="96" rx="8" fill="#FCEADB" stroke="#7C2D12" stroke-width="1.5"/>
+<text x="778" y="168" font-size="19" fill="#7C2D12" font-family="'Space Grotesk','Segoe UI',sans-serif" letter-spacing="0">≈312 camera-hours a night</text>
+<text x="778" y="196" font-size="14" fill="#8B7E6F" font-style="italic">nobody watches them</text>
+<rect x="70" y="336" width="290" height="104" rx="8" fill="#FFFFFF" stroke="#D4622B" stroke-width="2"/>
+<text x="88" y="376" font-size="16" fill="#1C1917" font-family="'JetBrains Mono',Consolas,monospace" letter-spacing="0.5">1 · PREFLIGHT</text>
+<text x="88" y="404" font-size="14" fill="#8B7E6F" font-style="italic">Is this run trustworthy at all?</text>
+<rect x="420" y="336" width="290" height="104" rx="8" fill="#FFFFFF" stroke="#D4622B" stroke-width="2"/>
+<text x="438" y="376" font-size="16" fill="#1C1917" font-family="'JetBrains Mono',Consolas,monospace" letter-spacing="0.5">2 · ANALYSE</text>
+<text x="438" y="404" font-size="14" fill="#8B7E6F" font-style="italic">Find every person, follow them</text>
+<rect x="770" y="336" width="290" height="104" rx="8" fill="#FFFFFF" stroke="#D4622B" stroke-width="2"/>
+<text x="788" y="376" font-size="16" fill="#1C1917" font-family="'JetBrains Mono',Consolas,monospace" letter-spacing="0.5">3 · PHANTOMS</text>
+<text x="788" y="404" font-size="14" fill="#8B7E6F" font-style="italic">Drop reflections, statues, posters</text>
+<rect x="1120" y="336" width="290" height="104" rx="8" fill="#FFFFFF" stroke="#D4622B" stroke-width="2"/>
+<text x="1138" y="376" font-size="16" fill="#1C1917" font-family="'JetBrains Mono',Consolas,monospace" letter-spacing="0.5">4 · IDENTITY</text>
+<text x="1138" y="404" font-size="14" fill="#8B7E6F" font-style="italic">One person = one id</text>
+<rect x="1120" y="530" width="290" height="104" rx="8" fill="#FFFFFF" stroke="#D4622B" stroke-width="2"/>
+<text x="1138" y="570" font-size="16" fill="#1C1917" font-family="'JetBrains Mono',Consolas,monospace" letter-spacing="0.5">5 · ANSWERS</text>
+<text x="1138" y="598" font-size="14" fill="#8B7E6F" font-style="italic">4 questions, each with a tier</text>
+<path d="M780.0 524 L950 582.0 L780.0 640 L610 582.0 z" fill="#FFFFFF" stroke="#1C1917" stroke-width="2"/>
+<text x="780.0" y="587.0" font-size="15" fill="#1C1917" text-anchor="middle">Camera moved, or data invalid?</text>
+<rect x="70" y="530" width="290" height="104" rx="8" fill="#FFFFFF" stroke="#D4622B" stroke-width="2"/>
+<text x="88" y="570" font-size="16" fill="#1C1917" font-family="'JetBrains Mono',Consolas,monospace" letter-spacing="0.5">6 · REPORT</text>
+<text x="88" y="598" font-size="14" fill="#8B7E6F" font-style="italic">One page, published at 06:00</text>
+<rect x="1080" y="664" width="340" height="96" rx="8" fill="#7C2D12" stroke="#7C2D12" stroke-width="2"/>
+<text x="1098" y="704" font-size="19" fill="#FFF7F5" font-family="'Space Grotesk','Segoe UI',sans-serif" letter-spacing="0">NOTHING IS PUBLISHED</text>
+<text x="1098" y="732" font-size="14" fill="#FCEADB" font-style="italic">a wrong number is worse than none</text>
+<rect x="70" y="852" width="320" height="108" rx="8" fill="#FFFFFF" stroke="#1C1917" stroke-width="2"/>
+<text x="88" y="892" font-size="19" fill="#1C1917" font-family="'Space Grotesk','Segoe UI',sans-serif" letter-spacing="0">The morning report</text>
+<text x="88" y="920" font-size="14" fill="#8B7E6F" font-style="italic">read in 2 minutes, not 8 hours</text>
+<rect x="450" y="852" width="340" height="108" rx="8" fill="#FFFFFF" stroke="#1C1917" stroke-width="2"/>
+<text x="468" y="892" font-size="19" fill="#1C1917" font-family="'Space Grotesk','Segoe UI',sans-serif" letter-spacing="0">Anomalies to review</text>
+<text x="468" y="920" font-size="14" fill="#8B7E6F" font-style="italic">only the deviations, with a timestamp</text>
+<rect x="850" y="852" width="320" height="108" rx="8" fill="#FFFFFF" stroke="#1C1917" stroke-width="2"/>
+<text x="868" y="892" font-size="19" fill="#1C1917" font-family="'Space Grotesk','Segoe UI',sans-serif" letter-spacing="0">Annotated video</text>
+<text x="868" y="920" font-size="14" fill="#8B7E6F" font-style="italic">jump to the moment worth watching</text>
+<rect x="450" y="1000" width="720" height="92" rx="8" fill="#FDF5EF" stroke="#D4622B" stroke-width="1.5"/>
+<text x="468" y="1040" font-size="19" fill="#1C1917" font-family="'Space Grotesk','Segoe UI',sans-serif" letter-spacing="0">Learned baseline · this venue’s normal per zone, hour and weekday</text>
+<text x="468" y="1068" font-size="14" fill="#8B7E6F" font-style="italic">built from every night that came before</text>
+</svg>

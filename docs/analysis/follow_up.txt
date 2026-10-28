@@ -1,0 +1,1770 @@
+Yes — this changes my recommendation materially, and the analysis you pasted is much more grounded than the generic roadmap I gave earlier.
+
+The key thing is: you've already built a surprising amount of the architecture. Your current problem isn't “what tools should we add?” It's that some foundational assumptions are wrong or unvalidated.
+
+My blunt assessment
+
+I would rank your current priorities like this:
+
+🔴 P0 — Fix before adding anything
+
+1. Calibrate the ground plane
+
+This is the biggest issue.
+
+You currently have:
+
+ground_points = []
+
+while the pipeline is using:
+
+MAX_WALK_SPEED_MPS
+
+That means you're applying real-world physical constraints to coordinates that aren't actually in a reliable real-world coordinate system.
+
+So your impossible-movement gate can actively reject correct associations.
+
+I would disable/bypass every metre-based rule until calibration is actually completed.
+
+Not tune it.
+
+Not lower the threshold.
+
+Disable it.
+
+Then calibrate one camera properly and validate the resulting geometry.
+
+2. Fix the detector before touching sophisticated tracking
+
+This part of your analysis is absolutely correct.
+
+If:
+
+D0 removes ~71% of boxes on height
+D1 removes ~37.7%
+a dead band removes ~18.8%
+
+then your tracker is receiving a damaged measurement stream.
+
+No tracker can recover reliably from:
+
+REAL PERSON
+    ↓
+DETECTOR
+    ↓
+❌ PERSON REMOVED
+    ↓
+TRACKER
+    ↓
+nothing to track
+
+So the current:
+
+69 fragments → 18 people
+
+doesn't automatically prove BoT-SORT/ByteTrack is the primary problem.
+
+You need to establish:
+
+What percentage of actual visible people survive the detector → tracker input boundary?
+
+That's your first measurement.
+
+3. Fix GMC immediately
+
+Your observation here is also correct.
+
+If:
+
+camera = fixed
+
+then running global camera-motion compensation by default deserves scrutiny.
+
+If you're currently using:
+
+GMC_METHOD = "sof"
+
+I would A/B test it immediately:
+
+Run A → GMC OFF
+Run B → GMC SOF
+
+Same exact video.
+
+Same detector.
+
+Same tracker.
+
+Compare:
+
+track survival
+ID switches
+fragments
+recovery
+processing time
+
+Don't assume GMC helps just because it's a feature.
+
+For a genuinely fixed camera, unnecessary motion compensation can add complexity without giving you anything useful.
+
+4. Then fix track persistence
+
+Once the detector isn't deleting people and geometry isn't poisoning decisions, this becomes the next major problem.
+
+You identified:
+
+no predict → search → recover ladder
+
+That's important.
+
+I'd implement:
+
+ACTIVE
+   │
+   │ detection missing
+   ▼
+TEMPORARILY_LOST
+   │
+   ├── prediction
+   │
+   ├── nearby candidate search
+   │
+   ├── appearance/Re-ID
+   │
+   └── trajectory validation
+          │
+          ▼
+       RECOVERED
+
+Only after the recovery window expires:
+
+TEMPORARILY_LOST
+       ↓
+   TERMINATED
+
+This is much better than:
+
+missing detection
+→ kill track
+5. Then create the actual state machine
+
+I agree with your analysis that this is missing.
+
+You have logic scattered around the pipeline, but you don't yet have a formal person lifecycle.
+
+I'd make it explicit:
+
+NEW
+ ↓
+CANDIDATE
+ ↓
+CONFIRMED
+ ↓
+ACTIVE
+ ↓
+TEMP_LOST
+ ├── RECOVERED → ACTIVE
+ └── TIMEOUT   → ENDED
+
+And separately, visit state:
+
+UNKNOWN
+ ↓
+OUTSIDE
+ ↓
+ENTERING
+ ↓
+INSIDE
+ ↓
+EXITING
+ ↓
+OUTSIDE
+
+That gives you two different concepts:
+
+Identity lifecycle
+
+and
+
+Venue-presence lifecycle
+
+Don't mix them.
+
+6. Your “presence estimator” needs scrutiny
+
+This is another important observation.
+
+You said:
+
+line crossing yes; region estimator IS presence
+
+That can become a major counting bug.
+
+A person merely being inside a polygon does not necessarily mean:
+
+“this person entered.”
+
+For example:
+
+Person already inside
+       ↓
+camera starts
+       ↓
+polygon detects person
+       ↓
+WRONG: ENTRY
+
+You need transition evidence, not simply region membership.
+
+7. Your UNCERTAIN state needs to become operational
+
+Right now:
+
+trust = neither
+
+exists, but nothing consumes it.
+
+That's basically dead architecture.
+
+Make uncertainty actionable:
+
+CONFIRMED
+    ↓
+event accepted
+
+
+PROBABLE
+    ↓
+additional evidence
+
+
+UNCERTAIN
+    ↓
+don't affect official count
+    ↓
+review queue
+
+
+REJECTED
+    ↓
+discard
+
+This is actually how you move toward a trustworthy system.
+
+And it resolves one of the questions from my previous answer:
+
+You don't necessarily need to promise “99%.”
+
+You can instead say:
+
+99% of confirmed events are correct, while ambiguous events are explicitly isolated.
+
+That's a much stronger product architecture.
+
+8. Your two biggest missing pieces are actually ground truth + test methodology
+
+I agree 100% with your conclusion here.
+
+You cannot honestly say:
+
+"Version B is more accurate."
+
+unless you have:
+
+GROUND TRUTH
+     ↓
+Run A
+     ↓
+Run B
+     ↓
+Compare
+
+Otherwise you're doing:
+
+I changed something
+ ↓
+It looks better
+ ↓
+probably improved
+
+That's dangerous.
+
+Your 13-case test matrix should become the backbone
+
+I would make this a mandatory regression suite.
+
+At minimum:
+
+01 Single person enters
+02 Single person exits
+03 Person stands on line
+04 Person turns around on line
+05 Person enters → exits → re-enters
+06 Two people cross
+07 Two people occlude each other
+08 Person temporarily disappears
+09 Staff + customer interact
+10 Staff crosses customer path
+11 IR/night transition
+12 Person partially occluded
+13 Person remains inside until video ends
+
+Then every pipeline change gets:
+
+             BASELINE
+                 │
+        ┌────────┴────────┐
+        ▼                 ▼
+     VERSION A         VERSION B
+        │                 │
+        └────────┬────────┘
+                 ▼
+          SAME 13 CASES
+                 │
+                 ▼
+        REGRESSION REPORT
+
+This will stop you from fixing one thing and silently breaking three others.
+
+What I would NOT build yet
+
+Based on what you've shown me:
+
+❌ Pose
+
+Not yet.
+
+Pose answers:
+
+What is the body doing?
+
+Your current system can't reliably answer:
+
+Who is this person?
+
+So don't add another expensive model.
+
+❌ Action recognition
+
+Same reason.
+
+Later:
+
+P0042
+→ staff
+→ dining
+→ bending
+→ standing
+
+But first make P0042 actually stay P0042.
+
+❌ DeepStream
+
+Not yet.
+
+It can make a working pipeline faster.
+
+It cannot fix:
+
+wrong detections
+wrong geometry
+wrong IDs
+wrong event logic
+
+First get correctness.
+
+Then optimize throughput.
+
+❌ Optical flow as a tracking solution
+
+I agree with your distinction.
+
+Use it later as:
+
+compute/motion gate
+
+not:
+
+identity engine
+
+For a fixed camera:
+
+No meaningful motion
+→ don't waste detector compute
+
+
+Motion
+→ detector/tracker
+
+That's useful.
+
+But it's not your current blocker.
+
+One thing I would add to your analysis
+
+You identified almost everything, but I'd add one P0 diagnostic:
+
+Build a detector audit BEFORE modifying the tracker
+
+Take your sealed windows and produce:
+
+GROUND TRUTH PERSON
+       │
+       ├── detector found?
+       │
+       ├── detector confidence
+       │
+       ├── bounding-box quality
+       │
+       ├── height filtering?
+       │
+       ├── dead-band filtering?
+       │
+       ├── ROI filtering?
+       │
+       └── passed to tracker?
+
+For every missed person:
+
+VISIBLE PERSON
+      ↓
+YOLO found them?
+      ↓
+YES
+      ↓
+Which filter deleted them?
+
+This will tell you whether your 71% loss is actually:
+
+YOLO itself
+
+or:
+
+YOLO
+ ↓
+height gate
+ ↓
+ROI
+ ↓
+confidence threshold
+ ↓
+dead-band
+ ↓
+NMS
+ ↓
+tracker input
+
+That's a very important distinction.
+
+The order I'd use now
+
+Forget my previous Phase 1–8 roadmap.
+
+Given the actual state of your code, I'd do:
+
+P0
+│
+├── 1. Disable poisoned metre-based logic
+│
+├── 2. Calibrate ground plane
+│
+├── 3. Audit detector → tracker input
+│
+├── 4. Fix height/dead-band filtering
+│
+├── 5. A/B test GMC OFF vs SOF
+│
+└── 6. Establish detector baseline
+│
+▼
+P1
+│
+├── 7. Track confirmation
+├── 8. Track persistence
+├── 9. Lost → predict → recover
+├── 10. Tracklet stitching
+└── 11. Global ID stability
+│
+▼
+P2
+│
+├── 12. Formal identity state machine
+├── 13. Formal IN/OUT state machine
+├── 14. Remove presence-based counting
+├── 15. Re-entry/visit logic
+└── 16. Staff/customer separation
+│
+▼
+P3
+│
+├── 17. Confidence fusion
+├── 18. UNCERTAIN → review queue
+├── 19. Event validation
+└── 20. Anomaly integration
+│
+▼
+P4
+│
+├── 21. Day/IR modality policy
+├── 22. Motion gate
+├── 23. Crowd mode
+└── 24. Conditional Re-ID
+│
+▼
+P5
+│
+├── 25. 13-case regression suite
+├── 26. 24-hour stress test
+├── 27. Memory/resource monitoring
+├── 28. DB queue
+└── 29. Version-stamped events
+│
+▼
+P6
+│
+└── TensorRT / DeepStream / throughput optimization
+And only after that:
+Pose
+Action recognition
+Advanced anomaly detection
+Multi-camera Re-ID
+The biggest insight from what you pasted
+
+Your system doesn't currently have a “model problem” or a “tracker problem.”
+
+It has a measurement integrity problem.
+
+Your pipeline is making decisions from inputs that aren't yet trustworthy:
+
+             WRONG GEOMETRY
+                  +
+             MISSING BOXES
+                  +
+             IR/COLOR SHIFT
+                  +
+          WEAK TRACK PERSISTENCE
+                  ↓
+           WRONG ID ASSOCIATION
+                  ↓
+             WRONG EVENTS
+                  ↓
+             WRONG COUNTS
+
+So I would not add more intelligence yet.
+
+I'd first make the existing information trustworthy.
+
+And specifically, the first three experiments I'd run are:
+
+① Calibrate the ground plane → disable all metre-based gates until verified.
+
+② Produce a detector survival audit → find exactly where those 71%/37.7%/18.8% losses happen.
+
+③ Run GMC OFF vs SOF → same video, same configuration, objective comparison.
+
+Those three experiments will probably tell you more about the real architecture problem than adding five new ML models.
+
+give the complete plan after u seeing what we already have soo full list and suggestion and recommndation and complete guidance 
+
+Yes. Based on the actual system you already have, I would change the plan substantially.
+
+You do not need to start from scratch, and you should not add every CV technology we discussed earlier. You already have many good components. The goal now is to turn them into a controlled, measurable pipeline and fix the foundations before adding complexity.
+
+1. Where your system stands right now
+
+From the audit you provided:
+
+✅ Already built
+Local ID → Global ID mapping
+Canonical IDs / merge mapping
+Re-entry ≠ unique person
+Staff/customer separation
+Re-ID with topology/co-visibility vetoes
+Impossible-movement logic
+Hysteresis
+Decision logging
+Per-stage ledger
+Camera health
+Tracklet stitching
+Camera-specific configuration
+Zones
+Configuration files
+Partial anomaly infrastructure
+🟡 Exists but is incomplete
+Track confirmation
+Line crossing
+Presence/region estimation
+Confidence scores
+trust=neither
+Homography
+IR handling
+Day/night handling
+🔴 Missing
+Proper track recovery ladder
+Formal identity state machine
+Formal IN/OUT state machine
+Conditional compute
+DB queue
+Motion gate
+Scene-change detection
+Crowd mode
+Event-level version stamping
+Proper anomaly integration
+Ground-truth dataset
+Regression test suite
+Actual camera-plane calibration
+
+And your current measured:
+
+69 fragments → 18 people
+
+is the number I would take extremely seriously.
+
+2. The architecture I recommend now
+
+Don't add more models yet.
+
+Make your system look like this:
+
+                    VIDEO
+                      │
+                      ▼
+              VIDEO INGESTION
+                      │
+                      ▼
+              CAMERA HEALTH
+                      │
+                      ▼
+          CALIBRATION / GEOMETRY
+                      │
+                      ▼
+          MODALITY DETECTION
+          DAY / COLOR / IR
+                      │
+                      ▼
+             PREPROCESSING
+                      │
+                      ▼
+             MOTION / CHANGE
+                 GATE
+                      │
+                      ▼
+                DETECTOR
+                      │
+                      ▼
+             DETECTION FILTER
+                      │
+                      ▼
+               MOT TRACKER
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+    TRACK MEMORY              RE-ID
+          │                       │
+          └───────────┬───────────┘
+                      ▼
+            GLOBAL ID MANAGER
+                      │
+             ┌────────┴────────┐
+             ▼                 ▼
+          STAFF             CUSTOMER
+             │                 │
+             └────────┬────────┘
+                      ▼
+              TRAJECTORY ENGINE
+                      │
+                      ▼
+                 ZONE ENGINE
+                      │
+                      ▼
+             EVENT STATE MACHINE
+                      │
+                      ▼
+              EVENT VALIDATOR
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+      CONFIRMED               UNCERTAIN
+          │                       │
+          ▼                       ▼
+       DATABASE              REVIEW QUEUE
+          │
+          ▼
+     ANALYTICS / UI
+
+
+       SIDE SYSTEMS
+       ├── Decision Ledger
+       ├── Evidence Clips
+       ├── Camera Health
+       ├── Anomaly Engine
+       ├── Metrics
+       └── Regression Tests
+
+The important thing is that each layer has a clear responsibility.
+
+3. P0 — Freeze the system
+
+Before changing anything:
+
+Create a baseline release.
+
+Record:
+
+git commit
+model version
+tracker version
+config version
+camera config
+thresholds
+Python dependencies
+GPU/CPU information
+
+Call it something like:
+
+BASELINE_2026_08_19
+
+Then every experiment is:
+
+BASELINE
+   ↓
+CHANGE ONE THING
+   ↓
+RUN SAME VIDEO
+   ↓
+COMPARE
+
+Never change five things simultaneously.
+
+Otherwise you won't know what fixed or broke the system.
+
+4. P0 — Ground-plane calibration
+
+This is your highest priority.
+
+You currently have:
+
+ground_points = []
+
+while using metre-based movement constraints.
+
+Stop doing that.
+
+Temporarily disable:
+
+maximum walking speed
+distance-per-second validation
+physical displacement veto
+any other metric based on assumed world coordinates
+
+until calibration is real.
+
+Then calibrate
+
+Pick known physical points:
+
+P1
+P2
+P3
+P4
+...
+
+Measure their real-world distances.
+
+Calculate the homography.
+
+Then verify:
+
+Camera coordinate
+       ↓
+Ground coordinate
+       ↓
+Real metres
+Calibration acceptance test
+
+Don't just say "homography exists."
+
+Test:
+
+If a person moves 3 metres physically, does the system estimate approximately 3 metres?
+
+If not, calibration isn't finished.
+
+5. P0 — Detector audit
+
+This is probably your second-biggest issue.
+
+You found:
+
+D0: ~71% lost through height filtering
+D1: ~37.7%
+dead band: ~18.8%
+
+Before touching tracking, determine exactly:
+
+Visible person
+     ↓
+YOLO detection
+     ↓
+confidence filter
+     ↓
+height filter
+     ↓
+ROI
+     ↓
+dead-band
+     ↓
+NMS
+     ↓
+tracker
+
+For every actual person in your ground truth:
+
+detected?
+confidence?
+bbox height?
+filtered?
+reason?
+passed to tracker?
+
+Create a detection survival report.
+
+Example:
+
+100 actual visible people
+       │
+       ├── 92 detected
+       │
+       ├── 8 missed by YOLO
+       │
+       ├── 20 deleted by height filter
+       │
+       ├── 5 deleted by dead band
+       │
+       └── 67 reach tracker
+
+That tells you where the real failure is.
+
+6. P0 — Fixed-camera GMC experiment
+
+You already identified:
+
+GMC_METHOD = sof
+
+for a fixed camera.
+
+Do a clean A/B test:
+
+A
+GMC OFF
+B
+GMC SOF
+
+Nothing else changes.
+
+Measure:
+
+track survival
+fragments
+ID switches
+recovery
+FPS
+latency
+
+My initial hypothesis would be GMC OFF, but don't assume it—measure it.
+
+7. P1 — Fix the tracking lifecycle
+
+Once detector input is trustworthy:
+
+Implement explicit states
+NEW
+ ↓
+CANDIDATE
+ ↓
+CONFIRMED
+ ↓
+ACTIVE
+ ↓
+TEMPORARILY_LOST
+ ├── RECOVERED → ACTIVE
+ └── TIMEOUT → TERMINATED
+Critical rule
+
+Missing detection ≠ person disappeared.
+
+A track should have memory.
+
+8. P1 — Recovery ladder
+
+Implement:
+
+TRACK LOST
+     │
+     ▼
+Kalman prediction
+     │
+     ▼
+search nearby detections
+     │
+     ▼
+motion compatibility
+     │
+     ▼
+appearance/Re-ID
+     │
+     ▼
+trajectory compatibility
+     │
+     ▼
+zone/topology compatibility
+     │
+     ▼
+recover OR terminate
+
+This should become one of your core pieces.
+
+9. P1 — Separate three IDs
+
+You already have Local vs Global.
+
+I'd make the model explicit:
+
+Detection ID
+     ↓
+Local Track ID
+     ↓
+Global Person ID
+
+And eventually:
+
+Global Person ID
+     ↓
+Visit ID
+
+Example:
+
+Person P104
+ ├── Visit V001
+ │    ├── IN 10:00
+ │    └── OUT 11:00
+ │
+ └── Visit V002
+      ├── IN 13:00
+      └── OUT 14:00
+
+This makes analytics much cleaner.
+
+10. P1 — Formal IN/OUT state machine
+
+Build this separately from tracking.
+
+UNKNOWN
+   ↓
+OUTSIDE
+   ↓
+APPROACHING_ENTRY
+   ↓
+CROSSING
+   ↓
+INSIDE
+   ↓
+APPROACHING_EXIT
+   ↓
+CROSSING
+   ↓
+OUTSIDE
+
+Then enforce:
+
+Entry requires
+confirmed track
+valid trajectory
+line crossing
+direction
+zone transition
+not already inside
+Exit requires
+confirmed track
+valid trajectory
+line crossing
+direction
+currently inside
+11. P1 — Remove presence-based counting
+
+A polygon saying:
+
+Person is inside.
+
+should never by itself create an IN event.
+
+Presence is evidence.
+
+Transition is the event.
+
+This is a major distinction.
+
+12. P1 — Re-entry logic
+
+Your existing logic is good.
+
+Formalize it:
+
+Unique Person
+       ≠
+Visit
+       ≠
+Entry Event
+
+So:
+
+P001
+IN
+OUT
+IN
+OUT
+
+means:
+
+unique_people = 1
+visits = 2
+entries = 2
+exits = 2
+13. P1 — Staff architecture
+
+Keep staff completely separate.
+
+Person
+ ├── STAFF
+ │     └── S004
+ │
+ └── CUSTOMER
+       └── P183
+
+Staff should have:
+
+persistent identity
+staff gallery
+allowed zones
+activity timeline
+shift/session information
+separate statistics
+
+And staff should never accidentally enter customer counts.
+
+14. P2 — Confidence fusion
+
+You already have many individual scores.
+
+Now combine them.
+
+For example:
+
+Identity confidence =
+    tracking
+  + Re-ID
+  + trajectory
+  + zone consistency
+  + temporal consistency
+  + co-visibility
+
+But don't blindly use a weighted average.
+
+Some conditions should be hard vetoes.
+
+Example:
+
+Re-ID = 0.96
+BUT
+impossible topology
+
+→ reject.
+
+That's better than:
+
+0.96 × weight
+
+overriding a physical impossibility.
+
+15. P2 — Operational uncertainty
+
+Your existing:
+
+trust = neither
+
+needs to become:
+
+CONFIRMED
+PROBABLE
+UNCERTAIN
+REJECTED
+
+And then:
+
+CONFIRMED
+→ official metric
+
+
+PROBABLE
+→ provisional
+
+
+UNCERTAIN
+→ review queue
+
+
+REJECTED
+→ ignored
+
+This is much better than forcing every ambiguous observation into a definitive answer.
+
+16. P2 — Evidence system
+
+You already have decision_log.py.
+
+Excellent.
+
+Extend it so every important event has:
+
+event_id
+timestamp
+camera_id
+global_person_id
+visit_id
+event_type
+zone
+direction
+
+
+detector_confidence
+track_confidence
+reid_confidence
+trajectory_confidence
+event_confidence
+
+
+model_version
+tracker_version
+calibration_version
+config_version
+
+
+evidence_frame
+evidence_clip
+decision_reason
+
+Now you can answer:
+
+Why did the system count this person?
+
+17. P2 — Anomaly engine
+
+You already have:
+
+anomaly_baseline.py
+
+Wire it into the event system.
+
+Start with deterministic anomalies:
+
+Identity
+ID switch suspicion
+impossible movement
+duplicate identity
+Counting
+entry without valid transition
+exit without previous visit
+person never exited
+Staff
+staff in restricted zone
+staff outside expected zone/time
+Behaviour
+excessive loitering
+unusual zone transition
+crowd buildup
+
+Don't start with a fancy neural anomaly model.
+
+Rules first.
+
+18. P2 — Day / IR modality engine
+
+Your data shows this is a real issue:
+
+~96 IR flips / 20 minutes.
+
+That is not a minor edge case.
+
+Treat:
+
+COLOR
+
+and
+
+IR / MONOCHROME
+
+as different visual regimes.
+
+Your system should know:
+
+CURRENT_MODALITY = COLOR
+
+or
+
+CURRENT_MODALITY = IR
+
+Then use different:
+
+preprocessing
+detection thresholds
+Re-ID thresholds
+appearance weighting
+zone masks if necessary
+19. Two zone maps for day/night
+
+Your conclusion about masks is correct.
+
+Don't make:
+
+ONE DAYLIGHT MASK
+
+and hope it survives IR.
+
+Use:
+
+Camera
+ ├── COLOR configuration
+ │    ├── zones
+ │    └── masks
+ │
+ └── IR configuration
+      ├── zones
+      └── masks
+
+Then automatically switch based on modality.
+
+20. P3 — Motion gate
+
+Only after identity is stable.
+
+Use motion primarily for:
+
+compute reduction.
+
+Static scene
+→ reduce detector calls
+
+
+Movement
+→ increase detector frequency
+
+Don't make optical flow responsible for identity.
+
+21. P3 — Conditional compute
+
+This is how you eventually get speed.
+
+Instead of:
+
+EVERY FRAME
+→ detector
+→ Re-ID
+→ pose
+→ everything
+
+use:
+
+Every frame
+→ tracker
+
+
+Every N frames
+→ detector
+
+
+Uncertain track
+→ Re-ID
+
+
+Specific staff/activity event
+→ pose
+
+
+Important anomaly
+→ expensive analysis
+
+This should become your main compute strategy.
+
+22. P3 — Crowd mode
+
+When people increase:
+
+1–5 people
+
+normal configuration.
+
+When:
+
+20+ people
+
+switch configuration.
+
+Crowd mode can change:
+
+detector frequency
+tracking parameters
+Re-ID frequency
+confidence thresholds
+association strategy
+
+Don't wait until crowds destroy your normal tracker.
+
+23. P3 — Scene-change detection
+
+Add:
+
+camera angle changed?
+desk moved?
+lighting changed?
+large obstruction?
+lens covered?
+
+If major scene change:
+
+STOP TRUSTING OLD CALIBRATION
+
+This is critical because otherwise your system can produce confidently wrong results.
+
+24. P3 — Camera health
+
+You already have this.
+
+Expand it to:
+
+ONLINE
+FROZEN
+BLACK
+OVEREXPOSED
+UNDEREXPOSED
+BLURRED
+OBSTRUCTED
+ANGLE_CHANGED
+MODALITY_CHANGED
+
+Camera health should influence event confidence.
+
+25. P4 — Database architecture
+
+Move DB writes off the CV thread.
+
+Use:
+
+CV
+ ↓
+Event Queue
+ ↓
+DB Worker
+
+The CV pipeline must never wait for PostgreSQL.
+
+For a 24-hour video this becomes important.
+
+26. P4 — Version everything
+
+Your stamp_build.py is currently unused per event.
+
+Fix that.
+
+Every event should contain:
+
+pipeline_version
+detector_version
+tracker_version
+reid_version
+calibration_version
+camera_config_version
+
+Otherwise:
+
+"Why did yesterday produce 2,104 entries and today's pipeline produces 2,083?"
+
+becomes impossible to investigate.
+
+27. P4 — The 13-case regression suite
+
+This is mandatory.
+
+Your sealed test set should contain at least:
+
+01 Single person entry
+02 Single person exit
+03 Person standing on line
+04 Person turns around
+05 Re-entry
+06 Two people crossing
+07 Occlusion
+08 Temporary disappearance
+09 Staff + customer
+10 Staff/customer crossing
+11 IR transition
+12 Partial occlusion
+13 Person still inside at video end
+
+Every code/model/config change runs against it.
+
+28. Build actual ground truth
+
+Your current:
+
+gt.txt = copy-forward
+
+should not be accepted.
+
+Fill the sealed windows manually.
+
+You don't need to label every frame of 24 hours.
+
+Instead, create representative truth windows.
+
+For each person:
+
+GT ID
+start
+end
+entry
+exit
+zone transitions
+staff/customer
+
+For difficult cases, annotate frame-level information.
+
+29. Metrics you should actually care about
+
+Don't make mAP your main KPI.
+
+Track:
+
+Detection
+Recall
+Precision
+False negatives
+False positives
+Tracking
+ID switches
+Track fragmentation
+Track survival
+Track recovery rate
+Identity
+Global-ID accuracy
+Re-ID recovery
+False merges
+False splits
+Counting
+False IN
+False OUT
+Missed IN
+Missed OUT
+Unique-person accuracy
+Visit accuracy
+Events
+Event precision
+Event recall
+Uncertain-event rate
+System
+FPS
+latency
+GPU utilization
+CPU utilization
+RAM
+VRAM
+queue depth
+30. Your main KPI hierarchy
+
+I'd rank them:
+
+                    #1
+             UNIQUE PERSON ACCURACY
+                    │
+                    ▼
+              ID STABILITY
+                    │
+                    ▼
+              IN/OUT ACCURACY
+                    │
+                    ▼
+             EVENT ACCURACY
+                    │
+                    ▼
+                 SPEED
+
+Don't sacrifice identity integrity simply to achieve a higher FPS.
+
+But don't use accuracy as an excuse for an unusably slow system either.
+
+31. Only after correctness: optimization
+
+Then introduce:
+
+NVIDIA GPU
+
+CUDA
+
+TensorRT
+
+FP16 → INT8 where acceptable
+
+DeepStream / GStreamer
+
+Efficient:
+
+decoding
+batching
+inference
+pipeline management
+
+These are throughput optimizations, not fixes for bad logic.
+
+32. Pose / skeleton
+
+Now we get to the thing you originally asked about.
+
+Add this after identity stability.
+
+Architecture:
+
+Global Person
+      │
+      ▼
+Pose estimator
+      │
+      ▼
+17/25/etc. body keypoints
+      │
+      ▼
+Activity engine
+
+Possible activities:
+
+standing
+walking
+sitting
+bending
+reaching
+falling
+
+But remember:
+
+Pose does not improve basic IN/OUT counting by itself.
+
+It's an additional intelligence layer.
+
+33. Action recognition
+
+After pose:
+
+Pose sequence
+      ↓
+Temporal model
+      ↓
+Action
+
+For example:
+
+P004
+10:31–10:33
+Reception
+Standing → Walking → Bending → Standing
+
+This is where your system starts becoming genuine activity analytics rather than people counting.
+
+34. What I would NOT add right now
+
+For your current state:
+
+❌ Don't add another tracker just because it's newer.
+
+First establish why the current one fails.
+
+❌ Don't add Pose yet.
+❌ Don't add DeepStream yet.
+❌ Don't add optical flow as tracking.
+❌ Don't add a giant action model.
+❌ Don't endlessly change YOLO.
+❌ Don't tune thresholds without ground truth.
+❌ Don't trust any accuracy number without sealed labels.
+35. Your development workflow should change
+
+Every change should follow:
+
+HYPOTHESIS
+    ↓
+CHANGE ONE THING
+    ↓
+RUN SAME TEST WINDOW
+    ↓
+COMPARE METRICS
+    ↓
+ACCEPT / REJECT
+    ↓
+COMMIT
+
+Example:
+
+Hypothesis: height filtering is deleting real people.
+
+Then:
+
+Baseline
+height filter = 0.35
+
+
+Experiment
+height filter = 0.20
+
+
+Same video
+Same frames
+Same tracker
+Same config otherwise
+
+Then determine whether:
+
+Recall ↑
+Track survival ↑
+False positives ↑/↓
+ID switches ↑/↓
+
+Only then keep the change.
+
+36. Your final system roadmap
+
+I would structure the project into these milestones:
+
+🔴 M0 — Measurement foundation
+ Freeze baseline
+ Ground-truth windows
+ Detector audit
+ Metrics dashboard
+ Reproducible experiments
+🔴 M1 — Geometry
+ Ground-plane calibration
+ Validate homography
+ Disable poisoned metric gates until calibrated
+ Validate zones
+ Day/IR zone mapping
+🔴 M2 — Detection integrity
+ Fix height filtering
+ Fix dead band
+ Validate ROI
+ Validate confidence threshold
+ Measure detector survival
+🔴 M3 — Stable tracking
+ GMC A/B
+ Track confirmation
+ Track memory
+ Lost state
+ Prediction
+ Recovery
+ Tracklet stitching
+ Global ID stability
+🟠 M4 — Event logic
+ Formal identity state machine
+ Formal IN/OUT state machine
+ Transition-based counting
+ Re-entry logic
+ Visit model
+ Staff separation
+🟠 M5 — Confidence & reasoning
+ Confidence fusion
+ Hard vetoes
+ Confirmed/probable/uncertain/rejected
+ Event validation
+ Decision explanations
+ Review queue
+🟠 M6 — Environment robustness
+ Color/IR classifier
+ Separate modality policies
+ Camera health
+ Scene-change detection
+ Crowd mode
+ Motion gate
+🟡 M7 — Production architecture
+ Event queue
+ Async DB
+ Evidence worker
+ Version stamping
+ Resource monitoring
+ 24-hour stress test
+🟡 M8 — Performance
+ GPU profiling
+ TensorRT
+ FP16
+ INT8 testing
+ DeepStream/GStreamer
+ Conditional inference
+ Throughput optimization
+🟢 M9 — Advanced intelligence
+ Pose/skeleton
+ Staff activity
+ Action recognition
+ Advanced anomaly detection
+ Multi-camera identity
+ Long-term behavioural analytics
+37. The most important change to your mindset
+
+Your current project should not be:
+
+"How do I make the AI detect people better?"
+
+It should be:
+
+"How do I make every decision traceable, measurable, recoverable, and defensible when the vision model is wrong?"
+
+That means:
+
+Vision
+  ↓
+Evidence
+  ↓
+Tracking
+  ↓
+Identity
+  ↓
+Geometry
+  ↓
+Temporal reasoning
+  ↓
+Event
+  ↓
+Confidence
+  ↓
+Decision
+  ↓
+Evidence
+
+And every step can say:
+
+"Here's what I saw, here's what I believed, here's why I believed it, and here's how confident I am."
+
+That is the architecture I'd build around what you already have.
+
+If I had your repository right now
+
+I would not touch Pose, DeepStream, or new fancy models first.
+
+My first work session would be:
+
+1. Run the 13 sealed windows.
+2. Produce detector survival audit.
+3. Calibrate the ground plane.
+4. Disable the currently poisoned metre-based vetoes.
+5. A/B GMC OFF vs SOF.
+6. Measure track survival / fragments / ID switches.
+7. Fix the lost → predict → recover lifecycle.
+8. Implement the IN/OUT state machine.
+9. Turn UNCERTAIN into an actual review state.
+10. Re-run the exact same 13 windows.
+
+Only when that baseline is stable would I move toward motion gating, IR adaptation, asynchronous processing, TensorRT/DeepStream, and finally pose/action intelligence.
+
+That sequence gives you something much more valuable than a huge collection of ML components: a system where you can prove whether each change actually made it better.

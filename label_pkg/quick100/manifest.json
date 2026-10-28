@@ -1,0 +1,17 @@
+{
+  "camera": "CAM.112",
+  "source_run": "output/profE",
+  "n_images": 100,
+  "n_pred_rows": 486,
+  "pred_rows_outside_window": 4871,
+  "raw_frame_first": 2253,
+  "raw_frame_last": 3604,
+  "new_frame_first": 1,
+  "new_frame_last": 1352,
+  "mapping": "new_frame = index of raw frame in sorted order, 1-based; prediction frame = raw frame + 1 (MOT is 1-indexed)",
+  "subset_of": "label_pkg/profE",
+  "subset_source_frames": [
+    301,
+    400
+  ]
+}

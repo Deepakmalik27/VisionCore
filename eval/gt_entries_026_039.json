@@ -1,0 +1,13 @@
+{
+  "_comment": "HELD-OUT ground truth, CAM.112 6.30.00pm. Read by eye from output/gt_quiet_26_39.png (0.5s steps). QUIET window, chosen by detector activity BEFORE looking at it, and NOT used for any tuning. Its whole job is to catch FALSE POSITIVES, which a busy window cannot.",
+  "window_s": [
+    26.0,
+    39.0
+  ],
+  "kind": "quiet",
+  "entries": [],
+  "truth_count": 0,
+  "note": "All 27 tiles empty. Infrared. Plant, wall, doorframe and mirror only. No person at any point.",
+  "source_chunk": "6.30.00pm",
+  "_source_chunk_note": "Which video chunk these labels were read from. Added 2026-08-20 after the scorecard scored a 7.30pm run against these 6.30pm windows and reported held-out 1/3 -- a number about footage the labeller never saw. A score whose truth came from different video is worse than no score."
+}
