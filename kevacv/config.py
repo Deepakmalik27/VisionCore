@@ -364,6 +364,25 @@ LIVE_REID_MEMORY_TTL_S = 1800.0
 LIVE_REID_MAX_SPEED_PX_S = 560.0
 LIVE_APPEARANCE_THRESH = 0.5
 ENABLE_COVISIBILITY_BLOCK = True
+# ── partial-body crop guard ─────────────────────────────────────────────────
+# A person entering frame is detected while only PART of them is visible, and
+# that half-body crop becomes their ReID anchor. When they walk fully into
+# view their appearance vector no longer matches their own anchor, so the
+# tracker mints a second id -- the switch is caused by the BIRTH, not the crowd.
+#
+# MEASURED on the 19:30-20:30 hour (2026-08-26):
+#     tracks born touching a frame edge      294 / 605  (49%)
+#     box AREA growth in first 20 frames     1.66x edge-born vs 1.32x mid-frame
+#     handoff rate (one person, two ids)     6.5% edge-born vs 5.1% mid-frame
+#
+# So the mechanism is real -- edge births ARE partial bodies -- but it accounts
+# for only ~3 of 35 handoffs, which is why this is opt-in and A/B'd rather than
+# assumed. It follows ENABLE_OCCLUSION_GUARD exactly: do not BLOCK the track,
+# only refuse to let a bad crop become its identity. Blocking births at the
+# door would lose arrivals, and the door is where arrivals come from.
+ENABLE_PARTIAL_CROP_GUARD = False
+PARTIAL_EDGE_FRAC = 0.02        # within 2% of a frame edge counts as touching
+
 ENABLE_OCCLUSION_GUARD = True
 ENABLE_SWAP_REVALIDATION = True
 SWAP_MARGIN = 0.1
@@ -575,7 +594,10 @@ STAFF_SOLE_DWELL_S = 600.0
 # filter (610x1070 is 1.75:1, inside MIN/MAX_BODY_ASPECT) and then D1 doubles
 # its own tolerance on a bad ground fit and waves them through.
 #
-# Generous on purpose. It is not a person-size model; D1 is, once ground_points
+# Generous on purpose. It is not a person-size model. D1 is -- but NOT, as this
+# line used to claim, 'once ground_points exist': measured 2026-08-29, feeding
+# D1 the measured homography made it worse on both clips. See
+# ENABLE_D1_EXACT_PLANE for the numbers. Formerly said: D1 is, once ground_points
 # exist.
 #
 # 2026-08-15 -- HEIGHT RAISED 0.70 -> 0.95 ON MEASUREMENT, NOT PREFERENCE.
@@ -789,6 +811,40 @@ CARRIED_MIN_HEAD_DROP = 0.15
 # than a missed one — it carries ONE id, so two people share an identity while
 # they overlap; its centre sits between them, so it triggers the wrong zone;
 # and when it splits, both are re-born as new ids. Symptom 9, driving 4/11/15.
+# ── the AUXILIARY head detector ─────────────────────────────────────────────
+# A SECOND detector, run only for its head class, alongside the primary one.
+#
+# WHY NOT JUST USE THE 2-CLASS DETECTOR AS THE DETECTOR
+#     models/best.pt (CrowdHuman, person+head) was A/B'd as the primary
+#     detector on 2026-08-26 against hand-labelled ground truth:
+#
+#         yolo11x.pt   HOTA 0.7884   DetA 0.8501   recall 0.8857
+#         best.pt      HOTA 0.2558   DetA 0.3339   recall 0.4436
+#
+#     CrowdHuman is street-level, where a standing person's height/width is
+#     ~2.5; on this oblique overhead fisheye it is ~1.14, so its PERSON class
+#     collapses. Its HEAD class, measured separately on the same clip, recalls
+#     73.3% -- too low to be the detector, ample as an occlusion signal.
+#
+#     So: bodies from the good body detector, heads from the head detector.
+#     Set to None (the default) and nothing changes; the cost is one extra
+#     forward pass per frame, which is why it is opt-in.
+HEAD_DETECTOR = None            # e.g. "models/best.pt"
+HEAD_DETECTOR_CONF = 0.25       # heads are small; the body threshold is too strict
+
+# D1 SIZE FILTER: use the MEASURED plane instead of the learned regression.
+#
+# D1 has always been handed _PerspectiveModel -- a linear fit over this run's
+# own boxes, which config.py itself documents as yielding impossible camera
+# heights (5.51 -> 4.34 -> 4.20 m within one run). The EXACT homography built
+# from operator-measured floor points was never reachable by it, because
+# GroundPlane.expected_h returned None outside auto mode.
+#
+# OFF by default: the exact plane's height model assumes vertical extent shares
+# the floor's local scale, which is approximate on an oblique camera. Whether
+# that beats a contaminated regression is measurable, so measure it.
+ENABLE_D1_EXACT_PLANE = False
+
 ENABLE_MERGED_SPLIT = True
 ENABLE_HEAD_RECOVERY = True
 # ── head->body geometry: THE SOURCE OF THE TALL BOXES ───────────────────────
@@ -935,6 +991,18 @@ ENTRY_LINE_FLIP = True
 # where guests pause and a dining threshold people stride through need opposite
 # settings — entry_lines_band and entry_lines_confirm_s.
 LINE_CROSS_FRAMES = 2
+# PER-PERSON DOOR STATE. One person cannot enter twice without leaving.
+#
+# The 20-minute run reported IN 61 / OUT 66 -- more unique exits than entries,
+# impossible for a closed room. Measured 2026-08-28: 127 crossing events from
+# 15 people (8.5 each), because the counting lines sit INSIDE the room, so
+# pacing past one reads as an arrival. Tier-A dedupe cannot help: it collapses
+# one crossing under several ids inside 2.5s/140px, and these are minutes apart.
+#
+# OFF by default so it is A/B'd, not assumed -- the same rule every other
+# change today was held to.
+ENABLE_CROSSING_STATE = False
+
 ENABLE_CROSSING_CONFIRM = True
 
 # PRIOR STABILITY — the first of the six published conditions for a valid
@@ -1013,6 +1081,27 @@ RENDER_CRF = 28             # visually lossless enough for review at this size
 # watching — which is why nobody watches it. 60 gives 4x: the same frames, the
 # same numbers, an hour reviewable in 15 minutes, and you can still pause.
 PLAYBACK_FPS = 60
+# PLAYBACK_TARGET_S — aim the OUTPUT at a fixed duration instead of a fixed
+# speed-up. PLAYBACK_FPS alone speeds every video by the same factor, so a
+# 10-minute clip stays 10x too fast to read while an 8-hour one is still
+# 2 hours to watch. Targeting a duration inverts that: short clips play slow
+# enough to actually see, long ones compress harder.
+#
+#     play_fps = clamp(frames / PLAYBACK_TARGET_S, PLAYBACK_FPS_MIN, _MAX)
+#
+# Clamped both ways on purpose. Below ~8 fps the video stutters; above ~120 fps
+# no player renders it honestly and ffmpeg starts dropping frames -- an 8-hour
+# chunk simply cannot become 2 minutes, and pretending otherwise would silently
+# lose frames rather than admit it. None = keep the old fixed-speed behaviour.
+PLAYBACK_TARGET_S = None
+PLAYBACK_FPS_MIN = 8.0
+PLAYBACK_FPS_MAX = 120.0
+# OVERLAY_ALPHA — how opaque the annotation layer is over the footage.
+# 1.0 is the old behaviour: boxes, skeletons and trails painted solid, which
+# hides the very thing a reviewer is trying to judge. Below ~0.6 the labels
+# stop being readable. The HUD band is NEVER blended: it sits on letterbox,
+# not on video, and a translucent HUD would just look broken.
+OVERLAY_ALPHA = 1.0
 
 # ── precision ───────────────────────────────────────────────────────────────
 # fp16 halves the memory traffic of every GPU forward pass. On an L4 that is
@@ -1143,6 +1232,7 @@ RUN_CONFIG_KEYS = {
     # multiplies EVERY pixel gate by 1.5x, silently rescaling thresholds the
     # notebook tuned at 1280 and confounding any A/B on them.
     "analysis.enable_head_recovery": "ENABLE_HEAD_RECOVERY",
+    "analysis.enable_d1_exact_plane": "ENABLE_D1_EXACT_PLANE",
     "analysis.enable_merged_split": "ENABLE_MERGED_SPLIT",
     "analysis.enable_absurd_size_cap": "ENABLE_ABSURD_SIZE_CAP",
     "analysis.enable_size_filter": "ENABLE_SIZE_FILTER",
@@ -1223,6 +1313,147 @@ RUN_CONFIG_KEYS = {
     "analysis.crossing_confirm_s": "CROSSING_CONFIRM_S",
     "analysis.line_cross_frames": "LINE_CROSS_FRAMES",
     "analysis.crossing_min_prior_s": "CROSSING_MIN_PRIOR_S",
+    "analysis.enable_partial_crop_guard": "ENABLE_PARTIAL_CROP_GUARD",
+    "analysis.partial_edge_frac": "PARTIAL_EDGE_FRAC",
+    # ── auto-wired 2026-08-26 ────────────────────────────────────────────
+    # 129 constants the engine reads had NO yaml key, so no alternative to
+    # them had ever been tested. Mapping a name changes no default; it only
+    # makes the value reachable by an A/B. See tools/audit_yaml_coverage.py.
+    "analysis.botsort_match_thresh": "BOTSORT_MATCH_THRESH",
+    "analysis.carried_contain": "CARRIED_CONTAIN",
+    "analysis.carried_height_tol": "CARRIED_HEIGHT_TOL",
+    "analysis.carried_max_area_ratio": "CARRIED_MAX_AREA_RATIO",
+    "analysis.carried_min_fit_samples": "CARRIED_MIN_FIT_SAMPLES",
+    "analysis.carried_min_head_drop": "CARRIED_MIN_HEAD_DROP",
+    "analysis.cross_val_anchor_sim": "CROSS_VAL_ANCHOR_SIM",
+    "analysis.cross_val_gallery_sim": "CROSS_VAL_GALLERY_SIM",
+    "analysis.d1_guard_warmup": "D1_GUARD_WARMUP",
+    "analysis.d1_max_drop_frac": "D1_MAX_DROP_FRAC",
+    "analysis.dataset_export_every_s": "DATASET_EXPORT_EVERY_S",
+    "analysis.dataset_min_boxes": "DATASET_MIN_BOXES",
+    "analysis.detector_half": "DETECTOR_HALF",
+    "analysis.drive_tz": "DRIVE_TZ",
+    "analysis.embed_batch": "EMBED_BATCH",
+    "analysis.enable_attire_merge_tier": "ENABLE_ATTIRE_MERGE_TIER",
+    "analysis.enable_carried_suppress": "ENABLE_CARRIED_SUPPRESS",
+    "analysis.enable_conf_hysteresis": "ENABLE_CONF_HYSTERESIS",
+    "analysis.enable_covisibility_block": "ENABLE_COVISIBILITY_BLOCK",
+    "analysis.enable_crossing_state": "ENABLE_CROSSING_STATE",
+    "analysis.enable_crossing_confirm": "ENABLE_CROSSING_CONFIRM",
+    "analysis.enable_cross_validation": "ENABLE_CROSS_VALIDATION",
+    "analysis.enable_dataset_export": "ENABLE_DATASET_EXPORT",
+    "analysis.enable_display_renumber": "ENABLE_DISPLAY_RENUMBER",
+    "analysis.enable_exposure_adapt": "ENABLE_EXPOSURE_ADAPT",
+    "analysis.enable_face_corroboration": "ENABLE_FACE_CORROBORATION",
+    "analysis.enable_face_merge_tier": "ENABLE_FACE_MERGE_TIER",
+    "analysis.enable_face_veto": "ENABLE_FACE_VETO",
+    "analysis.enable_global_tracklet": "ENABLE_GLOBAL_TRACKLET",
+    "analysis.enable_ir_hard_cut": "ENABLE_IR_HARD_CUT",
+    "analysis.enable_live_phantom_suppress": "ENABLE_LIVE_PHANTOM_SUPPRESS",
+    "analysis.enable_live_separability": "ENABLE_LIVE_SEPARABILITY",
+    "analysis.enable_observations": "ENABLE_OBSERVATIONS",
+    "analysis.enable_occlusion_guard": "ENABLE_OCCLUSION_GUARD",
+    "analysis.enable_reid_calibration": "ENABLE_REID_CALIBRATION",
+    "analysis.enable_reid_stitch": "ENABLE_REID_STITCH",
+    "analysis.enable_resolution_scaling": "ENABLE_RESOLUTION_SCALING",
+    "analysis.enable_staff_gallery_sweep": "ENABLE_STAFF_GALLERY_SWEEP",
+    "analysis.enable_staff_zone_promotion": "ENABLE_STAFF_ZONE_PROMOTION",
+    "analysis.enable_swap_revalidation": "ENABLE_SWAP_REVALIDATION",
+    "analysis.entry_line_flip": "ENTRY_LINE_FLIP",
+    "analysis.eval_export": "EVAL_EXPORT",
+    "analysis.eval_max_frames": "EVAL_MAX_FRAMES",
+    "analysis.eval_window": "EVAL_WINDOW",
+    "analysis.exposure_bright_mean": "EXPOSURE_BRIGHT_MEAN",
+    "analysis.exposure_clip_frac": "EXPOSURE_CLIP_FRAC",
+    "analysis.exposure_dark_mean": "EXPOSURE_DARK_MEAN",
+    "analysis.exposure_max_clip": "EXPOSURE_MAX_CLIP",
+    "analysis.face_max_tries": "FACE_MAX_TRIES",
+    "analysis.face_merge_sim_threshold": "FACE_MERGE_SIM_THRESHOLD",
+    "analysis.face_min_det_score": "FACE_MIN_DET_SCORE",
+    "analysis.face_min_face_px": "FACE_MIN_FACE_PX",
+    "analysis.face_model_name": "FACE_MODEL_NAME",
+    "analysis.face_recrop_frames": "FACE_RECROP_FRAMES",
+    "analysis.face_recrop_max_tracks": "FACE_RECROP_MAX_TRACKS",
+    "analysis.face_retry_every_s": "FACE_RETRY_EVERY_S",
+    "analysis.face_scope": "FACE_SCOPE",
+    "analysis.face_sim_threshold": "FACE_SIM_THRESHOLD",
+    "analysis.face_source_recrop": "FACE_SOURCE_RECROP",
+    "analysis.face_veto_margin": "FACE_VETO_MARGIN",
+    "analysis.face_veto_max_edge_score": "FACE_VETO_MAX_EDGE_SCORE",
+    "analysis.ffmpeg_hwaccel": "FFMPEG_HWACCEL",
+    "analysis.gap_merge_s": "GAP_MERGE_S",
+    "analysis.global_tracklet_max_ids": "GLOBAL_TRACKLET_MAX_IDS",
+    "analysis.handoff_veto_sim": "HANDOFF_VETO_SIM",
+    "analysis.head_recovery_conf_penalty": "HEAD_RECOVERY_CONF_PENALTY",
+    "analysis.head_recovery_min_conf": "HEAD_RECOVERY_MIN_CONF",
+    "analysis.hsv_merge_sim_threshold": "HSV_MERGE_SIM_THRESHOLD",
+    "analysis.hud_smooth_s": "HUD_SMOOTH_S",
+    "analysis.ir_chroma_threshold": "IR_CHROMA_THRESHOLD",
+    "analysis.ir_cut_min_gap_s": "IR_CUT_MIN_GAP_S",
+    "analysis.ir_debounce_frames": "IR_DEBOUNCE_FRAMES",
+    "analysis.ir_detect_conf_floor": "IR_DETECT_CONF_FLOOR",
+    "analysis.ir_sat_threshold": "IR_SAT_THRESHOLD",
+    "analysis.ir_track_frac": "IR_TRACK_FRAC",
+    "analysis.live_appearance_thresh": "LIVE_APPEARANCE_THRESH",
+    "analysis.live_reid_sim_threshold": "LIVE_REID_SIM_THRESHOLD",
+    "analysis.max_body_aspect": "MAX_BODY_ASPECT",
+    "analysis.max_walk_speed_mps": "MAX_WALK_SPEED_MPS",
+    "analysis.min_blur_variance": "MIN_BLUR_VARIANCE",
+    "analysis.min_crop_px_blur_gate": "MIN_CROP_PX_BLUR_GATE",
+    "analysis.min_event_s": "MIN_EVENT_S",
+    "analysis.min_seated_s": "MIN_SEATED_S",
+    "analysis.motion_gate": "MOTION_GATE",
+    "analysis.motion_idle_s": "MOTION_IDLE_S",
+    "analysis.motion_min_frac": "MOTION_MIN_FRAC",
+    "analysis.obs_emb_stride": "OBS_EMB_STRIDE",
+    "analysis.obs_motion_window": "OBS_MOTION_WINDOW",
+    "analysis.obs_stationary_px_s": "OBS_STATIONARY_PX_S",
+    "analysis.phantom_centre_jitter": "PHANTOM_CENTRE_JITTER",
+    "analysis.phantom_min_span_s": "PHANTOM_MIN_SPAN_S",
+    "analysis.phantom_size_cv": "PHANTOM_SIZE_CV",
+    "analysis.playback_fps": "PLAYBACK_FPS",
+    "analysis.playback_target_s": "PLAYBACK_TARGET_S",
+    "analysis.playback_fps_min": "PLAYBACK_FPS_MIN",
+    "analysis.playback_fps_max": "PLAYBACK_FPS_MAX",
+    "analysis.overlay_alpha": "OVERLAY_ALPHA",
+    "analysis.proxy_jpeg_quality": "PROXY_JPEG_QUALITY",
+    "analysis.reembed_every_s": "REEMBED_EVERY_S",
+    "analysis.ref_diagonal_px": "REF_DIAGONAL_PX",
+    "analysis.reid_crops_per_track": "REID_CROPS_PER_TRACK",
+    "analysis.reid_half": "REID_HALF",
+    "analysis.reid_handoff_gap_s": "REID_HANDOFF_GAP_S",
+    "analysis.reid_handoff_m": "REID_HANDOFF_M",
+    "analysis.reid_handoff_px": "REID_HANDOFF_PX",
+    "analysis.reid_stationary_m": "REID_STATIONARY_M",
+    "analysis.reid_stationary_px": "REID_STATIONARY_PX",
+    "analysis.render_coast_s": "RENDER_COAST_S",
+    "analysis.render_crf": "RENDER_CRF",
+    "analysis.render_direct_h264": "RENDER_DIRECT_H264",
+    "analysis.render_only_occupied": "RENDER_ONLY_OCCUPIED",
+    "analysis.render_video": "RENDER_VIDEO",
+    "analysis.render_window": "RENDER_WINDOW",
+    "analysis.snapshot_every_s": "SNAPSHOT_EVERY_S",
+    "analysis.staff_dominance_ratio": "STAFF_DOMINANCE_RATIO",
+    "analysis.staff_gallery_dir": "STAFF_GALLERY_DIR",
+    "analysis.staff_match_threshold": "STAFF_MATCH_THRESHOLD",
+    "analysis.staff_min_spread": "STAFF_MIN_SPREAD",
+    "analysis.staff_min_video_share": "STAFF_MIN_VIDEO_SHARE",
+    "analysis.staff_min_visits": "STAFF_MIN_VISITS",
+    "analysis.staff_override_min_s": "STAFF_OVERRIDE_MIN_S",
+    "analysis.staff_override_share_min_s": "STAFF_OVERRIDE_SHARE_MIN_S",
+    "analysis.staff_sole_dwell_s": "STAFF_SOLE_DWELL_S",
+    "analysis.static_centre_jitter": "STATIC_CENTRE_JITTER",
+    "analysis.static_min_life_by_role": "STATIC_MIN_LIFE_BY_ROLE",
+    "analysis.static_min_life_s": "STATIC_MIN_LIFE_S",
+    "analysis.static_size_jitter": "STATIC_SIZE_JITTER",
+    "analysis.swap_margin": "SWAP_MARGIN",
+    "analysis.tile_nms_iou": "TILE_NMS_IOU",
+    "analysis.tile_target_min_px": "TILE_TARGET_MIN_PX",
+    "analysis.trail_mode": "TRAIL_MODE",
+    "analysis.use_ffmpeg_reader": "USE_FFMPEG_READER",
+    "analysis.use_real_online_reid": "USE_REAL_ONLINE_REID",
+    "analysis.head_detector": "HEAD_DETECTOR",
+    "analysis.head_detector_conf": "HEAD_DETECTOR_CONF",
     "analysis.head_to_body_ratio": "HEAD_TO_BODY_RATIO",
     "analysis.head_recovery_aspect": "HEAD_RECOVERY_ASPECT",
     # Tile geometry as config, because "how expensive is tiling" is a question

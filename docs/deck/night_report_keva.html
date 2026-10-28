@@ -5,14 +5,16 @@
 <style>
 :root{--fog:#FAF8F5;--paper:#FFFEFB;--slate:#1C1917;--copper:#D4622B;
  --sage:#8B7E6F;--hair:#DDD5CB;--tint:#FDF5EF;--olive:#5C6B4F;
- --slatelt:#F5F1EB}
+ --slatelt:#F5F1EB;--copperdk:#7C2D12;--copperlt:#FCEADB}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
  --fog:#1C1917;--paper:#22201D;--slate:#F5F1EB;
  --copper:#E8844A;--sage:#B5ADA1;--hair:#35312D;
- --tint:#2A1D17;--slatelt:#2A2724}}
+ --tint:#2A1D17;--slatelt:#2A2724;
+ --copperdk:#E8844A;--copperlt:#2A1D17}}
 :root[data-theme="dark"]{--fog:#1C1917;--paper:#22201D;
  --slate:#F5F1EB;--copper:#E8844A;--sage:#B5ADA1;
- --hair:#35312D;--tint:#2A1D17;--slatelt:#2A2724}
+ --hair:#35312D;--tint:#2A1D17;--slatelt:#2A2724;
+ --copperdk:#E8844A;--copperlt:#2A1D17}
 *{box-sizing:border-box}
 body{margin:0;background:var(--fog);color:var(--slate);
  font-family:'Space Grotesk',-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased}
@@ -33,16 +35,15 @@ h2{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.7rem;let
 .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
 .tile{background:var(--paper);border:1px solid var(--hair);
  border-radius:8px;padding:18px 18px 16px}
+.tile.miss{border-color:var(--copperdk);background:var(--copperlt)}
 .tile .v{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:clamp(1.7rem,3.4vw,2.5rem);
  font-weight:600;line-height:1;font-variant-numeric:tabular-nums}
+.tile.miss .v{color:var(--copperdk)}
 .tile .k{font-size:.9rem;color:var(--sage);margin-top:.5em}
 .tier{display:inline-block;font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.58rem;
  letter-spacing:.14em;padding:.25em .6em;border-radius:3px;margin-top:.9em;
  background:var(--tint);color:var(--copper);border:1px solid var(--copper)}
-.tier.exact{background:#5C6B4F1a;color:var(--olive);
- border-color:var(--olive)}
-:root[data-theme="dark"] .tier.exact,
-@media (prefers-color-scheme:dark){}
+.tier.exact{background:transparent;color:var(--olive);border-color:var(--olive)}
 .meter{background:var(--paper);border:1px solid var(--hair);
  border-radius:8px;padding:20px}
 .meterbar{height:34px;border-radius:5px;overflow:hidden;display:flex;
@@ -54,7 +55,7 @@ h2{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.7rem;let
 .swatch{display:inline-block;width:11px;height:11px;border-radius:2px;
  margin-right:7px;vertical-align:baseline}
 .rows{display:flex;flex-direction:column;gap:9px}
-.row{display:grid;grid-template-columns:132px 1fr 74px;align-items:center;
+.row{display:grid;grid-template-columns:150px 1fr 74px;align-items:center;
  gap:14px}
 .row .nm{font-size:.9rem;overflow:hidden;text-overflow:ellipsis;
  white-space:nowrap}
@@ -64,81 +65,67 @@ h2{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.7rem;let
 .track i{display:block;height:100%;background:var(--copper);
  border-radius:0 4px 4px 0}
 .row .val{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.86rem;text-align:right;
- color:var(--slate);font-variant-numeric:tabular-nums}
+ font-variant-numeric:tabular-nums}
 table{width:100%;border-collapse:collapse;font-size:.88rem}
 th{text-align:left;font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.62rem;
  letter-spacing:.14em;text-transform:uppercase;color:var(--sage);
  padding:0 10px 9px 0;border-bottom:1px solid var(--hair);font-weight:500}
-td{padding:11px 10px 11px 0;border-bottom:1px solid var(--hair)}
+td{padding:10px 10px 10px 0;border-bottom:1px solid var(--hair)}
 td.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
-.flag{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:.62rem;color:var(--sage)}
 .callout{background:var(--paper);border:1px solid var(--hair);
  border-left:3px solid var(--copper);border-radius:6px;
  padding:16px 20px;font-size:.9rem;color:var(--sage);line-height:1.6}
+.callout.warn{border-left-color:var(--copperdk);background:var(--copperlt)}
 .callout b{color:var(--slate)}
 ul.caveats{margin:0;padding-left:1.1em;color:var(--sage);font-size:.88rem;
- line-height:1.65;display:flex;flex-direction:column;gap:.55em}
+ line-height:1.65;display:flex;flex-direction:column;gap:.6em}
 footer{margin-top:38px;padding-top:16px;border-top:1px solid var(--hair);
  color:var(--sage);font-size:.78rem}
 @media(max-width:760px){.tiles{grid-template-columns:repeat(2,1fr)}
- .row{grid-template-columns:104px 1fr 60px}}
+ .row{grid-template-columns:110px 1fr 60px}}
 </style>
 <div class="wrap">
 <header><div class="brandline"><div>
 <h1>Delilah — Reception</h1>
-<div class="sub">CAM.112 · 2026-07-28 · 19:30–20:30 · 1.0 h of footage · provenance verified</div></div>
+<div class="sub">CAM.112 · 2026-07-28 · 20:10–20:30 · 20 minutes of evening service</div></div>
 <div class="stamp">Keva Vision · morning report</div>
 </div></header>
 <div class="tiles">
-<div class="tile"><div class="v">8</div><div class="k">guests<br><span style="opacity:.75">range 8–8</span></div><span class="tier">ESTIMATE</span></div>
-<div class="tile"><div class="v">97.0%</div><div class="k">desk covered<br><span style="opacity:.75">of observed footage</span></div><span class="tier exact">EXACT</span></div>
-<div class="tile"><div class="v">0</div><div class="k">times the desk was empty<br><span style="opacity:.75">not one gap</span></div><span class="tier exact">EXACT</span></div>
-<div class="tile"><div class="v">3.4 s</div><div class="k">median time to greet<br><span style="opacity:.75">1 of 8 guests reached</span></div><span class="tier">PROXY</span></div>
+<div class="tile"><div class="v">61.1%</div><div class="k">desk covered<br><span style="opacity:.75">target is 90%</span></div><span class="tier exact">EXACT</span></div>
+<div class="tile miss"><div class="v">3</div><div class="k">gaps of a minute or more<br><span style="opacity:.75">longest 3.4 min</span></div><span class="tier">EXACT</span></div>
+<div class="tile miss"><div class="v">5</div><div class="k">guests waited through a gap<br><span style="opacity:.75">nobody at the desk</span></div><span class="tier">EXACT</span></div>
+<div class="tile"><div class="v">8</div><div class="k">most people in the room at once<br><span style="opacity:.75">needs no identity</span></div><span class="tier exact">EXACT</span></div>
 </div>
+<div class="callout warn" style="margin-top:16px"><b>This is the finding.</b> The desk was unstaffed three times for a minute or more, the longest for 3.4 minutes, and 5 guests stood waiting through one of them. Coverage came to 61.1% against a 90% target. Nobody had to watch twenty minutes of footage to learn that.</div>
 <h2>Was the desk covered?</h2>
-<div class="meter"><div class="meterbar"><i style="width:97.0%;background:var(--copper)"></i><i style="width:3.0%;background:var(--slatelt);border:1px dashed var(--hair)"></i></div><div class="meterkey"><span><span class="swatch" style="background:var(--copper)"></span>staffed <b>97.0%</b></span><span><span class="swatch" style="background:var(--slatelt);border:1px solid var(--hair)"></span>nobody at the desk <b>3.0%</b></span><span style="margin-left:auto">target <b>90%</b></span></div></div>
+<div class="meter"><div class="meterbar"><i style="width:61.1%;background:var(--copper)"></i><i style="width:38.9%;background:var(--slatelt);border:1px dashed var(--hair)"></i></div><div class="meterkey"><span><span class="swatch" style="background:var(--copper)"></span>staffed <b>61.1%</b></span><span><span class="swatch" style="background:var(--slatelt);border:1px solid var(--hair)"></span>nobody at the desk <b>38.9%</b></span><span style="margin-left:auto">target <b>90%</b></span></div></div>
 <h2>Who worked the desk, and for how long</h2>
 <div class="rows">
-<div class="row"><div class="nm">staff1<small>face</small></div><div class="track"><i style="width:100.0%"></i></div><div class="val">22.5 min</div></div>
-<div class="row"><div class="nm">29<small>zone</small></div><div class="track"><i style="width:84.88888888888889%"></i></div><div class="val">19.1 min</div></div>
-<div class="row"><div class="nm">8<small>zone</small></div><div class="track"><i style="width:50.222222222222214%"></i></div><div class="val">11.3 min</div></div>
-<div class="row"><div class="nm">27<small>zone</small></div><div class="track"><i style="width:47.11111111111111%"></i></div><div class="val">10.6 min</div></div>
-<div class="row"><div class="nm">2<small>zone</small></div><div class="track"><i style="width:45.33333333333333%"></i></div><div class="val">10.2 min</div></div>
-<div class="row"><div class="nm">sarah<small>face</small></div><div class="track"><i style="width:41.777777777777786%"></i></div><div class="val">9.4 min</div></div>
-<div class="row"><div class="nm">33<small>zone</small></div><div class="track"><i style="width:32.88888888888889%"></i></div><div class="val">7.4 min</div></div>
-<div class="row"><div class="nm">staff2<small>face</small></div><div class="track"><i style="width:32.88888888888889%"></i></div><div class="val">7.4 min</div></div>
-<div class="row"><div class="nm">staff4<small>face</small></div><div class="track"><i style="width:27.999999999999996%"></i></div><div class="val">6.3 min</div></div>
-<div class="row"><div class="nm">722<small>zone</small></div><div class="track"><i style="width:27.111111111111107%"></i></div><div class="val">6.1 min</div></div>
-<div class="row"><div class="nm">staff3<small>face</small></div><div class="track"><i style="width:22.22222222222222%"></i></div><div class="val">5.0 min</div></div>
-<div class="row"><div class="nm">141<small>zone</small></div><div class="track"><i style="width:12.000000000000002%"></i></div><div class="val">2.7 min</div></div>
+<div class="row"><div class="nm">staff7<small>face 100%</small></div><div class="track"><i style="width:100.0%"></i></div><div class="val">7.8 min</div></div>
+<div class="row"><div class="nm">staff2<small>face 95%</small></div><div class="track"><i style="width:35.8974358974359%"></i></div><div class="val">2.8 min</div></div>
+<div class="row"><div class="nm">sarah<small>face 100%</small></div><div class="track"><i style="width:28.20512820512821%"></i></div><div class="val">2.2 min</div></div>
+<div class="row"><div class="nm">staff4<small>face 100%</small></div><div class="track"><i style="width:20.512820512820515%"></i></div><div class="val">1.6 min</div></div>
+<div class="row"><div class="nm">staff6<small>face 100%</small></div><div class="track"><i style="width:14.102564102564106%"></i></div><div class="val">1.1 min</div></div>
+<div class="row"><div class="nm">staff1<small>face 85%</small></div><div class="track"><i style="width:10.256410256410257%"></i></div><div class="val">0.8 min</div></div>
 </div>
-<div class="callout" style="margin-top:14px"><b>Read this one carefully.</b> Five of these are face-matched names; the rest are anonymous ids the system saw holding the desk. Some of the ids are almost certainly the same people as the names, so treat the list as time-at-desk, not as a headcount of staff.</div>
-<h2>Where the hour was spent</h2>
+<div class="callout" style="margin-top:14px"><b>All six were matched by face</b>, at 85–100% confidence, against staff photographs. Between them they held the desk for 16.3 of the 20 minutes — which is the other way of reading the 61% above.</div>
+<h2>Where the twenty minutes were spent</h2>
 <div class="rows">
-<div class="row"><div class="nm">Reception</div><div class="track"><i style="width:100.0%"></i></div><div class="val">133 min</div></div>
-<div class="row"><div class="nm">Waiting area</div><div class="track"><i style="width:24.812030075187966%"></i></div><div class="val">33 min</div></div>
-<div class="row"><div class="nm">Main entrance</div><div class="track"><i style="width:15.789473684210526%"></i></div><div class="val">21 min</div></div>
-<div class="row"><div class="nm">Dining</div><div class="track"><i style="width:15.037593984962406%"></i></div><div class="val">20 min</div></div>
+<div class="row"><div class="nm">Reception</div><div class="track"><i style="width:100.0%"></i></div><div class="val">66 min</div></div>
+<div class="row"><div class="nm">Waiting area</div><div class="track"><i style="width:40.909090909090914%"></i></div><div class="val">27 min</div></div>
+<div class="row"><div class="nm">Main entrance</div><div class="track"><i style="width:13.636363636363635%"></i></div><div class="val">9 min</div></div>
 </div>
-<h2>Every guest the system saw</h2>
-<table><tr><th>id</th><th>first seen</th><th>last seen</th><th>minutes</th><th>waited</th><th>greeted</th><th>note</th></tr>
-<tr><td class="mono">3</td><td class="mono">00:13</td><td class="mono">38:32</td><td class="mono">38.3</td><td class="mono">23 s</td><td>no</td><td class="flag"></td></tr>
-<tr><td class="mono">16</td><td class="mono">00:31</td><td class="mono">58:21</td><td class="mono">57.8</td><td class="mono">153 s</td><td>yes</td><td class="flag"></td></tr>
-<tr><td class="mono">28</td><td class="mono">01:07</td><td class="mono">17:41</td><td class="mono">16.6</td><td class="mono">—</td><td>no</td><td class="flag">not counted — never crossed the door</td></tr>
-<tr><td class="mono">36</td><td class="mono">01:56</td><td class="mono">08:01</td><td class="mono">6.1</td><td class="mono">8 s</td><td>no</td><td class="flag"></td></tr>
-<tr><td class="mono">40</td><td class="mono">02:01</td><td class="mono">58:20</td><td class="mono">56.3</td><td class="mono">119 s</td><td>no</td><td class="flag"></td></tr>
-<tr><td class="mono">57</td><td class="mono">03:40</td><td class="mono">59:35</td><td class="mono">55.9</td><td class="mono">7 s</td><td>no</td><td class="flag"></td></tr>
-<tr><td class="mono">59</td><td class="mono">03:41</td><td class="mono">59:47</td><td class="mono">56.1</td><td class="mono">98 s</td><td>yes</td><td class="flag"></td></tr>
-<tr><td class="mono">121</td><td class="mono">13:19</td><td class="mono">59:09</td><td class="mono">45.8</td><td class="mono">83 s</td><td>no</td><td class="flag"></td></tr>
-<tr><td class="mono">528</td><td class="mono">31:46</td><td class="mono">32:22</td><td class="mono">0.6</td><td class="mono">33 s</td><td>no</td><td class="flag"></td></tr>
-<tr><td class="mono">771</td><td class="mono">44:59</td><td class="mono">45:54</td><td class="mono">0.9</td><td class="mono">—</td><td>no</td><td class="flag">not counted — never crossed the door</td></tr>
-<tr><td class="mono">856</td><td class="mono">56:49</td><td class="mono">59:24</td><td class="mono">2.6</td><td class="mono">—</td><td>no</td><td class="flag">not counted — never crossed the door</td></tr>
-<tr><td class="mono">1089</td><td class="mono">58:19</td><td class="mono">58:47</td><td class="mono">0.5</td><td class="mono">18 s</td><td>no</td><td class="flag">not counted — never crossed the door</td></tr>
+<h2>Every answer, with its tier</h2>
+<table><tr><th>question</th><th>answer</th><th>tier</th><th>what would make it wrong</th></tr>
+<tr><td>Was the desk covered?</td><td class="mono">61.1%</td><td class="mono">EXACT</td><td style="color:var(--sage)">counts the station, not a person</td></tr>
+<tr><td>Desk unstaffed for 60s or more?</td><td class="mono">3</td><td class="mono">EXACT</td><td style="color:var(--sage)">longest 3.4 min, 5 guests waiting</td></tr>
+<tr><td>How fast were guests greeted?</td><td class="mono">1.2 s</td><td class="mono">PROXY</td><td style="color:var(--sage)">proximity is not conversation · 9 never approached</td></tr>
+<tr><td>How many guests?</td><td class="mono">168</td><td class="mono">WEAK</td><td style="color:var(--sage)">implausible — identity is fragmenting, do not use</td></tr>
+<tr><td>Most people in the room at once</td><td class="mono">8</td><td class="mono">EXACT</td><td style="color:var(--sage)">needs no identity, so it is the reliable headcount</td></tr>
 </table>
-<div class="callout" style="margin-top:16px"><b>8 of 12</b> people crossed the door and count as guests; the other 4 were seen but never crossed it, so they are listed and excluded. <b>2</b> had a staff member come within reach. That is the number to argue about — not the 3.4 s.</div>
 <h2>What needs a human eye</h2>
-<div class="callout">Nothing was flagged tonight. <b>That means no rule fired — not that nothing happened.</b> Until the anomaly baseline has more nights of this room to compare against, an empty list is weak evidence.</div>
+<div class="callout">Nothing was flagged by a rule. <b>That is not the same as nothing happening</b> — the three desk gaps above were measured, not flagged, because the anomaly baseline has not yet seen enough nights of this room to know what normal looks like.</div>
 <h2>How much to trust this</h2>
-<ul class="caveats"><li>107 cells inside a counted zone never produced a single detection — either nobody stood there, or we are blind there.</li><li>17 cells had over 90% of their detections removed by the filters. If they are not under a mask, a filter is eating real people.</li><li>55 track pairs moved in lockstep — likely reflections in the mirrored wall, and they inflate a headcount if left in.</li><li>Accuracy is self-graded: HOTA not measured, because no hand-labelled footage exists yet.</li></ul>
-<footer>Generated from the run artefacts of <span class="mono">delilah_1hr</span> — SUMMARY.txt, CAM.112_scorecard.json and people.csv. EXACT = measured directly. ESTIMATE = needed identity to hold, so it carries a range. PROXY = a stand-in signal; staff standing near a guest is not proof of a conversation. A number without a tier does not go on this page.</footer>
+<ul class="caveats"><li>The guest count of 168 is wrong and the system says so itself: at most 8 people were ever in the room, so 168 identities means one person is being split into several. Read the occupancy figure instead.</li><li>167 cells inside a counted zone never produced a single detection — either nobody stood there, or we are blind there, and those two are worth different money.</li><li>21 track pairs moved in lockstep and could not be resolved. Measured on a later run: these were duplicate tracks at the reception desk, not reflections.</li><li>Desk coverage counts the station, not a person — a different staff member at the desk still counts as covered. It also rests entirely on the six identities called staff; if that call is wrong, so is the percentage.</li><li>Accuracy is self-graded. HOTA is not measured, because no hand-labelled footage exists yet.</li></ul>
+<footer>Generated from the run artefacts of <span class="mono">DEMO_FINAL</span> — SUMMARY.txt, CAM.112_scorecard.json and people.csv. EXACT = measured directly. PROXY = a stand-in signal. WEAK = may over-count; never act on it alone. A number without a tier does not go on this page.</footer>
 </div>

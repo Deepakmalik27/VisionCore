@@ -1,0 +1,19 @@
+{
+ "task": 2,
+ "taken_utc": "2026-08-26T14:03:08Z",
+ "hash": "f0e5014be513",
+ "summary": {
+  "tracks": 0,
+  "boxes": 0,
+  "shapes_loose": 0,
+  "roles_set": 0,
+  "roles": {}
+ },
+ "annotations": {
+  "version": 0,
+  "tags": [],
+  "shapes": [],
+  "tracks": [],
+  "intervals": []
+ }
+}

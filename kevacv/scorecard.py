@@ -345,10 +345,26 @@ def verdicts(card: Dict[str, Any]) -> List[Dict[str, str]]:
 
     g = card.get("ground_plane") or {}
     if g:
-        ok = g.get("ok") and 1.5 <= (g.get("camera_h_m") or 0) <= 4.0 \
-            and (g.get("horizon_row") or -1) >= 0
+        # THE BOUNDS BELONG TO THE AUTO FIT, NOT TO EVERY PLANE.
+        #
+        # camera_h_m and horizon_row are products of the automatic perspective
+        # fit. An EXACT homography built from measured ground_points computes
+        # neither -- it does not need to infer the camera, it was given the
+        # floor. Applying the auto-fit bounds to it read `camera Nonem, horizon
+        # row None` and FAILED a plane that was correct, which is the precise
+        # way to teach an operator that measuring their floor achieves nothing.
+        if g.get("mode") == "exact" or g.get("camera_h_m") is None:
+            ok = bool(g.get("ok"))
+        else:
+            ok = g.get("ok") and 1.5 <= (g.get("camera_h_m") or 0) <= 4.0 \
+                and (g.get("horizon_row") or -1) >= 0
         add("ground plane", PASS if ok else FAIL,
-            f"camera {g.get('camera_h_m')}m, horizon row {g.get('horizon_row')}")
+            (f"EXACT homography from measured ground_points — camera height "
+             f"and horizon are not computed in this mode, so the auto-fit "
+             f"sanity bounds do not apply"
+             if (g.get("mode") == "exact" or g.get("camera_h_m") is None)
+             else f"camera {g.get('camera_h_m')}m, "
+                  f"horizon row {g.get('horizon_row')}"))
 
     a = card.get("arrival_confidence") or {}
     if a:

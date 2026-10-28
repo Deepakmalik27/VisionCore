@@ -115,10 +115,24 @@ class ReIDEmbeddingExtractor:
                         flat = flat[:self.embedding_dim]
                     flat = torch.nn.functional.normalize(flat, p=2, dim=0)
                     return flat.cpu().numpy()
-        except Exception:
-            vec = np.zeros(self.embedding_dim, dtype=np.float32)
-            vec[0] = 1.0
-            return vec
+        except Exception as _e:
+            # RETURNING A CONSTANT VECTOR IS THE WORST POSSIBLE FALLBACK HERE.
+            #
+            # This used to return [1, 0, 0, ...] on any failure. Every person
+            # then has the SAME embedding, so cosine similarity between any two
+            # people is exactly 1.0 -- identity collapses completely, silently,
+            # and every downstream Re-ID decision becomes a coin flip that
+            # thinks it is certain. A wrong answer that looks like a confident
+            # answer is strictly worse than no answer.
+            #
+            # None says "no embedding available" and callers must handle it.
+            # tools/wiring_audit.py marks this module DO NOT WIRE for exactly
+            # this reason; if it is ever wired, this must fail visibly.
+            import logging
+            logging.getLogger(__name__).error(
+                "ReID embedding failed (%s) -- returning None, NOT a constant "
+                "vector. A constant vector makes every person identical.", _e)
+            return None
 
     def extract_batch_embeddings(self, crops: List[np.ndarray], is_ir: Optional[bool] = None) -> List[np.ndarray]:
         """Extract Re-ID embeddings for a batch of crops in a single parallel GPU pass."""

@@ -240,6 +240,9 @@ if __name__ == "__main__":
     here = pathlib.Path(__file__).parent
     (here / "keva_vision_flow.svg").write_text(svg(), encoding="utf-8")
     (here / "keva_vision_flow.drawio").write_text(drawio(), encoding="utf-8")
+    import cairosvg   # the decks embed the raster, so it is not a manual step
+    cairosvg.svg2png(url=str(here / "keva_vision_flow.svg"),
+                     write_to=str(here / "keva_vision_flow.png"), scale=2)
 
     # one runnable check: every edge endpoint must name a real node, and no two
     # boxes may overlap -- an overlap is invisible in the XML and obvious on stage.

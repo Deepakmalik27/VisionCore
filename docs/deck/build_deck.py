@@ -2,13 +2,21 @@
 
 Audience: a CTO and a COO who do not read code.
 
-EVERY NUMBER ON THESE SLIDES IS MEASURED. The source is the 1-hour Delilah run
-in `keva_delilah_1hr/` (SUMMARY.txt, CAM.112_scorecard.json, people.csv) —
-CAM.112 Reception, 2026-07-28, 19:30–20:30. Nothing is a mock-up any more; the
-earlier illustrative report slide has been replaced by that run's real output.
+EVERY NUMBER ON THESE SLIDES IS MEASURED, and all of them come from ONE run:
+`~/Downloads/keva_vision_FINAL/` — CAM.112 Reception, Delilah LA, 2026-07-28,
+twenty minutes of evening service (SUMMARY.txt, CAM.112_scorecard.json,
+people.csv). The earlier one-hour run is no longer quoted anywhere, so the
+deck has a single story with a single set of figures.
+
+That run FOUND SOMETHING, and it is the spine of the deck: the reception desk
+was unstaffed three times, the longest for 3.4 minutes, with five guests
+waiting through one of the gaps. Coverage 61.1% against a 90% target.
+
+It also got a number badly wrong — 168 guests, when at most 8 people were ever
+in the room — and said so itself. Both facts are on the slides. A system that
+flags its own bad number is the thing worth buying.
 
 The ONE blank left on purpose is the infrastructure figure on the last slide.
-Fill it in yourself rather than letting me invent a number.
 
 Livery is the Keva restaurant app's own — see keva_theme.py.
 """
@@ -38,7 +46,7 @@ SLIDES = [
     dict(kind="title",
          eyebrow="KEVA VISION · DELILAH LA",
          title="Nobody watches the cameras.",
-         sub="What we are building, what it already measures, "
+         sub="What we are building, what it found in twenty minutes, "
              "and what it will take to finish."),
 
     dict(kind="statement",
@@ -63,32 +71,6 @@ SLIDES = [
                  "Protect recorder. Keva Vision reads what is already "
                  "recording. CAM.112 — the reception camera — is the pilot."),
 
-    dict(kind="table",
-         eyebrow="WHAT IT ANSWERS",
-         title="Four questions, and how sure we can honestly be.",
-         head=["The question", "Why the floor cares",
-               "What one hour of real footage gave us"],
-         rows=[
-             ["Was the desk covered?",
-              "An unstaffed host stand is a guest who walks back out.",
-              "97.0% covered, zero gaps. MEASURED — it only asks 'is anyone "
-              "standing here', so it never depends on telling people apart."],
-             ["How many guests?",
-              "A number to reconcile against the POS.",
-              "8 guests. Two independent methods — a door line and a floor "
-              "region — both returned 8. An ESTIMATE that agreed with itself."],
-             ["How fast were guests greeted?",
-              "The first sixty seconds decide the review.",
-              "3.4 s — but only 1 of the 8 was ever approached. "
-              "This is the number we do not yet trust. See the honest slide."],
-             ["What happened last night?",
-              "One page, on the desk at 06:00.",
-              "Published, with every figure carrying its own confidence "
-              "label. A number without one does not go on the page."],
-         ],
-         foot="Targets are written down in docs/SUCCESS_CRITERIA.md, so "
-              "'good enough' is a decision rather than a moving line."),
-
     dict(kind="full",
          eyebrow="HOW IT WORKS",
          title="One night in. One page out.",
@@ -103,62 +85,106 @@ SLIDES = [
                  "night. The plant is masked out — it moves, and moving "
                  "leaves look like people."),
 
-    dict(kind="video",
-         eyebrow="THE RESULT, PLAYED",
-         title="Sixty seconds of it working.",
-         file=VIDEO,
-         meta="CAM.112 · 2026-07-28, 19:43–19:47 · 62 s · 4× speed "
-              "(one hour of service renders to fifteen minutes)",
-         look=[
-             "Orange box = staff. Blue box = guest. The system works the role "
-             "out from behaviour — it is not reading uniforms.",
-             "Watch the names: 'staff1' and 'sarah' are face-matched against "
-             "the staff photos. The rest stay anonymous ids on purpose.",
-             "Bottom right, the entry-line counter ticks over as people cross. "
-             "Crossing the line is what counts as an arrival; standing near "
-             "the door does not.",
-             "Watch an id stay with a person as they cross the room. That is "
-             "the hard part, and it is what August was spent fixing.",
+    dict(kind="statement",
+         eyebrow="WHAT TWENTY MINUTES FOUND",
+         title="The desk was empty three times.\nGuests were waiting.",
+         stats=[("61.1%", "desk covered · target is 90%"),
+                ("3", "gaps of a minute or more"),
+                ("5", "guests waited through one")],
+         body=[
+             "This is not a capability demo. It is a finding, from twenty "
+             "minutes of ordinary evening service on 28 July.",
+             "Reception went unstaffed three separate times — 3.4 minutes from "
+             "08:32, 1.9 minutes from 15:04, and 1.6 minutes from 17:44. "
+             "During the first, five guests stood in the waiting area with "
+             "nobody at the desk.",
+             "Three times in twenty minutes is not a fluke — it is a pattern "
+             "nobody could have seen without watching the whole night.",
+             "No manager watched this footage. Nobody had to. It arrived as a "
+             "line on a page the next morning.",
          ]),
 
-    dict(kind="split",
-         eyebrow="FROM PIXELS TO A SENTENCE",
-         title="This is the raw material. Nobody will ever read it.",
-         image="frame_routes.png",
-         stats=[("193", "paths walked"), ("44", "came in"), ("23", "went out")],
-         body=[
-             "That is a single twenty-minute window with every path drawn on "
-             "top of it. It is honest, complete, and completely useless to a "
-             "manager.",
-             "The whole job of Keva Vision is turning that picture into one "
-             "sentence a GM can act on:",
-             "“The reception desk held all hour, eight guests came through "
-             "the door, and only one of them was ever approached.”",
+    dict(kind="video",
+         eyebrow="THE RESULT, PLAYED",
+         title="Watch the desk go empty.",
+         file=VIDEO,
+         embed="_deck.mp4",
+         poster="_clip_poster.jpg",
+         meta="CAM.112 · 2026-07-28, 20:15–20:22 · 96 s · 4× speed. "
+              "Embedded in this file — press play. Full-resolution master: "
+              "docs/deck/keva_vision_demo_clip.mp4",
+         look=[
+             "It opens on ordinary service — the HUD top left reads "
+             "reception: STAFFED. Watch that word.",
+             "At 38 seconds it flips to AWAY and the copper bar appears. That "
+             "is the first of the three gaps, caught live.",
+             "Watch 'waiting now' climb to 4 while the desk reads AWAY. Those "
+             "are the guests standing there with nobody to greet them.",
+             "Orange box = staff, blue box = guest. The role comes from "
+             "behaviour, not from uniforms. Names like 'staff1' are "
+             "face-matched against staff photographs.",
+             "At 1:28 the desk reads STAFFED again. The gap ran 3.4 minutes "
+             "of real service.",
          ]),
 
     dict(kind="imagelist",
-         eyebrow="ONE HOUR, MEASURED",
-         title="What the pilot actually produced.",
+         eyebrow="WHAT LANDS AT 06:00",
+         title="The finding, on one page.",
          image="report_answers.png",
          eye=[
-             "Two independent counting methods — a line across the door and a "
-             "region on the floor — both returned 8. In July they disagreed, "
-             "2 against 6.",
-             "Desk coverage is the number we are willing to promise on: it "
-             "only asks whether anyone is standing there, so it never depends "
-             "on telling people apart.",
-             "Nothing was flagged for review — which means no rule fired, not "
-             "that nothing happened. The page says so in those words.",
+             "Every figure carries a confidence label. EXACT means measured "
+             "directly; PROXY means a stand-in signal; WEAK means do not act "
+             "on it alone.",
+             "Desk coverage is the number we are willing to promise on — it "
+             "only asks whether anyone is standing at the station, so it never "
+             "depends on telling people apart.",
+             "Occupancy — at most 8 in the room — is the other reliable one, "
+             "for the same reason: it counts bodies visible, not identities.",
          ]),
 
     dict(kind="image",
          eyebrow="WHO ACTUALLY HELD THE DESK",
-         title="Time at the desk, by person.",
+         title="Six people, all matched by face.",
          image="report_desk.png",
-         caption="Five of these are real names, matched to staff photographs "
-                 "by face. The rest are anonymous ids — and some of them are "
-                 "almost certainly the same people, which is exactly why the "
-                 "page says so instead of printing a staff headcount."),
+         caption="Every one of the six was matched against a staff photograph "
+                 "at 85–100% confidence. Between them they held the desk for "
+                 "16.3 of the 20 minutes — which is the other way of reading "
+                 "61%."),
+
+    dict(kind="three",
+         eyebrow="THE NUMBER IT GOT WRONG",
+         title="It counted 168 guests. The room held 8.",
+         cols=[
+             ("WHAT IT REPORTED", [
+                 "168 unique guests, tagged WEAK.",
+                 "Two other counting methods disagreed with it and with each "
+                 "other: a line across the door said 36, a region on the floor "
+                 "said 10.",
+                 "In an earlier one-hour run those two methods agreed exactly. "
+                 "On this footage they do not.",
+             ]),
+             ("WHY IT IS WRONG", [
+                 "At most 8 people were ever in the room at once, and the busiest "
+                 "single frame held 10.",
+                 "Even a complete turnover every two minutes only reaches about "
+                 "80 people in twenty minutes.",
+                 "So 168 identities means the system is splitting one person "
+                 "into several as they move — 158 of those 168 never crossed "
+                 "the door at all.",
+             ]),
+             ("WHY WE ARE SHOWING YOU", [
+                 "Because the system said it first. The report prints the word "
+                 "IMPLAUSIBLE next to its own number and tells the reader to "
+                 "use the identity-free count instead.",
+                 "A tool that hides a bad number costs you a decision. This one "
+                 "refuses to let 168 be quoted.",
+                 "The desk-coverage finding on the previous slides does not "
+                 "depend on identity at all, which is exactly why we lead with "
+                 "it.",
+             ]),
+         ],
+         foot="Every figure here is read straight out of the run's own "
+              "scorecard and summary — including the one it got wrong."),
 
     dict(kind="statement",
          eyebrow="ANOMALIES",
@@ -170,10 +196,12 @@ SLIDES = [
              "The system builds a picture of what normal looks like for this "
              "room, at this hour, on this day of the week — from its own "
              "history.",
-             "Then it raises only what genuinely deviates from that. Nobody "
-             "hand-tunes a number, and nobody re-tunes it per venue.",
-             "And it reports in the floor's language — “host stand unstaffed "
-             "during the peak ramp”, not “zone 3 count below threshold”.",
+             "Then it raises only what genuinely deviates. Nobody hand-tunes a "
+             "number, and nobody re-tunes it per venue.",
+             "It has not earned that yet here. This run flagged nothing, "
+             "because one twenty-minute clip is not a history — the three desk "
+             "gaps were measured, not flagged. More nights is what turns the "
+             "second into the first.",
          ]),
 
     dict(kind="three",
@@ -181,35 +209,37 @@ SLIDES = [
          title="The honest slide.",
          cols=[
              ("PROVEN, MEASURED", [
-                 "A full hour at Delilah ran end to end and published a "
-                 "report: 97% desk coverage, zero gaps.",
-                 "The door line and the floor region both counted 8 guests. "
-                 "Two methods, one answer.",
-                 "Identity churn is down to 56% of tracks from 83% in July, "
-                 "after a single tuning change.",
-                 "Face matching put real names — sarah, staff1 — against "
-                 "time at the desk.",
+                 "A twenty-minute run produced a real operational finding: "
+                 "three desk gaps, 3.4 min at worst, five guests waiting.",
+                 "Six staff matched to photographs by face at 85–100% "
+                 "confidence.",
+                 "The floor geometry now solves exactly, from 36 measured "
+                 "correspondences rather than an estimate.",
+                 "Desk coverage and peak occupancy need no identity, so they "
+                 "hold even while identity does not.",
              ]),
              ("KNOWN GAPS", [
-                 "Greet time is the weak number: 3.4 s came from one guest "
-                 "out of eight. The other seven were never approached, and "
-                 "we cannot yet tell a real service failure from a "
-                 "measurement one.",
-                 "No hand-labelled footage, so the system still grades its "
-                 "own homework. We will not call that accuracy.",
-                 "107 grid cells inside a counted zone never produced a "
-                 "single detection — either nobody stood there, or we are "
-                 "blind there.",
+                 "Identity fragments: 205 tracks became 162 chains, and the "
+                 "guest count blew out to 168 against a true ceiling of ~8 in "
+                 "the room.",
+                 "Greet time is a proximity proxy, and 9 guests were never "
+                 "approached at all — we cannot yet separate a service failure "
+                 "from a measurement one.",
+                 "167 grid cells inside a counted zone never produced a single "
+                 "detection: either nobody stood there, or we are blind there.",
+                 "No hand-labelled footage, so the system still grades its own "
+                 "homework.",
              ]),
              ("WHAT CLOSES THEM", [
                  "A labelling pass — a person marks a few hours of real "
-                 "footage. The single biggest credibility unlock.",
-                 "Re-train the detector on our own frames rather than "
-                 "generic ones.",
-                 "A second angle at the entrance, which is what moves "
-                 "counting from a range to a number.",
-                 "A language model for the greet question — a different "
-                 "tool for something vision alone cannot answer.",
+                 "footage. The single biggest credibility unlock, and what "
+                 "turns 'self-graded' into 'accurate'.",
+                 "Re-train the detector on our own frames rather than generic "
+                 "ones, which is what stops the fragmenting.",
+                 "A second angle at the entrance, which is what moves counting "
+                 "from a range to a number.",
+                 "More nights, so the anomaly baseline has a normal to compare "
+                 "against.",
              ]),
          ]),
 
@@ -220,17 +250,19 @@ SLIDES = [
              ("01", "Approval to run on live footage",
               "Move off saved clips and onto the nightly stream from the "
               "venue's own recorder. This is the gate that turns a "
-              "demonstration into a service."),
+              "demonstration into a service — and the only way the anomaly "
+              "baseline ever gets a history to learn from."),
              ("02", "Infrastructure budget",
               "A GPU machine to process a night's footage before morning. "
-              "One hour of one camera took roughly an hour to process — "
-              "figure attached separately."),
+              "Twenty minutes of one camera renders in five — figure attached "
+              "separately."),
              ("03", "A second camera angle at the entrance",
-              "The one thing software cannot substitute for. It is what "
-              "moves guest counting from a range to a number."),
+              "The one thing software cannot substitute for. It is what fixes "
+              "the counting problem on the previous slide."),
          ],
          foot="What comes back: a nightly one-page report, and an annotated "
-              "video that jumps straight to the moment worth watching."),
+              "video that jumps straight to the moment worth watching — like "
+              "the one you just saw."),
 ]
 
 
@@ -397,21 +429,33 @@ def build_pptx():
         elif k == "video":
             s = new()
             eyebrow(s, sl["eyebrow"])
-            text(s, sl["title"], 0.85, 1.05, 11.6, 0.9, size=42)
-            card(s, 0.85, 2.15, 11.6, 0.95, TINT, BRASS)
-            text(s, "▶  " + sl["file"], 1.15, 2.35, 11.0, 0.4, size=19,
+            text(s, sl["title"], 0.85, 1.02, 11.6, 0.7, size=34)
+
+            # The clip is EMBEDDED, not linked. A path on a slide is not a
+            # demo -- it is a promise the room cannot check.
+            vw = 6.9
+            vh = vw * 1372 / 1920
+            mov = s.shapes.add_movie(
+                str(HERE / sl["embed"]), Inches(0.85), Inches(1.85),
+                Inches(vw), Inches(vh),
+                poster_frame_image=str(HERE / sl["poster"]),
+                mime_type="video/mp4")
+            mov.line.color.rgb = C(LINE)
+            text(s, sl["meta"], 0.85, 1.9 + vh, 7.0, 0.5, size=11.5,
+                 color=MUTED, italic=True)
+
+            x = 8.15
+            text(s, "WHAT TO LOOK FOR", x, 1.85, 4.3, 0.3, size=11,
                  color=BRASS, font=MONO)
-            text(s, sl["meta"], 1.15, 2.76, 11.0, 0.4, size=13, color=MUTED,
-                 italic=True)
-            text(s, "WHAT TO LOOK FOR", 0.85, 3.45, 11.6, 0.3, size=11,
-                 color=BRASS, font=MONO)
-            rule(s, 3.75)
-            y = 3.95
+            rule(s, 2.15, x, 4.3)
+            y = 2.35
             for i, ln in enumerate(sl["look"], 1):
-                text(s, f"{i:02d}", 0.85, y, 0.6, 0.4, size=14, color=BRASS,
+                text(s, f"{i:02d}", x, y, 0.5, 0.35, size=12.5, color=BRASS,
                      font=MONO)
-                text(s, ln, 1.55, y, 10.9, 0.8, size=15, color=INK)
-                y += 0.82
+                lines = -(-len(ln) // 40)
+                text(s, ln, x + 0.55, y, 3.75, lines * 0.22, size=12.5,
+                     color=INK, space=1.3)
+                y += lines * 0.22 + 0.30
 
         elif k == "split":
             s = new()
@@ -474,8 +518,9 @@ def build_pptx():
                     yy += lines * 0.23 + 0.30
                 x += 3.9
             rule(s, 6.98)
-            text(s, "Every figure on the left is measured and reproducible "
-                    "from the repository. Nothing on this slide is a projection.",
+            text(s, sl.get("foot", "Every figure here is measured and "
+                            "reproducible from the run artefacts. Nothing on "
+                            "this slide is a projection."),
                  0.85, 7.08, 11.6, 0.4, size=12, color=MUTED, italic=True)
 
         elif k == "ask":
@@ -494,10 +539,21 @@ def build_pptx():
             text(s, sl["foot"], 0.85, y + 0.05, 11.6, 0.6, size=15,
                  color=INK, italic=True)
 
+    # PowerPoint locks a file it has open, and python-pptx cannot overwrite it.
+    # Save to the canonical name when we can; otherwise take the next free one
+    # and say so, rather than dying with a PermissionError.
     out = HERE / "Keva_Vision_CTO_COO.pptx"
-    if out.exists() and (HERE / ("~$" + out.name)).exists():
-        out = HERE / "Keva_Vision_CTO_COO_NEW.pptx"   # the original is open in PowerPoint
-    prs.save(str(out))
+    for cand in [out] + [HERE / f"Keva_Vision_CTO_COO_v{i}.pptx"
+                         for i in range(2, 20)]:
+        try:
+            prs.save(str(cand))
+            out = cand
+            break
+        except PermissionError:
+            continue
+    else:
+        raise PermissionError("every candidate filename is locked — "
+                              "close PowerPoint")
     return out, len(prs.slides.__iter__.__self__._sldIdLst)
 
 

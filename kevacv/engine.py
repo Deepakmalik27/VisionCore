@@ -101,6 +101,40 @@ DETECTOR_MODEL = None          # path to best.pt
 from .venue_profile import DEFAULTS as _VP_DEFAULTS  # noqa: E402
 VENUE_PROFILE = {k: dict(v) if isinstance(v, dict) else v
                  for k, v in _VP_DEFAULTS.items()}
+
+
+def load_venue_profile(video_path=None, zones_path=None, explicit=None):
+    """Merge a per-venue profile over the defaults, in place.
+
+    WHY THIS FUNCTION HAS TO EXIST
+        venue_profile.load_profile() has always known how to find a profile --
+        `profile_<video stem>.json` beside the footage, `profile.json`, or a
+        "profile" key inside the zones file -- and NOTHING ever called it.
+        VENUE_PROFILE was therefore always the hard-coded DEFAULTS, and a
+        venue that wrote a profile got silence: no file read, no warning, no
+        `_source` key to reveal it. Found by tools/wiring_audit.py on
+        2026-08-26.
+
+        This matters because VENUE_PROFILE["camera"] supplies person_height_m
+        and hfov_deg to the ground plane and to every metre conversion. A
+        venue whose people are not 1.70 m had no supported way to say so.
+
+    Returns the merged profile and records where it came from, so a run can
+    always answer "which numbers did this use, and who chose them".
+    """
+    global VENUE_PROFILE
+    try:
+        from .venue_profile import load_profile as _lp
+        VENUE_PROFILE = _lp(video_path=video_path, zones_path=zones_path,
+                            explicit=explicit)
+    except Exception as _e:                      # never fail a run over this
+        _log.warning("venue profile load failed (%s) — using defaults", _e)
+        return VENUE_PROFILE
+    _src = (VENUE_PROFILE or {}).get("_source", "defaults")
+    if _src and _src != "defaults":
+        _log.info("\U0001f3e2 venue profile: %s", _src)
+        _log.info("   camera: %s", (VENUE_PROFILE.get("camera") or {}))
+    return VENUE_PROFILE
 EVAL_WINDOW = None             # (start_s, end_s) when scoring a labelled slice
 NATIVE_FPS_OVERRIDE = None     # force a source fps when the container lies
 
@@ -1371,7 +1405,14 @@ def _drop_implausible(dets, persp, stats=None):
     yet, nothing is dropped — a filter that fires on missing information is
     worse than no filter.
     """
-    if not ENABLE_SIZE_FILTER or len(dets) == 0 or persp is None or not persp.ready:
+    # `persp` is now either a _PerspectiveModel (learned fit, has .ready) or a
+    # GroundPlane (measured homography, has .ok). Asking for .ready on the
+    # latter raised AttributeError the first time D1 was handed a real plane.
+    # Duck-type the readiness question rather than the type.
+    _geo_ready = getattr(persp, "ready", None)
+    if _geo_ready is None:
+        _geo_ready = bool(getattr(persp, "ok", False))
+    if not ENABLE_SIZE_FILTER or len(dets) == 0 or persp is None or not _geo_ready:
         return dets
     # A count with no denominator cannot be judged. "D1 dropped 29,124" reads
     # alarming or fine depending entirely on whether that is 2% or 60% of the
@@ -1397,7 +1438,14 @@ def _drop_implausible(dets, persp, stats=None):
                   f"{globals().get('D1_MAX_DROP_FRAC', 0.12):.0%} — the geometry "
                   f"fit is not trustworthy; tolerance relaxed "
                   f"{SIZE_FILTER_TOL}x -> {_tol}x for the rest of this video. "
-                  f"Supply ground_points in the venue profile for the real fix.")
+                  f"NOTE: supplying ground_points does NOT fix this. That "
+                  f"advice was here for months and was tested on 2026-08-29: "
+                  f"D1 fed by the measured homography tripled its drops "
+                  f"(9.6% -> 27.2%) and cost 13 points of recall, because the "
+                  f"plane gives the FLOOR's metres-per-pixel and using it for "
+                  f"a person's VERTICAL extent under-estimates height on an "
+                  f"oblique camera. A correct fix needs camera height and tilt, "
+                  f"not just a ground homography. See ENABLE_D1_EXACT_PLANE.")
     mask = implausible_size_mask(dets.xyxy, persp.expected_h, tol=_tol)
     if not any(mask):
         return dets
@@ -1910,6 +1958,19 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                 # changes, so 10 h of footage becomes ~60-80 min to review.
                 # Falls back to eff_fps when Cell 2e hasn't run (short clips).
                 _play_fps = float(globals().get("PLAYBACK_FPS", eff_fps) or eff_fps)
+                # Duration-targeted playback: scale the speed-up to the length
+                # of THIS video instead of applying one factor to all of them.
+                _tgt = globals().get("PLAYBACK_TARGET_S")
+                if _tgt:
+                    _nfr = len(frame_log) or 1
+                    _lo = float(globals().get("PLAYBACK_FPS_MIN", 8.0))
+                    _hi = float(globals().get("PLAYBACK_FPS_MAX", 120.0))
+                    _want = _nfr / float(_tgt)
+                    _play_fps = max(_lo, min(_hi, _want))
+                    _log.info(
+                        f"\U0001f3ac playback: {_nfr} frames -> {_play_fps:.1f} fps "
+                        f"= {_nfr / _play_fps:.0f}s of video "
+                        f"(target {_tgt}s{'; CLAMPED' if _want != _play_fps else ''})")
                 if globals().get("RENDER_DIRECT_H264") and _ffmpeg_ok():
                     # V64a: straight to h264 — the ~1.5GB raw mp4v intermediate
                     # never exists and the runner's re-encode pass is skipped.
@@ -2150,8 +2211,35 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
                         dy = pts[-1][1] - pts[0][1]
                         if dx * dx + dy * dy < 1600:  # <40px net = not walking
                             continue
-                    cv2.polylines(frame, [np.array(pts, dtype=np.int32)], False,
-                                  (200, 200, 60), 2)
+                    # BREAK THE TRAIL AT A JUMP -- DO NOT DRAW THROUGH IT.
+                    #
+                    # trails are keyed by CANONICAL id, so when identity memory
+                    # merges two raw tracks into one person, both their anchors
+                    # land in the same deque. polylines then drew a straight
+                    # line from wherever one segment ended to wherever the other
+                    # began -- on the 19:50 clip, a 1500px streak clean across
+                    # the room. MEASURED 2026-08-26: no track actually moves
+                    # like that (median 2 px/frame, p99 56, max 294, zero jumps
+                    # over 400). So the streak was pure rendering: it depicted
+                    # motion that never happened, on the video a GM judges.
+                    #
+                    # Splitting is the honest fix. Suppressing the trail would
+                    # hide the merge; drawing through it asserts a walk that did
+                    # not occur. A gap shows exactly what is known: two places,
+                    # one identity, nothing observed in between.
+                    _lim = max(120.0, frame.shape[1] * 0.06)
+                    _seg = [pts[0]]
+                    for _a, _b in zip(pts, list(pts)[1:]):
+                        if (_b[0] - _a[0]) ** 2 + (_b[1] - _a[1]) ** 2 > _lim * _lim:
+                            if len(_seg) >= 2:
+                                cv2.polylines(frame, [np.array(_seg, dtype=np.int32)],
+                                              False, (200, 200, 60), 2)
+                            _seg = [_b]
+                        else:
+                            _seg.append(_b)
+                    if len(_seg) >= 2:
+                        cv2.polylines(frame, [np.array(_seg, dtype=np.int32)],
+                                      False, (200, 200, 60), 2)
             # v53: zone counts moved OFF the video onto the HUD band (3rd line) —
             # nothing is ever drawn over people any more; polygons stay outlined
             # ── #18 STALE STATUS ────────────────────────────────────────────
@@ -2220,6 +2308,12 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
             # painted over the video — the full camera view stays visible
             frame = cv2.copyMakeBorder(frame, 88, 0, 0, 0,
                                        cv2.BORDER_CONSTANT, value=(25, 25, 25))
+            # Keep an untouched copy so the annotation layer can be blended
+            # back at OVERLAY_ALPHA. Taken AFTER the letterbox so the two
+            # images are the same shape, and the band is excluded at blend
+            # time rather than by cropping here.
+            _clean_frame = frame.copy() if float(
+                globals().get("OVERLAY_ALPHA", 1.0)) < 0.999 else None
             cv2.putText(frame, hud, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
                         (255, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(frame, hud2, (10, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
@@ -2246,6 +2340,18 @@ def render_annotated(video_path, out_path, frame_log, canon, roles, events,
             cv2.putText(frame, f"{mmss(t)} / {mmss(_span)} real",
                         (frame.shape[1] - 240, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (170, 170, 170), 1, cv2.LINE_AA)
+            # BLEND BEFORE ANYTHING WRITES THE FRAME.
+            #
+            # There are two output paths -- the h264 pipe (live, via
+            # RENDER_DIRECT_H264) and the cv2 writer -- and the pipe runs
+            # FIRST. Blending after it changes only the fallback path, so the
+            # rendered video would look identical while the setting reported
+            # as applied. Row 0-87 is the HUD letterbox and stays opaque:
+            # it sits on black, not on footage.
+            if _clean_frame is not None:
+                _al = float(globals().get("OVERLAY_ALPHA", 1.0))
+                frame[88:] = cv2.addWeighted(frame[88:], _al,
+                                             _clean_frame[88:], 1.0 - _al, 0)
             if _ff_pipe is not None:
                 try:
                     _ff_pipe.stdin.write(frame.tobytes())
@@ -2334,6 +2440,10 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     # resolution (a screenshot, a different export of the same footage),
     # so load_zone_config auto-scales polygon coordinates to whatever this
     # video's actual frame_w x frame_h turns out to be.
+    # Load the venue profile BEFORE anything reads VENUE_PROFILE["camera"].
+    # No profile file = defaults, exactly as before, so this changes nothing
+    # until a venue actually writes one.
+    load_venue_profile(video_path=video_path, zones_path=zones_path)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"cannot open {video_path}")
@@ -2431,7 +2541,22 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         _rad = 90.0
         _keep = []
         for (_mx1, _my1, _mx2, _my2) in dets.xyxy:
-            _bc = ((_mx1 + _mx2) / 2.0, _my2)
+            # THE SAME ANCHOR THE REST OF THE PIPELINE USES.
+            #
+            # This read _my2 -- the literal bottom edge -- while zone
+            # classification uses anchor_point(), i.e. FOOT_ANCHOR_FRAC (0.85)
+            # up from the bottom. So the two disagreed about where a detection
+            # "is", and a box could be INSIDE a mask for labelling purposes and
+            # OUTSIDE it for deletion purposes at the same instant.
+            #
+            # That is exactly the plant: its box runs past the leaves down onto
+            # the floor, so the bottom edge escapes the traced polygon while the
+            # 0.85 anchor sits inside it. Measured 2026-08-26 on the quiet clip:
+            # 85 detections had their 0.85 anchor inside a mask and survived,
+            # and the plant was rendered as `P4 dead area 1 mask:0.64` -- a
+            # potted plant, tracked as a person, wearing the name of the mask
+            # that was supposed to delete it.
+            _bc = anchor_point((_mx1, _my1, _mx2, _my2), False)
             _inside = any(_in_poly(polygons[_n], _bc) for _n in _mask_names)
             if not _inside:
                 _keep.append(True)
@@ -2981,6 +3106,51 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     _persp = _PerspectiveModel()
     _supp_stats = {}
     _has_head = _detector_has_head_class(model)
+    # AUXILIARY HEAD DETECTOR (see config.HEAD_DETECTOR for the measurements).
+    # Kept strictly separate from _has_head: that flag describes the PRIMARY
+    # model and is what _det_classes() consults. Conflating them would ask
+    # yolo11x for class 1, which is 'bicycle', and invent people from bikes.
+    _head_model = None
+    _head_aux = False
+    _n_aux_heads = [0]
+    _n_partial = [0]       # crops refused for touching a frame edge
+    if globals().get("HEAD_DETECTOR"):
+        try:
+            from ultralytics import YOLO as _YOLO
+            _head_model = _YOLO(str(globals()["HEAD_DETECTOR"]))
+            if not _detector_has_head_class(_head_model):
+                _log.warning("HEAD_DETECTOR %s is not a 2-class person/head "
+                             "model (classes=%s) — auxiliary heads DISABLED",
+                             globals()["HEAD_DETECTOR"], _head_model.names)
+                _head_model = None
+            else:
+                _head_aux = True
+                _log.info("auxiliary head detector: %s (bodies still from %s)",
+                          globals()["HEAD_DETECTOR"], DETECTOR_MODEL)
+        except Exception as _e:
+            _log.warning("HEAD_DETECTOR failed to load (%s) — continuing with "
+                         "bodies only, which is the previous behaviour", _e)
+            _head_model = None
+
+    def _detect_heads(img):
+        """-> sv.Detections of HEADS only, or None when no aux detector.
+
+        Returns only class 1. The aux model's person boxes are deliberately
+        discarded: its person class scored recall 0.44 against ground truth
+        and merging those in is precisely the regression this design avoids.
+        """
+        if _head_model is None:
+            return None
+        try:
+            _r = _head_model(img, conf=float(globals().get("HEAD_DETECTOR_CONF", 0.25)),
+                             iou=0.45, imgsz=YOLO_IMGSZ, classes=[1],
+                             verbose=False, device=device_str)[0]
+            _h = sv.Detections.from_ultralytics(_r)
+            _n_aux_heads[0] += len(_h)
+            return _h
+        except Exception as _e:
+            _log.warning("aux head detection failed on one frame (%s)", _e)
+            return None
     _n_head_only = 0
     _n_recovered = [0]          # bodies rebuilt from orphan heads (symptom 12)
     _n_split = [0]              # merged person boxes split apart (symptom 9)
@@ -3043,8 +3213,14 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                   "the end-of-chunk pass, after they have already consumed "
                   "canonical ids for the length of the chunk")
 
-    def _filter_chain(dets, t):
-        """Raw detector output -> what the tracker is allowed to see."""
+    def _filter_chain(dets, t, aux_heads=None):
+        """Raw detector output -> what the tracker is allowed to see.
+
+        aux_heads, when given, REPLACES the heads that would have come from the
+        primary detector's own class 1. Heads are consumed inside this function
+        and never returned, so nothing downstream -- tracker, ReID, counting --
+        can see a head box or mistake one for a person.
+        """
         nonlocal _n_head_only
         _funnel.record_first("yolo raw", len(dets))
         _raw_for_ghost = (dets.xyxy.copy() if len(dets) else None)
@@ -3092,13 +3268,15 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
 
         _n = len(dets)
         dets, _heads = _split_person_head(dets, _has_head)
+        if aux_heads is not None and len(aux_heads):
+            _heads = aux_heads
         _n_head_only += len(_heads_without_person(_heads, dets))
         _funnel.record("person/head split", _n, len(dets))
         # Occlusion recovery: a head with no body around it is a person the
         # detector lost behind someone else. ADDS detections, so the funnel
         # shows it as a stage whose out exceeds its in — the only one that
         # should, and worth seeing as such.
-        if ENABLE_MERGED_SPLIT and _has_head:
+        if ENABLE_MERGED_SPLIT and (_has_head or _head_aux):
             # Two heads in one person box is two people (symptom 9). Runs
             # BEFORE head recovery so the split heads are then correctly seen
             # as belonging to a body, not as orphans needing a new one.
@@ -3106,7 +3284,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             dets, _n_sp = _split_merged_persons(dets, _heads)
             _n_split[0] += _n_sp
             _funnel.record("split merged (+)", _n, len(dets))
-        if ENABLE_HEAD_RECOVERY and _has_head:
+        if ENABLE_HEAD_RECOVERY and (_has_head or _head_aux):
             _n = len(dets)
             dets, _n_rec = _recover_bodies_from_heads(
                 dets, _heads, _persp, frame_w, frame_h)
@@ -3118,7 +3296,14 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
         dets = _suppress_carried(dets, _persp, _supp_stats)
         _funnel.record("carried-object suppress", _n, len(dets))
         _n = len(dets)
-        dets = _drop_implausible(dets, _persp, _supp_stats)
+        # D1's geometry source. The measured homography when the operator has
+        # supplied ground_points AND the flag is on; otherwise the learned
+        # regression, exactly as before.
+        _d1_geo = _persp
+        if (globals().get("ENABLE_D1_EXACT_PLANE", False)
+                and _ground is not None and getattr(_ground, "mode", "") == "exact"):
+            _d1_geo = _ground
+        dets = _drop_implausible(dets, _d1_geo, _supp_stats)
         _funnel.record("implausible size", _n, len(dets))
         _n = len(dets)
         dets = _drop_masked(dets, t)
@@ -3572,7 +3757,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             _raw = (_detect_tiled(frame) if ENABLE_TILED_DETECT
                     else sv.Detections.from_ultralytics(_pre_result))
             with _prof.stage("filters"):
-                dets = _dedup_nms(_filter_chain(_raw, t))
+                dets = _dedup_nms(_filter_chain(_raw, t, _detect_heads(frame)))
             _n_pre_track = len(dets)
             # THE DEAD BAND. The detector emits everything >= CONF_THRESHOLD,
             # but BoT-SORT's new_track_thresh (= NEW_TRACK_CONF) decides what
@@ -3605,7 +3790,8 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             # NMS makes the SURVIVING id flip with per-frame confidence rank,
             # which feeds the live identity memory an oscillating id: worse
             # than the duplicate. The other two branches NMS BEFORE the tracker.
-            dets = _filter_chain(sv.Detections.from_ultralytics(result), t)
+            dets = _filter_chain(sv.Detections.from_ultralytics(result), t,
+                                 _detect_heads(frame))
             if dets.tracker_id is None:
                 dets = dets[np.zeros(len(dets), dtype=bool)]
                 dets.tracker_id = np.array([], dtype=object)
@@ -3613,7 +3799,7 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             _raw = (_detect_tiled(frame) if ENABLE_TILED_DETECT
                     else sv.Detections.from_ultralytics(_pre_result))
             with _prof.stage("filters"):
-                dets = _dedup_nms(_filter_chain(_raw, t))
+                dets = _dedup_nms(_filter_chain(_raw, t, _detect_heads(frame)))
             _n_pre_track = len(dets)
             dets = tracker.update_with_detections(dets)
             _funnel.record("tracker (bytetrack)", _n_pre_track, len(dets))
@@ -3628,6 +3814,22 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
                 for _b in range(_a + 1, len(_bx)):
                     if _boxes_occluding(_bx[_a], _bx[_b]):
                         _occluded_idx.add(_a); _occluded_idx.add(_b)
+
+        # PARTIAL-BODY GUARD (see config.ENABLE_PARTIAL_CROP_GUARD).
+        # A box clipped by the frame edge shows part of a person, so its crop
+        # describes a half body. Joining _occluded_idx means that crop is not
+        # banked as an identity -- the same treatment, for the same reason, as
+        # a crop contaminated by a neighbouring body. The TRACK is untouched:
+        # the person is still detected, still tracked, still counted. Only the
+        # appearance vector waits until there is a whole person to describe.
+        if globals().get("ENABLE_PARTIAL_CROP_GUARD", False) and len(dets.xyxy):
+            _ef = float(globals().get("PARTIAL_EDGE_FRAC", 0.02))
+            _mx, _my = frame_w * _ef, frame_h * _ef
+            for _i, (_x1, _y1, _x2, _y2) in enumerate(dets.xyxy):
+                if (_x1 <= _mx or _y1 <= _my
+                        or _x2 >= frame_w - _mx or _y2 >= frame_h - _my):
+                    _occluded_idx.add(_i)
+                    _n_partial[0] += 1
 
         # `_vecs` is assigned only inside the re-id branch below; the
         # observation rows read it unconditionally, so a run with re-id off
@@ -4096,11 +4298,15 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
     else:
         _caps.degraded(
             "tiled detect (SAHI)", "off — detecting on the downscaled frame only",
-            f"a person at the far wall is ~60px tall at {frame_w}x{frame_h}. "
-            f"That is small-object detection, which is what bad boxes (#8), "
-            f"merged people (#9) and detection flicker (#11) are. Enable "
-            f"ENABLE_TILED_DETECT to give them {YOLO_IMGSZ // TILE_PX}x "
-            f"effective resolution.")
+            f"a person at the far wall is ~60px tall at {frame_w}x{frame_h}, "
+            f"which is small-object detection -- the cause of bad boxes (#8), "
+            f"merged people (#9) and detection flicker (#11). Tiling would "
+            f"give them {YOLO_IMGSZ // TILE_PX}x effective resolution, BUT IT "
+            f"WAS MEASURED AND REJECTED on this camera (2026-08-26, against "
+            f"hand-labelled ground truth): DetA 0.8501 -> 0.6598, HOTA 0.7884 "
+            f"-> 0.7052. On an oblique fisheye a person spans tile boundaries "
+            f"and is fragmented faster than small-object recall is gained. "
+            f"Re-test before enabling; do not enable on this advice alone.")
 
     _onnx_avail, _onnx_gpu = onnx_providers()
     if ENABLE_FACE_CORROBORATION:
@@ -5159,6 +5365,25 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
 
             if n_merged:
                 events, crossings, _ = remap_events(events, crossings, mapping)
+                # FRAME_LOG MUST BE REMAPPED TOO, OR GREETING SUBTRACTS TWO
+                # DIFFERENT PEOPLE'S CLOCKS.
+                #
+                # remap_events moves `events` and `crossings` into canonical
+                # ids and always has. frame_log was left in the pre-merge
+                # space -- and derive.staff_contacts() reads frame_log while
+                # derive.arrivals_by_id() reads events. Greeting is then
+                #     contact_time(raw id)  -  arrival_time(canonical id)
+                # i.e. one person's proximity minus another's arrival. That is
+                # how people.csv came to carry greet_s = -91.7: a greeting
+                # 91.7 SECONDS BEFORE the guest arrived. Found 2026-08-29.
+                #
+                # One identity space, everywhere. Boxes are
+                # (tid, x1, y1, x2, y2); only the id changes.
+                if frame_log:
+                    frame_log = [
+                        (_fi, _t, [(mapping.get(_b[0], _b[0]),) + tuple(_b[1:])
+                                   for _b in _boxes])
+                        for _fi, _t, _boxes in frame_log]
                 # F2: remap_events recomputes role from fragment majority-dwell
                 # — which voted "customer" during the live loop. A face match
                 # against the ENROLLED gallery outranks dwell: force it, or the
@@ -5602,6 +5827,27 @@ def process_video(camera_id, video_path, zones_path, max_seconds=None, device=No
             crossings, confirm_s=CROSSING_CONFIRM_S, per_line=zcfg_confirm,
             track_first_seen=_first_seen,
             min_prior_s=float(globals().get("CROSSING_MIN_PRIOR_S", 0.0)))
+        # PER-PERSON DOOR STATE, after the U-turn filter and for the same
+        # reason it runs after tier-A dedupe: each fixes a different error and
+        # they compose in this order. Dedupe collapses one crossing wearing
+        # several ids; the U-turn filter cancels a crossing the person
+        # immediately reversed; this one suppresses the SECOND arrival of
+        # somebody who never left.
+        if globals().get("ENABLE_CROSSING_STATE", False):
+            from .analytics import enforce_crossing_state
+            crossings, _cs_diag = enforce_crossing_state(crossings, roles=roles)
+            _log.info(
+                f"\U0001f6aa door state: {_cs_diag['raw']} crossing(s) -> "
+                f"{_cs_diag['kept']} (IN {_cs_diag['in']} / OUT "
+                f"{_cs_diag['out']}); suppressed {_cs_diag['suppressed']} "
+                f"repeat(s) by someone already on that side; "
+                f"{_cs_diag['initial_occupants']} initial occupant(s) "
+                f"(present before the clip opened). "
+                f"conservation {'HOLDS' if _cs_diag['balances'] else 'VIOLATED'}")
+            if not _cs_diag["balances"]:
+                _log.error("      !! exits still exceed entries + initial "
+                           "occupants — the state machine did not restore "
+                           "conservation; do not trust the ledger")
         _born = [u for u in _uturn if u.get("dropped_reason")]
         if _born:
             _bl = {}

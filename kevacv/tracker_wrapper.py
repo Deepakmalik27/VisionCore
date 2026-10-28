@@ -25,7 +25,14 @@ except ImportError:
 class TrackerWrapper:
     """Unified wrapper around BoxMOT trackers (BoostTrack++, BoT-SORT, StrongSORT, ByteTrack)."""
 
-    SUPPORTED_TRACKERS = ("boosttrack", "botsort", "strongsort", "bytetrack", "ocsort")
+    # ONLY LIST WHAT _init_tracker CAN ACTUALLY BUILD.
+    #
+    # strongsort and ocsort were advertised here and have no branch below, so
+    # asking for either fell through to a fallback that uses the DETECTOR'S ROW
+    # INDEX as the track id -- ids that renumber every frame, presented as
+    # tracking. Advertising a capability that silently degrades is worse than
+    # not offering it: the caller has no way to find out.
+    SUPPORTED_TRACKERS = ("boosttrack", "botsort", "bytetrack")
 
     def __init__(self,
                  tracker_type: str = "boosttrack",

@@ -216,11 +216,25 @@ def guest_ids(run, roles=None, arrivals=None):
     """
     roles = roles or run.get("roles") or {}
     arrivals = arrivals if arrivals is not None else arrivals_by_id(run, roles)
-    if arrivals:
-        return sorted(arrivals, key=str)
     seen = {e.get("track_id") for e in (run.get("events") or [])
             if roles.get(e.get("track_id")) != "staff"}
-    return sorted((t for t in seen if t is not None), key=str)
+    seen = {t for t in seen if t is not None}
+    # THE FALLBACK IS PER-PERSON, NOT PER-RUN.
+    #
+    # This used to be `if arrivals: return arrivals` -- a GLOBAL switch. The
+    # moment ONE person produced a door crossing, the "seen inside" fallback
+    # became unreachable for EVERYONE else. Measured 2026-08-28: a person
+    # present for 320 SECONDS was dropped from the guest count because they
+    # entered off-camera while somebody else happened to cross a line.
+    #
+    # A door crossing is evidence a person arrived. Its ABSENCE is not
+    # evidence they were never here -- especially on this camera, where the
+    # counting lines sit inside the room and 45% of non-staff were never seen
+    # in an entry zone at all. So: anyone with an arrival counts, AND anyone
+    # non-staff actually observed in a counted zone counts.
+    if arrivals:
+        return sorted(set(arrivals) | seen, key=str)
+    return sorted(seen, key=str)
 
 
 def staff_contacts(run, roles=None, radius_bodies=GREET_RADIUS_BODIES,
@@ -398,8 +412,18 @@ def report_rows(run, clock=None):
             # greet latency needs BOTH an arrival and a contact. Without the
             # door it is unknowable, and None keeps it out of the CSV as blank
             # rather than as a zero anyone could average.
-            "greet_s": (round(cs[0] - arr, 1)
-                        if (cs and arr is not None) else None),
+            # ONLY CONTACTS AT OR AFTER THE ARRIVAL COUNT.
+            #
+            # This took cs[0] -- the FIRST contact -- with no check that it
+            # happened after `arr`. answers.py:261 already had the guard
+            # (`[c for c in contacts if c >= t_in]`); this second, unguarded
+            # copy is the one that lands in people.csv, the file an analyst
+            # actually opens. Measured 2026-08-28: person 8 carried
+            # greet_s = -91.7, a greeting 91.7 SECONDS BEFORE they arrived.
+            # Two code paths computing one quantity, only one of them guarded.
+            "greet_s": (round(min(c for c in cs if c >= arr) - arr, 1)
+                        if (cs and arr is not None
+                            and any(c >= arr for c in cs)) else None),
             "confidence": conf.get(tid),
             "flags": " ".join(flags) or None,
         })
@@ -545,7 +569,15 @@ def enrich(run):
     gids = guest_ids(run, roles, arr)
     run.setdefault("guest_ids", gids)
     run.setdefault("contacts", staff_contacts(run, roles))
-    run.setdefault("id_confidence", id_confidence(run, gids))
+    # SCORE STAFF TOO, NOT ONLY GUESTS.
+    #
+    # id_confidence() only populates ids it is GIVEN, and it was given the
+    # guest list. Every staff row therefore printed "conf --" -- which reads
+    # as "confidence was not computed for this person" when in truth the
+    # function was never asked about them. Found 2026-08-29.
+    _staff_ids = [t for t, r in (roles or {}).items() if r == "staff"]
+    run.setdefault("id_confidence",
+                   id_confidence(run, list(gids) + _staff_ids))
     custs, t2c = build_customer_registry(run)
     run.setdefault("customers", custs)
     run.setdefault("track_to_customer", t2c)

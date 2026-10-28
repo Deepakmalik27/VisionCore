@@ -94,6 +94,9 @@ def main(argv=None):
     p.add_argument("--user", default="prabh")
     p.add_argument("--password", default=os.environ.get("CVAT_PASSWORD", ""))
     p.add_argument("--out", default=".", help="directory for gt_<camera>.txt")
+    p.add_argument("--min-boxes", type=int, default=0,
+                   help="drop unlabelled tracks shorter than this many boxes "
+                        "(flicker; a real person cannot appear for 0.2 s)")
     a = p.parse_args(argv)
     # PREFER THE STORED TOKEN.
     #
@@ -127,7 +130,23 @@ def main(argv=None):
     # with id -1 and reported separately rather than silently mixed in.
     next_id = 1
     rotated = 0
+    dropped_short = 0
     for tr in ann.get("tracks") or []:
+        # A GROUND TRUTH BOX IS A CLAIM THAT A PERSON WAS THERE.
+        #
+        # Detector-seeded tracks that live a fraction of a second are flicker --
+        # reflections, plant leaves, half-bodies. Leaving them in gt means the
+        # pipeline is scored as MISSING a person every frame it correctly
+        # ignores a phantom, which drives recall down for being right.
+        # Deleting them in CVAT is the proper fix; --min-boxes is the same rule
+        # applied at export so a scoring run is not blocked on 35 mouse clicks.
+        _live = [s for s in tr.get("shapes") or [] if not s.get("outside")]
+        _rolev = [a.get("value") for s in tr.get("shapes") or []
+                  for a in s.get("attributes") or []
+                  if a.get("value") in ("staff", "guest")]
+        if a.min_boxes and len(_live) < a.min_boxes and not _rolev:
+            dropped_short += 1
+            continue
         tid = next_id
         next_id += 1
         # ROLE LIVES ON THE SHAPES, NOT THE TRACK.
@@ -144,6 +163,16 @@ def main(argv=None):
         # role on some frames and not others meant it for the whole track.
         from collections import Counter as _C
         _votes = _C()
+        # TRACK-LEVEL FIRST: tasks seeded by tools/cvat_seed_task.py declare
+        # `role` IMMUTABLE, so CVAT stores one value on the TRACK and the
+        # shapes carry nothing. Tasks 1 and 3 declared it mutable and store it
+        # per-shape. Both shapes exist in this project, so read both rather
+        # than assume -- assuming is what made this export return "unknown"
+        # for 775 staff shapes on 2026-08-26.
+        for _at in tr.get("attributes") or []:
+            _v = _at.get("value")
+            if _v in ("staff", "guest"):
+                _votes[_v] += 100          # an explicit track value outranks shapes
         for _sh in tr.get("shapes") or []:
             for _at in _sh.get("attributes") or []:
                 _v = _at.get("value")
@@ -192,6 +221,10 @@ def main(argv=None):
     n_tracks = len({t for _, t, *_ in rows if t != -1})
     print(f"  wrote {gt}  ({len(rows)} rows, {n_tracks} track(s))")
     print(f"  wrote {roles}  (the staff/guest truth, which nothing else has)")
+    if dropped_short:
+        print(f"  dropped {dropped_short} unlabelled track(s) under {a.min_boxes} "
+              f"boxes as flicker. They are still in CVAT -- this only affects "
+              f"THIS export. Delete them there to make it permanent.")
     if rotated:
         print(f"  NOTE: {rotated} shape(s) were ROTATED in CVAT. MOT has no "
               f"rotation field and the detector only emits axis-aligned boxes, "

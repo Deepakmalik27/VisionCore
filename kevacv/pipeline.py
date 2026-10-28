@@ -720,11 +720,18 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                 if _unresolved:
                     result["findings"].append(
                         ("WARN", f"{_unresolved} track pair(s) moved in lockstep "
-                                 f"and could NOT be resolved — possible "
-                                 f"reflections, review before trusting the "
-                                 f"headcount. Draw the glass as a `mirror` "
-                                 f"polygon (CVAT -> cvat_to_calibration) to "
-                                 f"resolve them."))
+                                 f"and could NOT be resolved — review before "
+                                 f"trusting the headcount. A constant offset "
+                                 f"means a reflection, OR two people standing "
+                                 f"still together, OR two boxes on ONE "
+                                 f"stationary person; this test cannot tell "
+                                 f"them apart. MEASURED on the 19:30 hour "
+                                 f"(2026-08-26): the pairs were at the "
+                                 f"reception desk and `staff2` paired with "
+                                 f"THREE different ids at ~120px — duplicate "
+                                 f"tracks, not reflections. Draw a `mirror` "
+                                 f"polygon ONLY if there is real glass in "
+                                 f"frame; it will not resolve duplicates."))
 
             # DETECTING A PHANTOM AND STILL COUNTING IT IS WORSE THAN NOT
             # DETECTING IT. Until now this stage logged "static=3 rigid=4
@@ -926,7 +933,10 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                 # Whether the INDEPENDENT arrival estimators agree. Without
                 # this the report resolves a 1-vs-4 disagreement through
                 # `trust=` and prints one confident number.
-                agreement=_arrival_agreement(result))
+                agreement=_arrival_agreement(result),
+                # Bodies-visible-per-frame, for the one headcount that does not
+                # depend on the identity layer.
+                frame_log=run.get("frame_log"))
             result["answers"] = to_report_rows(answers)
             result["answer_objects"] = answers
             for a in answers:
@@ -968,10 +978,22 @@ def run_camera(video_path, zones_path, out_dir, *, camera_id="CAM",
                 ppl, stf, anom
             st.count("people", len(ppl)).count("staff", len(stf))
             st.count("anomalies", len(anom))
+            # The desk-coverage TIMELINE. report_slim.coverage_strip() renders
+            # it only when covered_windows is supplied, and nothing ever
+            # supplied it, so the one visual that answers "WHEN was the desk
+            # unstaffed" has never appeared in a SUMMARY.txt.
+            _cw = None
+            for _a in (result.get("answers") or []):
+                _d = (_a.get("detail") if isinstance(_a, dict)
+                      else getattr(_a, "detail", None)) or {}
+                if _d.get("covered_windows") is not None:
+                    _cw = _d["covered_windows"]
+                    break
             written = write_slim_outputs(
                 out, meta,
                 answers=result.get("answers") or [],
                 staff=stf, anomalies=anom, people=ppl,
+                covered_windows=_cw,
                 notes=[m for _, m in result["findings"]])
             # No snaps= : the engine's "snapshots" is a LIST of (t, image)
             # timeline thumbnails, not the {person_id: crop} this wants.
@@ -1248,8 +1270,11 @@ def _build_scorecard(result, out, camera_id, video_path, zones_path):
         _evts = run.get("events") or []
         _dur = float(run.get("duration_s") or 0.0)
         if _evts and _dur > 0:
+            # line_name=None -> every door that actually produced a
+            # crossing. Hardcoding "entry line" here made this check
+            # measure nothing the moment that line was removed.
             card["occupancy_reconciliation"] = _rec(_evts, crossings, _dur,
-                                                    line_name="entry line")
+                                                    line_name=None)
             _log.info("\n" + _drec(card["occupancy_reconciliation"]))
         else:
             _log.warning(f"!! occupancy reconciliation SKIPPED: "

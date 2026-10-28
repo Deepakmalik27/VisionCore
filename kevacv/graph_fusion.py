@@ -1,20 +1,44 @@
-"""graph_fusion.py — P2 Graph-Based Identity Fusion (Min-Cost Flow / Global Optimization).
+"""graph_fusion.py -- multi-evidence tracklet fusion. NEVER CALLED IN PRODUCTION.
 
-WHY THIS EXISTS
-    The 6-tier Re-ID cascade (CLIP -> Anchor -> HSV -> Handoff -> Stationary -> Face) evaluates
-    evidence in rigid sequential order ("first-tier-wins"). When CLIP and HSV disagree 
-    (10-20% of cases), greedy heuristics pick the wrong tier and lock in false merges.
+STATUS 2026-08-26: 263 LOC, imported only by __init__.py, executed by nothing.
+Flagged by tools/wiring_audit.py.
 
-THE PRINCIPLE
-    Joint Multi-Evidence Graph Optimization.
+THE NAME WAS WRONG, AND THAT IS WHY IT WAS TRUSTED WITHOUT BEING READ
+    This file used to be titled "Min-Cost Flow / Global Optimization" and
+    claimed to "solve global minimum-cost assignment using SciPy Linear Sum
+    Assignment (Hungarian)". It does not. solve_graph_fusion() performs greedy
+    cheapest-edge-first agglomeration over a union-find, and
+    scipy.optimize.linear_sum_assignment is imported at the top and never
+    called -- a fact recorded in that function's own docstring while the title
+    still advertised the opposite.
+
+    Agglomeration is arguably the RIGHT shape: one person may own many
+    tracklets, which a 1-to-1 assignment forbids. The problem was never the
+    algorithm, only the claim.
+
+WHAT IT MIGHT ACTUALLY BE WORTH
+    Its real difference from the shipped 6-tier cascade is not global vs
+    greedy -- both are greedy. It is that evidence is scored JOINTLY
+    (appearance + colour histogram + spatial feasibility + face, weighted)
+    rather than in a fixed tier order where the first tier to fire wins.
+
+    That remains a plausible lever. Measured 2026-08-26, the ReID embeddings
+    separate identities well (intra 0.83 / inter 0.69, margin +0.14,
+    nearest-neighbour wrong 0-12%), so the AssA shortfall is in GATING, not in
+    appearance -- and gating is exactly what this replaces.
+
+BEFORE WIRING IT
+    Nothing currently assembles the tracklet dicts it wants (reid_emb,
+    hsv_hist, face_id, entry/exit positions), and it has never executed. It
+    needs that plumbing plus an A/B against the hand-labelled ground truth,
+    like every other change in this project.
+
+ORIGINAL DESIGN NOTES (intent, kept; behaviour corrected above)
     1. Construct a global association graph where nodes are tracklets.
-    2. Compute pairwise transition costs using ALL weighted evidence channels simultaneously:
-       - Deep appearance distance (CLIP / FastReID)
-       - Color histogram similarity (HSV)
-       - Spatial & motion feasibility (GroundPlane floor distance & walk speed)
-       - Face recognition biometrics
-       - Temporal gap / overlap constraints
-    3. Solve global minimum-cost assignment using SciPy Linear Sum Assignment (Hungarian / Min-Cost Flow).
+    2. Compute pairwise transition costs from all evidence channels at once:
+       deep appearance distance, HSV colour similarity, ground-plane distance
+       and walk-speed feasibility, face biometrics, temporal gap/overlap.
+    3. Resolve the association (greedy agglomeration, see above).
 """
 from __future__ import annotations
 

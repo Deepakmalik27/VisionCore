@@ -91,6 +91,101 @@ def scale(pts, src_wh, dst_wh):
     return [[round(x * sx), round(y * sy)] for x, y in pts], sx
 
 
+def lattice_world(points, tile_cm, k=None, frame_size=None):
+    """Bare tile corners -> the [{"image":..,"world":..}] GroundPlane wants.
+
+    WHY THIS IS NOT A PASS-THROUGH
+        GroundPlane.from_zone_config expects a LIST of correspondences with
+        world coordinates in METRES:
+
+            "ground_points": [{"image": [x, y], "world": [X, Z]}, ...]
+
+        This tool used to write {"tile_cm": .., "points": [[x, y], ..]}, which
+        from_zone_config reads, raises KeyError on, CATCHES, and silently falls
+        back to the automatic fit. So a venue that measured its floor got the
+        guess anyway and nothing said so -- exactly the failure the engine's own
+        comment warns about ("the one failure mode that makes an operator stop
+        measuring"). Caught 2026-08-26: 57 hand-clicked corners had no effect.
+
+    HOW THE WORLD COORDS ARE RECOVERED
+        A clicked corner does not say WHICH tile it is, and the caller cannot
+        reasonably be asked to type a grid index 57 times. But the corners of a
+        flat tiled floor are a projective image of an integer lattice, so the
+        grid is recoverable: guess that four mutually-near corners are one tile,
+        solve the homography sending them to the unit square, and count how many
+        DISTINCT lattice cells the rest land on. The true grid wins outright.
+
+        Scored on distinct cells, not inliers: the degenerate homography that
+        squashes all 57 points into a 2x2 block scores a perfect 57/57 on
+        inliers and means nothing.
+
+    THE LENS
+        A homography assumes a pinhole camera. With fisheye k set, the outer
+        corners bend off the lattice -- measured here as 21/57 raw vs 36/57
+        rectified. Points are undistorted first when k is known.
+    """
+    import itertools
+    import numpy as np
+
+    P = np.asarray(points, dtype=float)
+    if len(P) < 5:
+        return None, "fewer than 5 corners"
+    Q = P
+    if k and frame_size:
+        try:
+            import sys as _s
+            _s.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from kevacv.fisheye import to_rectified
+            Q = np.array([to_rectified(x, y, float(k), tuple(frame_size))
+                          for x, y in P], dtype=float)
+        except Exception:
+            Q = P
+
+    def homog(src, dst):
+        A = []
+        for (x, y), (u, v) in zip(src, dst):
+            A.append([x, y, 1, 0, 0, 0, -u * x, -u * y, -u])
+            A.append([0, 0, 0, x, y, 1, -v * x, -v * y, -v])
+        _, _, V = np.linalg.svd(np.array(A))
+        H = V[-1].reshape(3, 3)
+        return H / H[2, 2]
+
+    def apply(H, pts):
+        q = np.c_[pts, np.ones(len(pts))] @ H.T
+        return q[:, :2] / q[:, 2:3]
+
+    UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float)
+    best = (0, None, None)
+    n = len(Q)
+    for i in range(n):
+        d = np.linalg.norm(Q - Q[i], axis=1)
+        near = np.argsort(d)[1:min(10, n)]
+        for combo in itertools.combinations(near, 3):
+            quad = np.array([Q[i], *(Q[c] for c in combo)])
+            c = quad.mean(0)
+            quad = quad[np.argsort(np.arctan2(quad[:, 1] - c[1], quad[:, 0] - c[0]))]
+            try:
+                H = homog(quad, UNIT)
+            except Exception:
+                continue
+            G = apply(H, Q)
+            if not np.isfinite(G).all() or np.abs(G).max() > 40:
+                continue
+            ok = np.abs(G - np.round(G)).max(1) < 0.25
+            cells = {tuple(v) for v in np.round(G[ok]).astype(int)}
+            if len(cells) > best[0]:
+                best = (len(cells), H, ok)
+    ncell, H, ok = best
+    if H is None or ncell < 5:
+        return None, f"no consistent lattice ({ncell} cells)"
+    G = np.round(apply(H, Q)).astype(int)
+    T = float(tile_cm) / 100.0                      # cm -> METRES, what world wants
+    out = [{"image": [float(px), float(py)],
+            "world": [float(gx * T), float(gy * T)]}
+           for (px, py), (gx, gy), good in zip(P, G, ok) if good]
+    return out, f"{len(out)}/{len(P)} corners on {ncell} distinct lattice cells"
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -103,6 +198,8 @@ def main(argv=None):
                    help="resolution of the media you labelled in CVAT")
     p.add_argument("--tile-cm", type=float,
                    help="floor tile edge in cm (required for tile_corner points)")
+    p.add_argument("--fisheye-k", type=float, default=None,
+                   help="lens k (e.g. -0.083); undistorts before the grid fit")
     p.add_argument("--apply", action="store_true")
     a = p.parse_args(argv)
     # PREFER THE STORED TOKEN.
@@ -130,10 +227,17 @@ def main(argv=None):
                   data={"username": a.user, "password": a.password})["key"]
     task = api(a.base, f"/tasks/{a.task}", token=tok)
     ann = api(a.base, f"/tasks/{a.task}/annotations", token=tok)
-    names = {l["id"]: l["name"] for l in (task.get("labels") or [])}
-    if not names:
-        for l in api(a.base, f"/labels?task_id={a.task}", token=tok).get("results", []):
-            names[l["id"]] = l["name"]
+    # ALWAYS the /labels endpoint.
+    #
+    # task["labels"] is not a list on CVAT >= 2.x -- it is a paginated stub, so
+    # iterating it yields strings and `l["id"]` raises TypeError. The dedicated
+    # endpoint is the only shape-stable source. (Same trap already hit once in
+    # gt_from_cvat.py on 2026-08-26.)
+    names = {}
+    for l in api(a.base, f"/labels?task_id={a.task}", token=tok).get("results", []):
+        names[l["id"]] = l["name"]
+    if not names and isinstance(task.get("labels"), list):
+        names = {l["id"]: l["name"] for l in task["labels"] if isinstance(l, dict)}
 
     zpath = Path(a.zones)
     cfg = json.loads(zpath.read_text(encoding="utf-8"))
@@ -223,11 +327,18 @@ def main(argv=None):
                   f">=5 ADJACENT corners: four points fit ANY labelling with zero "
                   f"error, so four is not evidence.")
         else:
-            cfg["ground_points"] = {"tile_cm": a.tile_cm, "points": tiles}
-            cfg.pop("_ground_points_TEMPLATE", None)
-            print(f"\n  ground_points: {len(tiles)} corners @ {a.tile_cm} cm")
-            print("  -> next: python tools/calibrate_plane.py "
-                  f"--zones {zpath} (it will PASS/FAIL the fit before anything uses it)")
+            gp, why = lattice_world(tiles, a.tile_cm, k=a.fisheye_k,
+                                    frame_size=dst or src)
+            if gp is None:
+                print(f"\n  !! could not recover the tile grid: {why}. "
+                      f"ground_points NOT written -- a format the engine cannot "
+                      f"read is worse than none, because it fails silently.")
+            else:
+                cfg["ground_points"] = gp
+                cfg.pop("_ground_points_TEMPLATE", None)
+                print(f"\n  ground_points: {why}, tile {a.tile_cm} cm")
+                print(f"  written as [{{'image':..,'world':..}}] in METRES, which "
+                      f"is what GroundPlane.from_zone_config actually reads.")
 
     if lines:
         cfg.setdefault("entry_lines", {}).update(lines)

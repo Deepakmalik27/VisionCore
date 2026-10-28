@@ -114,6 +114,100 @@ analysis:
   # IR-flipping lobby; and it was a capacity downgrade too (yolo11x -> yolo11m).
   # Two confounded changes, never scored. Every notebook version used stock.
   detector: yolo11x.pt
+
+  # PER-PERSON DOOR STATE. One person cannot enter twice without leaving.
+  #
+  # Measured on the 20-minute clip, 2026-08-29:
+  #   OFF   IN 61 / OUT 66      impossible for a closed room
+  #   ON    IN 50 / OUT 58, 18 repeats suppressed, 44 initial occupants
+  #         conservation HOLDS (58 <= 50 + 44)
+  #
+  # It does NOT fix the guest count -- that rests on the identity layer, which
+  # is broken in both directions (merge on: 11 ids for 21 humans; merge off:
+  # 168 fragments). This only stops the LEDGER reporting an arithmetic
+  # impossibility, and makes initial occupants explicit instead of silent.
+  enable_crossing_state: true
+
+  # RE-ID STITCHING OFF.
+  #
+  # The offline merge fused people who are visibly on screen together. Measured
+  # 2026-08-28 against hand-labelled ground truth, merge ON vs OFF:
+  #
+  #                    identities (truth)   switches   HOTA     recall
+  #   crowded  ON            11 (21)           40      0.4665   0.6501
+  #   crowded  OFF           20 (21)           30      0.5318   0.7615
+  #   quiet    ON             5  (9)           24      0.8149   0.9153
+  #   quiet    OFF           17  (9)            6      0.8270   0.9150
+  #
+  # It improves BOTH clips, and on the crowd recovers 11 points of recall and
+  # nearly the correct number of people (20 of 21, from 11). Most of the
+  # apparent "id switches" were the merge itself: an id holding two people
+  # looks like an id that changes body.
+  #
+  # THE COST, STATED: the quiet clip now over-fragments (17 ids for 9 people).
+  # HOTA still improves because fusing two people costs more than splitting
+  # one, but the right long-term fix is a CONSERVATIVE merge, not no merge.
+  enable_reid_stitch: false
+
+  # FACE TRY BUDGET.
+  #
+  # 6 attempts per track was a CPU-era budget: face matching cost 21 ms/frame.
+  # It now costs 2.1 ms on GPU. Over a 5-minute track (4,700 frames) six tries
+  # is six samples, and MEASURED on 2026-08-27 that is why one man held tracks
+  # 35 AND 219 -- his face is detectable at det_score 0.87, the pipeline just
+  # never looked on the second track.
+  face_max_tries: 60
+  face_retry_every_s: 1.0
+
+  # OVERLAY_ALPHA — annotations blended over the footage instead of painted on
+  # it. Solid boxes/skeletons/trails hide the very thing a GM is trying to
+  # judge. The HUD band is never blended (it is on letterbox, not on video).
+  overlay_alpha: 0.85
+  # PLAYBACK_TARGET_S — aim the OUTPUT at ~2 minutes regardless of input
+  # length, instead of one fixed speed-up for every video. A 10-min clip then
+  # plays slow enough to read; an 8-hour one compresses harder. Clamped to
+  # 8-120 fps: an 8-hour chunk cannot honestly become 2 minutes, and the log
+  # says CLAMPED when it hits the wall rather than silently dropping frames.
+  playback_target_s: 300
+
+  # PARTIAL-BODY CROP GUARD.
+  #
+  # Prabh's observation, 2026-08-26: a person entering frame gets an id while
+  # only half visible, and the id changes once they are fully in view.
+  #
+  # Confirmed: boxes born touching a frame edge grow 1.66x in their first 20
+  # frames (vs 1.32x mid-frame), so the ReID anchor really is half a body.
+  # The fix does NOT block the track -- the person is detected, tracked and
+  # counted from frame one. It only refuses to let that half-body crop become
+  # their identity, exactly as ENABLE_OCCLUSION_GUARD already does for crops
+  # contaminated by a neighbour.
+  #
+  # A/B on the CROWDED ground truth (Task 3, 5,438 hand-labelled boxes),
+  # 3 runs each, spread <0.0002:
+  #     off   HOTA 0.5907   AssA 0.5429   recall 0.9321
+  #     on    HOTA 0.6025   AssA 0.5647   recall 0.9320   <- +0.0117
+  # Recall unchanged: the same people are found, their identities survive.
+  # On the QUIET clip it measured +0.0001 -- there is nobody entering to fix.
+  enable_partial_crop_guard: true
+
+  # THE TRACKER DEAD BAND, closed.
+  #
+  # The detector emits everything >= CONF_THRESHOLD (0.35), but BoT-SORT's
+  # new_track_thresh decided what may START a track, and it was 0.45. Every
+  # detection in [0.35, 0.45) was found, filtered, approved, handed to the
+  # tracker -- and silently refused. 4.0% of detections on the GT clip;
+  # 14,614 detections and 818 emptied frames on the 18:30 hour.
+  #
+  # A/B against hand-labelled ground truth, 2026-08-26:
+  #     0.45   HOTA 0.7940   AssA 0.7401   recall 0.8981   <- was live
+  #     0.35   HOTA 0.8088   AssA 0.7652   recall 0.9153   <- +0.0148
+  #     0.25   HOTA 0.7987   AssA 0.7503   recall 0.9239
+  #
+  # 0.25 finds MORE people and scores WORSE: below CONF_THRESHOLD you admit
+  # detections too weak to identify, so recall rises while identity rots.
+  # 0.35 is exactly CONF_THRESHOLD -- the tracker now accepts precisely what
+  # the filter chain approved, and nothing else. The band is gone, not moved.
+  new_track_conf: 0.35
   tracker: botsort-reid
   reid_weights: clip_market1501.pt
 

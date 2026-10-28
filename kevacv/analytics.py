@@ -238,6 +238,72 @@ class OccupancyRecorder:
 # Door-camera metrics
 # ---------------------------------------------------------------------------
 
+def enforce_crossing_state(crossings, roles=None):
+    """One person cannot enter twice without leaving. -> (kept, diagnostics)
+
+    THE BUG THIS CLOSES
+        The ledger reported IN 61 / OUT 66 -- more unique exits than entries,
+        which is impossible for a closed room. Measured 2026-08-28: 127 crossing
+        events came from 15 distinct people, 8.5 crossings each, because the
+        counting lines sit INSIDE the room. A receptionist pacing past a line
+        eight times generated eight "arrivals".
+
+        Tier-A dedupe cannot fix this and should not try: it collapses one
+        person crossing ONCE under several ids, inside a 2.5 s / 140 px window.
+        Crossings minutes apart are genuinely separate events -- the question is
+        not whether they happened, but whether they mean an arrival.
+
+    THE RULE
+        Per person, in time order:
+
+            OUTSIDE --in--> INSIDE      counted
+            INSIDE  --in--> INSIDE      suppressed: already inside
+            INSIDE  --out-> OUTSIDE     counted
+            OUTSIDE --out-> OUTSIDE     suppressed: already outside
+
+        A person first seen leaving was already inside when the clip began --
+        an INITIAL OCCUPANT. Their exit is real and is kept, but it is tagged
+        so a ledger can reconcile: entries + initial_occupants == exits, over a
+        closed period. Silently dropping it would undercount departures;
+        silently counting it as a matching exit is what made 61 look like 66.
+
+    Nothing is deleted. Suppressed events are returned in the diagnostics so a
+    reader can see what the rule removed and why.
+    """
+    roles = roles or {}
+    kept, suppressed = [], []
+    state = {}                      # track -> "in" | "out"
+    initial_occupants = set()
+    for c in sorted(crossings or [], key=lambda x: (float(x.get("t", 0)),
+                                                    str(x.get("track_id")))):
+        tid = c.get("track_id")
+        d = c.get("direction")
+        if tid is None or d not in ("in", "out"):
+            kept.append(c)          # nothing to reason about; never drop blind
+            continue
+        prev = state.get(tid)
+        if d == prev:
+            suppressed.append((c, f"already {'inside' if d == 'in' else 'outside'}"))
+            continue
+        if d == "out" and prev is None:
+            # never seen entering -> was already here when the clip opened
+            initial_occupants.add(tid)
+            c = dict(c, initial_occupant=True)
+        state[tid] = d
+        kept.append(c)
+    n_in = sum(1 for c in kept if c.get("direction") == "in")
+    n_out = sum(1 for c in kept if c.get("direction") == "out")
+    diag = {
+        "raw": len(crossings or []), "kept": len(kept),
+        "suppressed": len(suppressed),
+        "initial_occupants": len(initial_occupants),
+        "in": n_in, "out": n_out,
+        # the conservation identity this whole function exists to restore
+        "balances": (n_out <= n_in + len(initial_occupants)),
+    }
+    return kept, diag
+
+
 def venue_entry_lines(line_names):
     """Which door lines mean "arrived at the venue" -> set of names.
 
@@ -622,8 +688,28 @@ def reconcile_occupancy(events, crossings, t_end, step_s=30.0,
     if initial is None:
         initial = observed[0] if observed else 0
 
+    # WHICH DOORS COUNT.
+    #
+    # line_name used to be hardcoded by the caller to "entry line". When that
+    # line was deleted on 2026-08-27 (it had been drawn across a wall), this
+    # filter matched NOTHING: IN/OUT stayed 0/0, `expected` froze at `initial`
+    # for all 40 steps, and the reported max drift of 17 was not the doors
+    # disagreeing with the room -- it was the room being compared against no
+    # door at all. A check that silently measures nothing is worse than no
+    # check, because it publishes a number.
+    #
+    # Accept a name, a set of names, or None. None means "every door", which
+    # is the right default for a vestibule: leaving through the dining door
+    # empties this room just as surely as leaving through the street door.
+    _want = ({line_name} if isinstance(line_name, str)
+             else set(line_name) if line_name else None)
+    _present = {c.get("line") for c in (crossings or []) if c.get("line")}
+    if _want and not (_want & _present):
+        # asked for a door that produced no traffic -- say so and use them all
+        _want = None
     cr = [c for c in (crossings or [])
-          if line_name is None or c.get("line") == line_name]
+          if _want is None or c.get("line") in _want]
+    lines_used = sorted({c.get("line") for c in cr if c.get("line")}) or []
     ins = sorted(float(c["t"]) for c in cr
                  if str(c.get("direction", "")).lower() in ("in", "+1", "1"))
     outs = sorted(float(c["t"]) for c in cr
@@ -648,18 +734,45 @@ def reconcile_occupancy(events, crossings, t_end, step_s=30.0,
             "max_abs_drift": abs(worst["drift"]) if worst else 0,
             "worst_t": worst["t"] if worst else None,
             "final_drift": steps[-1]["drift"] if steps else 0,
-            "line": line_name}
+            "line": line_name,
+            # WHICH doors this actually used, and whether any crossed at all.
+            # Without these a drift number cannot be interpreted: 17 means one
+            # thing when 108 crossings were counted and something else entirely
+            # when zero were.
+            "lines_used": lines_used,
+            "n_crossings": len(cr),
+            "measurable": bool(cr)}
 
 
 def describe_reconciliation(rec, width=78):
     """The drift, in words, because a JSON field nobody reads is not a check."""
     if not rec or not rec["steps"]:
         return "OCCUPANCY RECONCILIATION — no data"
+    # A DRIFT NUMBER IS MEANINGLESS WITHOUT THE DOOR COUNT BEHIND IT.
+    #
+    # With zero crossings, `expected` is frozen at `initial` for every step, so
+    # the "drift" is just the room's own variation restated -- and it looked
+    # like a 17-person disagreement between two estimates. Refuse to publish a
+    # comparison when there is nothing on one side of it.
+    if not rec.get("measurable", True):
+        return ("=" * width + "\n"
+                "  OCCUPANCY RECONCILIATION — NOT MEASURABLE\n"
+                + "=" * width + "\n"
+                "  No door crossings were recorded, so `expected` never moves "
+                "from the\n  assumed initial occupancy and the 'drift' below "
+                "would be the room's\n  own variation compared against a "
+                "constant — not two estimates\n  disagreeing. Reported as "
+                "unmeasurable rather than as a number.\n"
+                f"  initial assumed: {rec['initial']}   "
+                f"doors requested: {rec['line'] or 'all'}   "
+                f"doors with traffic: {rec.get('lines_used') or 'none'}\n"
+                + "=" * width)
     L = ["=" * width,
          "  OCCUPANCY RECONCILIATION — do the doors agree with the room?",
          "=" * width,
          f"  initial occupancy assumed: {rec['initial']}"
-         f"   (line: {rec['line'] or 'all doors'})",
+         f"   (doors: {', '.join(rec.get('lines_used') or []) or 'all'};"
+         f" {rec.get('n_crossings', 0)} crossing(s))",
          f"  {'t':>8}{'expected':>10}{'observed':>10}{'drift':>8}"
          f"{'IN':>6}{'OUT':>6}"]
     for s in rec["steps"]:

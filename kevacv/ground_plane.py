@@ -175,11 +175,43 @@ class GroundPlane:
         return self.mode != "none"
 
     def expected_h(self, y):
-        """Pixel height of a standing person with feet at row y (auto mode)."""
-        if self.mode != "auto":
-            return None
-        h = self.a * float(y) + self.b
-        return h if h > 1e-6 else None
+        """Pixel height of a standing person with feet at row y.
+
+        EXACT MODE USED TO RETURN None, AND THAT MADE MEASURING THE FLOOR
+        POINTLESS FOR THE ONE FILTER IT WAS SOLD TO FIX.
+            config.py tells an operator that supplying ground_points is "the
+            real fix" for the implausible-size filter (D1). But D1 asks its
+            geometry object for expected_h, and this method answered None for
+            anything except the automatic fit -- so a venue that measured its
+            floor got exactly the behaviour of a venue that had not. Verified
+            2026-08-29 by measurement (the exact plane moved D1's drop count by
+            zero) and then in the code. Fixed by giving exact mode a real
+            answer.
+
+        HOW, AND THE APPROXIMATION IT MAKES
+            scale_at(y) is metres-per-pixel on the FLOOR at that row, straight
+            out of the measured homography. A person of person_h metres
+            standing there is therefore person_h / scale_at(y) pixels tall.
+
+            That treats vertical extent as sharing the floor's local scale,
+            which is exact for a camera looking straight down and approximate
+            for an oblique one -- it under-estimates height as the view tilts.
+            It is still anchored to real measured points, where the auto fit is
+            a regression over this run's own boxes and is documented in
+            config.py as producing physically impossible camera heights.
+            Whether the approximation beats that regression is an empirical
+            question, so this is A/B'd, not assumed.
+        """
+        if self.mode == "auto":
+            h = self.a * float(y) + self.b
+            return h if h > 1e-6 else None
+        if self.mode == "exact":
+            m_per_px = self.scale_at(float(y))
+            if not m_per_px or m_per_px <= 1e-9:
+                return None
+            h = float(self.person_h) / m_per_px
+            return h if h > 1e-6 else None
+        return None
 
     def to_ground(self, x, y):
         """Image point (x, y) — the FEET — to floor (X, Z) in metres.

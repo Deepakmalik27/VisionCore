@@ -114,6 +114,93 @@ check("MIN_WIDTH" in SLIT and "too_narrow" in SLIT,
 
 print()
 print("=" * 78)
+print("  2b. ARE THE 2026-08-26 A/B-PROVEN WINS ACTUALLY IN THE LIVE CONFIG?")
+print("=" * 78)
+# CODE being present is not the same as a SETTING being on. Every item here was
+# A/B'd against hand-labelled ground truth and applied; a demo run without them
+# is a demo of the OLD pipeline wearing the new code's version number.
+import json as _json
+
+_cfgp = ROOT / "config" / "cam112_gpu.yaml"
+# PARSE the yaml, do not grep it. Grepping matched "when tiled: true" inside a
+# COMMENT and reported SAHI as enabled while the actual setting was false --
+# a freshness gate that cries wolf gets ignored, which defeats the whole point.
+try:
+    import yaml as _yaml
+    _A = ((_yaml.safe_load(_cfgp.read_text(encoding="utf-8")) or {})
+          .get("analysis") or {}) if _cfgp.exists() else {}
+except Exception as _e:
+    _A = {}
+    check(False, "config/cam112_gpu.yaml parses as yaml", str(_e)[:60])
+check(_A.get("new_track_conf") == 0.35,
+      "dead band CLOSED (new_track_conf 0.35)",
+      f"got {_A.get('new_track_conf')!r}; 0.45 blocked 4% of detections "
+      f"from starting a track: HOTA 0.7940 vs 0.8088")
+check(_A.get("enable_partial_crop_guard") is True,
+      "partial-body crop guard ON",
+      "crowded GT: HOTA 0.5907 -> 0.6025, AssA +0.0218, recall unchanged")
+check(not _A.get("head_detector"),
+      "head detector NOT enabled",
+      "A/B'd and rejected: ids 22 -> 48, recall -8pp on the crowded clip")
+check(_A.get("tiled") is not True,
+      "SAHI NOT enabled",
+      "A/B'd and rejected: DetA 0.8501 -> 0.6598")
+check(_A.get("fps") == 15,
+      "fps 15 — the value the ground truth was labelled at",
+      "MOT frames are frame-INDEXED; a different fps renumbers every frame "
+      "and silently misaligns the ground truth")
+
+_zp = ROOT / "zones" / "CAM.112_zone_entryfix.json"
+_Z = _json.loads(_zp.read_text(encoding="utf-8")) if _zp.exists() else {}
+_gp = _Z.get("ground_points")
+check(isinstance(_gp, list) and len(_gp) >= 5 and "world" in (_gp[0] or {}),
+      "EXACT ground plane present, in the format the engine READS",
+      "a dict {tile_cm, points} is silently ignored by from_zone_config")
+_poly = _Z.get("polygons") or {}
+check("dead area 1 mask" in _poly and "plant area mask" not in _poly,
+      "tight plant mask REPLACED the greedy one",
+      "keeping both means the 13.8% detection loss continues")
+# The invariant is the SHAPE of a counting line, not how many there are.
+# Asserting "exactly 3" failed the moment the operator correctly deleted the
+# `entry line`, which sat on a wall outside the room -- a gate that blocks a
+# real fix is a gate people learn to ignore.
+_LN = _Z.get("entry_lines") or {}
+check(len(_LN) >= 1 and all(len(v) == 2 for v in _LN.values()),
+      f"every counting line is exactly 2 points ({len(_LN)} line(s): {sorted(_LN)})",
+      "supervision LineZone is a segment; more points are silently truncated")
+
+check("ENABLE_PARTIAL_CROP_GUARD" in CFG, "partial-crop guard code present")
+check("HEAD_DETECTOR" in CFG and "_head_aux" in ENG,
+      "aux head detector code present (parked, not enabled)")
+check(CFG.count('": "') > 150,
+      "config knobs wired to yaml (was 58, now ~186)",
+      "an unwired knob can never be A/B'd")
+check("tracks, not reflections" in PIPE and "ONLY if there is real glass" in PIPE,
+      "lockstep warning no longer prescribes drawing a mirror",
+      "measured 2026-08-26: those pairs are duplicate tracks at the reception "
+      "desk, not reflections")
+SCORE = (pkg_dir / "scorecard.py").read_text(encoding="utf-8")
+check('g.get("mode") == "exact"' in SCORE,
+      "an EXACT ground plane is not FAILed by auto-fit bounds")
+check("WAS MEASURED AND REJECTED" in ENG,
+      "tiled-detect advice carries its own measured rejection")
+
+try:
+    import onnxruntime as _ort
+    check("CUDAExecutionProvider" in _ort.get_available_providers(),
+          "onnxruntime has CUDA (face matching 10x)",
+          "listing it is not loading it — see LD_LIBRARY_PATH in ~/.keva_env")
+except Exception as _e:
+    check(False, "onnxruntime importable", str(_e)[:60])
+
+_gt = ROOT / "eval" / "gt_CAM_112.txt"
+_gtc = ROOT / "eval" / "crowded" / "gt_CAM_112.txt"
+check(_gt.exists() and _gtc.exists(),
+      "BOTH ground truths present (quiet + crowded)",
+      "without the crowded one every score is measured on a quiet room")
+
+print()
+print("=" * 78)
 print("  3. IS ANY OTHER COPY OF kevacv ON THIS MACHINE?")
 print("=" * 78)
 # A second checkout that happens to be earlier on sys.path is the exact failure

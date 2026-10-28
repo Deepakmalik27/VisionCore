@@ -142,6 +142,13 @@ def summary_txt(meta, answers, staff, anomalies, notes=None,
         L.append(f"  {a['label']:<38} {str(a['value']):<18} [{_tier(a.get('tier'))}]")
         for (lbl, val, tier) in a.get("extra", []):
             L.append(f"      {lbl:<34} {str(val):<18} [{_tier(tier)}]")
+        # The qualifier belongs NEXT TO the number, not in a legend at the
+        # bottom that nobody re-reads. Two per answer: enough to state what the
+        # number depends on, short enough that the page stays scannable.
+        import textwrap as _tw
+        for _c in (a.get("caveats") or [])[:2]:
+            for _i, _line in enumerate(_tw.wrap(str(_c), 68)):
+                L.append(f"      {'!' if _i == 0 else ' '} {_line}")
         L.append("")
 
     L.append(_SUB)

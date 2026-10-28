@@ -48,13 +48,38 @@ def _write(tmp_path, text):
 
 
 def test_shipped_config_sets_fps():
-    """The real file, not a fixture — this is the regression that shipped."""
+    """The real file, not a fixture — this is the regression that shipped.
+
+    UPDATED 2026-08-26. This asserted `FPS_TARGET == 8` and had been failing
+    for some time: cam112.yaml was changed from 8 to 15 and the test was not.
+    A permanently-red test is worse than no test, because the next real
+    regression hides inside "yeah, that one always fails".
+
+    WHY 15 IS THE VALUE THAT MATTERS
+        MOT ground truth is frame-INDEXED, so it is only valid for a run whose
+        frame sampling matches the clip it was labelled on. Both GT clips were
+        cut at 15 fps. Sample at any other rate and every frame renumbers, so
+        the ground truth silently aligns to the wrong moments and the HOTA it
+        reports is confident nonsense.
+
+        So this no longer asserts a literal. It asserts that the shipped config
+        and the labelled clips AGREE -- which is the property that would
+        actually break scoring if it drifted again.
+    """
     stub = _stub()
     r = apply_run_config(ROOT / "config" / "cam112.yaml", target=stub)
-    check(stub.FPS_TARGET == 8, "cam112.yaml drives FPS_TARGET to 8",
-          f"got {stub.FPS_TARGET}")
+    GT_CLIP_FPS = 15                      # both eval clips, verified by ffprobe
+    check(stub.FPS_TARGET == GT_CLIP_FPS,
+          f"cam112.yaml drives FPS_TARGET to {GT_CLIP_FPS}, matching the "
+          f"fps the ground-truth clips were cut at",
+          f"got {stub.FPS_TARGET}; a mismatch renumbers every frame and "
+          f"misaligns the ground truth with no error")
     check("FPS_TARGET" in r["applied"], "the change is reported to the caller")
-    check(r["applied"]["FPS_TARGET"]["from"] == 15,
+    # `from` is the TARGET's value before the call -- here the stub's 15, NOT
+    # the package default of 8. Worth stating: I asserted 8 and it failed,
+    # because apply_run_config reports what it actually overwrote, which is
+    # exactly what a provenance log should say.
+    check(r["applied"]["FPS_TARGET"]["from"] == _stub().FPS_TARGET,
           "the value it replaced is reported too, so the log shows the move")
 
 

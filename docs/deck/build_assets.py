@@ -2,7 +2,6 @@
 
   camera_wall.svg/.png   every device in docs/delilah_la_devices.json, real names
   frame_zones.png        output/door_check.png with the debug header cropped off
-  frame_routes.png       output/walked_routes.png, ditto
 
 Nothing here invents a number. Counts come from the device dump.
 """
@@ -122,7 +121,6 @@ def crop_header(src, dst, top=92):
 if __name__ == "__main__":
     n_cam, n_door, models = camera_wall()
     crop_header("door_check.png", "frame_zones.png")
-    crop_header("walked_routes.png", "frame_routes.png")
 
     # check: the wall must show every camera in the dump, and the model tally
     # must add back up to that same number -- a silently dropped camera on a
@@ -130,7 +128,7 @@ if __name__ == "__main__":
     _, cams, doors, _ = load()
     assert n_cam == len(cams) == sum(models.values()), "camera count disagrees"
     assert n_door == len(doors)
-    for f in ("camera_wall.png", "frame_zones.png", "frame_routes.png"):
+    for f in ("camera_wall.png", "frame_zones.png"):
         assert (HERE / f).stat().st_size > 10_000, f"{f} looks empty"
     print(f"assets ok · {n_cam} cameras, {n_door} doors, "
           f"{len(models)} distinct models")

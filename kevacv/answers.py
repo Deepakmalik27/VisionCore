@@ -182,7 +182,14 @@ def desk_coverage(events, staff_zones, observed_windows, roles=None,
     pct = _total(covered) / obs * 100.0
     a.value = round(pct, 1)
     a.detail = {"covered_s": round(_total(covered), 1), "observed_s": round(obs, 1),
-                "target_pct": target * 100, "meets_target": pct >= target * 100}
+                "target_pct": target * 100, "meets_target": pct >= target * 100,
+                # THE INTERVALS, not just their sum. report_slim.coverage_strip
+                # draws a WHEN timeline from these and has existed unused since
+                # it was written: write_slim_outputs takes covered_windows, and
+                # no caller ever passed it (found 2026-08-29). A percentage says
+                # how much; a manager needs to know WHEN.
+                "covered_windows": [[round(float(s0), 2), round(float(e0), 2)]
+                                    for s0, e0 in covered]}
     a.caveats.append("counts the STATION, not any one person — a different "
                      "staff member at the desk is still covered")
     a.caveats.append(f"depends entirely on the staff decision: "
@@ -200,7 +207,16 @@ def desk_gaps(events, staff_zones, observed_windows, roles=None,
     A percentage tells a manager how much; this tells them WHEN, which is the
     part they can act on.
     """
-    a = Answer("desk_gaps", "When was the desk empty?", tier=EXACT,
+    # SAY THE THRESHOLD IN THE LABEL.
+    #
+    # This reported "When was the desk empty? 0" while desk_coverage reported
+    # 94% -- i.e. 6% of the window HAD no staff. Both are correct: they call
+    # the same primitive, but this one only counts a gap once it lasts
+    # min_gap_s (60 s) UNBROKEN. Six percent of absence chopped into shorter
+    # flickers yields a truthful "0" that reads as "the desk was never empty".
+    # A reader cannot see a threshold that is not printed. Found 2026-08-29.
+    a = Answer("desk_gaps",
+               f"Desk unstaffed for {int(min_gap_s)}s or more?", tier=EXACT,
                denominator="observed footage")
     if not observed_windows:
         return a.unknown("no observed footage")
@@ -271,8 +287,65 @@ def greet_latency(arrivals, contacts, tier=PROXY):
 
 
 # ── Q3 ─────────────────────────────────────────────────────────────────────
+def peak_occupancy(frame_log, observed_windows=None, pctile=95):
+    """How many people were in the room at once. -> Answer
+
+    WHY THIS ANSWER EXISTS AND WHY IT IS THE TRUSTWORTHY ONE
+        Every other headcount here rests on IDENTITY -- "how many DIFFERENT
+        people" requires knowing that the person at 03:12 is the same one seen
+        at 03:40. Measured 2026-08-29 on hand-labelled ground truth, that
+        assumption does not hold on this camera in a crowd:
+
+            merge ON    11 identities for 21 real humans
+            merge OFF   168 fragments for the same room
+            splitting an impure tracklet by appearance: 1 of 4 succeeded,
+            because the tracker switches PRECISELY between people who look
+            alike, so appearance cannot undo a mistake appearance caused.
+
+        Simultaneous occupancy needs none of that. It asks only "how many
+        bodies are visible right now", which is pure detection -- measured at
+        precision 95.7% / recall 91.5% against the same ground truth. It is
+        the strongest claim this footage actually supports.
+
+    WHY A PERCENTILE AND NOT THE MAXIMUM
+        One frame with a duplicate box sets a maximum forever. The 95th
+        percentile survives a handful of bad frames while still describing the
+        busy moments, which is what a manager is asking about.
+
+    Returns EXACT because it is a direct count of detections per frame, with
+    no identity, no threshold and no merge in the path.
+    """
+    a = Answer("peak_occupancy", "Most people in the room at once",
+               tier=EXACT, denominator="analysed frames")
+    if not frame_log:
+        return a.unknown("no frames were analysed")
+    counts = []
+    for row in frame_log:
+        try:
+            _fi, t, boxes = row[0], row[1], row[2]
+        except (IndexError, TypeError):
+            continue
+        if observed_windows and not any(s <= float(t) <= e
+                                        for s, e in observed_windows):
+            continue
+        counts.append(len(boxes or []))
+    if not counts:
+        return a.unknown("no analysed frame fell inside the observed window")
+    counts.sort()
+    k = max(0, min(len(counts) - 1, int(round((pctile / 100.0) * (len(counts) - 1)))))
+    a.value = counts[k]
+    a.detail = {"pctile": pctile, "max": counts[-1],
+                "median": counts[len(counts) // 2], "frames": len(counts)}
+    a.caveats.append(f"p{pctile} of per-frame counts; the single busiest frame "
+                     f"held {counts[-1]}, the typical frame {counts[len(counts)//2]}")
+    a.caveats.append("counts BODIES VISIBLE, not unique people — it needs no "
+                     "identity, which is why it is the most reliable headcount "
+                     "here")
+    return a
+
+
 def guest_count(unique_ids, confidence=None, low_conf_bar=60, source="line",
-                agreement=None):
+                agreement=None, peak=None, observed_s=None):
     """How many guests? ESTIMATE with a range, because identity had to hold.
 
     The range is not decoration. Measured separability is ~0.66, so a single
@@ -314,13 +387,43 @@ def guest_count(unique_ids, confidence=None, low_conf_bar=60, source="line",
         a.caveats.append(f"cross-check {agreement['tier']}: {agreement['why']}")
         if agreement.get("tier") == "UNCERTAIN":
             a.tier = WEAK
+
+    # THE IDENTITY LAYER MUST BE ABLE TO SAY WHEN IT IS NOT TRUSTWORTHY.
+    #
+    # This answer counts DISTINCT IDENTITIES, and identity is the part of this
+    # pipeline that measurably fails on this camera. Ground truth, 2026-08-29:
+    #
+    #     merge ON    11 identities for 21 real humans   (fuses people)
+    #     merge OFF   168 fragments for the same room    (shatters them)
+    #     splitting an impure tracklet by appearance succeeded 1 time in 4,
+    #     because the tracker confuses precisely the people who look alike
+    #
+    # peak_occupancy needs no identity and is measured at precision 95.7% /
+    # recall 91.5%, so it is the honest yardstick. A room whose busiest moment
+    # holds `peak` people cannot plausibly turn over faster than roughly one
+    # full replacement every few minutes. When the claimed identity count runs
+    # far past that, the excess is fragmentation, not guests -- and the answer
+    # must say so rather than print a confident integer.
+    if peak and peak > 0 and a.value:
+        # generous: allow a COMPLETE turnover of the room every 2 minutes
+        turnovers = max(1.0, (float(observed_s or 0) / 120.0)) if observed_s else 1.0
+        plausible = peak * turnovers
+        if a.value > plausible:
+            a.tier = WEAK
+            a.caveats.append(
+                f"IMPLAUSIBLE vs the identity-free count: at most {peak} people "
+                f"were ever in the room at once, so even a full turnover every "
+                f"2 minutes gives ~{plausible:.0f}. {a.value} distinct "
+                f"identities means the identity layer is fragmenting one person "
+                f"into several — read the range, not the number")
+            a.low = min(a.low or 0, int(round(peak)))
     return a
 
 
 def answer_set(*, events=None, staff_zones=(), waiting_zones=(),
                observed_windows=None, roles=None, arrivals=None, contacts=None,
                unique_ids=None, confidence=None, arrival_source="line",
-               findings=(), agreement=None):
+               findings=(), agreement=None, frame_log=None):
     """The full set, in the ratified priority order, ready for report_slim.
 
     Q1 first because it is CRITICAL and achievable; Q3 last because it is the
@@ -328,10 +431,23 @@ def answer_set(*, events=None, staff_zones=(), waiting_zones=(),
     than by drama is itself a design decision.
     """
     obs = observed_windows or []
+    # Compute the identity-FREE headcount first, so guest_count can sanity-check
+    # its identity-DEPENDENT number against it.
+    _peak_ans = peak_occupancy(frame_log, obs) if frame_log else None
+    _peak_val = _peak_ans.value if (_peak_ans and _peak_ans.value) else None
+    _obs_s = sum(max(0.0, float(e) - float(s0)) for s0, e in obs) if obs else None
     out = [desk_coverage(events, staff_zones, obs, roles),
            desk_gaps(events, staff_zones, obs, roles, waiting_zones=waiting_zones),
            greet_latency(arrivals, contacts),
-           guest_count(unique_ids, confidence, source=arrival_source)]
+           guest_count(unique_ids, confidence, source=arrival_source,
+                       peak=_peak_val, observed_s=_obs_s)]
+    # PEAK OCCUPANCY LAST, because it is the answer the evidence supports MOST
+    # and the report is ordered by achievability, not by drama. It needs no
+    # identity, so it survives the identity failure that makes "how many
+    # guests" a range rather than a number. Only added when a frame_log is
+    # supplied; a caller that cannot provide one gets exactly the old set.
+    if _peak_ans is not None:
+        out.append(_peak_ans)
     # A run-level finding invalidates individual answers; say so on the answer
     # itself rather than only in a banner nobody re-reads.
     blockers = [m for lvl, m in findings if lvl == "ERROR"]
@@ -360,6 +476,11 @@ def to_report_rows(answers):
             extra.append(("never greeted", a.detail.get("n_ungreeted", 0), PROXY))
         if a.key == "guests" and a.detail:
             extra.append(("high confidence", a.detail.get("high_confidence"), WEAK))
+        # CARRY THE CAVEATS. They were built with care on every answer --
+        # "depends entirely on the staff decision", "counts the STATION not a
+        # person", "this is NOT 0%, it is unmeasured" -- and this function
+        # dropped all of them, so no reader has ever seen one. An honest
+        # qualifier that reaches nobody is the same as not writing it.
         rows.append({"label": a.label, "value": a.display, "tier": a.tier,
-                     "extra": extra})
+                     "extra": extra, "caveats": list(a.caveats or [])})
     return rows
