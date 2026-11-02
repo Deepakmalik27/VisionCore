@@ -1,0 +1,161 @@
+---
+title: "Edge Deployment"
+description: ""
+position: 2
+---
+This guide covers deploying the base vision agent on edge platforms (DGX Spark, IGX Thor, AGX Thor).
+
+The LLM is the blueprint default, **`nvidia/nemotron-3.5-lightning-30b-a3b`** — the same model as
+on every other platform. Each edge profile ships its own sizing file
+(`deploy/docker/services/nim/nemotron-3.5-lightning-30b-a3b/hw-<HARDWARE_PROFILE>*.env`), which pins
+the INT4 engine profile and caps the NIM at 30% of the device's unified memory so it coexists with
+the VLM. The LLM deploys as a normal Compose service; no standalone container is needed and no
+Hugging Face token is involved.
+
+<Note>
+Two alternatives when the default does not fit:
+
+- **`nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8`** (11.7 GB) — a smaller in-tree build for GPUs that
+  cannot host the default. Select it by setting `LLM_NAME` and `LLM_NAME_SLUG` in the overlay, as
+  shown in the commented lines below.
+- **A remote endpoint** — best latency on edge. Set `LLM_MODE=remote`, `LLM_NAME_SLUG=none`,
+  `LLM_BASE_URL` to an OpenAI-compatible endpoint (for example `https://integrate.api.nvidia.com`),
+  `LLM_NAME` to a model the endpoint serves, and `LLM_MODEL_TYPE` (`nim` or `openai`).
+</Note>
+
+## Prerequisites
+
+Before deploying, complete the [Prerequisites](/getting-started/prerequisites) for your platform.
+Also ensure to reboot the system and free up the GPU completely before deploying.
+
+You will also need:
+
+- **NGC CLI API Key** — for pulling container images
+- **HF Token** — optional; not needed by the default edge deployment
+
+For more details on VSS configurations and how to get API tokens, refer to:
+
+- [Agent Customization](/vision-agent/vss-agents/agent-customization)
+- [Agent Configuration](/vision-agent/vss-agents/agent-configuration) and [Configure the LLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-llm)
+
+
+Export credentials before deploying; Docker Compose reads them through `containers.env`:
+
+```bash
+export NGC_CLI_API_KEY=<your-ngc-api-key>
+export NVIDIA_API_KEY=<your-nvidia-api-key>
+export HF_TOKEN=<your-hf-token>
+```
+
+From the repository root, copy the checked-in template to any filename matching
+`*-overrides.env`. Files matching that pattern are ignored by Git so local
+settings and credentials are not committed. The commands below use
+`user-overrides.env` as a concrete example; if you choose another name, use it
+consistently in every `--env-file` argument. Repeat this copy only when you want
+to discard prior configuration changes:
+
+```bash
+cp deploy/docker/developer-profiles/dev-profile-base/overrides.env \
+  deploy/docker/developer-profiles/dev-profile-base/user-overrides.env
+```
+
+In `deploy/docker/developer-profiles/dev-profile-base/user-overrides.env`, update the existing
+`VSS_APPS_DIR`, `VSS_DATA_DIR`, `HOST_IP`, and `EXTERNAL_IP` values in place. Export
+`VSS_DATA_DIR` with that same absolute path, then run this block. The guard stops
+before `mkdir` or `chmod` if the value is absent or is not absolute:
+
+```bash
+: "${VSS_DATA_DIR:?Export VSS_DATA_DIR with the value from user-overrides.env}"
+case "$VSS_DATA_DIR" in
+  /*) ;;
+  *) echo "VSS_DATA_DIR must be an absolute path" >&2; exit 1 ;;
+esac
+mkdir -p \
+  "$VSS_DATA_DIR/data_log/analytics_cache" \
+  "$VSS_DATA_DIR/data_log/calibration_toolkit" \
+  "$VSS_DATA_DIR/data_log/elastic/data" \
+  "$VSS_DATA_DIR/data_log/elastic/logs" \
+  "$VSS_DATA_DIR/data_log/kafka" \
+  "$VSS_DATA_DIR/data_log/redis/data" \
+  "$VSS_DATA_DIR/data_log/redis/log" \
+  "$VSS_DATA_DIR/agent_eval/dataset" \
+  "$VSS_DATA_DIR/agent_eval/results"
+chmod -R 777 "$VSS_DATA_DIR/data_log" "$VSS_DATA_DIR/agent_eval"
+```
+
+For each selected configuration, save the remaining values in
+`deploy/docker/developer-profiles/dev-profile-base/user-overrides.env`, then run:
+
+<Warning>
+The local LLM and RT-VLM layouts below are implemented by the checked-in
+edge sizing files and profile configuration, but have not yet been measured on the
+target hardware. Validate the local models on your system before relying on
+them. Use the remote-LLM layout when local model loading fails or when lower
+response latency is required.
+</Warning>
+
+```bash
+cd deploy/docker
+export VSS_CONTAINER_TAG="${VSS_DOCS_IMAGE_TAG:-develop-latest}"
+docker compose -f compose.yml \
+  --env-file containers.env \
+  --env-file developer-profiles/dev-profile-base/.env \
+  --env-file developer-profiles/dev-profile-base/user-overrides.env \
+  config --quiet
+docker compose -f compose.yml \
+  --env-file containers.env \
+  --env-file developer-profiles/dev-profile-base/.env \
+  --env-file developer-profiles/dev-profile-base/user-overrides.env \
+  up --detach --pull always --force-recreate --build
+```
+
+## DGX Spark
+
+Add the platform values to `deploy/docker/developer-profiles/dev-profile-base/user-overrides.env`,
+then run the `docker compose config --quiet` / `up --detach --pull always --force-recreate --build` commands above:
+
+```ini
+# developer-profiles/dev-profile-base/user-overrides.env
+HARDWARE_PROFILE=DGX-SPARK
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+LLM_DEVICE_ID=0
+VLM_DEVICE_ID=0
+RT_VLM_DEVICE_ID=0
+LLM_MODE=local
+# The default LLM (nvidia/nemotron-3.5-lightning-30b-a3b) applies; to use the
+# smaller FP8 build instead, uncomment both lines:
+# LLM_NAME=nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8
+# LLM_NAME_SLUG=nvidia-nemotron-nano-9b-v2-fp8
+```
+
+`HARDWARE_PROFILE=DGX-SPARK` selects the Spark sizing files for both models: the LLM's
+`hw-DGX-SPARK*.env` (30% of unified memory, 64K context) and the VLM's Spark-shared limits, so the
+two fit together in the 128 GB pool. The `-sbsa` image tag is required on Spark — the default tag
+pulls the Tegra build, which crash-loops on missing GB10 libraries.
+
+## AGX Thor / IGX Thor
+
+On Thor the LLM shares the GPU with `rtvi-vlm` (the VLM used by the blueprint on Thor), so both
+memory budgets are set by the checked-in sizing files. Add the platform values to
+`user-overrides.env`, then run the same `docker compose` commands:
+
+```ini
+# developer-profiles/dev-profile-base/user-overrides.env
+HARDWARE_PROFILE=AGX-THOR # Set IGX-THOR on IGX hardware.
+LLM_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+VLM_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.35
+LLM_MODE=local
+# The default LLM (nvidia/nemotron-3.5-lightning-30b-a3b) applies; to use the
+# smaller FP8 build instead, uncomment both lines:
+# LLM_NAME=nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8
+# LLM_NAME_SLUG=nvidia-nemotron-nano-9b-v2-fp8
+```
+
+The LLM's `hw-AGX-THOR*.env` / `hw-IGX-THOR*.env` cap it at 30% of unified memory alongside
+RT-VLM's 35%, keeping the co-resident total under the 80% edge ceiling.
+
+<Note>
+For IGX Thor, set `HARDWARE_PROFILE=IGX-THOR` in the profile settings above.
+</Note>

@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+projectionMatrix_3x4_w2p:
+- 38.57230249515832
+- -179.98957828986195
+- -57.564986567160545
+- -585.6665477440481
+- -54.79916107462927
+- 12.40772071840189
+- -166.3846552742525
+- 514.037094917545
+- 0.07860144972705989
+- -0.017797073880055306
+- -0.059963526449816056
+- 1.0
+
+modelInfo:
+  - classID: 0
+    height: 1.60
+    radius: 0.3
+  - classID: 1
+    height: 1.60
+    radius: 0.3
+  - classID: 2
+    height: 1.60
+    radius: 0.3
+  - classID: 3
+    height: 0.48
+    radius: 0.3
+  - classID: 4
+    height: 0.2
+    radius: 0.52
+  - classID: 5
+    height: 2.75
+    radius: 1.00

@@ -1,0 +1,199 @@
+---
+title: "Troubleshooting"
+description: ""
+position: 4
+---
+This section provides solutions to common issues and error messages.
+
+## Cannot Access the UI
+
+**Symptom**: Browser shows "Unable to connect" or "Connection refused"
+
+**Possible Causes**: Backend server not running; incorrect URL or port; network connectivity issues; firewall blocking access
+
+**Solutions**:
+
+1. **Verify server is running**
+   ```bash
+   docker ps | grep auto-calib
+   # Or from compose directory:
+   docker compose ps
+   ```
+2. **Verify URL and port** — check browser address bar; try `http://localhost:<VSS_AUTO_CALIBRATION_UI_HOST_PORT>` from the server machine
+3. **Check network connectivity**
+   ```bash
+   ping <server-ip>
+   nc -vz <server-ip> <port>
+   ```
+4. **Check firewall settings** — ensure the UI port is allowed
+
+## Port Already in Use
+
+**Symptom**: Docker container fails to start with "port is already allocated" error
+
+**Solution**:
+
+1. Check what's using the port:
+   ```bash
+   sudo lsof -i :5000
+   sudo lsof -i :8010
+   ```
+2. Change ports in `.env` (`VSS_AUTO_CALIBRATION_HOST_PORT`, `VSS_AUTO_CALIBRATION_UI_HOST_PORT`) and restart:
+   ```bash
+   docker compose \
+     --profile "vss-auto-calibration" \
+     --profile "vss-auto-calibration-ui" \
+     down
+   docker compose \
+     --profile "vss-auto-calibration" \
+     --profile "vss-auto-calibration-ui" \
+     up -d
+   ```
+3. Or stop the conflicting process/container
+
+## API_URL_NOT_PROVIDED Error
+
+**Symptom**: UI loads but shows "API_URL_NOT_PROVIDED" error
+
+**Cause**: Docker Compose started without proper `HOST_IP` environment variable
+
+**Solution**:
+
+1. Stop services:
+   ```bash
+   docker compose \
+     --profile "vss-auto-calibration" \
+     --profile "vss-auto-calibration-ui" \
+     down
+   ```
+2. Verify `HOST_IP=<your_host_ip>` is set in `.env`
+3. Restart:
+   ```bash
+   docker compose \
+     --profile "vss-auto-calibration" \
+     --profile "vss-auto-calibration-ui" \
+     up -d
+   ```
+
+## Verification Fails
+
+**Symptom**: "Verify Project" button shows error, or project never reaches READY
+
+**Solutions**:
+
+1. **Check requirements checklist**
+   - ✓ At least **1** video or RTSP clip for **single-camera**; **2 or more** for **multi-camera**
+   - ✓ Layout image uploaded
+   - ✓ Alignment data uploaded or created
+   - ✓ Rectification state **COMPLETED** (Step 4) — verification rejects stale/nonlinear input
+2. **Verify alignment data**
+   - Minimum 4 complete point sets
+   - **Multi-camera**: each set must contain exactly three `[x, y]` pairs: Camera 0, Camera 1, and layout/BEV—even when the project has more than two cameras
+   - **Single-camera**: each set must include **camera + layout** point pairs (two `[x, y]` pairs per set)
+3. **Check video files** — ensure videos are not corrupted; re-upload if needed
+4. **After re-rectification** — verify again, then relaunch calibration and re-run post-processing
+5. **Check server logs**: `docker compose logs | grep -i error`
+
+## Calibration Fails or Takes Too Long
+
+**Symptom**: Calibration fails, takes longer than expected, or results look wrong
+
+**Solutions**:
+
+1. **Check input files** — video quality, layout image scale/orientation, alignment on ground plane (rectified space)
+2. **Check video synchronization** — same time window for all cameras; for RTSP, one combined capture for all streams
+3. **Review floor-plan scale** — set **Layout Pixels Per Meter** (`layout_px_per_m`) on Parameters (Floor-plan to 3D scale) or Settings; wrong scale causes misaligned BEV/overlays
+4. **Check server resources**: `top`, `nvidia-smi`
+5. **Try the other path independently** — VGGT does not require a successful AMC run (multi-camera, after rectification + verify)
+6. **Run / re-run layout post-processing** (multi-camera) after AMC or VGGT for overlays and evaluation
+7. **Reset project** and retry after fixing inputs
+
+## RTSP Capture Issues
+
+**Symptom**: RTSP capture card missing, capture fails, or ingested clips are out of sync
+
+**Solutions**:
+
+1. **Verify VIOS configuration** — confirm VIOS is running; set `VIOS_BASE_URL` in deployment `.env` if using VSS/VIOS deployment
+2. **Use source RTSP URLs** — for VIOS pre-registered streams, use the **source URL** (e.g., NVStreamer URL), not the VIOS-proxied URL
+3. **Capture timing** — configure **all** streams, then run **one** **Capture and add to project**; allowed duration is **60–1200 seconds** (1–20 minutes); use **Stop early** only after 60 seconds of **RECORDING**; wait for **INGESTED** (ingest is automatic—no separate ingest step)
+4. **Check server logs**: `docker compose logs | grep -i -E 'rtsp|vios|capture|ingest'`
+
+## Rectification Issues
+
+**Symptom**: Cannot advance past Rectification, Generate Videos fails, or calibration rejects nonlinear input
+
+**Solutions**:
+
+1. Confirm videos are uploaded before starting Auto / Manual / Videos Are Rectified
+2. For Auto/Manual: reach **Ready for Review**, then click **Generate Rectified Videos** (COMPLETED is required — READY_FOR_REVIEW alone does not unlock Next)
+3. Use **Videos Are Rectified** only when source footage is already linear
+4. After re-rectification, re-verify and relaunch AMC/VGGT, then re-run post-processing
+5. Check live **Rectification Logs** and `docker compose logs | grep -i rectif`
+
+## VGGT Calibration Issues
+
+**Symptom**: VGGT section unavailable, fails, or does not appear on Results
+
+**Solutions**:
+
+1. **Confirm project type** — VGGT is **multi-camera only** (two or more videos); not supported for single-camera
+2. **Verify model installation** — download the VGGT model and place it in `${VSS_DATA_DIR}/auto-calib/vggt/`
+3. **Run at the right time** — complete Rectification, verify the project, then **Start VGGT Calibration**; AMC is **not** required
+4. **View VGGT results** — after VGGT completes, run layout post-processing (multi-camera) for overlays; open **Results** and use the **VGGT** tab
+5. **Check server logs**: `docker compose logs | grep -i vggt`
+
+## VGGT Completes but Camera Placement or ROI Projection Is Incorrect
+
+**Symptom**: Verification succeeds and VGGT reaches **COMPLETED**, but cameras
+appear in the wrong positions or directions, or ROI/tripwire projections land in
+the wrong physical region.
+
+Completion confirms that the run finished; it does not confirm geometric
+accuracy. Check preparation and result generation before diagnosing scene
+ambiguity:
+
+1. **Check camera identities and inputs** — confirm each video corresponds to
+   the intended physical camera, preserve upload/stream order, and use footage
+   covering the same time window. Check that staged media is correctly rectified.
+2. **Check layout scale and floor-map alignment** — VSS uses alignment data to
+   place VGGT results on the floor map. Verify **Layout Pixels Per Meter** and
+   that each alignment point set identifies the same ground-plane location in
+   Camera 0, Camera 1, and the layout. Follow the [alignment coordinate-space rules](/system-components/calibration/auto-calibration/custom-dataset#alignment-data-alignment_datajson):
+   UI file uploads use original camera coordinates; interactive draw/save uses
+   rectified coordinates. After re-rectification, verify again and relaunch
+   calibration.
+3. **Complete layout post-processing** — rerun it after calibration, alignment,
+   scale, or rectification changes. Compare overlays for the intended result
+   type (AMC or VGGT) and use rectified frames when checking projections.
+4. **Validate the full group** — inspect every camera's position and viewing
+   direction against the installation. Check known physical locations and
+   ROI/tripwire projections, especially in repeated regions. Use [virtual-object overlays and ground-truth evaluation](/system-components/calibration/auto-calibration/workflow-steps#how-to-interpret-calibration-outputs)
+   when available. Correct reference-camera alignment alone does not validate
+   the other cameras.
+5. **Inspect scene suitability** — if geometry is still inconsistent, review
+   [shared scene content, weak connections, repeated structures, and occlusion](/system-components/calibration/auto-calibration/custom-dataset#vggt-camera-group-suitability)
+   in the affected views. These are possible contributors, not a diagnosis from
+   the completion state alone. Automatic frame selection, when available, may
+   not resolve ambiguity present throughout the footage.
+
+## Results and Export Issues
+
+**No calibration results available** — calibration results (overlays, metrics, camera parameters, world-coordinate export) are available when AMC **or** VGGT completes successfully. ROI/tripwire drawing and image-mode JSON export do not need calibration; see the "Results annotation editor is not shown" entry below. For multi-camera trajectory / virtual-GT overlays, also run **Layout Post-processing** on Execute.
+
+**Results annotation editor is not shown** — the editor appears once the project has uploaded videos and linear media (Rectification COMPLETED, or **Videos Are Rectified**). Calibration is not required for ROI/tripwire drawing or image-mode JSON export; it is only needed for world-coordinate verification and export. The editor is locked while AMC or VGGT is running.
+
+**Export fails** — check browser download settings, popup blocker, disk space; try a different browser; check `docker compose logs | grep -i export`
+
+**ROI verification not working or BEV looks wrong**
+
+1. Draw ROIs/tripwires on **Results** (optional post-calibration), then click **Show ROI & Tripwire Verification**
+2. Verify calibration completed (AMC and/or VGGT) and post-processing completed when overlays are missing
+3. Check **Layout Pixels Per Meter** (`layout_px_per_m`) on the Parameters step
+4. Compare layout pixels (Global target) with world-map projection; switch AMC/VGGT tabs if one result looks better
+5. Revisit alignment points and time-synchronized inputs
+6. Use **Reset to Original Calibration** in Full Export if metadata edits corrupted the export JSON
+
+## Performance Issues
+
+**UI slow or canvas laggy** — refresh browser, close other tabs, enable hardware acceleration, reduce zoom level, use latest Chrome.

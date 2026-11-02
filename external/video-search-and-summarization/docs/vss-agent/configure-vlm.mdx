@@ -1,0 +1,383 @@
+---
+title: "Configure the VLM"
+description: ""
+position: 2
+---
+This page describes how to configure the VLM for the VSS agent workflow—both **local** (NIM on the same machine as the agent) and **remote** (VLM served elsewhere). You can run the LLM and VLM locally or remotely, in any combination that suits your setup.
+
+For **remote** VLMs, as long as the API is [OpenAI compatible](https://platform.openai.com/docs/api-reference/chat), you can point the agent to it for video analysis during report generation, video understanding, video summarization, and more. Remote endpoints can enable rapid startup when they are already up and running.
+
+## Local VLM customization
+
+When deploying with a local VLM, the agent workflow uses a default NIM endpoint. You can customize it as follows:
+
+- **Default model:** Local VLMs are served by RT-VLM. The Base, Alerts, and Live Video Search profiles use Cosmos3 Nano Reasoner BF16 (`nim_nvidia_cosmos3-nano-reasoner_bf16-final`); Search uses the FP8 checkpoint (`nim_nvidia_cosmos3-nano-reasoner_modelopt-fp8-final_format_fix`) to share the GPU with its critic workload. The `VLM_NAME` value is the model ID advertised by RT-VLM, not the checkpoint name.
+
+<Info>
+Use an **NGC Personal API Key** when you explicitly deploy the standalone Cosmos3
+Reasoner NIM. The default developer profiles serve Cosmos3 through RT-VLM
+instead; use an authorized NGC credential for the RT-VLM image and model
+artifacts.
+</Info>
+
+- **Custom NIM env file:** Set `VLM_ENV_FILE` in the selected profile's `*-overrides.env` file to the path (absolute or relative to `deploy/docker`) of an env file that overrides NIM settings. See [NIM configuration settings](/getting-started/prerequisites#nim-configuration-settings) in Prerequisites.
+
+- **Different local model:** For a local VLM, configure RT-VLM rather than selecting a standalone NIM Compose profile. Set `VLM_NAME`, `VLM_NAME_SLUG=none`, `VLM_MODEL_TYPE=rtvi`, `RTVI_VLM_MODEL_PATH`, and `RTVI_VLM_MODEL_TO_USE` together in the selected profile's `*-overrides.env` file.
+
+  The supported model selections map to the following RT-VLM values:
+
+  | Model selection | `VLM_NAME` | `RTVI_VLM_MODEL_PATH` | `RTVI_VLM_MODEL_TO_USE` |
+  | --- | --- | --- | --- |
+  | `nvidia/cosmos3-reasoner` | `nim_nvidia_cosmos3-nano-reasoner_bf16-final` | `ngc:nim/nvidia/cosmos3-nano-reasoner:bf16-final` | `cosmos-reason3` |
+  | `nvidia/cosmos3-reasoner-fp8` | `nim_nvidia_cosmos3-nano-reasoner_modelopt-fp8-final_format_fix` | `ngc:nim/nvidia/cosmos3-nano-reasoner:modelopt-fp8-final_format_fix` | `cosmos-reason3` |
+
+<Note>
+`nvidia/cosmos3-reasoner` is a supported selection name. For the current
+profiles it maps to the Cosmos3 Nano BF16 RT-VLM checkpoint above; it is not a
+direct `VLM_NAME` value. Use the FP8 selection for the smaller-footprint
+checkpoint, including the Search profile default.
+</Note>
+
+<Note>
+The selection names above cover the Cosmos3 Nano checkpoints only. Cosmos3 Super
+has no selection name: set `VLM_NAME` and `RTVI_VLM_MODEL_PATH` directly to a
+matching pair instead. For the Search profile, see
+[Available VLM Models](/vision-agent/agent-workflows/search#search-available-vlm-models),
+which also covers which precision to use when RT-VLM shares a GPU with RTVI-CV.
+</Note>
+
+- **Compatibility:** The profile defaults are the shipped local configurations. For another model, ensure GPU memory meets its requirements and refer to [VLM NIM documentation](https://docs.nvidia.com/nim/vision-language-models/1.7.0/support-matrix.html).
+
+- **Custom VLM weights:** Set `VLM_CUSTOM_WEIGHTS` to the path of a directory containing custom VLM weights. See [VLM Custom Weights](/getting-started/prerequisites#vlm-custom-weights) in Prerequisites for download instructions.
+
+- **GPU assignment:** Set `VLM_DEVICE_ID` and `RT_VLM_DEVICE_ID` to pin the local VLM to a specific GPU (e.g. when sharing with a local LLM). See the quickstart deploy tab-set for examples.
+
+## Setup assumptions for remote VLMs
+
+Before you start, make sure you followed the [Prerequisites](/getting-started/prerequisites) section.
+It is also recommended to review the different parameters described in the [Quickstart](/getting-started/quickstart) guide.
+
+1. Register an account at [NVIDIA NGC](https://org.ngc.nvidia.com/setup). Get an NGC API key.
+
+2. Similarly login to [NVIDIA NIM API catalog](https://build.nvidia.com/). Get a NIM CATALOG API key.
+
+3. Ensure you are logged in to the NGC registry for docker to pull container images:
+
+   ```bash
+   docker login nvcr.io
+   Username: $oauthtoken
+   Password: <PASTE_NGC_API_KEY_HERE>
+   ```
+
+4. Ensure you have `NGC_CLI_API_KEY` set in your environment for the agent workflow to pull NIM containers:
+
+   ```bash
+   export NGC_CLI_API_KEY=<PASTE_NGC_API_KEY_HERE>
+   ```
+
+
+Copy the checked-in template to any filename matching `*-overrides.env` before
+modifying it. Files matching that pattern are ignored by Git so local settings
+and credentials are not committed. This guide uses `user-overrides.env` as a
+concrete example; if you choose another name, use it consistently in the
+deployment commands:
+
+```bash
+cp deploy/docker/developer-profiles/dev-profile-base/overrides.env \
+  deploy/docker/developer-profiles/dev-profile-base/user-overrides.env
+```
+
+For every configuration below, save the shown values in
+`deploy/docker/developer-profiles/dev-profile-base/user-overrides.env`, then validate and start
+the profile with the native Docker Compose command in [Quickstart](/getting-started/quickstart).
+
+## Managed remote VLMs
+
+### Using frontier OpenAI models
+
+1. Register an account at the [OpenAI API platform](https://platform.openai.com/). Get an API key.
+
+2. Choose a compatible model from the list in `curl https://api.openai.com/v1/models -H "Authorization: Bearer <PASTE_API_KEY_HERE>"`.
+
+3. Deploy the agent workflow and point it to the chosen model name. Set `VLM_MODEL_TYPE=openai`:
+
+   ```ini
+   # developer-profiles/dev-profile-base/user-overrides.env
+   LLM_MODE=local
+   LLM_DEVICE_ID=0
+   VLM_MODE=remote
+   VLM_NAME_SLUG=none
+   VLM_BASE_URL=https://api.openai.com
+   VLM_NAME=gpt-5.6
+   VLM_MODEL_TYPE=openai
+   VLM_PORT=30082
+   RTVI_VLM_ENDPOINT=https://api.openai.com/v1
+   RTVI_VLM_MODEL_TO_USE=openai-compat
+   RTVI_VLM_MODEL_PATH=none
+   OPENAI_API_KEY=<PASTE_API_KEY_HERE>
+   NVIDIA_API_KEY=<PASTE_NIM_CATALOG_API_KEY_HERE>
+   ```
+
+Examples of compatible openAI models:
+
+- [gpt-5.6](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
+- [gpt-4.1](https://developers.openai.com/api/docs/models/gpt-4.1)
+
+### Using other cloud-hosted models
+
+#### Reka
+
+1. Register an account at the [Reka Platform](https://app.reka.ai/). Get an API key.
+
+2. Choose a compatible model from the list in `curl "https://api.reka.ai/v1/models" -H "X-Api-Key: <PASTE_API_KEY_HERE>"`.
+
+3. Create a custom VSS Agent configuration from the shipped base profile configuration, then set `VSS_AGENT_CONFIG_FILE` to point to that custom file:
+
+   ```bash
+   cp ./deploy/docker/developer-profiles/dev-profile-base/vss-agent/configs/config.yml /path/to/config_reka.yml
+   # Edit /path/to/config_reka.yml for the Reka VLM settings.
+   ```
+
+   In `deploy/docker/developer-profiles/dev-profile-base/user-overrides.env`,
+   set `VSS_AGENT_CONFIG_FILE=/path/to/config_reka.yml`.
+
+4. Deploy the blueprint and point it to the chosen model name. Set `VLM_MODEL_TYPE=reka`:
+
+   ```ini
+   # developer-profiles/dev-profile-base/user-overrides.env
+   LLM_MODE=local
+   LLM_DEVICE_ID=0
+   VLM_MODE=remote
+   VLM_NAME_SLUG=none
+   VLM_BASE_URL=https://api.reka.ai
+   VLM_NAME=reka-flash
+   VLM_MODEL_TYPE=reka
+   VLM_PORT=30082
+   RTVI_VLM_ENDPOINT=https://api.reka.ai/v1
+   RTVI_VLM_MODEL_TO_USE=openai-compat
+   RTVI_VLM_MODEL_PATH=none
+   OPENAI_API_KEY=<PASTE_API_KEY_HERE>
+   NVIDIA_API_KEY=<PASTE_NIM_CATALOG_API_KEY_HERE>
+   ```
+
+## Self-hosted remote VLMs
+
+### Using downloadable NIM Containers
+
+1. Check [GPU requirements](https://docs.nvidia.com/nim/vision-language-models/1.7.0/support-matrix.html) to ensure the machine that will host the VLM NIM container is supported.
+
+2. Set `NGC_API_KEY` in your environment to be passed to the containers so they can pull model weights:
+
+   ```bash
+   export NGC_API_KEY=<PASTE_NGC_API_KEY_HERE>
+   ```
+
+3. On the compatible remote machine within your own infrastructure, start the VLM NIM container and ensure it is reachable by the VSS agent workflow machine:
+
+   ```bash
+   export LOCAL_NIM_CACHE=~/.cache/nim
+   mkdir -p "$LOCAL_NIM_CACHE"
+   chmod -R 777 "$LOCAL_NIM_CACHE"
+   docker run -it --rm \
+       --gpus 'device=0' \
+       --ipc host \
+       --shm-size=16gb \
+       -e NGC_API_KEY \
+       -v "$LOCAL_NIM_CACHE:/opt/nim/.cache" \
+       -p 30082:8000 \
+       nvcr.io/nim/nvidia/cosmos-reason2-8b:latest
+   ```
+
+<Note>
+In case you want to run several models (LLMs, VLMs) on the same machine, make sure to assign different GPUs using --gpus 'device=1' flag.
+You may assign multiple GPUs using --gpus 'device=1,2,3' etc.
+</Note>
+
+4. Start the VSS agent workflow and point it to the remote VLM NIM container:
+
+   ```ini
+   # developer-profiles/dev-profile-base/user-overrides.env
+   LLM_MODE=local
+   LLM_DEVICE_ID=0
+   VLM_MODE=remote
+   VLM_NAME_SLUG=none
+   VLM_BASE_URL=http://<remote-host>:30082
+   VLM_NAME=<vlm-model-id-from-v1-models>
+   VLM_MODEL_TYPE=nim
+   VLM_PORT=30082
+   RTVI_VLM_ENDPOINT=http://<remote-host>:30082/v1
+   RTVI_VLM_MODEL_TO_USE=openai-compat
+   RTVI_VLM_MODEL_PATH=none
+   NVIDIA_API_KEY=<PASTE_NIM_CATALOG_API_KEY_HERE>
+   ```
+
+Examples of downloadable NIM containers:
+
+- [nvcr.io/nim/nvidia/cosmos3-reasoner:1.7](https://catalog.ngc.nvidia.com/orgs/nim/teams/nvidia/containers/cosmos3-reasoner)
+- [nvcr.io/nim/nvidia/cosmos-reason2-8b:latest](https://catalog.ngc.nvidia.com/orgs/nim/teams/nvidia/containers/cosmos-reason2-8b?version=latest)
+- [nvcr.io/nim/nvidia/cosmos-reason2-2b:latest](https://catalog.ngc.nvidia.com/orgs/nim/teams/nvidia/containers/cosmos-reason2-2b?version=latest)
+
+### Using vLLM Container
+
+You can deploy an open-source VLM from Hugging Face or any other source using the NVIDIA vLLM container.
+Check the [NVIDIA vLLM container documentation](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/vllm?version=26.01-py3) for an introduction to vLLM and the vLLM container.
+
+1. Check [GPU requirements](https://docs.nvidia.com/nim/vision-language-models/1.7.0/support-matrix.html) to ensure the machine that will host the VLM is supported.
+
+2. On the compatible remote machine within your own infrastructure, start the NVIDIA vLLM container with a Hugging Face model and ensure it is reachable by the VSS agent workflow machine:
+
+   ```bash
+   docker run --gpus 'device=0' -it --rm -p 30082:8000 nvcr.io/nvidia/vllm:26.01-py3 \
+       python3 -m vllm.entrypoints.openai.api_server \
+       --model Qwen/Qwen3-VL-8B-Instruct \
+       --trust-remote-code \
+       --tensor-parallel-size 1 \
+       --gpu-memory-utilization 0.85 \
+       --port 8000 \
+       --max-model-len 65536
+   ```
+
+<Note>
+In case you want to run several models (LLMs, VLMs) on the same machine, make sure to assign different GPUs using --gpus 'device=1' flag.
+You may assign multiple GPUs using --gpus 'device=1,2,3' etc.
+</Note>
+
+<Note>
+If you see errors such as `ValueError: To serve at least one request with the models's max seq len (262144)`, you may need to use the `--max-model-len` flag to limit the maximum context window (input + output tokens per request) to allow the model to fit on smaller GPUs.
+While some models support up to 256K tokens, VSS agent requests typically use under 10K-20K tokens. Setting a lower value (e.g. 65536) reduces GPU memory reserved for KV cache.
+</Note>
+
+3. Start the VSS agent workflow and point it to the remote vLLM model:
+
+   ```ini
+   # developer-profiles/dev-profile-base/user-overrides.env
+   LLM_MODE=local
+   LLM_DEVICE_ID=0
+   VLM_MODE=remote
+   VLM_NAME_SLUG=none
+   VLM_BASE_URL=http://<remote-host>:30082
+   VLM_NAME=<vlm-model-id-from-v1-models>
+   VLM_MODEL_TYPE=vllm
+   VLM_PORT=30082
+   RTVI_VLM_ENDPOINT=http://<remote-host>:30082/v1
+   RTVI_VLM_MODEL_TO_USE=openai-compat
+   RTVI_VLM_MODEL_PATH=none
+   NVIDIA_API_KEY=<PASTE_NIM_CATALOG_API_KEY_HERE>
+   ```
+
+### Using Nemotron Omni (audio-enabled VLM)
+
+[NVIDIA Nemotron-3-Nano-Omni](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16) analyzes **video and audio** in a single MP4 clip.
+
+**Typical layout**
+
+- **LLM:** local on the VSS host (Nemotron Nano NIM)
+- **VLM:** remote Omni on another GPU (or the same machine on a different GPU), port **30082**
+
+<Note>
+**Before you start**
+
+- **Remote VLM only:** VSS does not bundle Omni weights when `VLM_MODE=remote`. Serve the model yourself (step 3).
+- **Enable audio:** Set `ENABLE_AUDIO=true` in the local `user-overrides.env` file. Audio-aware prompts and full-MP4 delivery apply only when `omni` appears in `VLM_NAME`.
+- **Non-Omni VLMs:** Cosmos and other VLMs ignore the audio track even with `ENABLE_AUDIO=true`; the agent logs a warning and falls back to JPEG frame sampling.
+- **Step order:** Run steps 1–3 in order. Video Q&A with audio needs the vLLM server (step 3) running. Deployed VSS in step 1 before vLLM was up? Finish step 3, then update `VLM_NAME` in `user-overrides.env` and recreate `vss-agent` (see step 3).
+</Note>
+
+1. **Deploy the VSS blueprint** (local LLM, remote VLM)
+
+   Complete [Prerequisites](/getting-started/prerequisites) and the [Quickstart](/getting-started/quickstart) **base** profile deploy flow. Use **remote VLM** layout.
+
+   **Profile settings** (in `developer-profiles/dev-profile-base/user-overrides.env`):
+
+   - `ENABLE_AUDIO=true` in `deploy/docker/developer-profiles/dev-profile-base/user-overrides.env`
+   - `VLM_BASE_URL` → vLLM host from step 3; use `http://` with **no** trailing `/v1` (for example `http://<VLM_HOST>:30082`)
+   - VLM host IP unknown? Deploy in step 1 anyway, then set `VLM_BASE_URL` and redeploy after step 3
+
+   **Configure** (`HARDWARE_PROFILE`, `HOST_IP`, and `EXTERNAL_IP`; see the Quickstart tab-set for your GPU):
+
+   ```ini
+   # developer-profiles/dev-profile-base/user-overrides.env
+   HARDWARE_PROFILE=<YOUR_GPU>
+   HOST_IP=<HOST_IP>
+   EXTERNAL_IP=<EXTERNAL_IP>
+   NGC_CLI_API_KEY=<PASTE_NGC_API_KEY_HERE>
+   NVIDIA_API_KEY=<PASTE_NIM_CATALOG_API_KEY_HERE>
+   HF_TOKEN=<your-hf-token>
+   ENABLE_AUDIO=true
+   VLM_MODE=remote
+   VLM_NAME_SLUG=none
+   VLM_BASE_URL=http://<VLM_HOST>:30082
+   VLM_NAME=<model-id-from-v1-models>
+   VLM_MODEL_TYPE=vllm
+   VLM_PORT=30082
+   RTVI_VLM_ENDPOINT=http://<VLM_HOST>:30082/v1
+   RTVI_VLM_MODEL_TO_USE=openai-compat
+   RTVI_VLM_MODEL_PATH=none
+   ```
+
+   **Verify** `deploy/docker/developer-profiles/dev-profile-base/user-overrides.env` contains:
+
+   - `VLM_MODE=remote`
+   - `VLM_BASE_URL`
+   - `ENABLE_AUDIO=true`
+   - `VLM_NAME` (set in step 3 once `/v1/models` is available)
+
+2. **Download model weights** (Hugging Face)
+
+   On the **VLM GPU host**, prepare weights per the [Nemotron-3-Nano-Omni model card](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16) for the checkpoint you serve in step 3 (for example `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`).
+
+3. **Serve the VLM on port 30082** (vLLM)
+
+   On the VLM host, set `VLM_HOST` to an IP or hostname reachable from the VSS host, pin a GPU, and start the OpenAI-compatible server:
+
+   ```bash
+   VLM_HOST=<ip-reachable-from-vss-host>
+   
+   CUDA_VISIBLE_DEVICES=1 vllm serve nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 \
+     --host 0.0.0.0 \
+     --port 30082 \
+     --max-model-len 131072 \
+     --tensor-parallel-size 1 \
+     --trust-remote-code \
+     --video-pruning-rate 0.5 \
+     --max-num-seqs 384 \
+     --media-io-kwargs '{"video": {"fps": 2, "num_frames": 256}}' \
+     --reasoning-parser nemotron_v3 \
+     --enable-auto-tool-choice \
+     --tool-call-parser qwen3_coder \
+     --kv-cache-dtype fp8 \
+     --no-enable-flashinfer-autotune
+   ```
+
+   **Get model id** (use for `VLM_NAME`):
+
+   ```bash
+   curl -s "http://${VLM_HOST}:30082/v1/models" | jq -r '.data[].id'
+   ```
+
+<Note>
+A mismatch between `VLM_NAME` and the `id` from `/v1/models` produces **HTTP 404** on chat completions.
+</Note>
+
+   **Reachability from the VSS host:**
+
+   ```bash
+   curl -s "http://${VLM_HOST}:30082/v1/models"
+   ```
+
+   **If step 1 ran before vLLM was ready** — set `VLM_NAME` in `user-overrides.env` to the returned `id`, then recreate `vss-agent`:
+
+   ```bash
+   cd /path/to/video-search-and-summarization/deploy/docker
+   export VSS_CONTAINER_TAG="${VSS_DOCS_IMAGE_TAG:-develop-latest}"
+   
+   docker compose -f compose.yml \
+     --env-file containers.env \
+     --env-file developer-profiles/dev-profile-base/.env \
+     --env-file developer-profiles/dev-profile-base/user-overrides.env \
+     up --detach --pull always --force-recreate vss-agent
+   ```
+
+### Known Issues
+
+- Alert verification workflow is optimized with Cosmos3 Nano Reasoner model and might not work with other models.

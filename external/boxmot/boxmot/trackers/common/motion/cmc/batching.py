@@ -1,0 +1,209 @@
+"""Gather and scatter track-owned camera-motion state around NumPy kernels."""
+
+from __future__ import annotations
+
+from collections import deque
+from collections.abc import Callable, Sequence
+
+import numpy as np
+
+from boxmot.trackers.common.geometry.obb import transform_aabbs, transform_obbs, transform_points
+from boxmot.trackers.common.motion.models import MotionModelAdapter
+
+
+def transform_filter_histories(
+    filters: Sequence,
+    transform_states: Callable,
+    transform_measurements: Callable,
+) -> None:
+    """Warp live, frozen and timed states together, retaining history shapes."""
+    state_records = []
+    measurement_records = []
+    for kalman in filters:
+        state_records.append((kalman, None, kalman.x, kalman.P))
+        if kalman._prediction_origin is not None:
+            state_records.append((kalman, "_prediction_origin", *kalman._prediction_origin))
+        owners = [kalman]
+        if not kalman.observed and kalman.attr_saved is not None:
+            saved = kalman.attr_saved
+            state_records.append((saved, None, saved["x"], saved["P"]))
+            owners.append(saved)
+        measurement_records.append((kalman, "_last_observed_measurement", kalman._last_observed_measurement))
+        for owner in owners:
+            for name in ("history_obs", "last_measurement"):
+                value = owner[name] if isinstance(owner, dict) else getattr(owner, name)
+                measurement_records.append((owner, name, value))
+
+    if state_records:
+        means, covariances = transform_states(
+            np.asarray([np.asarray(record[2]).reshape(-1) for record in state_records]),
+            np.asarray([record[3] for record in state_records]),
+        )
+        for (owner, name, original, _), mean, covariance in zip(state_records, means, covariances):
+            mean = mean.reshape(np.asarray(original).shape)
+            if name is not None:
+                setattr(owner, name, (mean, covariance))
+            elif isinstance(owner, dict):
+                owner["x"], owner["P"] = mean, covariance
+            else:
+                owner.x, owner.P = mean, covariance
+
+    measurements = []
+    for _, _, value in measurement_records:
+        items = value if isinstance(value, deque) else (value,)
+        measurements.extend(np.asarray(item).reshape(-1) for item in items if item is not None)
+    if not measurements:
+        return
+    warped = iter(transform_measurements(np.asarray(measurements)))
+    for owner, name, value in measurement_records:
+        if isinstance(value, deque):
+            result = deque(
+                (None if item is None else next(warped).reshape(np.asarray(item).shape) for item in value),
+                maxlen=value.maxlen,
+            )
+        else:
+            result = None if value is None else next(warped).reshape(np.asarray(value).shape)
+        if isinstance(owner, dict):
+            owner[name] = result
+        else:
+            setattr(owner, name, result)
+
+
+def transform_observation_histories(
+    tracks: Sequence, transform: np.ndarray, *, is_obb: bool, model: MotionModelAdapter | None = None
+) -> None:
+    """Warp shared observation arrays once, preserving aliases and metadata."""
+    observations = {}
+    visits = {}
+    for track in tracks:
+        local = {}
+        if track.last_observation[-1] >= 0:
+            local[id(track.last_observation)] = track.last_observation
+        for observation in track.observations.values():
+            local[id(observation)] = observation
+        observations.update(local)
+        for identity in local:
+            visits[identity] = visits.get(identity, 0) + 1
+    if not observations:
+        return
+    arrays = list(observations.values())
+    width = 5 if is_obb else 4
+    rows = np.asarray([np.asarray(item).reshape(-1)[:width] for item in arrays])
+    # A track may alias its own latest observation in the history dictionary.
+    # External callers can also share arrays between tracks; retain the prior
+    # per-track mutation count in that case, including casts to owner dtypes.
+    counts = np.asarray(list(visits.values()))
+    warp_boxes = transform_obbs if is_obb else transform_aabbs
+    for visit in range(int(counts.max())):
+        indices = np.flatnonzero(counts > visit)
+        warped = (
+            warp_boxes(rows[indices], transform) if model is None else model.transform_boxes(rows[indices], transform)
+        )
+        for index, row in zip(indices, warped):
+            arrays[index][:width] = row[:width]
+            rows[index] = arrays[index][:width]
+
+
+def transform_directions(
+    tracks: Sequence,
+    centers: np.ndarray,
+    transform: np.ndarray,
+    *,
+    attributes: tuple[str, ...] = ("velocity",),
+    step: float = 1.0,
+    invalid_to_zero: bool = False,
+    zero_input_to_zero: bool = False,
+    preserve_magnitude: bool = False,
+) -> None:
+    """Warp cached ``[dy, dx]`` directions with each track's original policy.
+
+    HybridSORT sums direction cues over multiple observations, so their
+    magnitudes carry association evidence and must survive camera correction.
+    Other trackers retain unit-direction normalization by default.
+    """
+    owners, vectors, origins = [], [], []
+    for track, center in zip(tracks, centers):
+        for name in attributes:
+            direction = getattr(track, name)
+            if direction is None:
+                continue
+            owners.append((track, name))
+            vectors.append(np.asarray(direction, dtype=float).reshape(2)[::-1])
+            origins.append(center)
+    if not owners:
+        return
+    vectors, origins = np.asarray(vectors), np.asarray(origins)
+    finite_inputs = np.isfinite(vectors).all(axis=1)
+    input_norms = np.linalg.norm(vectors, axis=1)
+    active = finite_inputs & (input_norms > 1e-12) if zero_input_to_zero else np.ones(len(vectors), dtype=bool)
+    transformed = vectors.copy()
+    if active.any():
+        points = np.stack((origins[active], origins[active] + step * vectors[active]), axis=1)
+        mapped = transform_points(points, transform).reshape(-1, 2, 2)
+        transformed[active] = (mapped[:, 1] - mapped[:, 0]) / step
+    norms = np.linalg.norm(transformed, axis=1)
+    valid = active & np.isfinite(transformed).all(axis=1) & np.isfinite(norms) & (norms > 1e-12)
+    normalized = np.zeros_like(transformed)
+    normalized[valid] = transformed[valid] / norms[valid, None]
+    if preserve_magnitude:
+        normalized[valid] *= input_norms[valid, None]
+    for index, (owner, name) in enumerate(owners):
+        if (
+            valid[index]
+            or invalid_to_zero
+            or (zero_input_to_zero and finite_inputs[index] and input_norms[index] <= 1e-12)
+        ):
+            setattr(owner, name, normalized[index, ::-1].copy())
+
+
+def transform_prediction_histories(
+    tracks: Sequence, transform: np.ndarray, *, model: MotionModelAdapter
+) -> None:
+    """Warp retained prediction rows together without changing array ownership."""
+    rows = [np.asarray(box).reshape(1, -1) for track in tracks for box in track.history]
+    if not rows:
+        return
+
+    # Repeated or overlapping rows must observe every earlier in-place warp.
+    # Normal histories own disjoint rows, including views into batched boxes.
+    contiguous = all(row.flags.c_contiguous for row in rows)
+    intervals = sorted((row.ctypes.data, row.ctypes.data + row.nbytes) for row in rows) if contiguous else []
+    overlapping = any(start < previous_end for (_, previous_end), (start, _) in zip(intervals, intervals[1:]))
+    if not contiguous or overlapping:
+        for row in rows:
+            row[:] = model.transform_boxes(row, transform)
+        return
+
+    groups: dict[int, list[np.ndarray]] = {}
+    for row in rows:
+        groups.setdefault(row.shape[1], []).append(row)
+    for group in groups.values():
+        transformed = model.transform_boxes(np.concatenate(group, axis=0), transform)
+        for row, geometry in zip(group, transformed, strict=True):
+            row[:] = geometry
+
+
+def transform_ocsort_tracks(
+    tracks: Sequence,
+    transform: np.ndarray,
+    *,
+    model: MotionModelAdapter,
+) -> None:
+    """Batch observation-centric AABB/OBB state, history and direction CMC."""
+    if not tracks:
+        return
+    is_obb = model.is_obb
+    means = np.asarray([np.asarray(track.kf.x).reshape(-1) for track in tracks])
+    centers = means[:, :2]
+    transform_observation_histories(tracks, transform, is_obb=is_obb, model=model)
+    transform_directions(tracks, centers, transform, step=1e-3 if is_obb else 1.0, zero_input_to_zero=is_obb)
+
+    # Predictions are appended before camera compensation. Keep these boxes
+    # in the same frame as the live state and retained observations.
+    transform_prediction_histories(tracks, transform, model=model)
+
+    transform_filter_histories(
+        [track.kf for track in tracks],
+        lambda means, covariances: model.transform_states(means, covariances, transform),
+        lambda measurements: model.transform_measurements(measurements, transform),
+    )

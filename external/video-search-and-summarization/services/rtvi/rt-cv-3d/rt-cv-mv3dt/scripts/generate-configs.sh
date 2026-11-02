@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# generate-configs.sh — generate the per-dataset MV3DT configs from a
+# calibration.json, using this repo's tools/rtvi-cv-mv3dt-utils generators
+# (referenced read-only; deps go into the local utils/venv).
+#
+# Outputs (all under generated/, consumed by stage-configs.sh / the compose mounts):
+#   generated/camInfo/<sensor>.yml     per-camera projection matrices + model priors
+#   generated/pub_sub_info_config.yml  sparse MQTT pub/sub neighbour graph
+#   generated/calibration.json         copy of the input file (bev-fusion bind-mount)
+#
+# (The tracker config is handled by stage-configs.sh, which rewrites its
+# cameraModelFilepath map to the camInfo generated here.)
+#
+# Usage:
+#   ./scripts/generate-configs.sh /path/to/calibration.json
+#
+# Env overrides:
+#   NEIGHBOR_CRITERIA  pub/sub neighbour graph (default: overlap_threshold:1e-6).
+#                      Forms: top_N:<K>  |  overlap_threshold:<T>. A sparse
+#                      vision-neighbour graph beats the dense all-to-all fallback
+#                      once camera counts grow.
+#   MQTT_BROKERS       broker host:port for the /trck topics (default:
+#                      ${MQTT_HOST:-localhost}:${MQTT_PORT:-1883}; ds-start also
+#                      rewrites host:port at container start).
+#   CLASS_SPECS        object-model priors, comma-separated "classID height radius"
+#                      triples in metres (default: warehouse RT-DETR classes 0-5).
+set -euo pipefail
+
+CALIB="${1:-}"
+if [ -z "$CALIB" ]; then
+  echo "ERROR: calibration path is required" >&2
+  echo "Usage: $0 /path/to/calibration.json" >&2
+  exit 2
+fi
+if [ ! -f "$CALIB" ]; then
+  echo "ERROR: calibration file not found: $CALIB" >&2
+  exit 2
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT/../../../.." && pwd)"
+TOOLS="$REPO_ROOT/tools/rtvi-cv-mv3dt-utils"
+[ -f "$TOOLS/generate_cam_info_configs.py" ] || { echo "ERROR: generators not found at $TOOLS" >&2; exit 1; }
+
+NEIGHBOR_CRITERIA="${NEIGHBOR_CRITERIA:-overlap_threshold:1e-6}"
+MQTT_BROKERS="${MQTT_BROKERS:-${MQTT_HOST:-localhost}:${MQTT_PORT:-1883}}"
+# Warehouse RT-DETR classes (person, humanoid x2, cart, box, forklift) — height/radius in m.
+CLASS_SPECS="${CLASS_SPECS:-0 1.60 0.3,1 1.60 0.3,2 1.60 0.3,3 0.48 0.3,4 0.2 0.52,5 2.75 1.00}"
+
+CAMINFO="$ROOT/generated/camInfo"
+GEN="$ROOT/generated"
+mkdir -p "$CAMINFO" "$GEN"
+
+# venv with the generators' deps (numpy/PyYAML/tqdm, from utils/requirements.txt)
+# shellcheck disable=SC1091
+source "$ROOT/scripts/ensure-venv.sh"
+ensure_venv || { echo "ERROR: could not set up utils/venv" >&2; exit 1; }
+
+# ── 1. Per-camera camInfo ────────────────────────────────────────────────────
+echo "── Generating camInfo → $CAMINFO"
+CLASS_ARGS=()
+IFS=',' read -ra TRIPLES <<< "$CLASS_SPECS"
+for t in "${TRIPLES[@]}"; do
+  read -ra F <<< "$t"
+  CLASS_ARGS+=(--class "${F[0]}" "${F[1]}" "${F[2]}")
+done
+rm -f "$CAMINFO"/*.yml
+"$VENV_PY" "$TOOLS/generate_cam_info_configs.py" \
+  --calibration-json "$CALIB" \
+  --output-dir "$CAMINFO" \
+  "${CLASS_ARGS[@]}"
+
+# ── 2. Sparse MQTT pub/sub neighbour graph ───────────────────────────────────
+echo "── Generating pub_sub_info_config.yml → $GEN  (neighbor_criteria=$NEIGHBOR_CRITERIA)"
+"$VENV_PY" "$TOOLS/generate_pub_sub_configs.py" \
+  --cam_info_path "$CAMINFO" \
+  --mqtt_brokers "$MQTT_BROKERS" \
+  --neighbor_criteria "$NEIGHBOR_CRITERIA" \
+  --output_path "$GEN"
+
+# bev-fusion mounts generated/calibration.json. Copy the input so the mount
+# tracks the same file camInfo was generated from. If compose started first,
+# Docker creates that path as a directory and this copy would fail opaquely.
+if [ -d "$GEN/calibration.json" ]; then
+  echo "ERROR: $GEN/calibration.json is a directory (an empty Docker bind-mount)." >&2
+  echo "       Remove it (sudo rm -rf '$GEN/calibration.json') and re-run this script." >&2
+  exit 1
+fi
+cp -f "$CALIB" "$GEN/calibration.json"
+echo "── Copied calibration.json → $GEN/calibration.json"
+
+# The container's runtime user must be able to read the bind-mounted camInfo
+# regardless of the host umask (e.g. 027 leaves it group-only).
+chmod -R o+rX "$ROOT/generated"
+
+echo
+echo "DONE. Generated:"
+echo "  $CAMINFO/  ($(ls -1 "$CAMINFO"/*.yml 2>/dev/null | wc -l | tr -d ' ') files)"
+echo "  $GEN/pub_sub_info_config.yml"
+echo "  $GEN/calibration.json"
+# NUM_CAMS must equal the cameras just generated: stage-configs.sh checks it, and
+# compose passes it to bev-fusion as MAX_EXPECTED_SENSORS, where a stale value is
+# silent.
+CAM_COUNT="$(ls -1 "$CAMINFO"/*.yml 2>/dev/null | wc -l | tr -d ' ')"
+ENV_FILE="$ROOT/docker/.env"
+echo
+if [ ! -f "$ENV_FILE" ]; then
+  echo "NOTE: $ENV_FILE not found; set NUM_CAMS=$CAM_COUNT there before staging."
+elif grep -qE '^[[:space:]]*NUM_CAMS=' "$ENV_FILE"; then
+  PREV="$(sed -nE 's/^[[:space:]]*NUM_CAMS=([^[:space:]#]*).*/\1/p' "$ENV_FILE" | head -1)"
+  if [ "$PREV" = "$CAM_COUNT" ]; then
+    echo "NUM_CAMS=$CAM_COUNT in docker/.env (already correct)"
+  else
+    # Keep any trailing comment on the line: it is the user's, not ours.
+    TRAILER="$(sed -nE 's/^[[:space:]]*NUM_CAMS=[^#]*(#.*)?$/\1/p' "$ENV_FILE" | head -1)"
+    if [ -n "$TRAILER" ]; then
+      sed -i -E "s|^[[:space:]]*NUM_CAMS=.*|NUM_CAMS=$CAM_COUNT  $TRAILER|" "$ENV_FILE"
+    else
+      sed -i -E "s|^[[:space:]]*NUM_CAMS=.*|NUM_CAMS=$CAM_COUNT|" "$ENV_FILE"
+    fi
+    echo "NUM_CAMS: $PREV -> $CAM_COUNT in docker/.env"
+  fi
+else
+  printf 'NUM_CAMS=%s\n' "$CAM_COUNT" >> "$ENV_FILE"
+  echo "NUM_CAMS=$CAM_COUNT appended to docker/.env"
+fi
+echo
+echo "Next: ./scripts/stage-configs.sh"

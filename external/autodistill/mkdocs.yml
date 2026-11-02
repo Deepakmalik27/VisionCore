@@ -1,0 +1,173 @@
+site_name: Autodistill
+site_url: https://docs.autodistill.com/
+site_author: Roboflow
+site_description: Distill large foundational models into smaller, domain-specific models for deployment
+repo_name: autodistill/autodistill
+repo_url: https://github.com/autodistill/autodistill
+edit_uri: https://github.com/autodistill/autodistill/tree/main/docs
+copyright: Roboflow 2024. All rights reserved.
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/roboflow
+    - icon: fontawesome/brands/youtube
+      link: https://www.youtube.com/roboflow
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/company/roboflow-ai/mycompany/
+    - icon: fontawesome/brands/twitter
+      link: https://twitter.com/roboflow
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home:
+    - Home: index.md
+    - Quickstart: quickstart.md
+    - Supported Models: supported-models.md
+    - What Model Should I Use?: what-model-should-i-use.md
+    - Popular Models:
+      - Grounded SAM 2: base_models/grounded-sam-2.md
+      - Grounded SAM: base_models/groundedsam.md
+      - Grounding DINO: base_models/grounding-dino.md
+      - PaliGemma: base_models/paligemma.md
+      - YOLO-World: base_models/yolo-world.md
+      - YOLOv8: target_models/yolov8.md
+    - Detection and Segmentation:
+      - Base Models:
+        - CoDet: base_models/codet.md
+        - DETIC: base_models/detic.md
+        - EfficientSAM: base_models/efficientsam.md
+        - Efficient YOLO-World: base_models/efficient-yolo-world.md
+        - FastSAM: base_models/fastsam.md
+        - Florence-2: target_models/florence2.md
+        - GPT-4o: base_models/gpt4o.md
+        - Grounded SAM: base_models/groundedsam.md
+        - Grounded Edge SAM: base_models/grounded-edgesam.md
+        - Grounding DINO: base_models/grounding-dino.md
+        - HLS Geospatial: base_models/hls-geospatial.md
+        - OWL-ViT: base_models/owlvit.md
+        - PaliGemma: base_models/paligemma.md
+        - Roboflow Universe: base_models/universe.md
+        - SAM HQ: base_models/samhq.md
+        - SegGPT: base_models/seggpt.md
+        - VLPart: base_models/vlpart.md
+        - YOLO-World: base_models/yolo-world.md
+      - Target Models:
+        - DETR: target_models/detr.md
+        - Florence-2: target_models/florence2.md
+        - PaliGemma: base_models/paligemma.md
+        - YOLOv5: target_models/yolov5.md
+        - YOLOv8: target_models/yolov8.md
+        - YOLO-NAS: target_models/yolonas.md
+    - Image Classification:
+      - Base Models:
+        - ALBEF: base_models/albef.md
+        - AltCLIP: base_models/altclip.md
+        - BioCIP: base_models/bioclip.md
+        - CLIP: base_models/clip.md
+        - MetaCLIP: base_models/metaclip.md
+        - RemoteCLIP: base_models/remoteclip.md
+        - SigLIP: base_models/siglip.md
+      - Target Models:
+        - DINOv2: target_models/dinov2.md
+        - YOLOv5: target_models/yolov5.md
+        - YOLOv8: target_models/yolov8.md
+        - ViT: target_models/vit.md
+    - Text Classification:
+      - Base Models:
+        - GPT and LLaMAfile: base_models/gpttext.md
+      - Target Models:
+        - DistilBERT: target_models/distilbert.md
+        - SetFit: target_models/setfit.md
+    - Community Models:
+      - Vision:
+        - EvaCLIP: base_models/evaclip.md
+    - Utilities:
+      - Visualize Predictions: utilities/visualize-predictions.md
+      - Combine Models: utilities/combine-models.md
+      - Compare Models: utilities/compare-models.md
+      - Use SAHI to Detect Objects: utilities/sahi.md
+      - Use Embeddings in Classification: utilities/use-embeddings-in-classification.md
+      - Apply Non-Maximum Suppression (NMS): utilities/nms.md
+    - Advanced:
+      - Command Line Interface: command-line-interface.md
+      - Image Loading: image-loading.md
+      - Labeling Large Datasets: large-datasets.md
+  - Library Reference:
+    - Index: reference/index.md
+    - Utilities: reference/utilities.md
+    - Base Models:
+      - Detection: reference/base-models/detection.md
+      - Classification: reference/base-models/classification.md
+      - Composed Model: reference/base-models/composed.md
+      - Embedding Model: reference/base-models/embedding.md
+    - Target Models:
+      - Detection: reference/target-models/detection.md
+      - Classification: reference/target-models/classification.md
+    - Ontologies:
+      - Caption Ontology: reference/ontologies/caption-ontology.md
+      - Embedding Ontology: reference/ontologies/embedding-ontology.md
+  - Contributing: /contributing/
+
+extra_css:
+  - stylesheets/extra.css
+
+theme:
+  name: 'material'
+  logo: 'logo.jpeg'
+  favicon: 'logo.jpeg'
+  palette:
+    # Palette for light mode
+    - scheme: default
+      primary: 'custom'
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+
+    # Palette toggle for dark mode
+    - scheme: slate
+      primary: 'custom'
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Roboto
+    code: Roboto Mono
+  custom_dir: 'docs/custom_theme'
+  features:
+    - navigation.top
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.prune
+    - navigation.footer
+    - navigation.tracking
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.indexes
+    - navigation.sections
+    - content.code.copy
+
+plugins:
+  - mkdocstrings
+  - search
+  - autorefs:
+      link_titles: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - attr_list
+  - md_in_html
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - "https://widget.kapa.ai/kapa-widget.bundle.js"
+  - "javascript/init_kapa_widget.js"
+  - "https://app.roboflow.com/scripts/utm.js"
+  - "javascript/segment.js"

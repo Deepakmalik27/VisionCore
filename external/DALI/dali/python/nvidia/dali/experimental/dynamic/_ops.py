@@ -1,0 +1,1132 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import base64
+import math
+from threading import Lock
+from typing import TypedDict
+
+import numpy as np
+
+import nvidia.dali as dali
+import nvidia.dali.backend_impl as _b
+
+from . import _capture, _device, _eval_context, _invocation
+from ._batch import Batch, _get_batch_size
+from ._batch import as_batch as _as_batch
+from ._device import Device, DeviceLike
+from ._nvtx import NVTXRange
+from ._tensor import Tensor, as_tensor
+from .capture._invariant import unwrap_invariant, unwrap_invariant_args
+
+_nvtx_to_tensor = NVTXRange("to_tensor", category="op_builder")
+
+
+def _shard_size(padded_size: int, shard_id: int, num_shards: int) -> int:
+    beg = math.floor(shard_id * padded_size / num_shards)
+    end = math.floor((shard_id + 1) * padded_size / num_shards)
+    return end - beg
+
+
+def _to_tensor(x, device=None, dtype=None):
+    with _nvtx_to_tensor:
+        if x is None:
+            return None
+        if isinstance(x, Tensor):
+            if dtype is not None and x.dtype != dtype:
+                return Tensor(x, dtype=dtype, device=device)
+            if device is not None:
+                return x.to_device(device)
+            return x
+        if isinstance(x, _invocation.InvocationResult):
+            if x.is_batch:
+                raise ValueError("Batch invocation result cannot be used as a single tensor")
+            return Tensor(invocation_result=x, device=device)
+        return Tensor(x, device=device, dtype=dtype)
+
+
+@NVTXRange("to_batch", category="op_builder")
+def _to_batch(x, batch_size, device=None, dtype=None):
+    if x is None:
+        return None
+    if isinstance(x, Batch):
+        if dtype is not None and x.dtype != dtype:
+            return _as_batch(x, dtype=dtype, device=device)
+        if device is not None:
+            return x.to_device(device)
+        return x
+    if isinstance(x, _invocation.InvocationResult):
+        if x.is_batch:
+            return Batch(invocation_result=x, device=device, dtype=dtype)
+        else:
+            x = _to_tensor(x, dtype=dtype)  # fall back to regular replication
+    actual_batch_size = _get_batch_size(x)
+    if actual_batch_size is not None:
+        if batch_size is not None and actual_batch_size != batch_size:
+            raise ValueError(f"Unexpected batch size: {actual_batch_size} != {batch_size}")
+        return Batch(x, device=device, dtype=dtype)
+
+    return Batch.broadcast(x, batch_size, device=device, dtype=dtype)
+
+
+@NVTXRange("get_input_device", category="op_builder")
+def _get_input_device(x):
+    if x is None:
+        return None
+    if isinstance(x, Batch):
+        return x.device
+    if isinstance(x, Tensor):
+        return x.device
+    if isinstance(x, (_b.TensorListCPU, _b.TensorCPU)):
+        return _device.Device.CPU
+    if isinstance(x, (_b.TensorListGPU, _b.TensorGPU)):
+        return _device.Device("gpu", x.device_id())
+    if hasattr(x, "__cuda_array_interface__"):
+        return _device.Device("gpu")
+    if hasattr(x, "__dlpack_device__"):
+        dev = x.__dlpack_device__()
+        if int(dev[0]) == 1 or int(dev[0]) == 3:  # CPU or CPU_PINNED
+            return _device.Device.CPU
+        elif int(dev[0]) == 2:
+            return _device.Device("gpu", dev[1])
+        else:
+            raise ValueError(f"Unknown DLPack device type: {dev.type}")
+    if hasattr(x, "__dlpack__"):
+        return _device.Device.CPU
+    if isinstance(x, list) and x:
+        return _get_input_device(x[0])
+    return None
+
+
+_nvtx_infer_batch_size = NVTXRange("_infer_batch_size", category="op_builder")
+
+
+def _infer_batch_size(*raw_args, **raw_kwargs):
+    batch_size = None
+    with _nvtx_infer_batch_size:
+        for x in list(raw_args) + list(raw_kwargs.values()):
+            x = unwrap_invariant(x)
+            x_batch_size = _get_batch_size(x)
+            if x_batch_size is not None:
+                if batch_size is not None:
+                    if x_batch_size != batch_size:
+                        raise ValueError(f"Inconsistent batch size: {x_batch_size} != {batch_size}")
+                else:
+                    batch_size = x_batch_size
+    return batch_size
+
+
+class ReaderMeta(TypedDict):
+    epoch_size: int
+    epoch_size_padded: int
+    number_of_shards: int
+    shard_id: int
+    pad_last_batch: int
+    stick_to_shard: int
+
+
+class Operator:
+    """Base class for all dynamic operators. Manages backend lifecycle, caching, and execution.
+
+    The actual operator subclasses are constructed via _op_builder.build_operator_class() factory
+    function.
+
+    Operator._get() can be used instead of the constructor to utilize the instance caching.
+    """
+
+    # Class members - each subclass will override in the factory function:
+    _schema = None
+    _schema_name = None
+    _supported_backends = frozenset()
+    _op_name = None  # CamelCase legacy class API name, without the module - e.g. "CoinFlip"
+    _fn_name = None  # snake_case api name - e.g. "coin_flip"
+    _legacy_op = None  # The legacy operator class from the nvidia.dali.ops module
+    _is_stateful = False
+    _has_random_state_arg = False
+    # Indicates if this operator is generated and we can autogenerate the stubs or we need
+    # to reimport the operator from py to pyi file.
+    _generated = False
+
+    def __init__(
+        self,
+        max_batch_size,
+        name=None,
+        device="cpu",
+        *,
+        _backend=None,
+        **kwargs,
+    ):
+        """Constructs an operator instance
+        Parameters
+        ----------
+        max_batch_size : int
+            The maximum batch size for this operator instance.
+        name : str, optional
+            The name of the operator instance.
+        device : Device or str, optional
+            The device where the operation is executed.
+        """
+        max_batch_size, name = unwrap_invariant_args(max_batch_size, name)
+        self._lock = Lock()
+        self._name = name
+        self._max_batch_size = max_batch_size
+        self._init_args = kwargs
+        self._api_type = None
+        self._is_copy = self._schema_name == "Copy"
+
+        self._device = _device.device(device)
+        if _backend is None:
+            if self._device.device_type in self._supported_backends:
+                _backend = self._device.device_type
+            elif self._device.device_type == "gpu" and "mixed" in self._supported_backends:
+                _backend = "mixed"
+            else:
+                raise ValueError(f'Invalid device "{device}" for operator `{self._schema_name}`')
+        else:
+            # _backend is an internal parameter - once it's passed explicitly, it must be correct
+            assert _backend in self._supported_backends, "Internal error: incompatible backend."
+        self._backend = _backend
+
+        # Information below is lazy-initialized
+        # TODO(klecki): Use @property or @cached_property for self-init.
+
+        # Metadata about batch/sample, layout, dim and type. See _make_meta() for more details.
+        self._input_meta = []
+        self._arg_meta = {}
+        # Number of outputs
+        self._num_outputs = None
+        # When an operator (e.g. TFRecord) returns a dictionary, outputs are named
+        self._output_names = None
+        # Expected device placement of the outputs
+        self._output_devices = None
+        # Instance of the legacy Python Operator from the nvidia.dali.ops module
+        self._op_inst = None
+        # Instance of the C++ OperatorBase class - used for direct invocation of operator
+        self._op_backend = None
+        self._op_spec = None
+        self._last_invocation = None
+
+    @classmethod
+    def _get(
+        cls,
+        max_batch_size: int,
+        name: str | None = None,
+        device: DeviceLike | None = None,
+        num_inputs: int | None = None,
+        call_arg_names: list[str] | None = None,
+        _backend: str | None = None,
+        *,
+        inputs,
+        init_args,
+        call_args,
+    ):
+        """Gets an operator instance for a specified set of parameters."""
+        if device is None:
+            device = Device.current()
+        if not isinstance(device, Device):
+            raise TypeError("device must be a Device instance")
+
+        def freeze_arg(arg):
+            if isinstance(arg, list):
+                return tuple(arg)
+            return arg
+
+        def freeze_args(args):
+            sorted_keys = sorted(args.keys())
+            return tuple([(k, freeze_arg(args[k])) for k in sorted_keys])
+
+        call_arg_names = freeze_arg(call_arg_names)
+        key = (
+            cls,
+            _backend,
+            device,
+            max_batch_size,
+            num_inputs,
+            call_arg_names,
+            freeze_args(init_args),
+            tuple((cls._make_meta(input) for input in inputs)),
+            freeze_args({name: cls._make_meta(arg) for name, arg in call_args.items()}),
+        )
+        ctx = _eval_context.EvalContext.current()
+        inst = ctx._instance_cache.pop(key, None)
+        if inst is None:
+            with device:
+                inst = cls(
+                    max_batch_size,
+                    name=name,
+                    device=device,
+                    _backend=_backend,
+                    **init_args,
+                )
+        inst._cache = ctx._instance_cache
+        inst._key = key
+        return inst
+
+    def _infer_num_outputs(self, *inputs, **args):
+        self._init_spec(inputs, args)
+        return self._num_outputs
+
+    @classmethod
+    def _input_device(
+        cls,
+        backend: str,
+        index: int,
+        actual_device: Device | None = None,
+        operator_device: Device | None = None,
+    ):
+        default_input_device = "gpu" if backend == "gpu" else "cpu"
+        actual_device_type = actual_device.device_type if actual_device is not None else None
+        dev_type = cls._schema.GetInputDevice(index, actual_device_type, default_input_device)
+        if dev_type is None:
+            return operator_device
+        if dev_type == "cpu":
+            dev_id = None
+        else:
+            if backend != "cpu":
+                dev_id = operator_device.device_id  # we need to match our current device
+            else:
+                # This is a CPU operator so it doesn't have a device id - we should just
+                # use whatever was passed in.
+                dev_id = actual_device.device_id if actual_device is not None else None
+
+        return Device(dev_type, dev_id)  # inherit the device id
+
+    _nvtx_convert_to_batches = NVTXRange("__call__: convert to batches", category="op_builder")
+    _nvtx_convert_to_tensors = NVTXRange("__call__: convert to tensors", category="op_builder")
+
+    @classmethod
+    def _process_params(cls, backend, op_device, batch_size, *raw_args, **raw_kwargs):
+        """
+        Processes run-time parameters passed to the operator to ones that can be consumed DALI
+        (Batch or Tensor).
+
+        This is a class method, as it doesn't require an operator instance - and this method
+        is essential for proper operator instance caching, as input/argument metadata is a part
+        of the operator cache key.
+        """
+
+        is_batch = batch_size is not None
+        if cls._has_random_state_arg:
+            from . import random
+
+            rng = random._resolve_rng(raw_kwargs.pop("rng", None))
+
+            # Only one random state tensor is created per call, not per sample.
+            raw_kwargs["_random_state"] = random._state_tensor(random._draw_state(rng))
+
+        inputs = []
+        kwargs = {}
+
+        input_device_id = None
+        input_device_id_src = None
+
+        def validate_input_device(dev, input_index):
+            nonlocal input_device_id
+            nonlocal input_device_id_src
+            if dev is not None and dev.device_type == "gpu":
+                if input_device_id is None:
+                    input_device_id = dev.device_id
+                    input_device_id_src = input_index
+                elif input_device_id != dev.device_id:
+                    from nvidia.dali.ops import _names
+
+                    src_name = _names._get_input_name(cls._schema, input_device_id_src)
+                    clash_name = _names._get_input_name(cls._schema, input_index)
+                    raise RuntimeError(
+                        f"Got inputs with different device ids:\n"
+                        f'{src_name!r} is on "gpu:{input_device_id}" '
+                        f'and {clash_name!r} is on "gpu:{dev.device_id}".'
+                    )
+
+        def convert_args(convert_fn):
+            for i, inp in enumerate(raw_args):
+                inp = unwrap_invariant(inp)
+                if inp is None:
+                    continue
+                actual_input_device = _get_input_device(inp)
+                validate_input_device(actual_input_device, i)
+                input_device = cls._input_device(backend, i, actual_input_device, op_device)
+                inp = convert_fn(inp, device=input_device)
+                inputs.append(inp)
+            for k, v in raw_kwargs.items():
+                v = unwrap_invariant(v)
+                if v is None:
+                    continue
+                dtype = cls._argument_conversion_map[k]
+                kwargs[k] = convert_fn(v, device=_device.Device.CPU, dtype=dtype)
+
+        if is_batch:
+            with Operator._nvtx_convert_to_batches:
+
+                def _batch(inp, device=None, dtype=None):
+                    return _to_batch(inp, batch_size, device=device, dtype=dtype)
+
+                convert_args(_batch)
+        else:
+            with Operator._nvtx_convert_to_tensors:
+                convert_args(_to_tensor)
+
+        return inputs, kwargs
+
+    def _infer_output_devices(self, *inputs, **args):
+        self._init_spec(inputs, args)
+        return self._output_devices
+
+    def _pre_call(self, *inputs, **args):
+        pass
+
+    def _is_backend_initialized(self):
+        return self._op_backend is not None
+
+    def _init_spec(self, inputs, args):
+        if self._op_spec is not None:
+            return
+        with self._lock:
+            self._init_spec_no_lock(inputs, args)
+
+    def _init_spec_no_lock(self, inputs, args):
+        if self._op_spec is None:
+            import nvidia.dali as dali
+
+            with self._device:
+                # Create fake DataNodes (they're quite lightweight) for the inputs and arguments,
+                # so we can use the ops API to obtain an OpSpec.
+                input_nodes = [
+                    dali.data_node.DataNode(
+                        name=f"input_{i}",
+                        device=inputs[i].device.device_type,
+                        source=None,
+                        ndim=inputs[i].ndim,
+                        dtype=inputs[i].dtype.type_id,
+                        layout="" if inputs[i].layout is None else inputs[i].layout,
+                    )
+                    for i in range(len(inputs))
+                ]
+                arg_nodes = {
+                    name: dali.data_node.DataNode(
+                        name=f"arg_{name}",
+                        device="cpu",
+                        source=None,
+                        ndim=arg.ndim,
+                        dtype=arg.dtype.type_id,
+                        layout="" if arg.layout is None else arg.layout,
+                    )
+                    for name, arg in args.items()
+                }
+
+                # legacy_op is a member of the old `ops` module - we use the ops API to obtain
+                # an OpSpec
+                op = self._legacy_op(name=self._name, device=self._backend, **self._init_args)
+                self._op_inst = op
+                out = op(*input_nodes, **arg_nodes)
+                if isinstance(out, (list, tuple)):
+                    spec = out[0].source.spec
+                elif isinstance(out, dict):
+                    spec = next(iter(out.values())).source.spec
+                    self._output_names = tuple(out.keys())
+                else:
+                    spec = out.source.spec
+
+                spec.InferOutputMetadata()
+
+                if isinstance(out, (tuple, list)):
+                    self._output_devices = []
+                    self._num_outputs = len(out)
+                    for o in out:
+                        device_type = o.device
+                        device_id = None if device_type == "cpu" else self._device.device_id
+                        self._output_devices.append(Device(device_type, device_id))
+                elif isinstance(out, dict):
+                    self._num_outputs = len(out)
+                    device_id = self._device.device_id
+                    self._output_devices = [
+                        Device(o.device, None if o.device == "cpu" else device_id)
+                        for o in out.values()
+                    ]
+                else:
+                    self._num_outputs = 1
+                    self._output_devices = [
+                        Device(out.device, None if out.device == "cpu" else self._device.device_id)
+                    ]
+
+                self._op_spec = spec
+                self._set_meta(inputs, args)
+
+    def _init_backend(self, ctx, inputs, args):
+        if self._op_backend is not None:
+            return
+
+        if ctx is None:
+            ctx = _eval_context.EvalContext.current()
+        with self._lock:
+            if self._op_backend is not None:
+                return
+            with self._device, ctx:
+                self._init_spec_no_lock(inputs, args)
+                self._op_spec.AddArg("num_threads", ctx.num_threads)
+                self._op_spec.AddArg(
+                    "device_id",
+                    (
+                        self._device.device_id
+                        if self._backend == "gpu" or self._backend == "mixed"
+                        else dali.types.CPU_ONLY_DEVICE_ID
+                    ),
+                )
+                if self._max_batch_size is None:
+                    self._max_batch_size = 1
+                self._op_spec.AddArg("max_batch_size", self._max_batch_size)
+                self._op_backend = _b._Operator(self._op_spec)
+
+    def _run(self, ctx, *inputs, batch_size=None, **args):
+        device_id = ctx.device_id if ctx is not None else None
+        device_ctx = Device("gpu", device_id) if device_id is not None else Device.CPU
+        with device_ctx:
+            if (
+                batch_size is not None
+                and self._max_batch_size is not None
+                and batch_size > self._max_batch_size
+                and self._is_stateful
+            ):
+                raise RuntimeError(
+                    f"The batch size {batch_size} is larger than the `max_batch_size` "
+                    f"{self._max_batch_size} specified when the operator was created."
+                )
+
+            def _is_batch():
+                for input in inputs:
+                    if isinstance(input, ((_b.TensorListCPU, _b.TensorListGPU))):
+                        return True
+                for input in args.values():
+                    if isinstance(input, ((_b.TensorListCPU, _b.TensorListGPU))):
+                        return True
+                return False
+
+            is_batch = batch_size is not None or _is_batch()
+            if self._is_backend_initialized():
+                # clearing the backend in a stateful op would destroy the state
+                self._check_compatible(inputs, batch_size, args)
+
+            self._init_backend(ctx, inputs, args)
+            workspace = _b._Workspace(ctx.thread_pool._create_facade(), ctx.cuda_stream)
+            ctx_device_id = ctx.device_id
+            for i, input in enumerate(inputs):
+                inp = self._to_batch(input)
+                # Validate input device unless the operator is a Copy, which is explicitly meant
+                # for cross-device communication.
+                if (
+                    not self._is_copy
+                    and inp.device.device_id is not None
+                    and inp.device.device_id != ctx_device_id
+                ):
+                    from nvidia.dali.ops import _names
+
+                    raise RuntimeError(
+                        f"The input {_names._get_input_name(self._schema, i)!r} is on device "
+                        f'"gpu:{inp.device.device_id}" which is not the device associated with the '
+                        f'current EvalContext ("{ctx_device_id}")'
+                    )
+                workspace.AddInput(inp.evaluate()._storage)
+            for name, arg in args.items():
+                workspace.AddArgumentInput(name, self._to_batch(arg).evaluate()._storage)
+            self._op_backend.SetupAndRun(workspace, batch_size)
+            out = workspace.GetOutputs()
+
+            result = out if is_batch else tuple(o[0] for o in out)
+            return result if self._output_names is None else dict(zip(self._output_names, result))
+
+    def _to_batch(self, x):
+        if not isinstance(x, Batch):
+            return Batch([x])
+        else:
+            return x
+
+    def _set_meta(self, inputs, args):
+        self._input_meta = [self._make_meta(input) for input in inputs]
+        self._arg_meta = {name: self._make_meta(arg) for name, arg in args.items()}
+
+    def _check_compatible(self, inputs, batch_size, args):
+        """Raises an error if the inputs and arguments are not compatible with this op instance."""
+
+        def error_header():
+            return (
+                f"The invocation of operator {self._display_name} "
+                f"is not compatible with the previous call:\n"
+            )
+
+        if batch_size is not None:
+            if batch_size > self._max_batch_size:
+                raise RuntimeError(
+                    f"{error_header()}"
+                    f"The batch size {batch_size} is larger than the `max_batch_size` "
+                    f"{self._max_batch_size} specified when the operator was created."
+                )
+
+        if len(inputs) != len(self._input_meta):
+            raise RuntimeError(
+                f"{error_header()}"
+                f"The number of inputs ({len(inputs)}) does not match the number "
+                f"of inputs used in the previous call ({len(self._input_meta)})."
+            )
+        for i, input in enumerate(inputs):
+            if self._input_meta[i] != self._make_meta(input):
+                raise RuntimeError(
+                    f"{error_header()}"
+                    f"The input {i} is not compatible with the input used in the previous call."
+                )
+        for name, arg in args.items():
+            if name not in self._arg_meta:
+                raise RuntimeError(
+                    f"{error_header()}" f"The argument `{name}` was not used in the previous call."
+                )
+            if self._arg_meta[name] != self._make_meta(arg):
+                raise RuntimeError(
+                    f"{error_header()}"
+                    f"The argument `{name}` is not compatible with the argument used in the "
+                    f"previous call."
+                )
+        for name in self._arg_meta:
+            if name not in args:
+                raise RuntimeError(
+                    f"{error_header()}"
+                    f"The argument `{name}` used in the previous call was not supplied in the "
+                    f"current one."
+                )
+
+    # TODO(klecki): Consider making a dataclass
+    @staticmethod
+    def _make_meta(x):
+        if x is None:
+            return ()
+        is_batch = False
+        if isinstance(x, _invocation.Invocation):
+            is_batch = x.is_batch
+        elif isinstance(x, Batch):
+            is_batch = True
+        else:
+            is_batch = False
+
+        return (
+            is_batch,
+            x.ndim,
+            x.layout,
+            x.dtype.type_id,
+        )
+
+    @property
+    def _display_name(self):
+        if "display_name" in self._init_args:
+            type_name = self._init_args["display_name"]
+        else:
+            type_name = self._schema.OperatorName()
+        if self._name is not None:
+            return f'type_name "{self._name}"'
+        else:
+            return type_name
+
+
+def _wire_arg(value):
+    """Convert a stored reader argument into a pipeline-ready constant DataNode."""
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (Tensor, Batch)):
+        if value.device.device_type != "cpu":
+            raise ValueError("GPU arguments are not supported")
+        return dali.types.Constant(np.asarray(as_tensor(value)), layout=value.layout, device="cpu")
+    return dali.types.Constant(value, device="cpu")
+
+
+# Defaults used by Reader for sharding; must match Reader.__init__ normalization.
+_READER_SHARD_DEFAULTS = {"shard_id": 0, "num_shards": 1, "stick_to_shard": False}
+
+
+class ReaderState:
+    """Serialized checkpoint state of a :class:`Reader`.
+
+    Wraps the serialized representation produced by the underlying operator's
+    :func:`SerializeCheckpoint`. It can be converted to a string with :func:`str`,
+    saved to disk, and later passed to :meth:`Reader.set_state` to restore the
+    reader to the captured iteration position.
+
+    The object also keeps a reference to the originating operator so that future
+    extensions can re-serialize the live state on demand.
+    """
+
+    def __init__(self, op: "Reader", serialized: str):
+        self._op = op
+        self._serialized = serialized
+
+    def __str__(self) -> str:
+        return self._serialized
+
+    def __repr__(self) -> str:
+        return f"ReaderState({self._serialized!r})"
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, ReaderState):
+            return self._serialized == other._serialized
+        if isinstance(other, str):
+            return self._serialized == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._serialized)
+
+
+class Reader(Operator):
+    """Base class for reader operators. Extends Operator with iteration support via next_epoch().
+
+    Readers maintain internal state and can provide samples or batches. Mixing iteration styles
+    (samples/batches/direct calls) on the same instance is forbidden."""
+
+    def __init__(
+        self,
+        batch_size=None,
+        name=None,
+        device="cpu",
+        shard_id=_READER_SHARD_DEFAULTS["shard_id"],
+        num_shards=_READER_SHARD_DEFAULTS["num_shards"],
+        stick_to_shard=_READER_SHARD_DEFAULTS["stick_to_shard"],
+        enable_checkpointing=False,
+        **kwargs,
+    ):
+        if name is None:
+            name = f"Reader_{id(self)}"
+        self._actual_batch_size = batch_size
+        self._batch_size = batch_size
+        self._captured_iter: "_capture.CapturedEpochIterator | None" = None
+        self._capture_mode: bool | None = None
+        self._checkpointing_enabled = enable_checkpointing
+        device = _device.device(device)
+        # _backend is forwarded via **kwargs, we don't need to touch it here
+        self._shard_id = shard_id if shard_id is not None else _READER_SHARD_DEFAULTS["shard_id"]
+        self._num_shards = (
+            num_shards if num_shards is not None else _READER_SHARD_DEFAULTS["num_shards"]
+        )
+        self._stick_to_shard = (
+            stick_to_shard
+            if stick_to_shard is not None
+            else _READER_SHARD_DEFAULTS["stick_to_shard"]
+        )
+
+        self._raw_tensor_args = {}
+        self._tensor_args = {}
+        # Used to know when to recompute _tensor_args for _raw_tensor_args
+        self._previous_batch_size: int | None = None
+        # Used to make sure that args passed to the constructor are not repeated in __call__
+        self._tensor_arg_names: set[str] = set()
+        # If set, the checkpoint state to apply once the backend is constructed.
+        self._pending_state = None
+        # If set, the reader is in an invalid state and cannot be used
+        self._disabled = False
+        # If set, the reader's op was transferred into a captured pipeline
+        self._transferred = False
+
+        if self._num_shards < 1:
+            raise ValueError(
+                f"The number of shards must be a positive integer. Got {self._num_shards}."
+            )
+        if self._shard_id < 0 or self._shard_id >= self._num_shards:
+            raise ValueError(
+                f"The shard_id={self._shard_id} is invalid. Must be in range "
+                + f"[0..{self._num_shards-1}]."
+            )
+        kwargs["shard_id"] = self._shard_id
+        kwargs["num_shards"] = self._num_shards
+        kwargs["stick_to_shard"] = self._stick_to_shard
+        kwargs["checkpointing"] = self._checkpointing_enabled
+        super().__init__(self._actual_batch_size, name, device, **kwargs)
+
+    def _enable_checkpointing(self):
+        if self._checkpointing_enabled:
+            return
+        if self._capture_mode is True:
+            raise NotImplementedError("Checkpointing is currently not supported in capture mode.")
+
+        if self._op_backend:
+            raise RuntimeError(
+                f"The operator '{self._schema_name}' was initialized with checkpointing disabled. "
+                f"Pass `enable_checkpointing=True` to the reader's constructor."
+            )
+        self._init_args["checkpointing"] = self._checkpointing_enabled = True
+
+    @classmethod
+    def _get(cls, *_, **__):
+        raise RuntimeError("Readers cannot be cached. Construct a new instance instead.")
+
+    def _init_spec_no_lock(self, inputs, args):
+        if self._op_spec is not None:
+            return
+        super()._init_spec_no_lock(inputs, args)
+
+    def _init_backend(self, ctx, inputs, args):
+        was_initialized = self._op_backend is not None
+        super()._init_backend(ctx, inputs, args)
+        if not was_initialized and self._pending_state is not None:
+            self._op_backend.RestoreCheckpoint(self._pending_state)
+            self._pending_state = None
+
+    def get_state(self, *, cuda_stream=None) -> "ReaderState":
+        """Returns the current checkpoint state of this reader.
+
+        The returned state object captures the iteration position of the underlying
+        loader. It can be passed back to :meth:`set_state` to resume processing
+        from this point. The state is serialized to a string by ``str(state)``.
+
+        .. warning::
+            The methods ``get_state`` and ``set_state`` are not inherently thread-safe
+            with respect to running the reader. External synchronization is necessary.
+
+        .. note::
+            If there are any pending asynchronous or deferred calls to this operator,
+            the function will wait for them to finish before getting the state.
+
+        Parameters
+        ----------
+        cuda_stream
+            The CUDA stream on which the readers is running or None.
+
+        Returns
+        -------
+        :class:`ReaderState`
+            An opaque state object that wraps a serialized checkpoint string.
+
+        Raises
+        ------
+        RuntimeError
+            If the reader has not started any epoch yet (the backend has not been
+            initialized) or if the underlying reader does not support checkpointing.
+        """
+        if self._op_backend is None:
+            raise RuntimeError(
+                "Cannot get the reader's state before its first iteration. "
+                "Call `next_epoch` once before calling `get_state`."
+            )
+        if not self._checkpointing_enabled:
+            raise RuntimeError(
+                f"The reader '{self._schema_name}' was initialized with checkpointing disabled. "
+                f"Pass `enable_checkpointing=True` to the reader's constructor."
+            )
+
+        # Make sure that all pending invocations are done before we save the state
+        if self._last_invocation is not None:
+            self._last_invocation.run()
+
+        # SaveCheckpoint returns a `bytes` blob (binary protobuf payload).
+        # Wrap it as a base64 ASCII string so it round-trips through JSON / `str`.
+        raw = self._op_backend.SaveCheckpoint(cuda_stream)
+        serialized = base64.b64encode(raw).decode("ascii")
+        return ReaderState(self, serialized)
+
+    def set_state(self, state) -> None:
+        """Restores the reader's iteration position from a saved state.
+
+        Parameters
+        ----------
+        state : :class:`ReaderState` or str
+            Either a state object obtained from :meth:`get_state`, or its
+            string representation (as produced by ``str(state)``).
+
+        .. warning::
+            The methods ``get_state`` and ``set_state`` are not inherently thread-safe
+            with respect to running the reader. External synchronization is necessary.
+
+        .. note::
+            If there are any pending asynchronous or deferred calls to this operator,
+            the function will wait for them to finish before setting the state.
+
+        If the reader's backend has not yet been initialized (i.e. no epoch has
+        been started), the state is buffered and applied automatically the first
+        time the backend is created.
+        """
+        if isinstance(state, ReaderState):
+            serialized = state._serialized
+        elif isinstance(state, str):
+            serialized = state
+        elif isinstance(state, bytes):
+            serialized = state.decode("ascii")
+        else:
+            raise TypeError(
+                "state must be a ReaderState, str or bytes, " f"got {type(state).__name__}."
+            )
+        # The C++ reader can only restore a snapshot before its prefetch thread
+        # has started - i.e. before the first iteration. Reject late calls clearly
+        # rather than letting the underlying assertion fire.
+        if self._op_backend is not None:
+            raise RuntimeError(
+                "Cannot set the reader's state after iteration has begun. "
+                "Call `set_state` on a freshly constructed reader, before any "
+                "call to `next_epoch`, `samples`, `batches` or `__call__`."
+            )
+        raw = base64.b64decode(serialized)
+        self._enable_checkpointing()
+        if self._op_backend is not None:
+            # if there was a previous invocation in flight, make sure it's finished before we
+            # try load the state
+            if self._last_invocation is not None:
+                self._last_invocation.run()
+            self._op_backend.RestoreCheckpoint(raw)
+        else:
+            self._pending_state = raw
+
+    def _shard_epoch_size(self):
+        epoch_size = self._op_backend.GetReaderMeta()["epoch_size_padded"]
+        return _shard_size(epoch_size, self._shard_id, self._num_shards)
+
+    def _advance_shard(self):
+        if not self._stick_to_shard:
+            self._shard_id = (self._shard_id + 1) % self._num_shards
+
+    def _teardown_capture(self) -> None:
+        """Tear down capture bindings. Reader is unrecoverable after transfer."""
+        self._capture_mode = None
+        self._captured_iter = None
+        if self._transferred:
+            self._disabled = True
+
+    def _wire_pipeline(self, source: "_capture.CaptureSource") -> tuple:
+        """Build the reader's pipeline outputs from its operator instance."""
+        op = self._legacy_op(name=self._name, device=self._backend, **self._init_args)
+        out = op(**{name: _wire_arg(value) for name, value in self._raw_tensor_args.items()})
+
+        if isinstance(out, dict):
+            assert source.output_keys is not None
+            outs = tuple(out[k] for k in source.output_keys)
+        elif isinstance(out, (tuple, list)):
+            outs = tuple(out)
+        else:
+            outs = (out,)
+        assert len(outs) == source.num_outputs
+        return outs
+
+    def _shape_result(self, source: "_capture.CaptureSource", batches: tuple):
+        if source.output_keys is not None:
+            return dict(zip(source.output_keys, batches))
+        return batches
+
+    def _transfer_into(self, pipe: dali.Pipeline) -> bool:
+        assert self._op_backend is not None
+        pipe._transfer_operator(self._name, self._op_backend)
+        self._transferred = True
+        return True
+
+    def _make_epoch_iterator(self, batch_size: int) -> "_capture.CapturedEpochIterator":
+        return _capture._ReaderEpochIterator(self, batch_size)
+
+    def _require_api_type(self, api_type: str) -> None:
+        """Set the API type if unset, or raise if it conflicts with a previous choice."""
+        if self._api_type is None:
+            self._api_type = api_type
+        elif self._api_type != api_type:
+            raise RuntimeError(
+                "Cannot mix `samples`, `batches` and `_run`/`__call__` on the same reader."
+            )
+
+    def _check_not_disabled(self):
+        if self._disabled:
+            raise RuntimeError(
+                "This reader is in an invalid state due to a previous error and cannot be used."
+            )
+
+    def _run_unchecked(self, ctx=None, **kwargs):
+        """Run the reader backend without API-type checking."""
+        self._check_not_disabled()
+        return super()._run(ctx, **kwargs)
+
+    @staticmethod
+    def _output_batch_size(outputs: tuple | dict) -> int:
+        """Get the batch size from the first output of a reader step."""
+        first = outputs[0] if isinstance(outputs, tuple) else next(iter(outputs.values()))
+        return first.batch_size if isinstance(first, Batch) else len(first)
+
+    def _pre_call(self, *inputs, **args):
+        self._require_api_type("_run")
+
+    def _run(self, ctx=None, *inputs, **args):
+        """
+        Runs the reader and obtains one result (batch or sample, depending on `batch_size`).
+
+        Do not call this function directly. Use `__call__` instead.
+        """
+        self._require_api_type("_run")
+        return super()._run(ctx, *inputs, **args)
+
+    def next_epoch(
+        self, batch_size=None, ctx: _eval_context.EvalContext | None = None, capture=False
+    ):
+        """
+        Obtains an iterator that goes over the next epoch from the reader.
+
+        The return value is an iterator that returns either individual samples (if `batch_size` is
+        ``None`` and was not specified at construction) or batches (if `batch_size` was specified
+        here or at construction).
+
+        This iterator will go over the dataset (or shard, if sharding was specified at construction)
+        once.
+
+        .. note::
+            The iterator must be traversed completely before the next call to `next_epoch` is made.
+            Therefore, it is impossible to traverse one reader using two iterators.
+            If another iterator is necessary, create a separate reader instance.
+
+        Parameters
+        ----------
+        batch_size : int, optional
+            The batch size. If not specified, the batch size from the constructor is used.
+        ctx : EvalContext, optional
+            The evaluation context. If not specified, the current context is used.
+        capture : bool, default: False
+            If True, capture operator sequences in a pipeline for prefetching.
+            Once used in capture mode, the reader cannot switch back.
+        """
+        batch_size = unwrap_invariant(batch_size)
+        self._check_not_disabled()
+
+        batch_size = self._get_batch_size(batch_size)
+
+        if capture:
+            if self._checkpointing_enabled:
+                raise NotImplementedError(
+                    "Checkpointing is currently not supported in capture mode."
+                )
+            if self._capture_mode is False:
+                raise RuntimeError(
+                    "This reader was previously used without capture=True "
+                    "and cannot switch to capture mode."
+                )
+            if batch_size is None:
+                raise ValueError("capture=True requires a non-None batch_size.")
+            self._capture_mode = True
+            return _capture.make_iterator(self, batch_size).batches(ctx)
+
+        if self._capture_mode is True:
+            raise RuntimeError(
+                "This reader was previously used with capture=True "
+                "and cannot switch to eager mode."
+            )
+        self._capture_mode = False
+
+        if batch_size is not None:
+            return self._batches(batch_size, ctx)
+        return self._samples(ctx)
+
+    def _process_tensor_args(self, batch_size: int | None):
+        """Converts stored tensor args to Batch/Tensor form for the given batch_size."""
+        if not self._raw_tensor_args:
+            return {}
+
+        if batch_size is None:
+            self._tensor_args = self._raw_tensor_args
+        elif self._previous_batch_size != batch_size:
+            self._tensor_args = {
+                name: Batch.broadcast(sample, batch_size)
+                for name, sample in self._raw_tensor_args.items()
+            }
+
+        self._previous_batch_size = batch_size
+        return self._tensor_args
+
+    def get_metadata(self, batch_size: int | None = None) -> ReaderMeta:
+        """Returns the metadata of the underlying reader operator"""
+
+        batch_size = unwrap_invariant(batch_size)
+        batch_size = self._get_batch_size(batch_size)
+        self._init_backend(None, (), self._process_tensor_args(batch_size))
+        try:
+            return self._op_backend.GetReaderMeta()
+        except ValueError as e:
+            raise RuntimeError("Reader was transferred to a captured pipeline.") from e
+
+    def _samples(self, ctx: _eval_context.EvalContext | None = None):
+        self._require_api_type("samples")
+
+        if ctx is None:
+            ctx = _eval_context.EvalContext.current()
+        with ctx:
+            if not self._is_backend_initialized():
+                if self._actual_batch_size is None:
+                    self._actual_batch_size = 1
+                if self._max_batch_size is None:
+                    self._max_batch_size = self._actual_batch_size
+                self._init_backend(ctx, (), self._process_tensor_args(self._actual_batch_size))
+
+            tensor_args = self._process_tensor_args(self._actual_batch_size)
+            epoch_size = self._shard_epoch_size()
+            idx = 0
+            while idx < epoch_size:
+                outputs = super()._run(ctx, batch_size=self._actual_batch_size, **tensor_args)
+                batch_size = self._output_batch_size(outputs)
+                assert batch_size == self._actual_batch_size
+                idx += batch_size
+                if isinstance(outputs, tuple):
+                    for x in zip(*outputs):
+                        outs = tuple(Tensor(o) for o in x)
+                        yield outs
+                else:
+                    names = outputs.keys()
+                    for x in zip(*outputs.values()):
+                        outs = tuple(Tensor(o) for o in x)
+                        yield dict(zip(names, outs))
+            self._advance_shard()
+
+    def _batches(self, batch_size=None, ctx: _eval_context.EvalContext | None = None):
+        self._require_api_type("batches")
+
+        if ctx is None:
+            ctx = _eval_context.EvalContext.current()
+        with ctx:
+            if batch_size is None:
+                batch_size = self._batch_size
+            if batch_size is None:
+                raise ValueError("Batch size was not specified")
+            if not self._op_backend:
+                if self._max_batch_size and self._max_batch_size < batch_size:
+                    raise ValueError(
+                        f"`batch_size` {batch_size} is larger than the `max_batch_size` "
+                        f"{self._max_batch_size} specified when the operator was created"
+                    )
+                self._max_batch_size = batch_size
+                tensor_args = self._process_tensor_args(batch_size)
+                self._init_backend(ctx, (), tensor_args)
+            else:
+                if self._max_batch_size and self._max_batch_size != batch_size:
+                    raise ValueError(
+                        f"`batch_size` {batch_size} is different than the `max_batch_size` "
+                        f"{self._max_batch_size} used in the previous call"
+                    )
+            epoch_size = self._shard_epoch_size()
+            idx = 0
+            while idx < epoch_size:
+                tensor_args = self._process_tensor_args(batch_size)
+                outputs = super()._run(ctx, batch_size=batch_size, **tensor_args)
+                batch_size = self._output_batch_size(outputs)
+                idx += batch_size
+                if isinstance(outputs, tuple):
+                    yield tuple(Batch(o) for o in outputs)
+                else:
+                    yield {name: Batch(o) for name, o in outputs.items()}
+            self._advance_shard()
+
+    def _get_batch_size(self, batch_size: int | None) -> int | None:
+        return batch_size if batch_size is not None else self._batch_size
+
+
+_all_ops = []
+_all_functions = []
+
+
+def _initialize():
+    from . import _op_builder
+
+    global _all_ops, _all_functions
+    _all_ops, _all_functions = _op_builder.build_operators()

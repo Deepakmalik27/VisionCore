@@ -1,0 +1,374 @@
+---
+title: "Agent Configuration"
+description: "Reference for VSS Agent YAML and environment configuration"
+position: 3
+---
+Configuration files define model connections, MCP clients, tools, agents,
+prompts, object stores, and telemetry. The VSS Agent is built on
+[NVIDIA NeMo Agent Toolkit](https://docs.nvidia.com/nemo/agent-toolkit/1.3/).
+
+The examples on this page follow the shipped Warehouse configuration:
+
+`deploy/docker/industry-profiles/warehouse-operations/vss-agent/configs/config.yml`
+
+Developer profiles use the same top-level structure but select different tools.
+Use the configuration file for the profile you deploy as the source of truth:
+
+- `deploy/docker/developer-profiles/dev-profile-base/vss-agent/configs/config.yml`
+- `deploy/docker/developer-profiles/dev-profile-lvs/vss-agent/configs/config.yml`
+- `deploy/docker/developer-profiles/dev-profile-search/vss-agent/configs/config.yml`
+- `deploy/docker/developer-profiles/dev-profile-alerts/vss-agent/configs/config.yml`
+
+## File Structure
+
+```yaml
+general:         # Frontend and telemetry
+object_stores:   # Report and chart storage
+function_groups: # MCP clients
+functions:       # Tools and sub-agents
+llms:            # LLM and VLM connections
+workflow:        # Top-level routing agent
+```
+
+## Model Configuration
+
+The `llms` section registers model endpoints with NAT. Names in this section
+are references used by tools and agents.
+
+```yaml
+llms:
+  llm:
+    _type: ${LLM_MODEL_TYPE:-nim}
+    model_name: ${LLM_NAME}
+    base_url: ${LLM_BASE_URL}/v1
+    max_tokens: 4096
+    temperature: 0.0
+
+  rtvi_vlm:
+    _type: openai
+    model_name: ${VLM_NAME}
+    base_url: ${RTVI_VLM_BASE_URL}/v1
+    temperature: 0.0
+```
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `_type` | Yes | NAT model provider, such as `nim` or `openai`. |
+| `model_name` | Yes | Model ID advertised by the endpoint. |
+| `base_url` | Provider-dependent | OpenAI-compatible API base URL. Shipped configurations append `/v1`. |
+| `max_tokens` | No | Maximum generated tokens. |
+| `temperature` | No | Sampling temperature; `0.0` selects deterministic sampling. |
+| `model_kwargs` | No | Provider-specific request options. |
+
+See [Configure the LLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-llm)
+and [Configure the VLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-vlm)
+for supported model-placement examples.
+
+## MCP Clients
+
+The Warehouse configuration connects to Video Analytics MCP with the
+streamable HTTP transport.
+
+```yaml
+function_groups:
+  video_analytics_mcp:
+    _type: mcp_client
+    server:
+      transport: streamable-http
+      url: ${VIDEO_ANALYSIS_MCP_URL}/mcp
+    include:
+      - video_analytics__get_incidents
+      - video_analytics__get_incident
+      - video_analytics__get_fov_histogram
+      - video_analytics__get_sensor_ids
+```
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `_type` | Yes | Must be `mcp_client`. |
+| `server.transport` | Yes | MCP transport. The shipped VA-MCP configuration uses `streamable-http`. |
+| `server.url` | Yes | MCP endpoint, including the `/mcp` path. |
+| `include` | No | Exact server tool names exposed to the Agent. |
+
+Tool references use the client name, a period, and the exposed tool name. For
+example: `video_analytics_mcp.video_analytics__get_incidents`.
+
+## Tools Reference
+
+### video_understanding
+
+Analyzes video with the configured VLM.
+
+```yaml
+video_understanding:
+  _type: video_understanding
+  vlm_name: ${VLM_MODEL_TYPE:-nim}_vlm
+  max_frames: 30
+  min_pixels: 3136
+  max_pixels: 12845056
+  reasoning: false
+  video_url_tool: vst_video_url
+  vlm_mode: ${VLM_MODE}
+  vst_internal_url: ${VST_INTERNAL_URL}
+  enable_audio: ${ENABLE_AUDIO:-false}
+```
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `vlm_name` | Yes | — | Reference to a model in `llms`. |
+| `max_frames` | No | `24` | Maximum sampled frames. Profiles override this for their model. |
+| `max_fps` | No | `2` | Maximum sampled frames per second. |
+| `min_pixels` | No | `1568` | Minimum sampled-frame pixel budget. |
+| `max_pixels` | No | `345600` | Maximum sampled-frame pixel budget. Profiles override this for their model. |
+| `reasoning` | No | `false` | Enables reasoning for supported Cosmos Reason models. |
+| `video_url_tool` | No | — | Tool used to obtain a VST clip URL. |
+| `time_format` | No | `iso` | `iso` for UTC timestamps or `offset` for seconds from stream start. |
+| `vlm_mode` | No | `local` | Model placement: `remote`, `local`, or `local_shared`. |
+| `vst_internal_url` | No | — | VST URL reachable from the Agent and local VLM. |
+| `enable_audio` | No | `false` | Sends full MP4 input to supported audio-aware VLMs. |
+
+The `time_format` value must match the related VST clip and snapshot tools.
+
+### VST clip and snapshot tools
+
+Tool instance names are profile-defined. The Warehouse profile names the
+instances `vst_video_url` and `vst_picture_url`, while their registered NAT
+types are `vst.video_clip` and `vst.snapshot`.
+
+```yaml
+vst_video_url:
+  _type: vst.video_clip
+  vst_internal_url: ${VST_INTERNAL_URL}
+  vst_external_url: ${VST_EXTERNAL_URL}
+  overlay_config: true
+  time_format: iso
+  enable_audio: ${ENABLE_AUDIO:-false}
+
+vst_picture_url:
+  _type: vst.snapshot
+  vst_internal_url: ${VST_INTERNAL_URL}
+  vst_external_url: ${VST_EXTERNAL_URL}
+  overlay_config: true
+  time_format: iso
+```
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `vst_internal_url` | Yes | — | VST URL for service-to-service calls. |
+| `vst_external_url` | Yes | — | Browser-reachable VST URL returned to clients. |
+| `overlay_config` | No | `false` | Requests object-detection overlays. |
+| `time_format` | No | `offset` | Timestamp format; keep it aligned across related tools. |
+| `enable_audio` | No | `false` | `vst.video_clip` only: preserves audio in generated clips. |
+| `timeout_seconds` | No | `10.0` | `vst.snapshot` only: snapshot request timeout. |
+
+### VST sensor-list tool
+
+The Warehouse top agent uses `vst_sensor_list` to retrieve the sensor names
+currently available from VST.
+
+```yaml
+vst_sensor_list:
+  _type: vst.sensor_list
+  vst_internal_url: ${VST_INTERNAL_URL}
+```
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `vst_internal_url` | Yes | — | VST URL used to list available sensors. |
+
+### chart_generator
+
+Generates bar and pie charts and stores them in the configured object store.
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `object_store_name` | No | — | Object-store entry for generated images. |
+| `object_store_base_url` | No | `http://localhost:8000/static/` | Directory URL used to serve chart images. |
+
+### multi_incident_formatter
+
+Formats incident data with video and snapshot URLs and optional charts.
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `video_url_tool` | Yes | — | Tool that returns incident video URLs. |
+| `picture_url_tool` | Yes | — | Tool that returns incident snapshot URLs. |
+| `incidents_tool` | Yes | — | Incident-listing tool. |
+| `chart_generator_tool` | No | — | Chart tool used when chart generation is enabled. |
+| `generate_chart` | No | `false` | Generates an incident chart. |
+| `chart_base_url` | No | `http://localhost:38000/reports/` | Public base URL for charts. |
+| `display_limit` | No | `20` | Incidents displayed with full details; valid range is 1–100. |
+
+### template_report_gen
+
+Generates incident reports from VLM analysis and an optional Markdown template.
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `object_store` | Yes | — | Object-store entry used for reports. |
+| `base_url` | No | `http://localhost:8000/static` | Public report-file base URL. |
+| `template_path` | No | Empty | Report-template directory. |
+| `template_name` | No | — | Main template filename. |
+| `llm_name` | For custom templates | Empty | LLM used to populate the template. |
+| `video_understanding_tool` | For custom templates | Empty | VLM analysis tool. |
+| `picture_url_tool` | No | `vst_picture_url` | Snapshot tool. |
+| `video_url_tool` | No | — | Video clip tool. |
+| `vlm_prompts` | No | Empty list | Prompts sent to the VLM. |
+| `report_prompt` | No | Empty | LLM instructions; custom prompts must contain `{template}`. |
+| `agent_version` | No | `v1.0.0` | Agent version recorded in reports. |
+| `save_local_copy` | No | `false` | Also writes reports beneath `output_dir`. |
+| `output_dir` | No | `./agent_reports` | Directory for local report copies. |
+
+### get_fov_counts_with_chart
+
+Fetches field-of-view object counts and generates a chart.
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `get_fov_histogram_tool` | Yes | — | VA-MCP field-of-view histogram tool. |
+| `chart_generator_tool` | Yes | — | Chart-generation tool. |
+| `chart_base_url` | No | `http://localhost:38000/reports/` | Public base URL for charts. |
+
+### geolocation
+
+The Smart Cities profile can use this tool to resolve coordinates through
+OpenStreetMap.
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `timeout` | No | `10` | OpenStreetMap request timeout in seconds. |
+
+## Agents
+
+### report_agent
+
+Generates a report for an incident or directly uploaded video.
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `get_incidents_tool` | No | — | VA-MCP incident-listing tool. |
+| `get_incident_tool` | No | — | VA-MCP single-incident tool. |
+| `template_report_tool` | No | — | Templated incident-report tool. |
+| `video_report_tool` | No | — | Uploaded-video report tool used when VA-MCP is not configured. |
+
+### multi_report_agent
+
+Lists and formats multiple incidents.
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `multi_incident_tool` | Yes | — | Tool that formats incident results and media URLs. |
+| `max_incidents` | No | `10000` | Maximum fetched incidents; valid range is 1–10000. |
+
+### Top Agent Workflow
+
+The top agent routes requests to direct tools and sub-agents.
+
+```yaml
+workflow:
+  _type: top_agent
+  llm_name: llm
+  log_level: INFO
+  max_iterations: 15
+  max_history: 20
+  llm_reasoning: true
+  planning_enabled: true
+  tool_names:
+    - get_fov_counts_with_chart
+    - vst_sensor_list
+    - vst_picture_url
+  subagent_names:
+    - report_agent
+    - multi_report_agent
+  prompt: |
+    You are a routing agent...
+```
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `llm_name` | Yes | — | LLM used by the routing agent. |
+| `log_level` | No | `INFO` | Agent log level. |
+| `max_iterations` | No | `10` | Maximum routing iterations. |
+| `max_history` | No | `10` | Retained conversation messages; `0` disables history. |
+| `llm_reasoning` | No | `false` | Enables model reasoning. |
+| `planning_enabled` | No | `false` | Enables plan-then-execute routing. |
+| `tool_names` | No | Empty list | Direct tools available to the top agent. |
+| `subagent_names` | No | Empty list | Streaming sub-agents available to the top agent. |
+| `prompt` | Yes | — | Routing and tool-use instructions. |
+
+## Telemetry
+
+```yaml
+general:
+  telemetry:
+    tracing:
+      phoenix:
+        _type: phoenix
+        endpoint: ${PHOENIX_ENDPOINT}/v1/traces
+        project: WH-vss-agent-${VSS_AGENT_VERSION}
+```
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `_type` | Yes | Telemetry provider; the shipped configuration uses `phoenix`. |
+| `endpoint` | Yes | OTLP/HTTP tracing endpoint. |
+| `project` | Yes | Phoenix project used to group traces. |
+
+For setup and trace inspection, see
+[Agent Observability](/vision-agent/vss-agents/observability).
+
+## Evaluation Configuration
+
+The `eval:` section configures the evaluation framework. See
+[Agent Evaluation](/vision-agent/vss-agents/agent-evaluation) for evaluator
+types and examples.
+
+## Environment Variables
+
+Profile `.env` files and the final local Compose override file supply values to
+the Agent container. Create and select that file as described in
+[Configuration](/system-components/configuration).
+
+| Variable | Purpose |
+| --- | --- |
+| `HOST_IP` | Deployment host used to derive externally reachable URLs. |
+| `VSS_AGENT_VERSION` | Agent image-tag and Phoenix telemetry-project suffix; it is not used by the version endpoint. Set `VSS_CONTAINER_TAG` alongside it when the telemetry suffix should change without selecting a different image. |
+| `VSS_AGENT_CONFIG_FILE` | Agent configuration path inside the container. |
+| `VSS_AGENT_HOST`, `VSS_AGENT_PORT` | Agent bind address and container port; the default container port is `8000`. |
+| `HITL_ENABLED` | Defaults to `true` for the in-stack VSS Agent in Docker Compose, enabling structured prompts in the VSS UI. Set to `false` to skip those dialogs. The NemoClaw OpenClaw harness uses a separate default of `false` and asks follow-up questions in chat. |
+| `VSS_AGENT_OBJECT_STORE_TYPE` | Object-store entry used by report and chart tools. |
+| `VSS_AGENT_REPORTS_BASE_URL` | Public base URL for reports and charts. |
+| `VSS_AGENT_TEMPLATE_PATH`, `VSS_AGENT_TEMPLATE_NAME` | Report-template directory and filename. |
+| `VIDEO_ANALYSIS_MCP_URL` | VA-MCP base URL used by the MCP client. |
+| `VST_INTERNAL_URL` | VST URL reachable from the Agent and local model services. |
+| `VST_EXTERNAL_URL` | Browser-reachable VST URL placed in responses. |
+| `LLM_NAME`, `LLM_BASE_URL` | LLM model ID and endpoint root. |
+| `VLM_NAME`, `VLM_BASE_URL` | VLM model ID and endpoint root. |
+| `VLM_MODEL_TYPE` | Selects the VLM entry prefix. Valid values are `nim`, `openai`, `vllm`, and `rtvi`; the Agent configuration appends `_vlm` to resolve `nim_vlm`, `openai_vlm`, `vllm_vlm`, or `rtvi_vlm`. |
+| `VLM_MODE` | VLM placement used for media handling. |
+| `RTVI_VLM_BASE_URL` | Internal RT-VLM endpoint root used by `rtvi_vlm`. |
+| `ENABLE_AUDIO` | Preserves and forwards audio for supported VLMs; default `false`. |
+| `PHOENIX_ENDPOINT` | Phoenix OTLP/HTTP endpoint root. |
+| `NVIDIA_API_KEY`, `OPENAI_API_KEY` | Optional credentials for a selected remote provider. |
+| `HF_TOKEN` | Optional credential for gated Hugging Face model weights. |
+
+`GET /api/v1/version` reports the installed `nvidia-vss-core` version, stamped
+into the image at build time as `<release line>+tree.<source tree sha>` — the
+release line being the nearest `v*` git tag (`3.3.0-rc0+tree.<sha>` on the
+3.3.0 line before its release). No environment variable sets or overrides it;
+nothing needs to be configured for a stock image to report its version.
+
+The checked-in profile files already define the service URLs and stable
+defaults. For a Docker Compose deployment, a `user-overrides.env` file should
+contain only values you need to change. See
+[Configuration](/system-components/configuration) for file precedence.
+For example, an override can contain:
+
+```bash
+VLM_MODE=local_shared
+LLM_NAME=nvidia/nemotron-3.5-lightning-30b-a3b
+LLM_BASE_URL=http://vss-llm-nim:8000
+VLM_NAME=nim_nvidia_cosmos3-nano-reasoner_bf16-final
+VLM_BASE_URL=http://rtvi-vlm:8000
+VLM_MODEL_TYPE=rtvi
+```

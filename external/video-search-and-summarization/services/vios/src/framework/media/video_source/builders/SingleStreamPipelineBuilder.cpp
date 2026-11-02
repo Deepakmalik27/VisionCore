@@ -1,0 +1,643 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "SingleStreamPipelineBuilder.h"
+#include "../decoders/gstnvvideodecoder.h"
+#include "../decoders/decoderpool.h"
+#include "../encoders/nvvideoencoder.h"
+#include "../encoders/image_encoder.h"
+#include "../../overlays/ll_overlay.h"
+#include "../processors/transforms/ll_transform.h"
+#include "../processors/compositors/nvcompositor.h"
+#include "../senders/videosenderpool.h"
+#include "../senders/webrtc_sink_consumer.h"
+#include "../senders/videowebRTCsender.h"
+#include "../producers/native_stream_monitor.h"
+#include "../producers/nativestreamproducer.h"
+#ifdef AARCH64_PLATFORM
+#include "../producers/gstnvipcproducer.h"
+#include "../producers/ipcproducerpool.h"
+#endif
+#include "logger.h"
+#include "config.h"
+#include "nvhwdetection.h"
+#include "utils.h"
+#include "osd/llosd.h"
+
+
+
+// Implementation of SingleStreamPipelineBuilder
+void SingleStreamPipelineBuilder::buildPipeline(const PipelineConfiguration& config)
+{
+    m_config = config;
+    
+    // Create common components first
+    createCommonComponents(config);
+    
+    if (config.isPassThrough()) {
+        buildPassThroughPipeline(config);
+    } else if (config.isNativeStream()) {
+        buildNativeStreamPipeline(config);
+    } else if (config.isGodsEyeView()) {
+        buildGodsEyeViewPipeline(config);
+    } else if (config.getOverlay().enabled && config.getOverlay().bboxEnabled && 
+               GET_CONFIG().enable_ipc_path == true)
+    {
+#ifdef AARCH64_PLATFORM
+        if (isJetsonPlatform())
+        {
+            buildIPCPipeline(config);
+        }
+        else
+#endif
+        {
+            buildStandardPipeline(config);
+        }
+    }
+    else
+    {
+        buildStandardPipeline(config);
+    }
+}
+
+void SingleStreamPipelineBuilder::buildPassThroughPipeline(const PipelineConfiguration& config)
+{
+    LOG(info) << "Alert: Pass Through Mode Enabled.. !" << endl;
+    
+    std::string codec = config.getCodec();
+    if (!codec.empty() && !iequals(codec, "H264") && !iequals(codec, "H265")) {
+        std::string unsupported_error = codec + " codec not supported in pass through mode";
+        LOG(error) << unsupported_error << endl;
+        throw std::invalid_argument(unsupported_error);
+    }
+    
+    VideoSenderPool* pool = VideoSenderPool::getInstance();
+    m_videoSender = pool->getVideoSender(config.getUri());
+    if (m_videoSender == nullptr) {
+        LOG(info) << "VideoSender not found in pool, adding stream: " << config.getUri() << endl;
+        pool->addStream(config.getUri());
+        m_videoSender = pool->getVideoSender(config.getUri());
+        
+        if (m_videoSender == nullptr) {
+            LOG(error) << "CRITICAL: Failed to create VideoWebRTCSender for URI: " << config.getUri() << endl;
+            throw std::runtime_error("Failed to create VideoWebRTCSender for pass-through mode");
+        }
+    }
+    
+    LOG(info) << "VideoSender created successfully for pass-through mode" << endl;
+    std::string deviceId = config.getDeviceId();
+    m_videoSender->createPassThroughMode(deviceId);
+}
+
+void SingleStreamPipelineBuilder::buildNativeStreamPipeline(const PipelineConfiguration& config)
+{
+    m_nativeStreamProducer = NativeStreamMonitor::getInstance()->getNativeStreamProducer(config.getDeviceId());
+    if (m_nativeStreamProducer == nullptr) {
+        LOG(error) << "Native stream producer is not found for deviceId:" << config.getDeviceId() << endl;
+        throw std::invalid_argument("NativeStreamProducer instance not found error");
+    }
+    m_nativeStreamProducer->setOptions(config.getOptions());
+}
+
+void SingleStreamPipelineBuilder::buildGodsEyeViewPipeline(const PipelineConfiguration& config)
+{
+    LOG(info) << "Creating decoder for file: " << config.getUri() << endl;
+    string consumer_name = "video_decoder_gods_eye_" + config.getPeerId();
+    m_decoder = std::make_shared<GstNvVideoDecoder>(consumer_name, config.getUri(), config.getOptions());
+    m_decoder->create(true);
+    
+    // Set up producer for live playback (including live image capture)
+    if (config.isLivePlayback()) {
+        setupDecoderWithProducer(m_decoder, config.getUri(), config);
+    }
+}
+
+#ifdef AARCH64_PLATFORM
+void SingleStreamPipelineBuilder::buildIPCPipeline(const PipelineConfiguration& config)
+{
+    LOG(info) << "Creating IPC Producer object" << endl;
+    string stream_id = getStreamIdFromUrl(config.getUri(), "/live/");
+    IPCProducerPool* pool = IPCProducerPool::getInstance();
+    m_ipcProducer = pool->getIPCProducer(stream_id);
+    if (m_ipcProducer == nullptr) {
+        pool->addStream(stream_id);
+        m_ipcProducer = pool->getIPCProducer(stream_id);
+        m_ipcProducer->setOptions(config.getOptions());
+        m_ipcProducer->create();
+    }
+}
+#endif
+
+void SingleStreamPipelineBuilder::buildStandardPipeline(const PipelineConfiguration& config)
+{
+    LOG(info) << "Building standard pipeline" << endl;
+    
+    // Check if we need a new decoder instance (recorded playback, image capture, or new_dec option)
+    bool needNewDecoder = config.isRecordedPlayback() || config.isImageCapture();
+    const auto& opts = config.getOptions();
+    if (opts.find("new_dec") != opts.end() && opts.at("new_dec") == "true") {
+        needNewDecoder = true;
+        LOG(info) << "new_dec option detected - creating dedicated decoder instance" << endl;
+    }
+    
+    if (needNewDecoder) {
+        LOG(info) << "Creating new decoder instance for recorded/image capture (not using pool)" << endl;
+        string consumer_name = "video_decoder_" + config.getPeerId();
+        m_decoder = std::make_shared<GstNvVideoDecoder>(consumer_name, config.getUri(), config.getOptions());
+        if (m_decoder->create(true) == -1) {
+            LOG(error) << "Error in Creating Pipeline" << endl;
+            throw std::invalid_argument("Error in Creating Pipeline");
+        }
+        LOG(info) << "New decoder instance created successfully" << endl;
+        
+        // Set up producer for live playback (including live image capture)
+        if (config.isLivePlayback() || config.isCloudStream() || config.isImageCapture() || config.getSensorType() == SENSOR_TYPE_MMS_ONVIF) {
+            setupDecoderWithProducer(m_decoder, config.getUri(), config);
+        }
+        
+        // For live image capture, we still need shared stream capability
+        if (config.isLivePlayback() && config.isImageCapture() && !config.isHlsPlayback()) {
+            m_decoder->setNeedSharedStream();
+            LOG(info) << "Set shared stream for live image capture" << endl;
+        }
+        else if (config.getSensorType() == SENSOR_TYPE_MMS_ONVIF) {
+            m_decoder->setNeedSharedStream();
+        }
+        // A dedicated decoder on a live source is fed by the stream monitor, and
+        // a decoder only registers itself as a consumer of that producer when it
+        // is marked as needing the shared stream.  Without this it starts,
+        // reports success and then sits at zero frames for good.
+        else if (config.isLivePlayback() && !config.isHlsPlayback()) {
+            m_decoder->setNeedSharedStream();
+            LOG(info) << "Dedicated live decoder registered for the shared stream" << endl;
+        }
+    } else {
+        LOG(info) << "Using decoder pool for live streaming" << endl;
+        // The pool finds or creates the decoder in one step and records this peer
+        // as one of its viewers, so a decoder can no longer be created twice for
+        // the same url, nor torn down while another viewer is still watching.
+        DecoderPool* pool = DecoderPool::getInstance();
+        m_decoder = pool->acquireDecoder(config.getUri(), config.getPeerId(), config.getOptions());
+
+        if (m_decoder) {
+            m_pooledDecoder = true;
+            m_decoder->setOptions(config.getOptions());
+
+            // IMediaDataProducer integration for single decoder case
+            if (config.isLivePlayback()) {
+                setupDecoderWithProducer(m_decoder, config.getUri(), config);
+            }
+
+            if (!config.isHlsPlayback()) {
+                m_decoder->setNeedSharedStream();
+            }
+        }
+        else {
+            // As before, a decoder that could not be built leaves m_decoder null and
+            // the pipeline carries on without one, rather than failing the request.
+            LOG(error) << "Error in Creating Pipeline for " << config.getUri() << endl;
+        }
+    }
+}
+
+void SingleStreamPipelineBuilder::destroyPipeline()
+{
+    LOG(info) << "Destroying single stream pipeline" << endl;
+    
+    try {
+        // Phase 1: Hand the decoder back.
+        //
+        // A pooled decoder may be shared with other viewers (another live view or
+        // a video wall tile on the same camera), so this pipeline must not decide
+        // on its own to shut it down. releaseDecoder() detaches this peer, counts
+        // what is left, and only tears the decoder down when this was the last
+        // viewer. Detaching and counting happen together under the pool lock, so a
+        // viewer arriving mid-teardown cannot attach to a decoder that is going away.
+        if (m_pooledDecoder && m_decoder) {
+            try {
+                DecoderPool::getInstance()->releaseDecoder(m_decoder, m_config.getUri(), m_config.getPeerId());
+            } catch (const std::exception& e) {
+                LOG(error) << "Exception while releasing pooled decoder: " << e.what() << endl;
+            }
+        }
+        // Private decoder (recorded playback, image capture, gods eye view, new_dec):
+        // owned outright by this pipeline, so tear it down here. It was never in the
+        // pool, so the pool must not be touched for it.
+        else if (m_decoder) {
+            try {
+                m_decoder->removeConsumer(m_config.getPeerId());
+                LOG(info) << "Removed consumer from decoder" << endl;
+            } catch (const std::exception& e) {
+                LOG(error) << "Exception while removing consumer: " << e.what() << endl;
+            }
+
+            if ((m_config.isCloudStream() || m_config.isImageCapture()) && m_decoder->getProducer()) {
+                try {
+                    clearDecoderProducer(m_decoder, m_config);
+                    LOG(info) << "Cleared producer from decoder" << endl;
+                } catch (const std::exception& e) {
+                    LOG(error) << "Exception while clearing producer: " << e.what() << endl;
+                }
+            }
+
+            // Explicit destroy() is required: the decoder is registered with
+            // StreamMonitor, which holds a reference to it, and destroy_internal()
+            // is what unregisters. Waiting for the destructor would deadlock that
+            // cycle, because the destructor cannot run while the registration holds
+            // the reference.
+            try {
+                m_decoder->destroy(true);
+            } catch (const std::exception& e) {
+                LOG(error) << "Exception while destroying decoder: " << e.what() << endl;
+            }
+        }
+
+        // Phase 2: Clear component references
+        // Releases this pipeline's reference to the decoder. Together with the
+        // teardown above and CommonVideoSource cleanup (from RemoveSink), the
+        // last reference goes away and the destructor runs.
+        m_decoder.reset();
+        m_videoSender.reset();
+        m_nativeStreamProducer.reset();
+#ifdef AARCH64_PLATFORM
+        m_ipcProducer.reset();
+#endif
+
+        // Phase 3: Destroy common components (encoder, transform, etc.)
+        destroyCommonComponents();
+        
+    } catch (const std::exception& e) {
+        LOG(error) << "Exception during single stream pipeline destruction: " << e.what() << endl;
+    } catch (...) {
+        LOG(error) << "Unknown exception during single stream pipeline destruction" << endl;
+    }
+    
+    LOG(info) << "Single stream pipeline destruction completed" << endl;
+}
+
+void SingleStreamPipelineBuilder::setupConsumerPipeline(const PipelineConfiguration& config)
+{
+    LOG(info) << "==========================================" << endl;
+    LOG(info) << "SETTING UP SINGLE STREAM PIPELINE" << endl;
+    LOG(info) << "==========================================" << endl;
+    LOG(info) << "Peer ID: " << config.getPeerId() << endl;
+    LOG(info) << "URI: " << config.getUri() << endl;
+    LOG(info) << "Playback Type: " << (config.isLivePlayback() ? "LIVE" : "RECORDED") << endl;
+    LOG(info) << "Image Capture: " << (config.isImageCapture() ? "YES" : "NO") << endl;
+    LOG(info) << "Pass Through: " << (config.isPassThrough() ? "YES" : "NO") << endl;
+    LOG(info) << "Native Stream: " << (config.isNativeStream() ? "YES" : "NO") << endl;
+    
+    // Log overlay configuration details
+    LOG(info) << "OVERLAY CONFIGURATION:" << endl;
+    LOG(info) << "  Overlay Enabled: " << (config.getOverlay().enabled ? "YES" : "NO") << endl;
+    LOG(info) << "  Bbox Enabled: " << (config.getOverlay().bboxEnabled ? "YES" : "NO") << endl;
+    LOG(info) << "  Sensor ID: " << config.getOverlay().sensorId << endl;
+    LOG(info) << "  Tag: " << config.getOverlay().tag << endl;
+    
+    // Log specific overlay options from the raw options map
+    const auto& opts = config.getOptions();
+    LOG(info) << "RAW OVERLAY OPTIONS:" << endl;
+    if (opts.find("overlay") != opts.end()) {
+        LOG(info) << "  overlay = " << opts.at("overlay") << endl;
+    }
+    if (opts.find("overlayBbox") != opts.end()) {
+        LOG(info) << "  overlayBbox = " << opts.at("overlayBbox") << endl;
+    }
+    if (opts.find("overlayDebug") != opts.end()) {
+        LOG(info) << "  overlayDebug = " << opts.at("overlayDebug") << endl;
+    }
+    if (opts.find("tripwire") != opts.end()) {
+        LOG(info) << "  tripwire = " << opts.at("tripwire") << endl;
+    }
+    if (opts.find("roi") != opts.end()) {
+        LOG(info) << "  roi = " << opts.at("roi") << endl;
+    }
+    if (opts.find("bboxDebug") != opts.end()) {
+        LOG(info) << "  bboxDebug = " << opts.at("bboxDebug") << endl;
+    }
+    if (opts.find("overlayShowSensorName") != opts.end()) {
+        LOG(info) << "  overlayShowSensorName = " << opts.at("overlayShowSensorName") << endl;
+    }
+    
+    // Log overlay component status
+    LOG(info) << "OVERLAY COMPONENT STATUS:" << endl;
+    LOG(info) << "  m_overlay created: " << (getOverlay() ? "YES" : "NO") << endl;
+    if (getOverlay()) {
+        LOG(info) << "  m_overlay->isOverlayEnabled(): " << (getOverlay()->isOverlayEnabled() ? "YES" : "NO") << endl;
+        LOG(info) << "  m_overlay->isBboxEnabled(): " << (getOverlay()->isBboxEnabled() ? "YES" : "NO") << endl;
+    }
+    LOG(info) << "  GET_OSD_INSTANCE()->isError(): " << (GET_OSD_INSTANCE()->isError() ? "YES" : "NO") << endl;
+    
+    // Log transform component status
+    LOG(info) << "TRANSFORM COMPONENT STATUS:" << endl;
+    LOG(info) << "  m_transform created: " << (getTransform() ? "YES" : "NO") << endl;
+    LOG(info) << "  m_transformSink created: " << (getTransformSink() ? "YES" : "NO") << endl;
+    LOG(info) << "  m_imageEncoder created: " << (getImageEncoder() ? "YES" : "NO") << endl;
+    LOG(info) << "==========================================" << endl;
+    
+    // Handle image capture pipeline
+    if (config.isImageCapture()) {
+        LOG(info) << "🎯 IMAGE CAPTURE PIPELINE SETUP" << endl;
+        LOG(info) << "==========================================" << endl;
+        
+        // Validate that we have the required components for image capture
+        if (!getImageEncoder()) {
+            LOG(error) << "❌ Image encoder not initialized for image capture" << endl;
+            return;
+        }
+
+        if (m_decoder) {
+            // Check if overlay is enabled for image capture
+            if (getOverlay() && !GET_OSD_INSTANCE()->isError() && getOverlay()->isOverlayEnabled()) {
+                LOG(info) << "🎨 IMAGE CAPTURE WITH OVERLAY PIPELINE" << endl;
+                
+                if (getTransform() && getTransformSink()) {
+                    // CORRECT: Decoder -> Transform -> Overlay -> TransformSink -> ImageEncoder
+                    m_decoder->setConsumer(config.getPeerId(), getTransform());
+                    getTransform()->setConsumer(getOverlay());
+                    getOverlay()->setConsumer(getTransformSink());
+                    getTransformSink()->setConsumer(getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [Decoder] → [Transform] → [Overlay] → [TransformSink] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   📸 Image with overlay will be captured and returned as JPEG buffer" << endl;
+                } else if (getTransform()) {
+                    // Fallback without transformSink: Decoder -> Transform -> Overlay -> ImageEncoder
+                    m_decoder->setConsumer(config.getPeerId(), getTransform());
+                    getTransform()->setConsumer(getOverlay());
+                    getOverlay()->setConsumer(getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [Decoder] → [Transform] → [Overlay] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   ⚠️  Missing TransformSink - may affect image quality" << endl;
+                } else {
+                    // Fallback: Decoder -> Overlay -> ImageEncoder (direct connection)
+                    m_decoder->setConsumer(config.getPeerId(), getOverlay());
+                    getOverlay()->setConsumer(getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [Decoder] → [Overlay] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   ⚠️  Missing Transform components - may affect image quality" << endl;
+                }
+            } else {
+                LOG(info) << "📸 IMAGE CAPTURE WITHOUT OVERLAY PIPELINE" << endl;
+                
+                // For image capture without overlay: Decoder -> Transform -> ImageEncoder
+                if (getTransform()) {
+                    m_decoder->setConsumer(config.getPeerId(), getTransform());
+                    getTransform()->setConsumer(getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [Decoder] → [Transform] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   📸 Image will be captured and returned as JPEG buffer" << endl;
+                } else {
+                    // Fallback: Decoder -> ImageEncoder (direct connection)
+                    m_decoder->setConsumer(config.getPeerId(), getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [Decoder] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   📸 Image will be captured and returned as JPEG buffer" << endl;
+                }
+            }
+        } else if (m_nativeStreamProducer) {
+            // Check if overlay is enabled for native stream image capture
+            if (getOverlay() && !GET_OSD_INSTANCE()->isError() && getOverlay()->isOverlayEnabled()) {
+                LOG(info) << "🎨 NATIVE STREAM IMAGE CAPTURE WITH OVERLAY PIPELINE" << endl;
+                
+                if (getTransform() && getTransformSink()) {
+                    // CORRECT: NativeStream -> Transform -> Overlay -> TransformSink -> ImageEncoder
+                    m_nativeStreamProducer->setConsumer(config.getPeerId(), getTransform());
+                    getTransform()->setConsumer(getOverlay());
+                    getOverlay()->setConsumer(getTransformSink());
+                    getTransformSink()->setConsumer(getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [NativeStreamProducer] → [Transform] → [Overlay] → [TransformSink] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   📸 Native stream image with overlay will be captured and returned as JPEG buffer" << endl;
+                } else if (getTransform()) {
+                    // Fallback without transformSink: NativeStream -> Transform -> Overlay -> ImageEncoder
+                    m_nativeStreamProducer->setConsumer(config.getPeerId(), getTransform());
+                    getTransform()->setConsumer(getOverlay());
+                    getOverlay()->setConsumer(getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [NativeStreamProducer] → [Transform] → [Overlay] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   ⚠️  Missing TransformSink - may affect image quality" << endl;
+                } else {
+                    // Fallback: NativeStream -> Overlay -> ImageEncoder (direct connection)
+                    m_nativeStreamProducer->setConsumer(config.getPeerId(), getOverlay());
+                    getOverlay()->setConsumer(getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [NativeStreamProducer] → [Overlay] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   ⚠️  Missing Transform components - may affect image quality" << endl;
+                }
+            } else {
+                LOG(info) << "📸 NATIVE STREAM IMAGE CAPTURE WITHOUT OVERLAY PIPELINE" << endl;
+                
+                // For native stream image capture without overlay: NativeStream -> Transform -> ImageEncoder
+                if (getTransform()) {
+                    m_nativeStreamProducer->setConsumer(config.getPeerId(), getTransform());
+                    getTransform()->setConsumer(getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [NativeStreamProducer] → [Transform] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   📸 Native stream image will be captured and returned as JPEG buffer" << endl;
+                } else {
+                    // Fallback: NativeStream -> ImageEncoder (direct connection)
+                    m_nativeStreamProducer->setConsumer(config.getPeerId(), getImageEncoder());
+                    LOG(info) << "✅ Pipeline: [NativeStreamProducer] → [ImageEncoder] → [JPEG Output]" << endl;
+                    LOG(info) << "   📸 Native stream image will be captured and returned as JPEG buffer" << endl;
+                }
+            }
+        } else {
+            LOG(error) << "❌ No decoder or native stream producer available for image capture" << endl;
+            return;
+        }
+
+        // Set quality for the decoder if available
+        if (m_decoder) {
+            int resizeWidth = 0, resizeHeight = 0;
+            if (opts.find("resize_width") != opts.end() && opts.find("resize_height") != opts.end())
+            {
+                resizeWidth = stringToInt(opts.at("resize_width"), 0);
+                resizeHeight = stringToInt(opts.at("resize_height"), 0);
+            }
+            // Set target resolution in decoder if transform is present and resize dimensions provided
+            if (getTransform() && resizeWidth > 0 && resizeHeight > 0)
+            {
+                m_decoder->setQuality(config.getPeerId(), "custom", resizeWidth, resizeHeight);
+                LOG(info) << "   ⚙️  Quality set to: custom, " << resizeWidth << "x" << resizeHeight << endl;
+            }
+            else
+            {
+                m_decoder->setQuality(config.getPeerId(), config.getQuality().quality);
+                LOG(info) << "   ⚙️  Quality set to: " << config.getQuality().quality << endl;
+            }
+        }
+
+        LOG(info) << "==========================================" << endl;
+        return; // Exit early for image capture
+    }
+    
+    // Regular pipeline setup (non-image capture)
+    // DASH without an overlay republishes the recording's own bitstream: the
+    // decoder parses it and hands it straight to the packager.  Nothing is
+    // decoded, transformed or encoded, which also preserves the recording's
+    // GOP so segments fall where the manifest says they do.
+    // A session that exists to re-encode must not take this path: republishing
+    // the source bitstream is the one thing it was created to avoid, and the
+    // packager is built around H.264 so a foreign codec simply stops here.
+    if (config.isDashPlayback() && !config.getOverlay().enabled && !config.isDashTranscode()
+        && m_decoder && getDashConsumer())
+    {
+        m_decoder->setConsumer(config.getPeerId(), getDashConsumer());
+        m_decoder->setLatencyDropExempt(config.getPeerId());
+        LOG(info) << "✅ Complete Pipeline: [Decoder (parse only)] → [DASH packager]" << endl;
+        return;
+    }
+
+    LOG(info) << "🎬 REGULAR VIDEO PIPELINE SETUP" << endl;
+    LOG(info) << "==========================================" << endl;
+    
+    if (m_decoder) {
+        LOG(info) << "📹 Using GstNvVideoDecoder as source" << endl;
+        
+        if (getOverlay() && !GET_OSD_INSTANCE()->isError() && getOverlay()->isOverlayEnabled()) {
+            LOG(info) << "🎨 OVERLAY PIPELINE (with OSD enabled)" << endl;
+            
+            // Decoder -> Transform -> Overlay -> Encoder -> WebRTC
+            if (getTransform()) {
+                m_decoder->setConsumer(config.getPeerId(), getTransform());
+                getTransform()->setConsumer(getOverlay());
+                LOG(info) << "   🔗 [Decoder] → [Transform] → [Overlay]" << endl;
+            } else {
+                m_decoder->setConsumer(config.getPeerId(), getOverlay());
+                LOG(info) << "   🔗 [Decoder] → [Overlay]" << endl;
+            }
+            
+            if (NvHwDetection::getInstance()->m_useNvV4l2Enc == true) {
+                if (getEncoder() && getWebrtcConsumer()) {
+                    getOverlay()->setConsumer(getEncoder());
+                    getEncoder()->setConsumer(getSinkConsumer(config));
+                    LOG(info) << "   🔗 [Overlay] → [HW Encoder] → [WebRTC Consumer]" << endl;
+                    LOG(info) << "✅ Complete Pipeline: [Decoder] → [Transform] → [Overlay] → [HW Encoder] → [WebRTC]" << endl;
+                }
+            } else {
+                if (getTransformSink() && getWebrtcConsumer()) {
+                    getOverlay()->setConsumer(getTransformSink());
+                    getTransformSink()->setConsumer(getSinkConsumer(config));
+                    LOG(info) << "   🔗 [Overlay] → [TransformSink] → [WebRTC Consumer]" << endl;
+                    LOG(info) << "✅ Complete Pipeline: [Decoder] → [Transform] → [Overlay] → [TransformSink] → [WebRTC]" << endl;
+                }
+            }
+        } else {
+            LOG(info) << "🎬 STANDARD PIPELINE (no overlay)" << endl;
+            
+            // Decoder -> Transform -> Encoder -> WebRTC (no overlay)
+            if (NvHwDetection::getInstance()->m_useNvV4l2Enc == true) {
+                if (getTransform() && getEncoder() && getWebrtcConsumer()) {
+                    m_decoder->setConsumer(config.getPeerId(), getTransform());
+                    getTransform()->setConsumer(getEncoder());
+                    getEncoder()->setConsumer(getSinkConsumer(config));
+                    LOG(info) << "✅ Complete Pipeline: [Decoder] → [Transform] → [HW Encoder] → [WebRTC]" << endl;
+                }
+            } else {
+                if (getTransformSink() && getWebrtcConsumer()) {
+                    m_decoder->setConsumer(config.getPeerId(), getTransformSink());
+                    getTransformSink()->setConsumer(getSinkConsumer(config));
+                    LOG(info) << "✅ Complete Pipeline: [Decoder] → [TransformSink] → [WebRTC]" << endl;
+                }
+            }
+        }
+    } else if (m_nativeStreamProducer) {
+        LOG(info) << "🌐 Using NativeStreamProducer as source" << endl;
+        
+        if (getOverlay() && !GET_OSD_INSTANCE()->isError() && getOverlay()->isOverlayEnabled()) {
+            LOG(info) << "🎨 NATIVE STREAM OVERLAY PIPELINE" << endl;
+            if (getTransform()) {
+                m_nativeStreamProducer->setConsumer(config.getPeerId(), getTransform());
+                getTransform()->setConsumer(getOverlay());
+                LOG(info) << "✅ Complete Pipeline: [NativeStream] → [Transform] → [Overlay]" << endl;
+            }
+        } else {
+            LOG(info) << "🎬 NATIVE STREAM STANDARD PIPELINE" << endl;
+            if (NvHwDetection::getInstance()->m_useNvV4l2Enc == true) {
+                if (getTransform() && getEncoder()) {
+                    m_nativeStreamProducer->setConsumer(config.getPeerId(), getTransform());
+                    getTransform()->setConsumer(getEncoder());
+                    LOG(info) << "✅ Complete Pipeline: [NativeStream] → [Transform] → [HW Encoder]" << endl;
+                }
+            } else {
+                if (getTransformSink()) {
+                    m_nativeStreamProducer->setConsumer(config.getPeerId(), getTransformSink());
+                    LOG(info) << "✅ Complete Pipeline: [NativeStream] → [TransformSink]" << endl;
+                }
+            }
+        }
+    }
+#ifdef AARCH64_PLATFORM
+    else if (m_ipcProducer) {
+        LOG(info) << "🔗 Using IPC Producer as source" << endl;
+        LOG(info) << "🎨 IPC OVERLAY PIPELINE (with bbox enabled)" << endl;
+
+        if (getOverlay() && !GET_OSD_INSTANCE()->isError() && getOverlay()->isBboxEnabled()) {
+            if (getTransform()) {
+                m_ipcProducer->setConsumer(config.getPeerId(), getTransform());
+                getTransform()->setConsumer(getOverlay());
+                LOG(info) << "✅ Complete Pipeline: [IPC Producer] → [Transform] → [Overlay]" << endl;
+            }
+        }
+    }
+#endif
+    
+    // Set original frame sizes for all components
+    LOG(info) << "⚙️  CONFIGURING COMPONENT FRAME SIZES" << endl;
+    LOG(info) << "==========================================" << endl;
+    
+    if (getOverlay()) {
+        getOverlay()->setOriginalFrameSize();
+        LOG(info) << "   📐 Overlay frame size configured" << endl;
+    }
+    if (getTransform()) {
+        getTransform()->setOriginalFrameSize();
+        LOG(info) << "   📐 Transform frame size configured" << endl;
+    }
+    if (getTransformSink()) {
+        getTransformSink()->setOriginalFrameSize();
+        LOG(info) << "   📐 TransformSink frame size configured" << endl;
+    }
+    
+    /* A DASH sink reads segments well behind the live edge, so it must not lose
+    ** frames to the interactive latency drop.  The decoder is pooled and shared
+    ** with WebRTC viewers, so the exemption is recorded against this peer's sink
+    ** only and leaves every other viewer's behaviour untouched. */
+    if (config.isDashPlayback() && m_decoder)
+    {
+        m_decoder->setLatencyDropExempt(config.getPeerId());
+        LOG(info) << "   DASH sink exempted from live latency frame drop" << endl;
+    }
+
+    LOG(info) << "==========================================" << endl;
+    LOG(info) << "🎉 SINGLE STREAM PIPELINE SETUP COMPLETE" << endl;
+    LOG(info) << "==========================================" << endl;
+}
+
+void SingleStreamPipelineBuilder::startPipeline()
+{
+    // Set up consumer pipeline first
+    setupConsumerPipeline(m_config);
+}
+
+void SingleStreamPipelineBuilder::stopPipeline()
+{
+    // Pooled decoders are released in destroyPipeline(). Removing their sink
+    // here bypasses DecoderPool ownership accounting and can stop a decoder
+    // while another acquired viewer is still attaching its consumer chain.
+    if (m_decoder && !m_pooledDecoder) {
+        m_decoder->removeConsumer(m_config.getPeerId());
+    } else if (m_nativeStreamProducer) {
+        m_nativeStreamProducer->removeConsumer(m_config.getPeerId());
+    }
+#ifdef AARCH64_PLATFORM
+    else if (m_ipcProducer) {
+        m_ipcProducer->removeConsumer(m_config.getPeerId());
+    }
+#endif
+}

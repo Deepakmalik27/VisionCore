@@ -1,0 +1,458 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { Button } from '@nvidia/foundations-react-core';
+import { IconInbox, IconCheck } from '@tabler/icons-react';
+import { Whisper, Tooltip } from 'rsuite';
+import { SearchData, QueryDataContext } from '../types';
+import { formatTime, parseDateAsLocal } from '../utils/Formatter';
+
+/** How long a card waits for the VST clip request before unlocking Retry. */
+export const SEARCH_CLIP_PLAYBACK_TIMEOUT_MS = 15_000;
+
+function settleWithTimeout<T>(
+  work: Promise<T> | T,
+  timeoutMs: number,
+): { promise: Promise<T>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let finished = false;
+
+  const clearTimer = () => {
+    if (!timer) return;
+    clearTimeout(timer);
+    timer = null;
+  };
+
+  const promise = new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => {
+      timer = null;
+      if (finished) return;
+      finished = true;
+      reject(new Error('Search clip playback timed out'));
+    }, timeoutMs);
+
+    Promise.resolve(work).then(
+      (value) => {
+        clearTimer();
+        if (finished) return;
+        finished = true;
+        resolve(value);
+      },
+      (error) => {
+        clearTimer();
+        if (finished) return;
+        finished = true;
+        reject(error);
+      },
+    );
+  });
+
+  return { promise, cancel: clearTimer };
+}
+
+const AddContextButton: React.FC<{ item: SearchData; onAddContext?: (ctx: QueryDataContext) => void }> = ({ item, onAddContext }) => {
+  const [addedState, setAddedState] = useState<'idle' | 'success'>('idle');
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    };
+  }, []);
+
+  const handleClick = useCallback(() => {
+    if (!onAddContext) return;
+    const ctx: QueryDataContext = {
+      id: `${item.video_name}-${item.start_time}-${item.end_time}`,
+      label: item.video_name,
+      // contextType: UI-only (chip tooltip / future grouping); not sent to the backend — see Chat onSend.
+      contextType: 'media/video',
+      data: {
+        sensorName: item.video_name,
+        startTime: item.start_time,
+        endTime: item.end_time,
+        mediaType: 'sensor-clip',
+      },
+    };
+    onAddContext(ctx);
+    setAddedState('success');
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => {
+      setAddedState('idle');
+      timeoutRef.current = null;
+    }, 2000);
+  }, [item.video_name, item.start_time, item.end_time, onAddContext]);
+
+  return (
+    <Button
+      kind="primary"
+      size="small"
+      className="flex-shrink-0 text-xs"
+      onClick={handleClick}
+      disabled={!onAddContext}
+      title="Add sensor context to chat"
+    >
+      {addedState === 'success' ? (
+        <>
+          <IconCheck className="w-2.5 h-2.5 shrink-0" style={{ color: 'inherit' }} />
+          <span>Added</span>
+        </>
+      ) : (
+        <span>+ Chat</span>
+      )}
+    </Button>
+  );
+};
+
+interface VideoSearchListProps {
+  data: SearchData[];
+  loading: boolean;
+  error: string | null;
+  isDark: boolean;
+  onRefresh: () => void;
+  /** Resolving to `false` means the clip could not be loaded, and the card shows a notice. */
+  onPlayVideo: (data: SearchData, showObjectsBbox: boolean) => void | Promise<boolean | void>;
+  showObjectsBbox?: boolean;
+  onAddContext?: (ctx: QueryDataContext) => void;
+}
+
+const EmptyState: React.FC<{ isDark: boolean }> = ({ isDark }) => (
+  <div className="p-4">
+    <div className="flex flex-col items-center justify-center py-8 text-center">
+      <IconInbox className={`w-12 h-12 mb-3 ${isDark ? 'text-gray-500' : 'text-gray-400'}`} stroke={1.5} />
+      <p className={isDark ? 'text-gray-400' : 'text-gray-600'}>Results will update here</p>
+    </div>
+  </div>
+);
+
+interface ErrorStateProps {
+  error: string;
+  isDark: boolean;
+  onRefresh: () => void;
+}
+
+const ErrorState: React.FC<ErrorStateProps> = ({ error, isDark, onRefresh }) => (
+  <div className="flex items-center justify-center h-full p-4">
+    <div className={`w-full max-w-2xl p-6 rounded-lg ${isDark ? 'bg-red-500/10 border border-red-500/20' : 'bg-red-50 border border-red-200'}`}>
+      <div className="flex items-center gap-2 mb-3">
+        <svg className={`w-5 h-5 flex-shrink-0 ${isDark ? 'text-red-400' : 'text-red-600'}`} fill="currentColor" viewBox="0 0 20 20">
+          <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+        </svg>
+        <p className={`font-bold text-lg ${isDark ? 'text-red-400' : 'text-red-700'}`}>Error loading items</p>
+      </div>
+      <div 
+        className={`text-sm mb-4 p-3 rounded max-h-48 overflow-y-auto ${isDark ? 'bg-gray-800/50 text-gray-300' : 'bg-white text-red-600 border border-red-100'}`}
+        style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+      >
+        {error}
+      </div>
+      <div className="flex justify-end">
+        <button 
+          onClick={onRefresh}
+          className="px-5 py-2.5 rounded-md font-medium transition-colors bg-blue-600 hover:bg-blue-700 text-white"
+        >
+          Retry
+        </button>
+      </div>
+    </div>
+  </div>
+);
+
+const CRITIC_SORT_ORDER: Record<string, number> = {
+  confirmed: 0,
+  unverified: 1,
+  rejected: 2,
+};
+
+function getCriticSortRank(item: SearchData): number {
+  return item.critic_result
+    ? (CRITIC_SORT_ORDER[item.critic_result.result] ?? 3)
+    : 3;
+}
+
+interface VideoCardProps {
+  item: SearchData;
+  index: number;
+  isDark: boolean;
+  showObjectsBbox: boolean;
+  onPlayVideo: (data: SearchData, showObjectsBbox: boolean) => void | Promise<boolean | void>;
+  onAddContext?: (ctx: QueryDataContext) => void;
+}
+
+const VideoCard: React.FC<VideoCardProps> = ({
+  item,
+  index,
+  isDark,
+  showObjectsBbox,
+  onPlayVideo,
+  onAddContext,
+}) => {
+  const [isOpeningVideo, setIsOpeningVideo] = useState(false);
+  const [playbackFailed, setPlaybackFailed] = useState(false);
+  const isMountedRef = useRef(true);
+  const playAttemptRef = useRef(0);
+  const cancelPlaybackTimeoutRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      cancelPlaybackTimeoutRef.current?.();
+    };
+  }, []);
+
+  // The VST clip request can fail (e.g. no recorded footage for the matched
+  // window), in which case the modal never opens. Surface that instead of
+  // silently dropping back to the play icon. A hung request must also
+  // time out so Play/Retry are not disabled indefinitely.
+  const handleOpenVideo = useCallback(async () => {
+    if (isOpeningVideo) return;
+    const attempt = ++playAttemptRef.current;
+    setIsOpeningVideo(true);
+    setPlaybackFailed(false);
+    const { promise, cancel } = settleWithTimeout(
+      onPlayVideo(item, showObjectsBbox),
+      SEARCH_CLIP_PLAYBACK_TIMEOUT_MS,
+    );
+    cancelPlaybackTimeoutRef.current = cancel;
+    try {
+      const opened = await promise;
+      if (!isMountedRef.current || attempt !== playAttemptRef.current) return;
+      if (opened === false) setPlaybackFailed(true);
+    } catch {
+      if (!isMountedRef.current || attempt !== playAttemptRef.current) return;
+      setPlaybackFailed(true);
+    } finally {
+      if (attempt === playAttemptRef.current) {
+        cancelPlaybackTimeoutRef.current = null;
+      }
+      if (isMountedRef.current && attempt === playAttemptRef.current) {
+        setIsOpeningVideo(false);
+      }
+    }
+  }, [isOpeningVideo, item, onPlayVideo, showObjectsBbox]);
+
+  return (
+    <div 
+      data-testid="search-result-card"
+      key={`${item.video_name}-${index}`}
+      className={`rounded-lg overflow-hidden bg-white shadow-sm dark:bg-neutral-900 w-[280px] min-w-[280px] max-w-[280px] box-border border ${
+        item.critic_result?.result === 'confirmed'
+          ? 'border-green-500 dark:border-green-400'
+          : item.critic_result?.result === 'rejected'
+          ? 'border-red-500 dark:border-red-400'
+          : item.critic_result?.result === 'unverified'
+          ? 'border-yellow-500 dark:border-yellow-400'
+          : 'border-gray-200 dark:border-gray-600'
+      }`}
+    >
+      <div className="p-4 pb-0 space-y-3">
+        <div className="flex items-center gap-2">
+          <Whisper
+            placement="top"
+            trigger="hover"
+            speaker={<Tooltip>{item.video_name}</Tooltip>}
+          >
+            <h3 className="font-medium text-sm truncate cursor-default flex-1 min-w-0">
+              {item.video_name}
+            </h3>
+          </Whisper>
+          {onAddContext ? <AddContextButton item={item} onAddContext={onAddContext} /> : null}
+        </div>
+        <div className="rounded-lg relative aspect-video group cursor-pointer">
+          <div className="rounded-lg absolute inset-0 bg-gradient-to-br from-gray-700 to-gray-900">
+            <img src={item.screenshot_url} alt={item.video_name} className="rounded-lg w-full h-full object-cover" />
+          </div>
+          
+          <button
+            type="button"
+            data-testid="video-play-overlay"
+            className={`absolute inset-0 flex items-center justify-center bg-transparent border-none p-0 ${isOpeningVideo ? 'cursor-wait' : 'cursor-pointer'}`}
+            onClick={handleOpenVideo}
+            disabled={isOpeningVideo}
+            aria-label={`Play ${item.video_name}`}
+          >
+            <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-lg bg-[#76b900]/50 flex items-center justify-center shadow-lg transition-transform hover:scale-110 border border-white/30">
+              {isOpeningVideo ? (
+                <div className="h-6 w-6 sm:h-7 sm:w-7 animate-spin rounded-full border-2 border-white border-t-transparent" />
+              ) : (
+                <svg className="w-6 h-6 sm:w-7 sm:h-7 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+              )}
+            </div>
+          </button>
+          
+          {playbackFailed && (
+            <div
+              role="alert"
+              data-testid="search-playback-notice"
+              className="rounded-lg absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 p-3 text-center bg-gray-200/95 dark:bg-neutral-900/95"
+            >
+              <div className="flex items-center gap-1.5 text-red-600 dark:text-red-500">
+                <svg
+                  aria-hidden="true"
+                  data-testid="search-playback-warning-icon"
+                  className="h-4 w-4 shrink-0"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M10.3 2.9 1.8 17a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 2.9a2 2 0 0 0-3.4 0Z" />
+                  <path d="M12 9v4" />
+                  <path d="M12 17h.01" />
+                </svg>
+                <p className="text-xs font-medium leading-snug">
+                  Video clip unavailable. Retry shortly.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  kind="secondary"
+                  size="small"
+                  onClick={handleOpenVideo}
+                  disabled={isOpeningVideo}
+                  data-testid="search-playback-notice-retry"
+                >
+                  Retry
+                </Button>
+                <Button
+                  kind="tertiary"
+                  size="small"
+                  onClick={() => setPlaybackFailed(false)}
+                  data-testid="search-playback-notice-dismiss"
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          )}
+
+          <div className="rounded-b-lg absolute bottom-0 left-0 right-0 px-4 py-2 bg-gradient-to-t from-black/70 to-transparent flex items-end justify-between">
+            <div className="text-white text-xs">
+              <span className="font-medium">{formatTime(parseDateAsLocal(item.start_time))}</span>
+              <span className="mx-1">/</span>
+              <span className="font-medium">{formatTime(parseDateAsLocal(item.end_time))}</span>
+            </div>
+            {item.description && (
+              <Whisper
+                placement="top"
+                trigger="hover"
+                speaker={<Tooltip>{item.description}</Tooltip>}
+              >
+                <div className="flex items-center gap-1 bg-white/20 backdrop-blur-sm rounded-full px-2 py-1 cursor-default">
+                  <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 20 20">
+                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                  </svg>
+                </div>
+              </Whisper>
+            )}
+          </div>
+        </div>
+      </div>
+
+    <div className="p-4 pt-0 space-y-2 my-2">
+      <div className="flex justify-between items-baseline">
+        <div className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between text-xs">
+          <span className={isDark ? 'text-gray-400' : 'text-gray-600'}>
+            Similarity:
+          </span>
+          <span data-testid="search-result-similarity" className="bg-gray-200 dark:bg-neutral-800 dark:text-white text-gray-900 font-semibold ml-1 px-3 py-1 rounded-md">
+            {item.similarity.toFixed(2)}
+          </span>
+        </div>
+      </div>
+      {item.critic_result && (
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-1.5">
+            <span className={`inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full ${
+              item.critic_result.result === 'confirmed'
+                ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
+                : item.critic_result.result === 'rejected'
+                ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400'
+                : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400'
+            }`}>
+              {item.critic_result.result === 'confirmed' ? '✓' : item.critic_result.result === 'rejected' ? '✗' : '?'}
+              {' '}{item.critic_result.result.charAt(0).toUpperCase() + item.critic_result.result.slice(1)}
+            </span>
+          </div>
+          {Object.keys(item.critic_result.criteria_met).length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {Object.entries(item.critic_result.criteria_met).map(([criterion, met]) => (
+                <span
+                  key={criterion}
+                  className={`text-[10px] px-1.5 py-0.5 rounded ${
+                    met
+                      ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                      : 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
+                  }`}
+                >
+                  {met ? '✓' : '✗'} {criterion}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+    </div>
+  );
+};
+
+
+export const VideoSearchList: React.FC<VideoSearchListProps> = ({
+    data,
+    loading,
+    error,
+    isDark,
+    onRefresh,
+    onPlayVideo,
+    showObjectsBbox = false,
+    onAddContext,
+}) => {
+    const sortedData = useMemo(() => {
+      const hasCritic = data.some((item) => item.critic_result);
+      if (!hasCritic) return data;
+
+      return [...data].sort((a, b) => {
+        const rankDiff = getCriticSortRank(a) - getCriticSortRank(b);
+        if (rankDiff !== 0) return rankDiff;
+        return (Number(b.similarity) || 0) - (Number(a.similarity) || 0);
+      });
+    }, [data]);
+
+    if (loading) {
+      return <EmptyState isDark={isDark} />;
+    }
+
+    if (error) {
+      return <ErrorState error={error} isDark={isDark} onRefresh={onRefresh} />;
+    }
+
+    if (data.length === 0) {
+      return <EmptyState isDark={isDark} />;
+    }
+
+    return (
+      <div className="p-4">
+        <div data-testid="search-results-grid" className="grid gap-4 grid-cols-[repeat(auto-fill,280px)] justify-start">
+          {sortedData.map((item, index) => (
+            <VideoCard
+              key={`${item.video_name}-${index}`}
+              item={item}
+              index={index}
+              isDark={isDark}
+              showObjectsBbox={showObjectsBbox}
+              onPlayVideo={onPlayVideo}
+              onAddContext={onAddContext}
+            />
+          ))}
+        </div>
+      </div>
+    );
+}

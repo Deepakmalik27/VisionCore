@@ -1,0 +1,188 @@
+// Copyright (c) 2017-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <optional>
+#include <string>
+
+#include "dali/operators/reader/file_reader_op.h"
+#include "dali/operators/reader/loader/utils.h"
+
+namespace dali {
+
+DALI_REGISTER_OPERATOR(readers__File, FileReader, CPU);
+
+DALI_SCHEMA(readers__File)
+  .DocStr(R"(Reads file contents and returns file-label pairs.
+
+This operator can be used in the following modes:
+
+1. Listing files from a directory, assigning labels based on subdirectory structure.
+
+In this mode, the directory indicated in `file_root` argument should contain one or more
+subdirectories. The files in these subdirectories are listed and assigned labels based on
+lexicographical order of the subdirectory. If you provide `file_filters` argument with
+a list of glob strings, the operator will list files matching at least one of the patterns.
+Otherwise, a default set of filters is used (see the default value of `file_filters` for
+details).
+
+For example, this directory structure::
+
+  <file_root>/0/image0.jpg
+  <file_root>/0/world_map.jpg
+  <file_root>/0/antarctic.png
+  <file_root>/1/cat.jpeg
+  <file_root>/1/dog.tif
+  <file_root>/2/car.jpeg
+  <file_root>/2/truck.jp2
+
+by default will yield the following outputs::
+
+  <contents of 0/image0.jpg>        0
+  <contents of 0/world_map.jpg>     0
+  <contents of 0/antarctic.png>     0
+  <contents of 1/cat.jpeg>          1
+  <contents of 1/dog.tif>           1
+  <contents of 2/car.jpeg>          2
+  <contents of 2/truck.jp2>         2
+
+and with ``file_filters = ["*.jpg", "*.jpeg"]`` will yield the following outputs::
+
+  <contents of 0/image0.jpg>        0
+  <contents of 0/world_map.jpg>     0
+  <contents of 1/cat.jpeg>          1
+  <contents of 2/car.jpeg>          2
+
+2. Use file names and labels stored in a text file.
+
+`file_list` argument points to a file which contains one file name and label per line.
+Example::
+
+  dog.jpg 0
+  cute kitten.jpg 1
+  doge.png 0
+
+The file names can contain spaces in the middle, but cannot contain trailing whitespace.
+
+The labels are parsed according to `label_dtype`. For example, with
+``label_dtype=types.FLOAT``, the list file can contain non-integer labels::
+
+  dog.jpg 0.375
+  cute kitten.jpg 1.5e-3
+
+3. Use file names and labels provided as a list of strings and numbers, respectively.
+
+Integer labels are passed in `labels` and floating point labels in `float_labels`.
+
+The type of the label output is controlled by `label_dtype`. Labels assigned based on
+the subdirectory structure or the position in `files` are converted to that type.
+
+As with other readers, the (file, label) pairs returned by this operator can be randomly shuffled
+and various sharding strategies can be applied. See documentation of this operator's arguments
+for details.
+)")
+  .NumInput(0)
+  .NumOutput(2)  // (Images, Labels)
+  .AddOptionalArg<string>("file_root",
+      R"(Path to a directory that contains the data files.
+
+If not using `file_list` or `files`. this directory is traversed to discover the files.
+`file_root` is required in this mode of operation.)",
+      nullptr)
+  .AddOptionalArg<string>("file_list",
+      R"(Path to a text file that contains one whitespace-separated ``filename label``
+pair per line. The filenames are relative to the location of that file or to `file_root`,
+if specified.
+
+This argument is mutually exclusive with `files`.)", nullptr)
+.AddOptionalArg("shuffle_after_epoch",
+      R"(If set to True, the reader shuffles the entire dataset after each epoch.
+
+`stick_to_shard` and `random_shuffle` cannot be used when this argument is set to True.
+
+See the Sharding and Shuffling documentation for details.)",
+      false)
+  .AddOptionalArg<int64_t>("shuffle_after_epoch_seed",
+      R"(Random seed for the dataset shuffling performed after each epoch.
+
+If not provided, a fixed default seed is used, which results in the same shuffling
+pattern across different training runs. Providing a custom seed allows for different
+shuffle patterns across training runs, which may be desirable for better statistical
+properties.
+
+.. note::
+    When using multiple DALI pipelines (e.g., for multi-GPU training), all pipeline
+    instances should use the same `shuffle_after_epoch_seed` to ensure a consistent
+    global shuffle across all shards.
+
+.. note::
+    This argument has no effect unless `shuffle_after_epoch` is set to ``True``.)",
+      nullptr, false)
+  .AddOptionalArg<vector<string>>("files", R"(A list of file paths to read the data from.
+
+If `file_root` is provided, the paths are treated as being relative to it.
+When using `files`, the labels are taken from `labels` argument or, if it was not supplied,
+contain indices at which given file appeared in the `files` list.
+
+This argument is mutually exclusive with `file_list`.)", nullptr)
+  .AddOptionalArg<vector<int>>("labels", R"(Labels accompanying contents of files listed in
+`files` argument.
+
+If neither this argument nor `float_labels` is used, sequential 0-based indices are used
+as labels.
+
+This argument is mutually exclusive with `float_labels`.)", nullptr)
+  .AddOptionalArg<vector<float>>("float_labels", R"(Floating point labels accompanying
+contents of files listed in `files` argument.
+
+Requires a floating point `label_dtype`. If `label_dtype` is not specified, the labels
+are returned as ``FLOAT``.
+
+This argument is mutually exclusive with `labels`.)", nullptr)
+  .AddOptionalTypeArg("label_dtype", R"(Data type of the label output.
+
+Supported types: ``INT32``, ``INT64`` and ``FLOAT``. If not specified, the type is
+``FLOAT`` when `float_labels` is provided and ``INT32`` otherwise.
+
+Labels read from `file_list` must be valid values of this type, e.g. ``0.375`` is
+rejected when the type is ``INT32``.)")
+  .AddOptionalArg<string>("file_filters", R"(A list of glob strings to filter the
+list of files in the sub-directories of the `file_root`.
+
+This argument is ignored when file paths are taken from `file_list` or `files`.)",
+      kKnownExtensionsGlob)
+  .AddOptionalArg<std::vector<string>>("dir_filters", R"(A list of glob strings to filter the
+list of sub-directories under `file_root`.
+
+This argument is ignored when file paths are taken from `file_list` or `files`.)", nullptr)
+  .AddOptionalArg<bool>("case_sensitive_filter", R"(If set to True, the filter will be matched
+case-sensitively, otherwise case-insensitively.)", false)
+  .OutputDType(0, DALI_UINT8)
+  .OutputDType(1, [](const OpSpec &spec) -> std::optional<DALIDataType> {
+    return GetFileLabelDType(spec);
+  })
+  .OutputNDim(0, 1)
+  .OutputNDim(1, 1)
+  .AddParent("LoaderBase");
+
+
+DALI_SCHEMA_ALIAS(FileReader, readers__File)
+    .Deprecate(
+        "1.0",
+        "readers__File",
+        R"code(In DALI 1.0 all readers were moved into a dedicated :mod:`~nvidia.dali.fn.readers`
+submodule and renamed to follow a common pattern. This is a placeholder operator with identical
+functionality to allow for backward compatibility.)code")
+    .MakeDocHidden();
+
+}  // namespace dali

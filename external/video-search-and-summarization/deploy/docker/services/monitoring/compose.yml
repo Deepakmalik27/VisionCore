@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  dcgm-exporter:
+    image: docker.io/nvidia/dcgm-exporter:3.3.6-3.4.2-ubuntu22.04
+    container_name: dcgm-exporter
+    profiles: ["dcgm-exporter"]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      - "${DCGM_EXPORTER_HOST_PORT:-9400}:9400"
+    restart: always
+
+  # OpenTelemetry collector and trace backend for the alert path.
+  #
+  # Both are opt-in via their own compose profiles and are absent from every
+  # shipped profile list, matching ALERT_ENABLE_OTEL_MONITORING defaulting to false:
+  # a deployment that has not asked for tracing runs exactly the containers it
+  # runs today.
+  otel-collector:
+    image: docker.io/otel/opentelemetry-collector-contrib:0.164.0
+    container_name: otel-collector
+    profiles: ["otel-collector"]
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - $VSS_APPS_DIR/services/monitoring/config/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      # Loopback-bound. Alert Bridge and every other producer reach the
+      # collector over the compose network (otel-collector:4318), so none of
+      # these needs a routable host binding -- and OTLP ingest is
+      # unauthenticated, so a wildcard bind lets anything that can reach the
+      # host inject forged spans into an operator's Jaeger and Phoenix. Set the
+      # *_HOST_PORT vars to "0.0.0.0:<port>" to widen deliberately.
+      - "${OTEL_COLLECTOR_GRPC_HOST_PORT:-127.0.0.1:4317}:4317"   # OTLP gRPC receiver
+      - "${OTEL_COLLECTOR_HTTP_HOST_PORT:-127.0.0.1:4318}:4318"   # OTLP HTTP receiver
+      - "${OTEL_COLLECTOR_METRICS_HOST_PORT:-127.0.0.1:8889}:8889"  # Prometheus scrape target
+    depends_on:
+      jaeger:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+
+  jaeger:
+    image: docker.io/jaegertracing/all-in-one:1.76.0
+    container_name: jaeger
+    profiles: ["jaeger"]
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - LOG_LEVEL=error
+    ports:
+      - "${JAEGER_UI_HOST_PORT:-16686}:16686"  # Jaeger UI
+      # Jaeger's own OTLP receivers are remapped on the host side: the
+      # collector already holds 4317/4318 there, and services send to the
+      # collector rather than straight here.
+      # Loopback for the same reason as the collector's: unauthenticated ingest.
+      - "${JAEGER_OTLP_GRPC_HOST_PORT:-127.0.0.1:4319}:4317"
+      - "${JAEGER_OTLP_HTTP_HOST_PORT:-127.0.0.1:4320}:4318"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  prometheus:
+    image: quay.io/prometheus/prometheus:v3.15.1
+    container_name: prometheus
+    profiles: ["prometheus"]
+    volumes:
+      - $VSS_APPS_DIR/services/monitoring/config/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    restart: always
+
+  grafana:
+    image: docker.io/grafana/grafana:13.2.4-ubuntu
+    container_name: grafana
+    profiles: ["grafana"]
+    ports:
+      - "${GRAFANA_HOST_PORT:-35000}:3000"
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - $VSS_APPS_DIR/services/monitoring/config/grafana-dashboard:/etc/grafana/dashboards
+      - $VSS_APPS_DIR/services/monitoring/config/grafana-provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - $VSS_APPS_DIR/services/monitoring/config/grafana-provisioning/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_USER=$GF_SECURITY_ADMIN_USER
+      - GF_SECURITY_ADMIN_PASSWORD=$GF_SECURITY_ADMIN_PASSWORD
+    restart: always
+
+  node-exporter:
+    image: quay.io/prometheus/node-exporter:v1.12.1
+    profiles: ["node-exporter"]
+    ports:
+      - "${NODE_EXPORTER_HOST_PORT:-19100}:9100"
+    restart: always
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.6
+    profiles: ["cadvisor"]
+    ports:
+      - "${CADVISOR_HOST_PORT:-18080}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    restart: always
+
+volumes:
+  grafana-storage:

@@ -1,0 +1,525 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Tests for Kaizen UI Foundations migration in the alerts package.
+ *
+ * Validates that:
+ * 1. Native HTML buttons/inputs/selects are replaced with Foundation components
+ *    (Button, TextInput, Select, Switch).
+ * 2. Dark mode backgrounds migrate to true black / neutral-900.
+ * 3. Accent colors shift from blue/cyan to NVIDIA green (#76b900).
+ * 4. Filter tag sensor colors switch from cyan/blue to green.
+ */
+
+import React from 'react';
+import { render, screen, fireEvent } from '@testing-library/react';
+
+// ---------- Foundation component mocks ----------
+jest.mock('@nvidia/foundations-react-core', () => {
+  const React = require('react');
+  return {
+    Button: React.forwardRef(({ children, kind, ...rest }: any, ref: any) =>
+      React.createElement('button', { ...rest, ref, 'data-kind': kind, 'data-foundation': 'Button' }, children),
+    ),
+    TextInput: React.forwardRef(({ onValueChange, ...rest }: any, ref: any) =>
+      React.createElement('input', {
+        ...rest,
+        ref,
+        'data-foundation': 'TextInput',
+        onChange: (e: any) => onValueChange?.(e.target.value),
+      }),
+    ),
+    Select: React.forwardRef(({ items, onValueChange, value, ...rest }: any, ref: any) =>
+      React.createElement(
+        'select',
+        {
+          ...rest,
+          ref,
+          'data-foundation': 'Select',
+          value,
+          onChange: (e: any) => onValueChange?.(e.target.value),
+        },
+        items?.map((item: any) =>
+          React.createElement('option', { key: item.value, value: item.value }, item.children),
+        ),
+      ),
+    ),
+    Switch: React.forwardRef(({ checked, onCheckedChange, slotLabel, labelSide: _labelSide, ...rest }: any, ref: any) =>
+      React.createElement('input', {
+        ...rest,
+        ref,
+        type: 'checkbox',
+        checked,
+        'aria-label': slotLabel,
+        'data-foundation': 'Switch',
+        onChange: (e: any) => onCheckedChange?.(e.target.checked),
+      }),
+    ),
+    Tag: React.forwardRef(({ children, ...rest }: any, ref: any) =>
+      React.createElement('button', { ...rest, ref, 'data-foundation': 'Tag', type: 'button' }, children),
+    ),
+  };
+});
+
+// ---------- Component imports ----------
+import { AlertsViewFilterControls } from '../../lib-src/components/AlertsSidebarControls';
+import { VLM_VERDICT } from '../../lib-src/types';
+import { CustomTimeInput } from '../../lib-src/components/CustomTimeInput';
+import { AlertsTable } from '../../lib-src/components/AlertsTable';
+
+// ---------- Tests ----------
+
+describe('Foundation component migration – FilterTag', () => {
+  const defaultProps = {
+    isDark: true,
+    vlmVerified: true,
+    vlmVerdict: VLM_VERDICT.ALL,
+    uniqueValues: {
+      sensors: ['Camera-1'],
+      alertTypes: ['Tailgating'],
+      alertTriggered: ['Motion'],
+    },
+    onVlmVerifiedChange: jest.fn(),
+    onVlmVerdictChange: jest.fn(),
+    onAddFilter: jest.fn(),
+    activeFilters: {
+      sensors: new Set<string>(['Camera-1']),
+      alertTypes: new Set<string>(),
+      alertTriggered: new Set<string>(),
+    },
+    onRemoveFilter: jest.fn(),
+    onClearAllFilters: jest.fn(),
+    timeWindow: 10,
+    showCustomTimeInput: false,
+    customTimeValue: '',
+    customTimeError: '',
+    onTimeWindowChange: jest.fn(),
+    onCustomTimeValueChange: jest.fn(),
+    onCustomTimeApply: jest.fn(),
+    onCustomTimeCancel: jest.fn(),
+    onOpenCustomTime: jest.fn(),
+    fetchSize: 100,
+    onFetchSizeChange: jest.fn(),
+    loading: false,
+    autoRefreshEnabled: false,
+    autoRefreshInterval: 5000,
+    onRefresh: jest.fn(),
+    onAutoRefreshToggle: jest.fn(),
+    onAutoRefreshIntervalChange: jest.fn(),
+  };
+
+  it('renders a button for the remove action', () => {
+    const { container } = render(<AlertsViewFilterControls {...defaultProps} />);
+    const btn = container.querySelector('button');
+    expect(btn).toBeTruthy();
+  });
+
+  it('calls onRemove with correct args when remove button is clicked', () => {
+    const onRemoveFilter = jest.fn();
+    render(<AlertsViewFilterControls {...defaultProps} onRemoveFilter={onRemoveFilter} />);
+    const btn = screen.getByLabelText('Remove filter Camera-1');
+    fireEvent.click(btn);
+    expect(onRemoveFilter).toHaveBeenCalledWith('sensors', 'Camera-1');
+  });
+
+  it('displays the filter text', () => {
+    render(<AlertsViewFilterControls {...defaultProps} />);
+    expect(screen.getByLabelText('Remove filter Camera-1')).toBeTruthy();
+  });
+});
+
+describe('Foundation component migration – CustomTimeInput', () => {
+  const defaultProps = {
+    isOpen: true,
+    timeWindow: 3600,
+    customTimeValue: '2h',
+    customTimeError: '',
+    isDark: true,
+    onTimeValueChange: jest.fn(),
+    onApply: jest.fn(),
+    onCancel: jest.fn(),
+  };
+
+  it('renders Foundation TextInput for custom period entry', () => {
+    const { container } = render(<CustomTimeInput {...defaultProps} />);
+    const input = container.querySelector('[data-foundation="TextInput"]');
+    expect(input).toBeTruthy();
+  });
+
+  it('renders Foundation Button components for Cancel and Apply', () => {
+    const { container } = render(<CustomTimeInput {...defaultProps} />);
+    const buttons = container.querySelectorAll('[data-foundation="Button"]');
+    const kinds = Array.from(buttons).map((b) => b.getAttribute('data-kind'));
+    expect(kinds).toContain('secondary');
+    expect(kinds).toContain('primary');
+  });
+
+  it('renders a dismiss (✕) button in the header', () => {
+    const { container } = render(<CustomTimeInput {...defaultProps} />);
+    const buttons = container.querySelectorAll('button');
+    const dismissBtn = Array.from(buttons).find(
+      (b) => b.textContent?.trim() === '✕',
+    );
+    expect(dismissBtn).toBeTruthy();
+  });
+
+  it('calls onCancel when Cancel button is clicked', () => {
+    const onCancel = jest.fn();
+    render(<CustomTimeInput {...defaultProps} onCancel={onCancel} />);
+    const cancelBtn = screen.getByText('Cancel');
+    fireEvent.click(cancelBtn);
+    expect(onCancel).toHaveBeenCalled();
+  });
+
+  it('calls onApply when Apply button is clicked', () => {
+    const onApply = jest.fn();
+    render(<CustomTimeInput {...defaultProps} onApply={onApply} />);
+    const applyBtn = screen.getByText('Apply');
+    fireEvent.click(applyBtn);
+    expect(onApply).toHaveBeenCalled();
+  });
+
+  it('disables Apply when there is a validation error', () => {
+    render(
+      <CustomTimeInput {...defaultProps} customTimeError="Invalid format" />,
+    );
+    const applyBtn = screen.getByText('Apply');
+    expect(applyBtn).toBeDisabled();
+  });
+
+  it('returns null when isOpen is false', () => {
+    const { container } = render(<CustomTimeInput {...defaultProps} isOpen={false} />);
+    expect(container.innerHTML).toBe('');
+  });
+
+  it('uses dark:bg-black instead of dark:bg-gray-800', () => {
+    const { container } = render(<CustomTimeInput {...defaultProps} />);
+    const root = container.firstElementChild as HTMLElement;
+    expect(root.className).toContain('bg-black');
+    expect(root.className).not.toContain('bg-gray-800');
+  });
+});
+
+describe('Foundation component migration – AlertsTable', () => {
+  const baseProps = {
+    alerts: [],
+    loading: false,
+    error: null,
+    isDark: true,
+    activeFilters: { sensors: new Set<string>(), alertTypes: new Set<string>(), alertTriggered: new Set<string>() },
+    onAddFilter: jest.fn(),
+    onPlayVideo: jest.fn(),
+    onRefresh: jest.fn(),
+  };
+
+  it('uses Foundation Button for retry on error', () => {
+    const { container } = render(
+      <AlertsTable {...baseProps} error="Network failure" />,
+    );
+    const retryBtn = container.querySelector('[data-foundation="Button"]');
+    expect(retryBtn).toBeTruthy();
+    expect(retryBtn?.getAttribute('data-kind')).toBe('primary');
+    expect(retryBtn?.textContent).toContain('Retry');
+  });
+
+  it('calls onRefresh when Retry is clicked', () => {
+    const onRefresh = jest.fn();
+    const { container } = render(
+      <AlertsTable {...baseProps} error="fail" onRefresh={onRefresh} />,
+    );
+    const retryBtn = container.querySelector('[data-foundation="Button"]') as HTMLElement;
+    fireEvent.click(retryBtn);
+    expect(onRefresh).toHaveBeenCalled();
+  });
+
+  it('uses green accent color for spinner instead of blue', () => {
+    const { container } = render(
+      <AlertsTable {...baseProps} loading={true} />,
+    );
+    const html = container.innerHTML;
+    expect(html).toContain('text-green-');
+    expect(html).not.toContain('text-blue-400');
+    expect(html).not.toContain('text-blue-500');
+  });
+
+  it('renders Foundation Buttons in table rows for expand/collapse and filters', () => {
+    const alertData = {
+      id: 'a1',
+      timestamp: '2026-01-01T00:00:00Z',
+      end: '2026-01-01T01:00:00Z',
+      sensor: 'Cam-1',
+      alertType: 'intrusion',
+      alertTriggered: 'motion',
+      alertDescription: 'Test alert',
+      metadata: {},
+    };
+    const { container } = render(
+      <AlertsTable {...baseProps} alerts={[alertData]} />,
+    );
+    const foundationButtons = container.querySelectorAll('[data-foundation="Button"]');
+    expect(foundationButtons.length).toBeGreaterThan(0);
+    const tertiaryButtons = Array.from(foundationButtons).filter(
+      (b) => b.getAttribute('data-kind') === 'tertiary',
+    );
+    expect(tertiaryButtons.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('uses bg-black instead of bg-gray-800 in dark mode table header', () => {
+    const alertData = {
+      id: 'a1',
+      timestamp: '2026-01-01T00:00:00Z',
+      sensor: 'S1',
+      alertType: 'T1',
+      alertTriggered: 'M1',
+      alertDescription: 'D1',
+      metadata: {},
+    };
+    const { container } = render(
+      <AlertsTable {...baseProps} alerts={[alertData]} />,
+    );
+    const html = container.innerHTML;
+    expect(html).not.toContain('bg-gray-800');
+  });
+
+  it('uses bg-black for even row backgrounds in dark mode', () => {
+    const alertData = {
+      id: 'a1',
+      timestamp: '2026-01-01T00:00:00Z',
+      sensor: 'S1',
+      alertType: 'T1',
+      alertTriggered: 'M1',
+      alertDescription: 'D1',
+      metadata: {},
+    };
+    const { container } = render(
+      <AlertsTable {...baseProps} alerts={[alertData]} />,
+    );
+    const rows = container.querySelectorAll('tr');
+    const dataRow = rows[1]; // first data row (index 0 is header)
+    expect(dataRow?.className).toContain('bg-black');
+  });
+
+  it('keeps rows in a separate scroll viewport below the toolbar and sticky column headers', () => {
+    const alertData = {
+      id: 'a1',
+      timestamp: '2026-01-01T00:00:00Z',
+      end: '2026-01-01T01:00:00Z',
+      sensor: 'S1',
+      alertType: 'T1',
+      alertTriggered: 'M1',
+      alertDescription: 'D1',
+      metadata: {},
+    };
+
+    render(<AlertsTable {...baseProps} alerts={[alertData]} />);
+
+    const toolbar = screen.getByTestId('alerts-table-toolbar');
+    expect(toolbar).toHaveClass('shrink-0');
+    expect(toolbar).not.toHaveClass('sticky');
+
+    const scrollContainer = screen.getByTestId('alerts-table-scroll-container');
+    expect(scrollContainer).toHaveClass('min-h-0', 'flex-1', 'overflow-auto');
+    expect(scrollContainer).not.toContainElement(toolbar);
+    expect(scrollContainer.previousElementSibling).toBe(toolbar);
+
+    const table = screen.getByTestId('alerts-table');
+    expect(table).toHaveClass('min-w-[1200px]');
+
+    const headers = table.querySelectorAll('th');
+    expect(headers.length).toBeGreaterThan(0);
+    headers.forEach((header) => {
+      expect(header).toHaveClass('sticky', 'top-0', 'z-10', 'bg-black');
+    });
+  });
+
+  it('defaults page size to 100 when pageSize omitted so total pages scale with row count', () => {
+    const makeRow = (i: number) => ({
+      id: `a-${i}`,
+      timestamp: '2026-01-01T00:00:00Z',
+      end: '2026-01-01T01:00:00Z',
+      sensor: 'S',
+      alertType: 'T',
+      alertTriggered: 'M',
+      alertDescription: 'D',
+      metadata: {},
+    });
+    const rows = Array.from({ length: 150 }, (_, i) => makeRow(i));
+    render(<AlertsTable {...baseProps} alerts={rows} />);
+    expect(screen.getByLabelText('Page 2')).toBeInTheDocument();
+  });
+
+  it('increases total pages when more alerts are passed with fixed pageSize (load-more style)', () => {
+    const makeRow = (i: number) => ({
+      id: `a-${i}`,
+      timestamp: '2026-01-01T00:00:00Z',
+      end: '2026-01-01T01:00:00Z',
+      sensor: 'S',
+      alertType: 'T',
+      alertTriggered: 'M',
+      alertDescription: 'D',
+      metadata: {},
+    });
+    const first = Array.from({ length: 15 }, (_, i) => makeRow(i));
+    const { rerender } = render(<AlertsTable {...baseProps} alerts={first} pageSize={10} />);
+    expect(screen.getByLabelText('Page 2')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Page 3')).not.toBeInTheDocument();
+
+    const extended = Array.from({ length: 25 }, (_, i) => makeRow(i));
+    rerender(<AlertsTable {...baseProps} alerts={extended} pageSize={10} />);
+    expect(screen.getByLabelText('Page 3')).toBeInTheDocument();
+  });
+
+  it('keeps the same page index on last page when row count grows (load more), and total pages increase', () => {
+    const makeRow = (i: number) => ({
+      id: `a-${i}`,
+      timestamp: `2026-01-01T00:00:${String(i).padStart(2, '0')}Z`,
+      end: '2026-01-01T01:00:00Z',
+      sensor: 'S',
+      alertType: 'T',
+      alertTriggered: 'M',
+      alertDescription: 'D',
+      metadata: {},
+    });
+    const ten = Array.from({ length: 10 }, (_, i) => makeRow(i));
+    const { rerender } = render(<AlertsTable {...baseProps} alerts={ten} pageSize={2} />);
+    fireEvent.click(screen.getByLabelText('Page 5'));
+    expect(screen.getByText(/Page 5 of 5/)).toBeInTheDocument();
+    expect(screen.getByText(/Showing 9[–-]10/)).toBeInTheDocument();
+
+    const eighteen = Array.from({ length: 18 }, (_, i) => makeRow(i));
+    rerender(<AlertsTable {...baseProps} alerts={eighteen} pageSize={2} />);
+    expect(screen.getByText(/Page 5 of 9/)).toBeInTheDocument();
+    expect(screen.getByText(/Showing 9[–-]10/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Page 9')).toBeInTheDocument();
+  });
+
+  it('navigates between pages using pagination controls', () => {
+    const makeRow = (i: number) => ({
+      id: `a-${i}`,
+      timestamp: `2026-01-01T00:00:${String(i).padStart(2, '0')}Z`,
+      end: '2026-01-01T01:00:00Z',
+      sensor: 'S',
+      alertType: 'T',
+      alertTriggered: 'M',
+      alertDescription: 'D',
+      metadata: {},
+    });
+    const rows = Array.from({ length: 6 }, (_, i) => makeRow(i));
+    render(
+      <AlertsTable
+        {...baseProps}
+        alerts={rows}
+        pageSize={2}
+      />,
+    );
+    expect(screen.getByText(/Page 1 of 3/)).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText('Page 2'));
+    expect(screen.getByText(/Page 2 of 3/)).toBeInTheDocument();
+  });
+});
+
+describe('Kaizen color palette – sensor filter colors', () => {
+  it('uses green colors for sensor filter tags instead of cyan/blue', () => {
+    const props = {
+      isDark: true,
+      vlmVerified: true,
+      vlmVerdict: VLM_VERDICT.ALL,
+      uniqueValues: {
+        sensors: ['Camera-1'],
+        alertTypes: [],
+        alertTriggered: [],
+      },
+      onVlmVerifiedChange: jest.fn(),
+      onVlmVerdictChange: jest.fn(),
+      onAddFilter: jest.fn(),
+      activeFilters: {
+        sensors: new Set<string>(['Camera-1']),
+        alertTypes: new Set<string>(),
+        alertTriggered: new Set<string>(),
+      },
+      onRemoveFilter: jest.fn(),
+      onClearAllFilters: jest.fn(),
+      timeWindow: 10,
+      showCustomTimeInput: false,
+      customTimeValue: '',
+      customTimeError: '',
+      onTimeWindowChange: jest.fn(),
+      onCustomTimeValueChange: jest.fn(),
+      onCustomTimeApply: jest.fn(),
+      onCustomTimeCancel: jest.fn(),
+      onOpenCustomTime: jest.fn(),
+      fetchSize: 100,
+      onFetchSizeChange: jest.fn(),
+      loading: false,
+      autoRefreshEnabled: false,
+      autoRefreshInterval: 5000,
+      onRefresh: jest.fn(),
+      onAutoRefreshToggle: jest.fn(),
+      onAutoRefreshIntervalChange: jest.fn(),
+    };
+    render(<AlertsViewFilterControls {...props} />);
+    const root = screen.getByTestId('alerts-filter-tag-sensor-camera-1');
+    const style = root.getAttribute('style') || '';
+    expect(style).toContain('rgb(34, 197, 94)');
+    expect(style).toContain('rgb(74, 222, 128)');
+    expect(style).not.toContain('rgb(34, 211, 238)');
+  });
+});
+
+describe('Foundation component migration – View Alerts controls', () => {
+  const defaultProps = {
+    isDark: true,
+    vlmVerified: true,
+    vlmVerdict: VLM_VERDICT.ALL,
+    uniqueValues: {
+      sensors: ['Camera-1'],
+      alertTypes: ['Tailgating'],
+      alertTriggered: ['Motion'],
+    },
+    onVlmVerifiedChange: jest.fn(),
+    onVlmVerdictChange: jest.fn(),
+    onAddFilter: jest.fn(),
+    activeFilters: {
+      sensors: new Set<string>(),
+      alertTypes: new Set<string>(),
+      alertTriggered: new Set<string>(),
+    },
+    onRemoveFilter: jest.fn(),
+    onClearAllFilters: jest.fn(),
+    timeWindow: 10,
+    showCustomTimeInput: false,
+    customTimeValue: '',
+    customTimeError: '',
+    onTimeWindowChange: jest.fn(),
+    onCustomTimeValueChange: jest.fn(),
+    onCustomTimeApply: jest.fn(),
+    onCustomTimeCancel: jest.fn(),
+    onOpenCustomTime: jest.fn(),
+    fetchSize: 100,
+    onFetchSizeChange: jest.fn(),
+    loading: false,
+    autoRefreshEnabled: false,
+    autoRefreshInterval: 5000,
+    onRefresh: jest.fn(),
+    onAutoRefreshToggle: jest.fn(),
+    onAutoRefreshIntervalChange: jest.fn(),
+  };
+
+  it('uses Foundation Switch for VLM Verified', () => {
+    render(<AlertsViewFilterControls {...defaultProps} />);
+    expect(screen.getByTestId('vlm-verified-toggle')).toHaveAttribute('data-foundation', 'Switch');
+  });
+
+  it('uses Foundation Select for Fetch Settings dropdowns', () => {
+    render(<AlertsViewFilterControls {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('alerts-settings-toggle'));
+    expect(screen.getByTestId('period-select')).toHaveAttribute('data-foundation', 'Select');
+    expect(screen.getByTestId('fetch-size-select')).toHaveAttribute('data-foundation', 'Select');
+  });
+
+  it('uses Foundation Select for filter dropdowns', () => {
+    render(<AlertsViewFilterControls {...defaultProps} />);
+    expect(screen.getByTestId('sensor-select')).toHaveAttribute('data-foundation', 'Select');
+    expect(screen.getByTestId('alert-type-select')).toHaveAttribute('data-foundation', 'Select');
+  });
+});

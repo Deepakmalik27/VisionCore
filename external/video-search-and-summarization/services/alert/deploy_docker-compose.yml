@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+
+  # Alert bridge service. Redis has been removed — dedup/filter state is
+  # in-process and durable state (verdict protection, alert configs) lives
+  # in Elasticsearch. No Redis container is required.
+  alert-bridge:
+    # Has to resolve to a 3.3 build: the files mounted below are 3.3 schema --
+    # config.yaml has no Redis section, and alert_request_defaults.yaml has no
+    # vss_params, which a pre-3.3 loader requires. Same coordinates as the
+    # profile deployments (deploy/docker/services/alert/compose.yml; defaults
+    # in deploy/docker/containers.env). Set VSS_CONTAINER_TAG to pin a release.
+    image: ${VSS_ALERT_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/vss-alert-ms}:${VSS_CONTAINER_TAG:-${VSS_ALERT_TAG:-develop-latest}}
+    #image: alert-bridge:19
+    user: "0:0"
+    network_mode: "host"
+    environment:
+      - FASTAPI_PORT=${FASTAPI_PORT:-9080}
+      - ALERT_REVIEW_MEDIA_BASE_DIR=${ALERT_REVIEW_MEDIA_BASE_DIR:-}
+      # Storage service endpoint override for VST media path resolution
+      # Example resolves to: http://127.0.0.1:30000
+      - STORAGE_MODULE_ENDPOINT=http://${HOST_IP:-127.0.0.1}:${STORAGE_HTTP_PORT:-30000}
+    volumes:
+      - ${ALERT_BRIDGE_CONFIG_FILE:-./config.yaml}:/app/config.yaml
+      # /app is the image WORKDIR, which is where the defaults loader looks
+      # when ALERT_BRIDGE_DEFAULTS_FILE is unset -- so mounting over that path
+      # is what makes a custom file take effect, with no in-container env var.
+      # Scope: this file feeds the request-entity validator, which the
+      # verification pipeline does not call, so it does not change live
+      # verification. See src/schemas/config/README.md.
+      - ${ALERT_BRIDGE_DEFAULTS_FILE:-./alert_request_defaults.yaml}:/app/alert_request_defaults.yaml
+
+
+    container_name: alert-bridge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

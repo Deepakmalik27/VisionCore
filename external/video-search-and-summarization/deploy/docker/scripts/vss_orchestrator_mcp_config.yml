@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# VSS Orchestrator MCP Server
+#
+# Exposes nine tools:
+#   vss_orchestrator__profiles - list all supported deployment profiles
+#   vss_orchestrator__prereqs - run Docker/GPU prerequisite checks
+#   vss_orchestrator__docker_generate - resolve env + compose YAML artifacts
+#   vss_orchestrator__docker_read - fetch generated env/yaml by docker_compose_id
+#   vss_orchestrator__docker_list - list docker container names
+#   vss_orchestrator__docker_logs - fetch docker logs by container name
+#   vss_orchestrator__docker_up - docker compose up -d --build --quiet-pull
+#   vss_orchestrator__docker_down - docker compose down -v --remove-orphans
+#   vss_orchestrator__docker_status - poll docker operation status/logs
+#
+# Start with:
+#   nat mcp serve --config_file deploy/docker/scripts/vss_orchestrator_mcp_config.yml --port 9988
+#
+# Server listens at: http://localhost:9988/mcp, or https://... when
+# ORCHESTRATOR_ENABLE_HTTPS=true (see the runner_class note below).
+
+general:
+  front_end:
+    _type: mcp
+    # TLS-capable worker. With ORCHESTRATOR_ENABLE_HTTPS=false (the default) it
+    # behaves exactly like the stock NAT worker; with true it serves HTTPS using
+    # ORCHESTRATOR_CERTFILE / ORCHESTRATOR_KEYFILE. Lives here rather than as a
+    # --runner_class CLI flag so every launcher gets the toggle.
+    runner_class: vss_agents.orchestrator.mcp_ssl_worker.SSLMCPWorker
+
+function_groups:
+  vss_orchestrator:
+    mdx_data_dir: "~/video-search-and-summarization/.mdx_data"
+    # Required output directory for docker_generate artifacts.
+    output_dir: "~/video-search-and-summarization/.orchestrator-artifacts"
+    # ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+    _type: vss_orchestrator
+    # Absolute path to the deploy/docker root. Set HOST_IP separately via env
+    # overrides in the docker_generate tool call, or pre-populate the selected profile .env.
+    deployments_dir: "~/video-search-and-summarization/deploy/docker"
+    # Absolute source compose yaml path.
+    source_compose_yaml: "~/video-search-and-summarization/deploy/docker/compose.yml"
+    # Absolute source profile env path. Supports {profile}.
+    source_env: "~/video-search-and-summarization/deploy/docker/developer-profiles/dev-profile-{profile}/.env"
+    # VSS_DATA_DIR base directory used by orchestrator (profile .env VSS_DATA_DIR is ignored).
+    mdx_data_directories:
+    - data_log/analytics_cache
+    - data_log/calibration_toolkit
+    - data_log/elastic/data
+    - data_log/elastic/logs
+    - data_log/kafka
+    - data_log/redis/data
+    - data_log/redis/log
+    - data_log/vss_video_analytics_api
+    - agent_eval/dataset
+    - agent_eval/results
+    - videos/dev-profile-alerts
+    - models
+    model_resolution:
+      hardware:
+        edge_profiles:
+        - DGX-SPARK
+        - IGX-THOR
+        - AGX-THOR
+        edge_allowed_profiles:
+        - base
+        - alerts
+        edge_device_ids:
+          llm: "0"
+          vlm: "0"
+          rt_vlm: "0"
+          rt_cv: "0"
+        # Keys define the set of supported hardware profiles.
+        # Values are env overrides (empty/null = supported, no overrides).
+        hardware_profiles:
+          # Default RTVI local-shared VLM memory utilization by hardware.
+          H100:
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.4"
+          L40S:
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.8"
+            # search co-locates RT-CV (SigLIP v2.0 + RT-DETR) with RT-VLM on the
+            # one 48 GiB GPU; 0.8 starves RT-CV and crashes the vLLM EngineCore.
+            search:
+              RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.7"
+          RTXPRO4500BW:
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.8"
+            RTVI_VLM_MAX_MODEL_LEN: "18000"
+            # Alerts with a remote LLM only. The board still takes the bf16
+            # checkpoint for local RT-VLM.
+            RTVI_VLM_MODEL_PATH: ngc:nim/nvidia/cosmos3-nano-reasoner:bf16-final
+            VLM_NAME: nim_nvidia_cosmos3-nano-reasoner_bf16-final
+          RTXPRO6000BW:
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.4"
+          GB300:
+            # GB300 is SBSA/arm64: those builds live in the same GHCR repos under
+            # an -sbsa suffix, which containers.env appends to whatever
+            # VSS_CONTAINER_TAG selects, so a release stays selectable. Pinning
+            # tags here instead would force an -sbsa develop build into a release
+            # deployment. Exported before containers.env is sourced, or the
+            # derived tags are already fixed by the time it is read.
+            VSS_CONTAINER_TAG_SUFFIX: "-sbsa"
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.2"
+            RTVI_VLLM_ATTENTION_BACKEND: TRITON_ATTN
+            # One GPU for every model service. The profile envs pin multi-GPU
+            # layouts (search puts the LLM and RT-Embed on device 1), a hard
+            # startup failure on a single-device host. A GB300 at a non-zero
+            # index needs these passed as docker_generate env_overrides.
+            LLM_DEVICE_ID: "0"
+            VLM_DEVICE_ID: "0"
+            SHARED_LLM_VLM_DEVICE_ID: "0"
+            FIXED_SHARED_DEVICE_IDS: "0"
+            RT_CV_DEVICE_ID: "0"
+            RT_EMBED_DEVICE_ID: "0"
+          OTHER:
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.7"
+          DGX-SPARK:
+            # SBSA/arm64 like GB300: same suffix, same reasoning. Covers all
+            # four suffixed images rather than the RT-VLM and RT-CV tags this
+            # used to pin, since the suffix is applied by containers.env per
+            # image, not per hardware profile.
+            VSS_CONTAINER_TAG_SUFFIX: "-sbsa"
+            # 0.35 for base as well as alerts: Spark's 128 GB unified pool
+            # leaves RT-VLM no room at the 0.7 an unset value falls back to.
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.35"
+            base:
+              VLM_NIM_KVCACHE_PERCENT: "0.2"
+          IGX-THOR:
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.35"
+          AGX-THOR:
+            RTVI_VLLM_GPU_MEMORY_UTILIZATION: "0.35"
+    profile_mode_to_env_modes:
+      alerts:  # must set modes below for profile that has modes
+        verification: 2d_cv
+        real-time: 2d_vlm
+    include:
+    - profiles
+    - prereqs
+    - docker_generate
+    - docker_read
+    - docker_list
+    - docker_logs
+    - docker_up
+    - docker_down
+    - docker_status
+
+llms:
+  nim_llm:
+    _type: nim
+    model_name: meta/llama-3.1-70b-instruct
+    temperature: 0.0
+    max_tokens: 1024
+
+# dummy workflow required to start MCP server
+workflow:
+  _type: react_agent
+  tool_names: [vss_orchestrator]
+  llm_name: nim_llm

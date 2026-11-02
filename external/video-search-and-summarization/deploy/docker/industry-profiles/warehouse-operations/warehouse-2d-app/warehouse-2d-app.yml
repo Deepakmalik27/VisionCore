@@ -1,0 +1,142 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+include:
+
+services:
+
+  vss-behavior-analytics-2d:
+    extends:
+      file: ${VSS_APPS_DIR}/services/analytics/behavior-analytics/compose.yml
+      service: vss-behavior-analytics-base
+    profiles: ["vss-behavior-analytics-2d"]
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json:/resources/vss-behavior-analytics-config.json
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/resources/calibration.json
+    container_name: vss-behavior-analytics
+    networks:
+      default:
+        aliases:
+          - vss-behavior-analytics
+    command: python3 apps/analytics/main_analytics_2d_app.py --config /resources/vss-behavior-analytics-config.json --calibration /resources/calibration.json
+    depends_on:
+      broker-health-check:
+        condition: service_completed_successfully
+      bp-configurator-2d:
+        condition: service_healthy
+
+  vss-behavior-analytics-playback-2d:
+    extends:
+      file: ${VSS_APPS_DIR}/services/analytics/behavior-analytics/compose.yml
+      service: vss-behavior-analytics-base
+    profiles: ["vss-behavior-analytics-playback-2d"]
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json:/resources/vss-behavior-analytics-config.json
+      - $VSS_DATA_DIR/playback/warehouse_loading_dock_playback.json:/opt/mdx/playback/warehouse_loading_dock_playback.json
+    container_name: vss-behavior-analytics-playback
+    command: python3 apps/playback/playback_frames.py --config /resources/vss-behavior-analytics-config.json --playback-filepath /opt/mdx/playback/warehouse_loading_dock_playback.json
+
+  bp-configurator-2d:
+    extends:
+      file: ${VSS_APPS_DIR}/services/configurators/vss-configurator/docker-compose.yaml
+      service: bp-configurator-base
+    profiles: !override ["bp-configurator-2d"]
+    container_name: vss-configurator
+    networks:
+      default:
+        aliases:
+          - vss-configurator
+    environment:
+      ENABLE_CALIBRATION_PROCESS: ${ENABLE_CALIBRATION_PROCESS:-false}
+      PROFILE_CONFIG_FILE: $VSS_APPS_DIR/industry-profiles/warehouse-operations/blueprint-configurator/blueprint_config.yml
+      DS_CONFIG_DIR: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/deepstream/configs/
+      NVSTREAMER_CONFIG_DIR: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/nvstreamer/configs
+      RECOMPUTE_BEV_CENTERS_ENABLED: false
+      SENSOR_FILE_PATH: ${SENSOR_FILE_PATH:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/camera_configs/camera_info.json}
+      CHECK_SENSOR_IN_CALIBRATION_FILE: false
+      ENABLE_SENSOR_CONFIGURATOR: true
+      SEND_CONFIG_TO_SDR: false
+      CALL_SENSOR_ADD_API: true
+    env_file:
+      - ${VSS_APPS_DIR}/containers.env
+      - ${BP_CONFIGURATOR_BASE_ENV_FILE:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/.env}
+      - ${BP_CONFIGURATOR_ENV_FILE:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/overrides.env}
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations:$VSS_APPS_DIR/industry-profiles/warehouse-operations:rw
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET:/opt/data
+    depends_on:
+      broker-health-check:
+        condition: service_completed_successfully
+
+  perception-2d:
+    extends:
+      file: $VSS_APPS_DIR/services/rtvi/rtvi-cv/compose.yaml
+      service: perception
+    profiles: ["perception-2d"]
+    container_name: vss-rtvi-cv
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/deepstream/configs/:/opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/configs/
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/models-download.json:/opt/config/models-download.json:ro
+      - $VSS_DATA_DIR/models/:/opt/storage/
+    environment:
+      GST_PLUGIN_PATH: /opt/nvidia/deepstream/deepstream/sources/gst-plugins/gst-nvdstextembedder
+      TRANSFORMERS_OFFLINE: 0
+      HF_HUB_OFFLINE: 0
+      DS_MODEL_FAMILY: rtdetr-warehouse
+      DS_MODE_FLAG: "1"
+      DS_TRACKER_REID: "false"
+      DS_SHOW_SENSOR_ID: "false"
+      NGC_CLI_API_KEY: ${NGC_CLI_API_KEY}
+      DS_MODEL_DOWNLOAD: auto
+    depends_on:
+      sdr-controller:
+        condition: service_started
+      sensor-ms-2d:
+        condition: service_started
+      broker-health-check:
+        condition: service_completed_successfully
+      bp-configurator-2d:
+        condition: service_healthy
+
+  kibana-init-container-2d:
+    build:
+      context: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app
+      dockerfile: Dockerfiles/kibana-dashboard.Dockerfile
+    profiles: ["kibana-init-container-2d"]
+    container_name: vss-kibana-init
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/kibana-dashboard/warehouse-2d-kibana-objects.ndjson:/opt/vss/kibana-objects.ndjson
+    command: bash /opt/vss/init-scripts/kibana-import-dashboard.sh
+    depends_on:
+      kibana:
+        condition: service_healthy
+
+  import-calibration-output-container-2d:
+    build:
+      context: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app
+      dockerfile: Dockerfiles/import-calibration.Dockerfile
+    profiles: ["import-calibration-output-container-2d"]
+    container_name: vss-import-calibration-output
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/opt/vss/calibration.json
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-2d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/images:/opt/vss/images/
+    command: bash /opt/vss/init-scripts/calibration-import.sh
+    restart: on-failure:5
+    depends_on:
+      bp-configurator-2d:
+        condition: service_healthy
+
+volumes:
+  perception-2d:

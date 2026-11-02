@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Defaults keep `helm lint` on this chart passing; umbrella profiles set enabled,
+# command, and config.kafkaConfigJson.
+enabled: false
+
+global: {}
+
+replicas: 1
+
+image:
+  repository: ghcr.io/nvidia-ai-blueprints/vss/vss-behavior-analytics
+  tag: "develop-latest"
+  pullPolicy: IfNotPresent
+
+port: 8080
+
+service:
+  type: ClusterIP
+
+waitForKafka:
+  enabled: false
+  host: ""
+  port: 9092
+  topic: ""
+  image: confluentinc/cp-kafka:8.4.0
+  maxAttempts: 120
+  sleepSeconds: 5
+
+# Container command (including app entrypoint and --config path).
+command: []
+
+# Full application JSON for vss-behavior-analytics-config.json (parent-owned).
+config:
+  kafkaConfigJson: ""
+
+resourceFiles:
+  calibration:
+    enabled: false
+    mountPath: /resources/calibration.json
+    # Set: fetch calibration.json from this endpoint via initContainer instead
+    # of the ConfigMap. Same fetch/validate logic as mv3dt-config-init.py.
+    apiUrl: ""
+    fetchTimeoutSeconds: 300
+    fetchPollSeconds: 10
+  roadNetwork:
+    enabled: false
+    mountPath: /resources/road-network.json
+
+downloadResourcesFromNgc: false
+downloadResourcesFromNgcWaitSeconds: 300
+downloadResourcesJob:
+  ttlSecondsAfterFinished: null
+ngcApiKeySecretName: "ngc-api"
+ngcApiKeySecretKey: "NGC_CLI_API_KEY"
+ngcOrg: "nvidia"
+ngcDownload:
+  image:
+    repository: docker.io/library/ubuntu
+    tag: "22.04"
+    pullPolicy: IfNotPresent
+ngcResourcesToDownload: []
+
+forceResourcesStorageFromValues: false
+resourcesPvc:
+  size: 1Gi
+  storageClass: ""
+  accessMode: ReadWriteOnce
+
+imagePullSecrets: []
+
+resources: {}
+
+nodeSelector: {}
+
+tolerations: []

@@ -1,0 +1,516 @@
+# Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+##################################################################
+# OpenCV
+##################################################################
+if (BUILD_OPENCV)
+  # Single find_package call with the full set of components needed for the
+  # current build. `imgcodecs` is added when BUILD_TEST is on (test fixtures
+  # use cv::imread/imwrite for golden images and diff dumps). Splitting into
+  # two find_package calls would risk core/imgproc and imgcodecs resolving
+  # against different OpenCV installs and mixing versions on the link line.
+  set(_opencv_components core imgproc)
+  if (BUILD_TEST)
+    list(APPEND _opencv_components imgcodecs)
+  endif()
+
+  find_package(OpenCV 5.0 QUIET COMPONENTS ${_opencv_components})
+  if(NOT OpenCV_FOUND)
+    find_package(OpenCV 4.0 QUIET COMPONENTS ${_opencv_components})
+  endif()
+  if(NOT OpenCV_FOUND)
+    find_package(OpenCV 3.0 REQUIRED COMPONENTS ${_opencv_components})
+  endif()
+
+  message(STATUS "Found OpenCV: ${OpenCV_INCLUDE_DIRS} (found suitable version \"${OpenCV_VERSION}\", minimum required is \"3.0\")")
+  include_directories(SYSTEM ${OpenCV_INCLUDE_DIRS})
+
+  # Production link line: only core+imgproc, never imgcodecs (keeps libdali
+  # free of opencv_imgcodecs and its bundled codec statics:
+  # libwebp/libpng/libjasper/libIlmImf/libtiff).
+  list(APPEND DALI_LIBS opencv_core opencv_imgproc)
+  message("OpenCV production libraries: opencv_core opencv_imgproc")
+  list(APPEND DALI_EXCLUDES libopencv_core.a;libopencv_imgproc.a;libopencv_highgui.a)
+
+  if (BUILD_TEST)
+    set(DALI_OPENCV_TEST_EXTRA_LIBS opencv_imgcodecs CACHE INTERNAL
+        "OpenCV imgcodecs target, for test executables only")
+  else()
+    # Drop any stale value from a previous BUILD_TEST=ON configuration so a
+    # reconfigure to BUILD_TEST=OFF cannot leave imgcodecs hanging in the cache.
+    unset(DALI_OPENCV_TEST_EXTRA_LIBS CACHE)
+  endif()
+endif()
+
+##################################################################
+#
+# Optional dependencies
+#
+##################################################################
+
+##################################################################
+# Google C++ testing framework
+##################################################################
+if (BUILD_TEST)
+  set(BUILD_GTEST ON CACHE INTERNAL "Build gtest submodule")
+  set(BUILD_GMOCK OFF CACHE INTERNAL "Build gmock submodule")
+  check_and_add_cmake_submodule(${PROJECT_SOURCE_DIR}/third_party/googletest EXCLUDE_FROM_ALL)
+  include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third_party/googletest/googletest/include)
+  set_target_properties(gtest PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+##################################################################
+# Google Benchmark
+##################################################################
+if (BUILD_BENCHMARK)
+  set(BENCHMARK_ENABLE_TESTING OFF CACHE INTERNAL "Build benchmark testsuite")
+  check_and_add_cmake_submodule(${PROJECT_SOURCE_DIR}/third_party/benchmark EXCLUDE_FROM_ALL)
+  include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third_party/benchmark/include/benchmark)
+  set_target_properties(benchmark PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+##################################################################
+# PyBind
+##################################################################
+if (BUILD_PYTHON)
+  if (USE_PREBUILD_PYBIND11)
+    find_package(pybind11 REQUIRED)
+  else()
+    check_and_add_cmake_submodule(${PROJECT_SOURCE_DIR}/third_party/pybind11)
+  endif()
+endif()
+
+##################################################################
+# LMDB
+##################################################################
+if (BUILD_LMDB)
+  find_package(LMDB 0.9 REQUIRED)
+  include_directories(SYSTEM ${LMDB_INCLUDE_DIR})
+  list(APPEND DALI_LIBS ${LMDB_LIBRARIES})
+  list(APPEND DALI_EXCLUDES liblmdb.a)
+endif()
+
+##################################################################
+# libsnd
+##################################################################
+if(BUILD_LIBSND)
+  find_library(libsnd_LIBS
+          NAMES sndfile libsndfile
+          PATHS ${LIBSND_ROOT_DIR} "/usr/local" ${CMAKE_SYSTEM_PREFIX_PATH}
+          PATH_SUFFIXES lib lib64)
+  if(${libsnd_LIBS} STREQUAL libsnd_LIBS-NOTFOUND)
+    message(FATAL_ERROR "libsnd (sndfile) could not be found. Try to specify it's location with `-DLIBSND_ROOT_DIR`.")
+  endif()
+  message(STATUS "Found libsnd: ${libsnd_LIBS}")
+  list(APPEND DALI_LIBS ${libsnd_LIBS})
+endif()
+
+##################################################################
+# libtar
+##################################################################
+if(BUILD_LIBTAR)
+  if(BUILD_FOR_CONDA)
+    set(libtar_NAMES tar libtar)
+  else()
+    set(libtar_NAMES libtar.a tar libtar)
+  endif()
+  find_library(libtar_LIBS
+          NAMES ${libtar_NAMES}
+          PATHS ${LIBTAR_ROOT_DIR} "/usr/local" ${CMAKE_SYSTEM_PREFIX_PATH}
+          PATH_SUFFIXES lib lib64)
+  if(${libtar_LIBS} STREQUAL libtar_LIBS-NOTFOUND)
+    message(FATAL_ERROR "libtar could not be found. Try to specify it's location with `-DLIBTAR_ROOT_DIR`.")
+  endif()
+  message(STATUS "Found libtar: ${libtar_LIBS}")
+  list(APPEND DALI_LIBS ${libtar_LIBS})
+  list(APPEND DALI_EXCLUDES libtar.a)
+endif()
+
+
+##################################################################
+# nvcomp
+##################################################################
+# The nvCOMP version DALI is built against and depends on. Only the major version
+# is enforced when looking for the headers and the library, as it defines the ABI.
+set(DALI_NVCOMP_VERSION "5.3.0.16")
+string(REGEX MATCH "^[0-9]+" DALI_NVCOMP_VERSION_MAJOR "${DALI_NVCOMP_VERSION}")
+set(DALI_INSTALL_REQUIRES_NVCOMP "")
+if(BUILD_NVCOMP)
+  # The Linux distribution packages put each major version in a versioned subdirectory
+  # and expose only one of them (not necessarily ours) in the default location.
+  find_path(
+    nvcomp_INCLUDE_DIR
+    NAMES nvcomp.h
+    HINTS ${NVCOMP_ROOT_DIR}
+    PATHS "/usr/local/cuda" "/usr/local" ${CMAKE_SYSTEM_PREFIX_PATH}
+    PATH_SUFFIXES libnvcomp${DALI_NVCOMP_VERSION_MAJOR}-dev-cuda-${CUDA_VERSION_MAJOR}
+                  include/libnvcomp${DALI_NVCOMP_VERSION_MAJOR}-dev-cuda-${CUDA_VERSION_MAJOR}
+                  include include/nvcomp)
+  if (${nvcomp_INCLUDE_DIR} STREQUAL nvcomp_INCLUDE_DIR-NOTFOUND)
+    message(FATAL_ERROR "nvCOMP headers could not be found. Try to specify nvcomp location with `-DNVCOMP_ROOT_DIR`.")
+  endif()
+  set(nvcomp_VERSION_MAJOR "unknown")
+  if (EXISTS "${nvcomp_INCLUDE_DIR}/nvcomp/version.h")
+    file(STRINGS "${nvcomp_INCLUDE_DIR}/nvcomp/version.h" nvcomp_VERSION_MAJOR
+         REGEX "^#define NVCOMP_VER_MAJOR +[0-9]+")
+    string(REGEX REPLACE "^#define NVCOMP_VER_MAJOR +([0-9]+).*" "\\1"
+           nvcomp_VERSION_MAJOR "${nvcomp_VERSION_MAJOR}")
+  endif()
+  if (NOT nvcomp_VERSION_MAJOR STREQUAL DALI_NVCOMP_VERSION_MAJOR)
+    # Don't keep the wrong location in the cache, so that the next run searches again.
+    # This must precede message(FATAL_ERROR), which stops processing.
+    set(nvcomp_WRONG_INCLUDE_DIR "${nvcomp_INCLUDE_DIR}")
+    unset(nvcomp_INCLUDE_DIR CACHE)
+    message(FATAL_ERROR "nvCOMP ${DALI_NVCOMP_VERSION_MAJOR}.x is required, but the headers found in "
+                        "${nvcomp_WRONG_INCLUDE_DIR} are version ${nvcomp_VERSION_MAJOR}. "
+                        "Try to specify nvcomp location with `-DNVCOMP_ROOT_DIR`.")
+  endif()
+  include_directories(SYSTEM ${nvcomp_INCLUDE_DIR})
+  if (NOT WITH_DYNAMIC_NVCOMP)
+    # Discard a library with a wrong major version, e.g. found by an older configuration.
+    # Symlinks are resolved, so an unversioned libnvcomp.so pointing to the right version is kept.
+    if (nvcomp_LIBS)
+      get_filename_component(nvcomp_LIBS_REALPATH "${nvcomp_LIBS}" REALPATH)
+      if (NOT nvcomp_LIBS_REALPATH MATCHES
+          "libnvcomp\\.so\\.${DALI_NVCOMP_VERSION_MAJOR}(\\.[0-9]+)*$")
+        message(STATUS "Discarding nvcomp_LIBS=${nvcomp_LIBS}, as it's not "
+                       "libnvcomp.so.${DALI_NVCOMP_VERSION_MAJOR}. Searching again.")
+        unset(nvcomp_LIBS CACHE)
+      endif()
+    endif()
+    find_library(
+      nvcomp_LIBS
+      NAMES libnvcomp.so.${DALI_NVCOMP_VERSION_MAJOR}
+      HINTS ${NVCOMP_ROOT_DIR}
+      PATHS "/usr/local/cuda" "/usr/local" ${CMAKE_SYSTEM_PREFIX_PATH}
+      PATH_SUFFIXES lib lib64 libnvcomp${DALI_NVCOMP_VERSION_MAJOR}-cuda-${CUDA_VERSION_MAJOR})
+    if(${nvcomp_LIBS} STREQUAL nvcomp_LIBS-NOTFOUND)
+      message(FATAL_ERROR "nvCOMP libs could not be found. Try to specify nvcomp location with `-DNVCOMP_ROOT_DIR`.")
+    endif()
+    message(STATUS "Found nvCOMP: ${nvcomp_LIBS} ${nvcomp_INCLUDE_DIR}.")
+    list(APPEND DALI_LIBS ${nvcomp_LIBS})
+  else()
+    message(STATUS "Found nvCOMP: ${nvcomp_INCLUDE_DIR}.")
+    set(DALI_INSTALL_REQUIRES_NVCOMP "\'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR} == ${DALI_NVCOMP_VERSION}\',")
+    message(STATUS "Adding nvComp requirement as: ${DALI_INSTALL_REQUIRES_NVCOMP}")
+  endif()
+endif()
+
+
+##################################################################
+# FFmpeg
+##################################################################
+if(BUILD_FFMPEG)
+  include(CheckStructHasMember)
+  include(CheckTypeSize)
+
+  set(FFMPEG_ROOT_DIR "" CACHE PATH "Folder contains ffmpeg")
+  set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH YES)
+
+  find_package(PkgConfig REQUIRED)
+  foreach(m avformat avcodec avfilter avutil swscale)
+      # We do a find_library only if FFMPEG_ROOT_DIR is provided
+      if(NOT FFMPEG_ROOT_DIR)
+        string(TOUPPER ${m} M)
+        pkg_check_modules(${m} REQUIRED lib${m})
+        list(APPEND FFmpeg_LIBS ${m})
+      else()
+        # Set the name of the destination variable, it cannot be the same across
+        # consecutive find_library calls to avoid caching
+        set(FFmpeg_Lib "FFmpeg_Lib${m}")
+        find_library(${FFmpeg_Lib} ${m}
+              PATHS ${FFMPEG_ROOT_DIR}
+              PATH_SUFFIXES lib lib64
+              NO_DEFAULT_PATH)
+        list(APPEND FFmpeg_LIBS ${${FFmpeg_Lib}})
+      endif()
+  endforeach(m)
+
+  include_directories(${avformat_INCLUDE_DIRS})
+  list(APPEND DALI_LIBS ${avformat_LIBRARIES})
+  CHECK_STRUCT_HAS_MEMBER("struct AVStream" codecpar libavformat/avformat.h HAVE_AVSTREAM_CODECPAR LANGUAGE CXX)
+  set(CMAKE_EXTRA_INCLUDE_FILES libavcodec/avcodec.h)
+  CHECK_TYPE_SIZE("AVBSFContext" AVBSFCONTEXT LANGUAGE CXX)
+
+  list(APPEND DALI_LIBS ${FFmpeg_LIBS})
+endif()
+
+##################################################################
+# Boost preprocessor
+##################################################################
+include_directories(${PROJECT_SOURCE_DIR}/third_party/boost/preprocessor/include)
+
+##################################################################
+# RapidJSON
+##################################################################
+include_directories(${PROJECT_SOURCE_DIR}/third_party/rapidjson/include)
+
+##################################################################
+# FFTS
+##################################################################
+if (BUILD_FFTS AND NOT PREBUILD_DALI_LIBS)
+  set(GENERATE_POSITION_INDEPENDENT_CODE ON CACHE BOOL "-fPIC")
+  set(ENABLE_SHARED OFF CACHE BOOL "shared library target")
+  set(ENABLE_STATIC ON CACHE BOOL "static library target")
+  # dynamic machine code generation works only for x86
+  if(NOT (${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64"))
+    set(DISABLE_DYNAMIC_CODE ON CACHE BOOL "Disables the use of dynamic machine code generation")
+  endif()
+
+  # Workaround for Clang as msse3 is only enabled if GCC is detected
+  if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse -msse2 -msse3")
+    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse -msse2 -msse3")
+    SET(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -msse -Xcompiler -msse2 -Xcompiler -msse3")
+  endif()
+
+  block(SCOPE_FOR VARIABLES)
+    # FFTS passes sizes that are not multiples of 32 to aligned_alloc(32, size).
+    # Use its posix_memalign fallback, which accepts these sizes, including under ASan.
+    set(HAVE_ALIGNED_ALLOC OFF)
+    check_and_add_cmake_submodule(${PROJECT_SOURCE_DIR}/third_party/ffts EXCLUDE_FROM_ALL)
+  endblock()
+  include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third_party/ffts/include)
+  list(APPEND DALI_LIBS ffts)
+  list(APPEND DALI_EXCLUDES libffts.a)
+endif()
+
+##################################################################
+# CUTLASS
+##################################################################
+include_directories(SYSTEM third_party/cutlass/include)
+include_directories(SYSTEM third_party/cutlass/tools/util/include)
+
+##################################################################
+# CocoAPI
+##################################################################
+if(NOT PREBUILD_DALI_LIBS)
+  set(SOURCE_FILES third_party/cocoapi/common/maskApi.c)
+  add_library(cocoapi STATIC ${SOURCE_FILES})
+  set_target_properties(cocoapi PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  list(APPEND DALI_LIBS cocoapi)
+  list(APPEND DALI_EXCLUDES libcocoapi.a)
+endif()
+
+##################################################################
+# cfitsio
+##################################################################
+if(BUILD_CFITSIO)
+  find_library(cfitsio_LIBS
+          NAMES libcfitsio.so libcfitsio
+          PATHS ${CFITSIO_ROOT_DIR} "/usr/local" ${CMAKE_SYSTEM_PREFIX_PATH}
+          PATH_SUFFIXES lib lib64)
+  if(${cfitsio_LIBS} STREQUAL cfitsio_LIBS-NOTFOUND)
+    message(FATAL_ERROR "cfitsio could not be found. Try to specify it's location with `-DCFITSIO_ROOT_DIR`.")
+  endif()
+  message(STATUS "Found cfitsio: ${cfitsio_LIBS}")
+  list(APPEND DALI_LIBS ${cfitsio_LIBS})
+endif()
+
+##################################################################
+# CV-CUDA
+##################################################################
+if (BUILD_CVCUDA)
+  set(DALI_BUILD_PYTHON ${BUILD_PYTHON})
+  set(DALI_BUILD_TESTS ${BUILD_TESTS})
+  set(DALI_BUILD_TESTS_CPP ${BUILD_TESTS_CPP})
+  set(DALI_BUILD_TESTS_WHEELS ${BUILD_TESTS_WHEELS})
+  set(DALI_BUILD_TESTS_PYTHON ${BUILD_TESTS_PYTHON})
+  set(BUILD_PYTHON OFF)
+  set(BUILD_TESTS OFF)
+  set(BUILD_TESTS_CPP OFF)
+  set(BUILD_TESTS_WHEELS OFF)
+  set(BUILD_TESTS_PYTHON OFF)
+  # for now we use only median blur from CV-CUDA
+  set(CV_CUDA_SRC_PATERN medianblur median_blur morphology warp HQResize)
+  check_and_add_cmake_submodule(${PROJECT_SOURCE_DIR}/third_party/cvcuda)
+  set(BUILD_PYTHON ${DALI_BUILD_PYTHON})
+  set(BUILD_TESTS ${DALI_BUILD_TESTS})
+  set(BUILD_TESTS_CPP ${DALI_BUILD_TESTS_CPP})
+  set(BUILD_TESTS_WHEELS ${DALI_BUILD_TESTS_WHEELS})
+  set(BUILD_TESTS_PYTHON ${DALI_BUILD_TESTS_PYTHON})
+endif()
+
+##################################################################
+# nvimagecodec
+##################################################################
+set(DALI_INSTALL_REQUIRES_NVIMGCODEC "")
+if(BUILD_NVIMAGECODEC)
+  set(NVIMGCODEC_MIN_VERSION "0.9.0")
+  set(NVIMGCODEC_MAX_VERSION "0.10.0")
+  message(STATUS "nvImageCodec - requires version >=${NVIMGCODEC_MIN_VERSION}, <${NVIMGCODEC_MAX_VERSION}")
+  if (WITH_DYNAMIC_NVIMGCODEC)
+    message(STATUS "nvImageCodec - dynamic load")
+
+    # Silence DOWNLOAD_EXTRACT_TIMESTAMP warning in CMake 3.24:
+    if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
+      cmake_policy(SET CMP0135 NEW)
+    endif()
+
+    find_package(nvimgcodec ${NVIMGCODEC_MIN_VERSION}...<${NVIMGCODEC_MAX_VERSION})
+    if (NOT nvimgcodec_FOUND)
+      message(STATUS "nvImageCodec - not found; downloading from nvidia.com")
+      # Note: We are getting the x86_64 tarball, but we are only interested in the headers.
+      include(FetchContent)
+      if ("${CUDA_VERSION_MAJOR}" EQUAL "13")
+        FetchContent_Declare(
+            nvimgcodec_headers
+            URL      https://developer.download.nvidia.com/compute/nvimgcodec/redist/nvimgcodec/linux-x86_64/nvimgcodec-linux-x86_64-0.9.0.20_cuda13-archive.tar.xz
+            URL_HASH SHA512=a7a07e8f297eaeb41c51769dba57bd56773a88c2612df8bc7c563c8679ffb2da137106589af48f4448a1481764ca62bf5e1250dbfd017e3acbf394b1680e92c1
+        )
+      elseif ("${CUDA_VERSION_MAJOR}" EQUAL "12")
+        FetchContent_Declare(
+            nvimgcodec_headers
+            URL      https://developer.download.nvidia.com/compute/nvimgcodec/redist/nvimgcodec/linux-x86_64/nvimgcodec-linux-x86_64-0.9.0.20_cuda12-archive.tar.xz
+            URL_HASH SHA512=687e88cd850574bcfd7dbd5b728580ac4a8bd00ba64ed27f1866efa2b01c7ae0743617daddc3f3b743089484cfdd7fff85d1dc3c0fd99e016988171fbaf83363
+        )
+      else()
+        message(FATAL_ERROR "Unsupported CUDA major version: ${CUDA_VERSION_MAJOR}")
+      endif()
+      FetchContent_Populate(nvimgcodec_headers)
+      message("nvimgcodec_headers_SOURCE_DIR = ${nvimgcodec_headers_SOURCE_DIR}")
+      set(nvimgcodec_INCLUDE_DIR "${nvimgcodec_headers_SOURCE_DIR}/include")
+      if (NOT EXISTS "${nvimgcodec_INCLUDE_DIR}/nvimgcodec.h")
+        message(FATAL_ERROR "nvimgcodec.h not found in ${nvimgcodec_INCLUDE_DIR} - something went wrong with the download")
+      endif()
+    endif()
+    message(STATUS "Using nvimgcodec_INCLUDE_DIR=${nvimgcodec_INCLUDE_DIR}")
+    include_directories(SYSTEM ${nvimgcodec_INCLUDE_DIR})
+
+    # Setting default installation path for dynamic loading
+    message(STATUS "NVIMGCODEC_DEFAULT_INSTALL_PATH=${NVIMGCODEC_DEFAULT_INSTALL_PATH}")
+    add_definitions(-DNVIMGCODEC_DEFAULT_INSTALL_PATH=\"${NVIMGCODEC_DEFAULT_INSTALL_PATH}\")
+
+    if("$ENV{ARCH}" STREQUAL "aarch64-linux")
+      message(STATUS "ARCH is set to aarch64-linux")
+      set(NVIMGCODEC_PACKAGE_NAME "nvidia-nvimgcodec-tegra-cu${CUDA_VERSION_MAJOR}[all]")
+    else()
+      message(STATUS "ARCH is set to $ENV{ARCH}")
+      set(NVIMGCODEC_PACKAGE_NAME "nvidia-nvimgcodec-cu${CUDA_VERSION_MAJOR}[all]")
+    endif()
+    set(DALI_INSTALL_REQUIRES_NVIMGCODEC "\'${NVIMGCODEC_PACKAGE_NAME} >= ${NVIMGCODEC_MIN_VERSION}, < ${NVIMGCODEC_MAX_VERSION}',")
+    message(STATUS "Adding nvimagecodec requirement as: ${DALI_INSTALL_REQUIRES_NVIMGCODEC}")
+  else()
+    message(STATUS "nvImageCodec - static link")
+
+    set(NVIMGCODEC_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/nvimgcodec")
+
+    set(EXTRA_CMAKE_OPTIONS $ENV{EXTRA_CMAKE_OPTIONS})
+    if (NOT "${EXTRA_CMAKE_OPTIONS}" STREQUAL "")
+      string(REPLACE " " ";" EXTRA_CMAKE_OPTIONS_LIST ${EXTRA_CMAKE_OPTIONS})
+    else()
+      set(EXTRA_CMAKE_OPTIONS_LIST "")
+    endif()
+
+    include(ExternalProject)
+    ExternalProject_Add(
+      nvImageCodec
+      GIT_REPOSITORY    https://github.com/NVIDIA/nvImageCodec.git
+      GIT_TAG           v0.9.0
+      GIT_SUBMODULES    "external/pybind11"
+                        "external/NVTX"
+                        "external/googletest"
+                        "external/dlpack"
+                        "external/boost/preprocessor"
+      CMAKE_ARGS        "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+                        "-DCMAKE_INSTALL_PREFIX=${NVIMGCODEC_INSTALL_PREFIX}"
+                        "-DBUILD_TEST=OFF"
+                        "-DBUILD_SAMPLES=OFF"
+                        "-DBUILD_PYTHON=OFF"
+                        "-DBUILD_NVJPEG2K_EXT=ON"
+                        "-DWITH_DYNAMIC_NVJPEG2K=OFF"
+                        "-DBUILD_NVJPEG_EXT=ON"
+                        "-DWITH_DYNAMIC_NVJPEG=OFF"
+                        "-DBUILD_NVTIFF_EXT=OFF"
+                        "-DWITH_DYNAMIC_NVTIFF=OFF"
+                        "-DBUILD_NVBMP_EXT=OFF"
+                        "-DBUILD_NVPNM_EXT=OFF"
+                        "-DBUILD_LIBJPEG_TURBO_EXT=ON"
+                        "-DBUILD_LIBTIFF_EXT=ON"
+                        "-DBUILD_OPENCV_EXT=${BUILD_OPENCV}"
+                        "-DBUILD_DOCS=OFF"
+                        "${EXTRA_CMAKE_OPTIONS_LIST}"
+      PREFIX            "${NVIMGCODEC_INSTALL_PREFIX}"
+    )
+    set(nvimgcodec_INCLUDE_DIR "${NVIMGCODEC_INSTALL_PREFIX}/include")
+    set(nvimgcodec_LIBRARY_DIR "${NVIMGCODEC_INSTALL_PREFIX}/lib64")
+    message(STATUS "Using nvimgcodec_INCLUDE_DIR=${nvimgcodec_INCLUDE_DIR}")
+    message(STATUS "Using nvimgcodec_LIBRARY_DIR=${nvimgcodec_LIBRARY_DIR}")
+    include_directories(SYSTEM ${nvimgcodec_INCLUDE_DIR})
+    link_directories(${nvimgcodec_LIBRARY_DIR})
+
+    set(NVIMGCODEC_LIBS "")
+    list(APPEND NVIMGCODEC_LIBS nvimgcodec_static)
+    list(APPEND DALI_EXCLUDES libnvimgcodec_static.a)
+
+    list(APPEND NVIMGCODEC_LIBS opencv_ext_static)
+    list(APPEND DALI_EXCLUDES libopencv_ext_static.a)
+
+    list(APPEND NVIMGCODEC_LIBS jpeg_turbo_ext_static)
+    list(APPEND DALI_EXCLUDES libjpeg_turbo_ext_static.a)
+
+    list(APPEND NVIMGCODEC_LIBS tiff_ext_static)
+    list(APPEND DALI_EXCLUDES libtiff_ext_static.a)
+
+    list(APPEND NVIMGCODEC_LIBS nvjpeg2k_ext_static)
+    list(APPEND DALI_EXCLUDES libnvjpeg2k_ext_static.a)
+
+    list(APPEND NVIMGCODEC_LIBS nvjpeg_ext_static)
+    list(APPEND DALI_EXCLUDES libnvjpeg_ext_static.a)
+  endif()
+endif()
+
+
+##################################################################
+# AWS SDK
+##################################################################
+if(BUILD_AWSSDK)
+  find_path(AWSSDK_INCLUDE_DIR aws/core/Aws.h)
+  find_library(AWS_CPP_SDK_CORE_LIB NAMES aws-cpp-sdk-core)
+  find_library(AWS_CPP_SDK_S3_LIB NAMES aws-cpp-sdk-s3)
+  if ("${AWSSDK_INCLUDE_DIR}" STREQUAL "AWSSDK_INCLUDE_DIR-NOTFOUND" OR
+      "${AWS_CPP_SDK_CORE_LIB}" STREQUAL "AWS_CPP_SDK_CORE_LIB-NOTFOUND" OR
+      "${AWS_CPP_SDK_S3_LIB}" STREQUAL "AWS_CPP_SDK_S3_LIB-NOTFOUND")
+      message(WARNING "AWS SDK not found. Disabling AWS SDK support.")
+      set(BUILD_AWSSDK OFF)
+  else()
+    set(AWSSDK_LIBRARIES "")
+    list(APPEND AWSSDK_LIBRARIES ${AWS_CPP_SDK_S3_LIB})
+    list(APPEND AWSSDK_LIBRARIES ${AWS_CPP_SDK_CORE_LIB})
+    message(STATUS "AWSSDK_INCLUDE_DIR=${AWSSDK_INCLUDE_DIR}")
+    message(STATUS "AWSSDK_LIBRARIES=${AWSSDK_LIBRARIES}")
+  endif()
+endif()
+
+##################################################################
+# Google Cloud Storage (google-cloud-cpp)
+##################################################################
+if(BUILD_GCS)
+  find_package(google_cloud_cpp_storage CONFIG QUIET)
+  if (NOT google_cloud_cpp_storage_FOUND)
+    message(WARNING "google-cloud-cpp storage not found. Disabling Google Cloud Storage support.")
+    set(BUILD_GCS OFF)
+  elseif (google_cloud_cpp_storage_VERSION VERSION_LESS "3.0")
+    # gcs_client_manager.h uses gcs::DownloadChecksumValidationOption and gcs::ChecksumAlgorithm,
+    # which were introduced in google-cloud-cpp 3.0. Without this check an older install is
+    # accepted here and fails much later, with a compile error inside the GCS headers.
+    message(WARNING "google-cloud-cpp storage ${google_cloud_cpp_storage_VERSION} is too old, "
+                    "3.0 or newer is required. Disabling Google Cloud Storage support.")
+    set(BUILD_GCS OFF)
+  else()
+    message(STATUS "google-cloud-cpp storage version=${google_cloud_cpp_storage_VERSION}")
+  endif()
+endif()

@@ -1,0 +1,13 @@
+dataset:
+  ref: visdrone
+  split: val
+
+detector:
+  ref: yolox-x-visdrone
+  checkpoint: default
+
+reid:
+  ref: lmbn-n-duke
+
+evaluation:
+  class_map: auto

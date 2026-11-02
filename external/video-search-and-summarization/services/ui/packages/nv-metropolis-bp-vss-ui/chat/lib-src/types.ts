@@ -1,0 +1,252 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Types for the VSS chat interface.
+ *
+ * Consumes the versioned VSS agent API contract and retains the original
+ * chat-SSE transport as a compatibility fallback.
+ */
+
+import type { FileUploadResult } from 'common';
+
+export type ChatRole = 'user' | 'assistant';
+
+/**
+ * One tool/skill step reported by the agent while it works.
+ *
+ * `children` makes this a tree nested by `parent_id`. Keep it structured and
+ * render it as React instead of serialising to HTML and re-parsing it, which
+ * leaks half-written tags mid-stream.
+ */
+export interface ChatStep {
+  id: string;
+  name: string;
+  status: 'in_progress' | 'complete' | 'error';
+  /** Raw detail, shown only when the step is expanded. */
+  payload?: string;
+  index: number;
+  parentId?: string;
+  children?: ChatStep[];
+}
+
+/** Parent-provided renderable HTML shown under an assistant response. */
+export type CallerInfo = string;
+
+export interface ChatAttachment {
+  /** data: URL. Images only. */
+  content: string;
+  type: 'image';
+  name?: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  content: string;
+  /** Validated UI artifacts rendered separately and excluded from agent history. */
+  artifacts?: string[];
+  /** Populated for assistant messages that reported tool activity. */
+  steps?: ChatStep[];
+  /** True while tokens are still arriving. */
+  streaming?: boolean;
+  error?: string;
+  attachments?: ChatAttachment[];
+  /** Sent to the agent but never rendered (upload auto-prompts). */
+  hidden?: boolean;
+  /**
+   * Conversation active when an upload batch started. Used to drop a stale
+   * auto-prompt if the user switched conversations mid-upload.
+   */
+  uploadConversationId?: string;
+  /** HTML card rendered under an assistant answer, supplied by the embedder. */
+  callerInfo?: CallerInfo;
+  timestamp?: number;
+}
+
+/** A folder used to organize chat conversations. */
+export interface ChatFolder {
+  id: string;
+  name: string;
+  type: 'chat';
+}
+
+/** A named thread of messages. */
+export interface Conversation {
+  id: string;
+  name: string;
+  messages: ChatMessage[];
+  folderId?: string | null;
+}
+
+/**
+ * UI-only chip attached to the next message.
+ *
+ * `contextType` drives the chip icon and is never sent to the backend — only
+ * `data` is, inside the `[Context: …]` prefix. Search-tab
+ * `addChatQueryContext` calls keep working unchanged.
+ */
+export interface QueryDataContext {
+  id: string;
+  label: string;
+  contextType: string;
+  data: Record<string, unknown>;
+}
+
+/** Everything the panel needs to reach a backend. */
+export interface ChatEndpointConfig {
+  /** Chat endpoint, or the base of the same-origin agent API. */
+  url: string;
+  /** Selects the structured agent protocol; omitted keeps legacy chat SSE compatibility. */
+  transport?: 'chat-sse' | 'agent-api';
+  /** Agent surface label, used for policy and diagnostics. */
+  surface?: string;
+  /** Same-origin prefix used to relay absolute media handles from artifacts. */
+  mediaProxyUrl?: string;
+  /** Sent as Conversation-Id or agent API thread_id. */
+  conversationId: string;
+  /** Merged into the request body (the UI's custom agent params). */
+  extraParams?: Record<string, string | number | boolean>;
+  headers?: Record<string, string>;
+  /** Base VST API URL for chunked video upload; enables the upload button when set. */
+  uploadUrlBase?: string;
+}
+
+/**
+ * Called with each completed assistant answer.
+ *
+ * This is how feature tabs (search, alerts) receive results without the chat
+ * package knowing anything about them. Returning a string renders it as the
+ * message's caller-info card.
+ */
+export type ChatAnswerHandler = (
+  answer: string,
+  /** Scopes any per-conversation artifact the consumer fetches for this answer. */
+  conversationId: string,
+) => CallerInfo | boolean | void;
+
+/**
+ * Payload for a finished upload batch.
+ *
+ * `FileUploadResult` is re-used from `common` rather than widened to a plain
+ * record: the app's existing upload-complete handlers are typed against it, and
+ * a looser type here would fail to assign at the call site.
+ */
+export interface ChatVideoUploadCompletePayload {
+  results: { filename: string; result: FileUploadResult }[];
+}
+
+/** Handlers handed to an embedder that renders conversation controls itself. */
+export interface ChatSidebarControlHandlers {
+  conversations: Conversation[];
+  filteredConversations: Conversation[];
+  folders: ChatFolder[];
+  selectedConversationId: string | null;
+  searchTerm: string;
+  onSearchTermChange: (term: string) => void;
+  onSelectConversation: (id: string) => void;
+  onNewConversation: (folderId?: string | null) => void;
+  onRenameConversation: (id: string, name: string) => void;
+  onDeleteConversation: (id: string) => void;
+  onMoveConversation: (id: string, folderId: string | null) => void;
+  onCreateFolder: () => ChatFolder;
+  onRenameFolder: (id: string, name: string) => void;
+  onDeleteFolder: (id: string) => void;
+  onClearConversations: () => void;
+  onExportData: () => void;
+  onImportConversations: (data: unknown) => void;
+  /** True while a turn is in flight; controls are disabled. */
+  busy: boolean;
+}
+
+/** A field in the agent-parameters panel, parsed from the deployment's JSON. */
+export type ParamType = 'string' | 'number' | 'boolean' | 'select';
+
+export interface ParamFieldConfig {
+  name: string;
+  label: string;
+  type: ParamType;
+  'default-value': string | number | boolean;
+  options?: string[];
+  /** false = shown but read-only. */
+  changeable?: boolean;
+  'tooltip-info'?: string;
+}
+
+export interface ParamField extends ParamFieldConfig {
+  id: string;
+  value: string | number | boolean;
+}
+
+export type CustomAgentParamsValues = Record<string, string | number | boolean>;
+
+/** Feature switches, mapped from NEXT_PUBLIC_CHAT_* env flags. */
+export interface ChatFeatureFlags {
+  /** Send the whole thread rather than just the latest turn. */
+  chatHistory?: boolean;
+  /** Opt into allowing legacy vss-agent to pause for an inline response. */
+  hitl?: boolean;
+  /** Show the tool-step disclosure. */
+  intermediateSteps?: boolean;
+  /** Expand intermediate steps by default. */
+  expandIntermediateSteps?: boolean;
+  messageCopy?: boolean;
+  messageEdit?: boolean;
+  messageSpeaker?: boolean;
+  /** Show the mic button (browser SpeechRecognition). */
+  inputMic?: boolean;
+  /** Show the video upload button and welcome drop zone. */
+  uploadFile?: boolean;
+  /** Collect per-file metadata in the upload dialog. */
+  uploadFileMetadata?: boolean;
+  /** Show the theme toggle in the header menu. */
+  themeToggle?: boolean;
+  /** Show the conversation controls the panel owns (header menu). */
+  headerMenu?: boolean;
+}
+
+export interface ChatPanelProps {
+  endpoint: Omit<ChatEndpointConfig, 'conversationId'> & {
+    conversationId?: string;
+  };
+  title?: string;
+  /** Light surface against a dark app, or vice versa. */
+  theme?: 'light' | 'dark';
+  onThemeChange?: (theme: 'light' | 'dark') => void;
+  placeholder?: string;
+  /** @deprecated use `features.intermediateSteps` */
+  showSteps?: boolean;
+  features?: ChatFeatureFlags;
+  /** JSON describing the agent-parameter fields; from NEXT_PUBLIC_CHAT_API_CUSTOM_AGENT_PARAMS_JSON. */
+  customAgentParamsJson?: string;
+  /** JSON template for the upload dialog's metadata fields. */
+  uploadConfigTemplateJson?: string;
+  /** Auto-prompt sent after a successful upload; `{filenames}` is substituted. */
+  uploadHiddenMessageTemplate?: string;
+  /** Separates this instance's persisted conversations from another's. */
+  storageKeyPrefix?: string;
+  /** False while the surface is hidden; suppresses autoscroll work. */
+  isActive?: boolean;
+
+  /** Notified with each finished assistant answer. */
+  onAnswer?: ChatAnswerHandler;
+  /** Notified when a turn finishes, without the content. */
+  onAnswerComplete?: () => void;
+  /** Notified when the user sends, so tabs can clear stale results. */
+  onSubmit?: (message: string) => void;
+  /** Receives a function the embedder can call to submit a message itself. */
+  onSubmitMessageReady?: (submit: (message: string) => void) => void;
+  /** Notified when a message was submitted programmatically. */
+  onMessageSubmitted?: () => void;
+  /** Receives a function the embedder can call to add a context chip. */
+  onAddQueryContextReady?: (add: (item: QueryDataContext) => void) => void;
+  /** Notified when an upload batch finishes with at least one success. */
+  onChatVideoUploadComplete?: (payload: ChatVideoUploadCompletePayload) => void;
+  /** Notified whenever a turn starts or ends. */
+  onBusyChange?: (busy: boolean) => void;
+  /** Notified when a turn fails because the backend rejected the credentials. */
+  onAuthFailure?: () => void;
+  /** Receives conversation controls so an external sidebar can render them. */
+  onControlsReady?: (handlers: ChatSidebarControlHandlers) => void;
+
+  className?: string;
+}

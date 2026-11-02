@@ -1,0 +1,220 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "vss-alert-bridge.fullname" . }}
+  labels:
+    app.kubernetes.io/name: vss-alert-bridge
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  serviceName: {{ include "vss-alert-bridge.fullname" . }}
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vss-alert-bridge
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vss-alert-bridge
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      # At alert_agent.processes: 1, the shipped default, there is no
+      # supervisor: up to 10s to terminate and join the API child, up to 15s
+      # of drain, up to 5s to close the event-loop clients, up to 15s to stop
+      # the runtime. 45s bounded.
+      # Kubernetes' own 30s default does not cover that, and a cluster-wide
+      # change to it would cut the drain short silently.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 60 }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.waitForDependencies.enabled }}
+      {{- $g := .Values.global | default dict }}
+      {{- $pfx := default false (coalesce .Values.useReleaseNamePrefix (index $g "useReleaseNamePrefix")) }}
+      {{- $kafkaDef := ternary (printf "%s-kafka-kafka" .Release.Name) "kafka-kafka" $pfx }}
+      {{- $esDef := ternary (printf "%s-elasticsearch" .Release.Name) "elasticsearch" $pfx }}
+      {{- $kafkaH := .Values.waitForDependencies.kafkaHost | default $kafkaDef }}
+      {{- $esH := .Values.waitForDependencies.elasticsearchHost | default $esDef }}
+      initContainers:
+        - name: wait-for-kafka-elasticsearch
+          image: {{ .Values.waitForDependencies.image.repository }}:{{ .Values.waitForDependencies.image.tag }}
+          imagePullPolicy: {{ .Values.waitForDependencies.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Kafka {{ $kafkaH }}:{{ .Values.waitForDependencies.kafkaPort }}, Elasticsearch {{ $esH }}:{{ .Values.waitForDependencies.elasticsearchPort }}"
+              for i in $(seq 1 {{ .Values.waitForDependencies.maxRetries }}); do
+                if nc -z {{ $kafkaH }} {{ .Values.waitForDependencies.kafkaPort }} 2>/dev/null \
+                   && nc -z {{ $esH }} {{ .Values.waitForDependencies.elasticsearchPort }} 2>/dev/null; then
+                  echo "Kafka and Elasticsearch are accepting connections"
+                  exit 0
+                fi
+                echo "Attempt $i: waiting..."
+                sleep {{ .Values.waitForDependencies.retryInterval }}
+              done
+              echo "Timeout waiting for Kafka or Elasticsearch"
+              exit 1
+        {{- if .Values.waitForDependencies.vlmReadyUrl }}
+        - name: wait-for-vlm
+          image: {{ .Values.waitForDependencies.image.repository }}:{{ .Values.waitForDependencies.image.tag }}
+          imagePullPolicy: {{ .Values.waitForDependencies.image.pullPolicy }}
+          env:
+            - name: VLM_READY_URL
+              value: {{ tpl .Values.waitForDependencies.vlmReadyUrl . | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              deadline=$(( $(date +%s) + {{ .Values.waitForDependencies.vlmTimeoutSeconds }} ))
+              until wget -q -T 5 -O /dev/null "$VLM_READY_URL"; do
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  echo "Timeout waiting for RT-VLM readiness"
+                  exit 1
+                fi
+                echo "Waiting for RT-VLM readiness"
+                sleep 5
+              done
+              echo "RT-VLM is ready"
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: vss-alert-bridge
+          image: {{ include "vss-alert-bridge.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/python
+            - enhance_alert_with_vlm.py
+            - --config
+            - /app/runtime/config.yml
+          env:
+            {{- $g := .Values.global | default dict }}
+            {{- $pfx := default false (coalesce .Values.useReleaseNamePrefix (index $g "useReleaseNamePrefix")) }}
+            {{- /* Same merge as vss-agent: subchart vlmBaseUrl overrides global.vlmBaseUrl. tpl() supports optional {{…}} templates; "" and plain URLs are unchanged (tpl("") is ""; tpl("http://host:8000") is identical). Empty after tpl → VLM_BASE_URL uses $vlmDef below. */}}
+            {{- $rawVlmSub := .Values.vlmBaseUrl | default "" | toString }}
+            {{- $rawVlmGlob := index $g "vlmBaseUrl" | default "" | toString }}
+            {{- $rawVlmMerged := $rawVlmSub }}
+            {{- if eq (trim $rawVlmSub) "" }}
+            {{- $rawVlmMerged = $rawVlmGlob }}
+            {{- end }}
+            {{- $vlmUrl := trim (tpl $rawVlmMerged .) }}
+            {{- $globVlmUrl := trim (default "" (index $g "vlmBaseUrl")) }}
+            {{- $vstIngHost := ternary (printf "%s-vss-vios-ingress:30888" .Release.Name) "vss-vios-ingress:30888" $pfx }}
+            {{- $externalHost := index $g "externalHost" | default "" | trim }}
+            {{- $vstExternalPort := index $g "vstExternalPort" | default (index $g "externalPort") | default "" | toString | trim }}
+            {{- $subVn := trim (default "" .Values.vlmName) }}
+            {{- $globVn := trim (default "" (index $g "vlmName")) }}
+            {{- $vlmNameStr := $subVn | default $globVn | default "nvidia/cosmos3-nano-reasoner" }}
+            {{- $vlmDef := ternary (printf "http://%s-nvidia-cosmos3-reasoner:8000" .Release.Name) "http://nvidia-cosmos3-reasoner:8000" $pfx }}
+            - name: EXTERNAL_IP
+              value: {{ .Values.externalIp | default (ternary (printf "%s:%s" $externalHost $vstExternalPort) ($externalHost | default "127.0.0.1") (and (ne $externalHost "") (ne $vstExternalPort ""))) | quote }}
+            - name: INTERNAL_IP
+              value: {{ .Values.internalIp | default $vstIngHost | quote }}
+            - name: VLM_BASE_URL
+              value: {{ $vlmUrl | default $vlmDef | quote }}
+            - name: VLM_MODE
+              value: {{ ternary "remote" "local" (ne $globVlmUrl "") | quote }}
+            - name: VLM_NAME
+              value: {{ $vlmNameStr | quote }}
+            - name: RTVI_VLM_MODEL_TO_USE
+              value: {{ .Values.rtviVlmModelToUse | default $vlmNameStr | quote }}
+            - name: ALWAYS_ON_RULES_CONFIG
+              value: "/app/configs/realtime-config.yml"
+            {{- /* OpenTelemetry tracing. Off unless tracing.enabled is set, so a
+                   chart that says nothing renders exactly what it renders today.
+                   Without these the tracing block in configs/config.yml is
+                   unreachable tuning: the config knobs exist but nothing can
+                   switch the feature on. */}}
+            - name: ENABLE_OTEL_MONITORING
+              value: {{ (.Values.tracing).enabled | default false | quote }}
+            {{- if (.Values.tracing).enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ (.Values.tracing).otlpEndpoint | default (index ($g) "otelExporterOtlpEndpoint") | default "http://otel-collector:4318" | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ (.Values.tracing).serviceName | default "vss-alert-ms" | quote }}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ (.Values.tracing).resourceAttributes | default "" | quote }}
+            {{- /* The same set the compose file enumerates, for the same reason:
+                   what is not rendered here is unreachable in the pod. Metrics
+                   follow the traces setting, mirroring meters.py's own chain --
+                   without it, pointing the exporter at nothing leaves metrics
+                   retrying OTLP and blocking roughly seven seconds at exit. The
+                   attribute cap backstops span attributes lifted from Kafka,
+                   which the SDK otherwise leaves unlimited. */}}
+            - name: OTEL_TRACES_EXPORTER
+              value: {{ (.Values.tracing).tracesExporter | default "otlp" | quote }}
+            - name: OTEL_METRICS_EXPORTER
+              value: {{ (.Values.tracing).metricsExporter | default ((.Values.tracing).tracesExporter | default "otlp") | quote }}
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: {{ (.Values.tracing).metricExportIntervalMillis | default 60000 | quote }}
+            - name: OTEL_METRIC_EXPORT_TIMEOUT
+              value: {{ (.Values.tracing).metricExportTimeoutMillis | default 5000 | quote }}
+            - name: OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT
+              value: {{ (.Values.tracing).attributeValueLengthLimit | default 4096 | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: runtime-config
+              mountPath: /app/runtime
+              readOnly: true
+            - name: alert-type-config
+              mountPath: /app/alert_type_config.json
+              subPath: alert_type_config.json
+              readOnly: true
+            - name: realtime-config
+              mountPath: /app/configs/realtime-config.yml
+              subPath: realtime-config.yml
+              readOnly: true
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: runtime-config
+          configMap:
+            name: {{ include "vss-alert-bridge.fullname" . }}-config
+            items:
+              - key: config.yml
+                path: config.yml
+        - name: alert-type-config
+          configMap:
+            name: {{ include "vss-alert-bridge.fullname" . }}-config
+            items:
+              - key: alert_type_config.json
+                path: alert_type_config.json
+        - name: realtime-config
+          configMap:
+            name: {{ include "vss-alert-bridge.fullname" . }}-config
+            items:
+              - key: realtime-config.yml
+                path: realtime-config.yml
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

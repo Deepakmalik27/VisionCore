@@ -1,0 +1,222 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Multi-architecture Dockerfile for production builds (AMD64/ARM64)
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+
+# Builder stage - need this since distroless has no package manager
+FROM python:3.13-bookworm AS builder
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG BUILDPLATFORM
+
+ARG UV_LINK_MODE=copy
+
+# Install all dependencies needed for building and runtime
+# Note: ninja-build, libcairo2-dev, pkg-config are needed for building pycairo on ARM64
+# (no pre-built wheel available, so it compiles from source)
+RUN echo "Building for platform: ${TARGETPLATFORM:-unknown}, arch: ${TARGETARCH:-unknown}" && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        curl ca-certificates binutils \
+        ninja-build libcairo2-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+RUN mkdir -p /src/services/agent && \
+    chown ${USER_ID}:${GROUP_ID} /src/services/agent
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Version for hatch-vcs/setuptools-scm. A value is mandatory: the COPY lines
+# below name individual paths and never .git, so there is no history to derive
+# one from and the install fails without it.
+#
+# What lands here is <release line>+tree.<source tree sha>: the release line
+# from the nearest v* git tag (the same `git describe --match 'v[0-9]*'` every
+# pyproject's hatch-vcs runs, so a checkout install of this commit agrees), and
+# the git tree hash of the image's source paths (services/agent and libs/vss),
+# composed by build-dev-images.yml. This is not provenance metadata any more --
+# GET /api/v1/version reports the installed nvidia-vss-core version, so this
+# string is what a deployment tells the world it is running, and it has to
+# satisfy both PEP 440 (3.3.0rc0+tree.abc) and strict SemVer once normalised
+# (3.3.0-rc0+tree.abc).
+#
+# The local segment must stay TREE-derived, never commit-derived:
+# build-dev-images.yml re-tags an already-published manifest onto a later
+# commit whose source tree is identical, so a commit-derived stamp would be
+# stale the moment that reuse happens, while a tree-derived one stays true.
+#
+# The default is for local `docker build` only. It keeps a `0.0.0` release so
+# it cannot be mistaken for a shipped build and cannot satisfy any skill's
+# version range, and says `local` rather than naming a tree it did not verify.
+ARG VSS_PACKAGE_VERSION=0.0.0+local
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VSS_PACKAGE_VERSION}
+ENV GIT_LFS_SKIP_SMUDGE=1
+
+WORKDIR /src/services/agent
+
+# Copy project files
+# Own as root:root and copy read-only (0444 files, 0555 dirs) so the non-root
+# runtime user can read/execute but not own or modify the copied resources.
+COPY --chown=root:root --chmod=0444 services/agent/pyproject.toml /src/services/agent
+COPY --chown=root:root --chmod=0444 services/agent/LICENSE-3rd-party.txt /src/services/agent
+COPY --chown=root:root --chmod=0444 services/agent/uv.lock /src/services/agent
+# uv workspace: the meta pyproject (copied above) + each member's pyproject/src.
+# Tests are intentionally omitted from the image.
+COPY --chown=root:root --chmod=0444 services/agent/packages/vss_agents/pyproject.toml /src/services/agent/packages/vss_agents/pyproject.toml
+COPY --chown=root:root --chmod=0555 services/agent/packages/vss_agents/src /src/services/agent/packages/vss_agents/src
+# The library lives outside services/, and uv.lock names it ../../libs/vss/*
+# relative to the agent. The builder therefore mirrors the repo layout under
+# /src: uv refuses to normalise a relative path that climbs above the base
+# directory, so a flat /vss-agent with the library at /libs fails outright.
+# `--no-editable` bakes the library into .venv, so only .venv reaches the
+# runtime stage and this staging layout never ships.
+# `--no-editable` below bakes it into .venv, so only .venv reaches the runtime
+# stage and this staging path never ships.
+COPY --chown=root:root --chmod=0444 libs/vss/pyproject.toml /src/libs/vss/pyproject.toml
+COPY --chown=root:root --chmod=0444 libs/vss/core/pyproject.toml /src/libs/vss/core/pyproject.toml
+COPY --chown=root:root --chmod=0555 libs/vss/core/src /src/libs/vss/core/src
+COPY --chown=root:root --chmod=0444 libs/vss/cli/pyproject.toml /src/libs/vss/cli/pyproject.toml
+COPY --chown=root:root --chmod=0555 libs/vss/cli/src /src/libs/vss/cli/src
+COPY --chown=root:root --chmod=0444 services/agent/docker/cleanup_vulnerabilities.py /src/services/agent/cleanup_vulnerabilities.py
+
+# Create virtual environment and install dependencies
+# Use architecture-specific cache to avoid ARM64/AMD64 conflicts
+RUN --mount=type=cache,id=uv_cache_${TARGETARCH},target=/root/.cache/uv,sharing=private \
+    uv venv --seed .venv && \
+    . .venv/bin/activate && \
+    uv sync --frozen --no-dev --no-editable --extra agent --link-mode copy
+
+# The venv is built at /src/services/agent -- so uv can resolve the library at
+# ../../libs/vss -- but the runtime stage ships it at /vss-agent. Console
+# scripts bake an absolute interpreter path at install time, so rewrite them to
+# where they will actually live. `uv venv --relocatable` is not an option here:
+# it emits a #!/bin/sh wrapper and the distroless runtime has no shell.
+RUN grep -rlI '^#!/src/services/agent/\.venv/bin/' /src/services/agent/.venv/bin \
+    | xargs -r sed -i '1s|^#!/src/services/agent/\.venv/bin/|#!/vss-agent/.venv/bin/|'
+
+RUN uv pip uninstall setuptools
+RUN rm -rf /src/services/agent/.venv/lib/python3.13/site-packages/setuptools
+RUN find /src/services/agent/.venv -name "*.exe" -delete
+
+# Cleanup to reduce image size
+RUN find /src/services/agent/.venv -type d -name "__pycache__" -exec rm -rf {} + && \
+    find /src/services/agent/.venv -type d -name "tests" -exec rm -rf {} + && \
+    find /src/services/agent/.venv -type f -name "*.pyc" -delete && \
+    find /src/services/agent/.venv -type f -name "*.pyo" -delete && \
+    find /src/services/agent/.venv -type f -name "*.a" -delete
+
+# Remove PyTorch test binaries and unused components (~47 MB)
+RUN find /src/services/agent/.venv -type f -path "*/torch/bin/test_*" -delete && \
+    find /src/services/agent/.venv -type d -path "*/torch/test" -exec rm -rf {} + 2>/dev/null || true && \
+    rm -f /src/services/agent/.venv/lib/python3.13/site-packages/torch/bin/protoc* || true
+
+# Remove imageio_ffmpeg binary if present (~76 MB) - not needed since we use opencv
+RUN rm -rf /src/services/agent/.venv/lib/python3.13/site-packages/imageio_ffmpeg 2>/dev/null || true
+
+# OSRB: opencv-python-headless bundles FFmpeg libraries that contain patent-encumbered
+# codecs (H.264/H.265 in libavcodec, etc.). NVIDIA must not redistribute those, so the
+# default image ships WITHOUT OpenCV. Following the VST team's approach, we remove ALL
+# FFmpeg/codec libraries while building the container and provide an opt-in installer to
+# (re)install them at runtime. Video-decoding tools degrade gracefully (see
+# vss_agents.utils.optional_cv2); operators opt in at container startup with
+# INSTALL_PROPRIETARY_CODECS=true, which installs opencv-python-headless from PyPI on
+# their own machine (see docker/install_proprietary_codecs.py).
+RUN rm -rf /src/services/agent/.venv/lib/python3.13/site-packages/cv2 \
+           /src/services/agent/.venv/lib/python3.13/site-packages/opencv_python_headless.libs \
+           /src/services/agent/.venv/lib/python3.13/site-packages/opencv_python_headless-*.dist-info \
+    && find /src/services/agent/.venv \( \
+           -name 'libav*.so*' -o -name 'libswscale*.so*' -o -name 'libswresample*.so*' \
+           -o -name 'libpostproc*.so*' -o -name 'libx264*.so*' -o -name 'libx265*.so*' \
+           -o -name 'libde265*.so*' -o -name 'libopenh264*.so*' -o -name 'libkvazaar*.so*' \
+       \) -delete 2>/dev/null || true
+
+# Runtime stage - using NVIDIA distroless production image (supports AMD64 and ARM64)
+# 3.13-v4.1.2 is the latest NGC tag (Debian 13 / OpenSSL 3.5.7, Go 1.26.6). The prior
+# bookworm security-patches stage is removed: it targeted Debian 12 libssl3/liblzma5 and
+# must not be overlaid onto the v4 base.
+FROM nvcr.io/nvidia/distroless/python:3.13-v4.1.2 AS runtime
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ENV VSS_RUNTIME_UID=${USER_ID}
+ENV VSS_RUNTIME_GID=${GROUP_ID}
+
+# Copy cleanup script (as root to ensure proper permissions)
+COPY --from=builder /src/services/agent/cleanup_vulnerabilities.py /tmp/cleanup_vulnerabilities.py
+
+# Ensure we're running as root (UID 0) for cleanup operations
+# Distroless images don't have /etc/passwd, so use numeric UID
+USER 0
+
+# Remove unnecessary libraries using Python exec form (no shell needed)
+RUN ["/usr/local/bin/python3", "/tmp/cleanup_vulnerabilities.py"]
+
+# Remove the cleanup script after use
+RUN ["/usr/local/bin/python3", "-c", "import os; os.remove('/tmp/cleanup_vulnerabilities.py')"]
+
+# Remove the openssl CLI binary from the base image - the application only needs
+# libssl3.so/libcrypto.so shared libraries, not the CLI tool. This eliminates Grype
+# findings for CVE-2025-15467, CVE-2025-69419, CVE-2025-69420, CVE-2025-69421 etc.
+RUN ["/usr/local/bin/python3", "-c", "import os; os.path.exists('/usr/bin/openssl') and os.remove('/usr/bin/openssl')"]
+
+# Copy application without any dev needs
+COPY --from=builder --chown=root:root --chmod=0555 /src/services/agent/.venv /vss-agent/.venv
+COPY --from=builder --chown=root:root --chmod=0444 /src/services/agent/LICENSE-3rd-party.txt /vss-agent/LICENSE-3rd-party.txt
+
+# The NVIDIA Software License Agreement is not vendored in this source tree.
+# BuildKit performs this download itself, so no HTTP client is needed in any
+# stage, and --checksum verifies the bytes before the layer is created: a
+# CDN error page or a silently replaced document fails the build.
+ADD --chown=root:root --chmod=0444 \
+    --checksum=sha256:f5ad3da1faf5734a1f9ea1ad4ab6862236bf061a0ebbb02dea0fb726b81d7e0d \
+    https://www.nvidia.com/content/dam/en-zz/Solutions/license-agreements/enterprise-software/NVIDIA-Software-License-Agreement-2026.5.7.pdf \
+    /vss-agent/NVIDIA-Software-License-Agreement.pdf
+
+# Entrypoint wrapper + opt-in proprietary-codec installer (read-only app resources).
+COPY --chown=root:root --chmod=0555 services/agent/docker/entrypoint.py /vss-agent/entrypoint.py
+COPY --chown=root:root --chmod=0555 services/agent/docker/install_proprietary_codecs.py /vss-agent/install_proprietary_codecs.py
+
+# NAT writes transient workflow state here at startup. Keep app resources
+# immutable, but provide a narrowly scoped writable scratch directory.
+RUN ["/usr/local/bin/python3", "-c", "import os; os.makedirs('/vss-agent/.tmp', exist_ok=True); os.chown('/vss-agent/.tmp', int(os.environ['VSS_RUNTIME_UID']), int(os.environ['VSS_RUNTIME_GID'])); os.chmod('/vss-agent/.tmp', 0o700)"]
+
+# Writable target for the opt-in proprietary-codec install (INSTALL_PROPRIETARY_CODECS=true).
+# Empty by default; nothing patent-encumbered ships in the image.
+RUN ["/usr/local/bin/python3", "-c", "import os; os.makedirs('/vss-agent/.codecs', exist_ok=True); os.chown('/vss-agent/.codecs', int(os.environ['VSS_RUNTIME_UID']), int(os.environ['VSS_RUNTIME_GID'])); os.chmod('/vss-agent/.codecs', 0o700)"]
+
+# Build-time OSRB guard: fail the build if any patent-encumbered FFmpeg/codec library
+# leaked into the final image. Mirrors .github/scripts/check_no_patented_codecs.py
+# (kept inline because .github/ is outside this Docker build context). Distroless has no
+# shell, so this runs via python exec form.
+RUN ["/usr/local/bin/python3", "-c", "import os,re,sys; pat=re.compile(r'^(libavcodec|libavformat|libavutil|libavfilter|libavdevice|libavresample|libavif|libswscale|libswresample|libpostproc|libx264|libx265|libde265|libopenh264|libkvazaar).*\\.so',re.I); hits=[os.path.join(r,f) for b in ('/vss-agent','/usr') if os.path.exists(b) for r,_,fs in os.walk(b) for f in fs if pat.match(f)]; sys.exit('FAIL: patent-encumbered codec libraries present in image:\\n'+'\\n'.join(sorted(hits))) if hits else print('OK: no patent-encumbered codec libraries in image')"]
+FROM runtime AS agent-runtime
+ARG TARGETARCH
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PATH="/usr/local/bin:/vss-agent/.venv/bin:$PATH"
+# Set architecture-specific library paths based on Debian multiarch
+# Note: We include both possible paths for compatibility
+ENV LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH}"
+ENV FONTCONFIG_PATH="/etc/fonts"
+ENV XDG_DATA_DIRS="/usr/share"
+
+# Default config (will be overridden by docker-compose env vars)
+ENV HOST="0.0.0.0"
+ENV PORT="8000"
+
+WORKDIR /vss-agent
+
+# Switch to non-root user
+USER ${USER_ID}:${GROUP_ID}
+
+# Entrypoint wraps `nat` to optionally install proprietary codecs at startup
+# (INSTALL_PROPRIETARY_CODECS=true) before exec'ing nat with the given args.
+ENTRYPOINT ["/usr/local/bin/python3", "/vss-agent/entrypoint.py"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]

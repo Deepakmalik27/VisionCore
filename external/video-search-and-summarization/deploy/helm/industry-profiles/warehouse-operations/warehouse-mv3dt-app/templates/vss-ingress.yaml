@@ -1,0 +1,137 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Path routing equivalent to the vss-haproxy-ingress service in the warehouse
+# compose profiles. Needs a cluster-wide HAProxy ingress controller providing
+# the ingressClassName below. Leave host empty to match any hostname, so the
+# node IP works with no DNS.
+{{- $vi := .Values.vssIngress | default dict }}
+{{- $globalVi := index (.Values.global | default dict) "vssIngress" | default dict }}
+{{- if default false (index $globalVi "enabled") }}
+{{- $host := coalesce (index $vi "host") (index (.Values.global | default dict) "externalHost") "" }}
+{{- $vios := .Values.vios | default dict }}
+{{- $nvstreamerEnabled := default false (dig "vss-vios-nvstreamer" "enabled" false $vios) }}
+{{- $kibanaEnabled := default false (dig "kibana" "enabled" false (.Values.infra | default dict)) }}
+{{- $analytics := .Values.analytics | default dict }}
+{{- $analyticsEnabled := default false (index $analytics "enabled") }}
+{{- $behaviorEnabled := default false (dig "vss-behavior-analytics" "enabled" false $analytics) }}
+{{- $monitoringEnabled := default false (index (.Values.monitoring | default dict) "enabled") }}
+{{- /*
+  vst/storage and video-analytics-api match this file's old rendering exactly,
+  so they now come from services/common's shared route table. This profile
+  has no agent/ui/alert-bridge subcharts, so those routes don't apply here.
+
+  behavior-analytics, streamer, kibana, grafana, prometheus stay hand-written:
+  the table doesn't strip behavior-analytics (this file always has), streamer
+  has no table key, and monitoring was never in the table.
+*/}}
+{{- $b := dict }}
+{{- $_ := set $b "vst" (dict "service" (index $vi "vstServiceName" | default "vss-vios-ingress") "port" (index $vi "vstPort" | default 30888)) }}
+{{- if $analyticsEnabled }}
+{{- $_ := set $b "video-analytics-api" (dict "service" (index $vi "videoAnalyticsApiServiceName" | default "vss-video-analytics-api") "port" (index $vi "videoAnalyticsApiPort" | default 8081)) }}
+{{- end }}
+{{- include "vss.ingress.assertBackends" (dict "backends" $b) }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ index $vi "resourceName" | default "vss-ingress" }}
+  labels:
+    app.kubernetes.io/name: vss
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+  annotations:
+    # Strip the prefix for backends that serve from root. Kibana, Grafana and
+    # Prometheus build absolute links, so they are told their prefix instead
+    # (see the basePath / rootUrl / routePrefix values) and are not rewritten.
+    haproxy.org/path-rewrite: |
+{{- $sharedRewrites := include "vss.ingress.pathRewrites" (dict "backends" $b) }}
+{{- if $sharedRewrites }}
+      {{- $sharedRewrites | nindent 6 }}
+{{- end }}
+{{- if $behaviorEnabled }}
+      /behavior-analytics/(.*) /\1
+{{- end }}
+{{- if $nvstreamerEnabled }}
+      /streamer/(.*) /\1
+{{- end }}
+    # Normalize //vst/ double-slash produced by the VST UI when served under a
+    # /vst/ subpath. replace-path fires before use_backend; re-setting txn.path
+    # and txn.path_match lets the router find the vss-vios-ingress backend.
+    haproxy.org/frontend-config-snippet: |
+      http-request replace-path ^//vst(/.*)?$ /vst\1
+      http-request set-var(txn.path) path
+      http-request set-var(txn.path_match) var(txn.host_match),concat(,txn.path,),map_beg(/etc/haproxy/maps/path-prefix.map) if !{ var(txn.path_match) -m found }
+      {{- /* The deployment's version, answered by the ingress itself: this profile has
+             no agent behind /api. .Values.vssVersion is stamped by stamp_versions.py
+             (.github/version-convention.md). Only with a host: a hostless rule would
+             answer for every host on a shared HAProxy controller, i.e. report this
+             release's version for other deployments. */}}
+      {{- if $host }}
+      http-request return status 200 content-type application/json lf-string '{"service":"vss","version":"{{ .Values.vssVersion | toJson | trimAll "\"" }}"}' if { path /api/v1/version } { req.hdr(host),field(1,:) -i {{ $host }} }
+      {{- end }}
+spec:
+  ingressClassName: {{ index $vi "ingressClassName" | default "haproxy" | quote }}
+  rules:
+    -
+      {{- if $host }}
+      host: {{ $host | quote }}
+      {{- end }}
+      http:
+        paths:
+          {{- include "vss.ingress.paths" (dict "backends" $b) | nindent 10 }}
+{{- if $nvstreamerEnabled }}
+          - path: /streamer/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ index $vi "nvstreamerServiceName" | default "vss-vios-nvstreamer" }}
+                port:
+                  number: {{ index $vi "nvstreamerPort" | default 31000 }}
+{{- end }}
+{{- if $behaviorEnabled }}
+          - path: /behavior-analytics/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ index $vi "behaviorAnalyticsServiceName" | default "vss-behavior-analytics" }}
+                port:
+                  number: {{ index $vi "behaviorAnalyticsPort" | default 8080 }}
+{{- end }}
+{{- if $kibanaEnabled }}
+          - path: /kibana/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ index $vi "kibanaServiceName" | default "kibana" }}
+                port:
+                  number: {{ index $vi "kibanaPort" | default 5601 }}
+{{- end }}
+{{- if $monitoringEnabled }}
+          - path: /grafana/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ index $vi "grafanaServiceName" | default "grafana" }}
+                port:
+                  number: {{ index $vi "grafanaPort" | default 3000 }}
+          - path: /prometheus/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ index $vi "prometheusServiceName" | default "prometheus" }}
+                port:
+                  number: {{ index $vi "prometheusPort" | default 9090 }}
+{{- end }}
+{{- end }}

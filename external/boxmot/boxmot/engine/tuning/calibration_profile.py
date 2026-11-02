@@ -1,0 +1,176 @@
+"""Record and restore calibrated KF priors held fixed during parameter search."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from copy import copy
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from boxmot.engine.config.trackers import resolve_tracker_options
+from boxmot.engine.tuning.kalman_refinement import is_kalman_option
+from boxmot.trackers.common.config import flatten_tracker_options
+from boxmot.trackers.common.motion.kalman_filters.noise import KALMAN_NOISE_OPTIONS, KALMAN_TIMING_OPTIONS
+
+CALIBRATED_KF_OPTIONS = (
+    "kalman.type",
+    *KALMAN_NOISE_OPTIONS,
+    *KALMAN_TIMING_OPTIONS,
+    "kalman.variable_dt",
+    "kalman.adaptive_kf",
+)
+_REQUIRED_OPTIONS = (*KALMAN_NOISE_OPTIONS, *KALMAN_TIMING_OPTIONS, "kalman.variable_dt")
+
+
+def _metadata_selection(value: Any, *, key: str) -> tuple:
+    """Normalize unordered selections without accepting malformed provenance."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"Saved tuning calibration has invalid {key} metadata.")
+    valid = (
+        all(isinstance(item, int) and not isinstance(item, bool) for item in value)
+        if key == "class_ids"
+        else all(isinstance(item, str) and bool(item) for item in value)
+    )
+    if not valid or len(set(value)) != len(value):
+        raise ValueError(f"Saved tuning calibration has invalid {key} metadata.")
+    return tuple(sorted(value))
+
+
+def validate_calibration_metadata(args: Any, report: Mapping[str, Any]) -> None:
+    """Require the same calibration inputs as the validated resumed evaluation."""
+    expected = calibration_metadata(args)
+    for name in ("tracker", "geometry", "dataset", "split", "per_class"):
+        value = expected[name]
+        recorded = report.get(name)
+        if recorded != value or (name == "per_class" and not isinstance(recorded, bool)):
+            raise ValueError(f"Saved tuning calibration {name} differs from this run; start a new tuning run.")
+    recorded_build = report.get("build")
+    if (
+        not isinstance(recorded_build, str)
+        or not recorded_build
+        or Path(recorded_build).resolve() != Path(expected["build"])
+    ):
+        raise ValueError("Saved tuning calibration build differs from this run; start a new tuning run.")
+    for name in ("class_ids", "sequences"):
+        if _metadata_selection(report.get(name), key=name) != _metadata_selection(expected[name], key=name):
+            raise ValueError(f"Saved tuning calibration {name} differs from this run; start a new tuning run.")
+
+
+def record_tuning_calibration(report_path: Path, fixed_options: Mapping[str, Any]) -> None:
+    """Record calibrated settings that search must preserve when tuning resumes."""
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["tuning"] = {"fixed_options": dict(fixed_options)}
+    temporary = report_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(report_path)
+
+
+def load_tuning_calibration(
+    args: Any,
+    tune_dir: Path,
+    *,
+    overrides: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Restore a completed tuning calibration without refitting or starting Ray.
+
+    The saved profile supplies runtime defaults when no explicit tracker config
+    is given. Explicit flags, configs, and programmatic overrides may change
+    other tracker settings, but must preserve every fixed calibrated KF prior.
+    ``args`` is not modified, and its dataset/build fields must already have
+    been resolved and validated by evaluation setup.
+    """
+    directory = Path(tune_dir) / "kf-tuning"
+    config_path, report_path = directory / "calibrated.yaml", directory / "calibration.json"
+    if not config_path.exists() and not report_path.exists():
+        return None
+    if getattr(args, "tracker_backend", "python") != "python":
+        raise ValueError("Resuming a calibrated tuning run requires the Python tracker backend.")
+    if not config_path.is_file() or not report_path.is_file():
+        raise ValueError("Saved tuning calibration is incomplete; calibrated.yaml and calibration.json are required.")
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Saved tuning calibration report is malformed: {report_path}") from exc
+    if not isinstance(report, Mapping) or report.get("status") != "complete":
+        raise ValueError("Saved tuning calibration is not complete; start a new tuning run.")
+    if report.get("method") != "supervised_covariance_moments":
+        raise ValueError("Saved tuning calibration does not describe direct KF calibration.")
+    tuning = report.get("tuning")
+    if not isinstance(tuning, Mapping) or not isinstance(tuning.get("fixed_options"), Mapping):
+        raise ValueError("Saved calibration is missing tuning.fixed_options; it is not a calibrated tuning run.")
+    fixed = dict(tuning["fixed_options"])
+    validate_calibration_metadata(args, report)
+    try:
+        saved_yaml = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Saved tuning calibration profile is malformed: {config_path}") from exc
+    if isinstance(saved_yaml, Mapping):
+        saved_yaml = flatten_tracker_options(saved_yaml)
+    if not isinstance(saved_yaml, Mapping) or any(name not in saved_yaml for name in _REQUIRED_OPTIONS):
+        raise ValueError(
+            "Saved tuning calibration profile is incomplete; all KF scales and timing settings are required."
+        )
+    saved_args = copy(args)
+    saved_args.tracker_config = config_path
+    saved_args.variable_dt = None
+    saved_config = resolve_tracker_options(saved_args, include_defaults=True, stamp_timing=True)
+    expected_keys = {name for name in saved_config if name in CALIBRATED_KF_OPTIONS or is_kalman_option(name)}
+    if set(fixed) != expected_keys or any(name not in saved_yaml for name in expected_keys):
+        raise ValueError(
+            "Saved tuning calibration fixed_options must contain every applicable KF prior and timing setting."
+        )
+    for name, value in fixed.items():
+        if saved_config[name] != value or (isinstance(saved_config[name], bool) != isinstance(value, bool)):
+            raise ValueError(f"Saved tuning calibration {name} disagrees with its calibrated.yaml profile.")
+    effective_args = copy(args)
+    if getattr(args, "tracker_config", None) is None:
+        effective_args.tracker_config = config_path
+    config = resolve_tracker_options(effective_args, overrides, include_defaults=True, stamp_timing=True)
+    changed = sorted(
+        name
+        for name, value in fixed.items()
+        if config.get(name) != value or (isinstance(config.get(name), bool) != isinstance(value, bool))
+    )
+    if changed:
+        raise ValueError(
+            f"Cannot change fixed KF calibration when resuming: {', '.join(changed)}. Start a new tuning run."
+        )
+    return config, fixed
+
+
+def fixed_calibration_options(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture all calibrated priors, filter policies and any frozen camera mask."""
+    fixed = {name: value for name, value in config.items() if name == "kalman.type" or is_kalman_option(name)}
+    if config.get("cmc_min_conf") is not None:
+        fixed.update({name: config[name] for name in ("use_cmc", "cmc_method", "cmc_min_conf")})
+        fixed.update(
+            {name: config[name] for name in ("sof_target_width", "sof_ransac_reproj_threshold") if name in config}
+        )
+    return fixed
+
+
+def calibration_metadata(args: Any) -> dict[str, Any]:
+    """Describe the resolved input selection used to fit a tuning filter bank."""
+    return {
+        "tracker": args.tracker,
+        "geometry": args.geometry,
+        "dataset": args.dataset_id,
+        "split": args.split,
+        "build": str(Path(args.build_path).resolve()),
+        "sequences": list(getattr(args, "sequence_names", None) or args.seq_info),
+        "per_class": bool(getattr(args, "per_class", False)),
+        "class_ids": list(getattr(args, "tracker_class_ids", ()) or ()),
+    }
+
+
+__all__ = (
+    "CALIBRATED_KF_OPTIONS",
+    "calibration_metadata",
+    "fixed_calibration_options",
+    "load_tuning_calibration",
+    "record_tuning_calibration",
+    "validate_calibration_metadata",
+)

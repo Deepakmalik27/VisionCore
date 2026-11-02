@@ -1,0 +1,305 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <jsoncpp/json/json.h>
+#include <limits>
+#include <atomic>
+#include <gst/gst.h>
+#include "stats.h"
+#include "nvbufsurface.h"
+#include "gstnvvstmeta.h"
+
+
+namespace webrtc
+{
+    class VideoBroadcaster;
+}
+
+typedef enum
+{
+    InvalidMedia = -1,
+    MediaTypeVideo,
+    MediaTypeAudio,
+    MediaTypeAudioVideo
+} eMediaType;
+
+inline const char* mediaTypeAsString(eMediaType media_type)
+{
+    switch (media_type)
+    {
+        case MediaTypeVideo:   return "Video";
+        case MediaTypeAudio:   return "Audio";
+        case MediaTypeAudioVideo:   return "AudioVideo";
+        default:      return "InvalidMedia";
+    }
+}
+
+
+enum ConsumerType
+{
+    encoder = 0,
+    compositor = 1,
+    webrtcConsumer = 2,
+    dashConsumer = 3
+};
+
+typedef enum
+{
+    Buffer = 0,
+    Exit = 1,
+    Reset = 2,
+    Last_Frame = 3,
+    Invalid = 0xFFF
+} EncoderMsgType;
+
+class fdWrapper;
+struct _RawFrameParams
+{
+    _RawFrameParams()
+        : m_eos(false)
+    {
+        // Set the map data and size to 0
+        m_map.data = nullptr;
+        m_map.size = 0;
+    }
+
+    ~_RawFrameParams()
+    {
+        if (m_gstBuffer && m_map.data)
+        {
+            gst_buffer_unmap (m_gstBuffer, &m_map);
+        }
+        m_map.data = nullptr;
+        m_map.size = 0;
+
+        if (m_sample)
+        {
+            gst_sample_unref (m_sample);
+            m_sample = nullptr;
+        }
+        // If this instance owns an independent buffer (e.g. created via gst_buffer_copy_deep),
+        // we must unref it explicitly. Otherwise, the buffer is owned by m_sample or elsewhere.
+        if (m_owns_gstBuffer && m_gstBuffer)
+        {
+            gst_buffer_unref(m_gstBuffer);
+        }
+        m_gstBuffer = nullptr;
+
+        if (m_caps)
+        {
+            gst_caps_unref (m_caps);
+            m_caps = nullptr;
+        }
+    }
+
+    std::string     m_streamId;
+    unsigned char* m_buffer     = nullptr;
+    bool m_isYuvBuffer          = false;
+    GstBuffer* m_gstBuffer      = nullptr;
+    bool m_owns_gstBuffer       = false;  // true if m_gstBuffer must be gst_buffer_unref()'d here
+    GstMapInfo m_map;
+    GstSample*  m_sample        = nullptr;
+    GstCaps*    m_caps          = nullptr;
+    int         m_sourceWidth   = 0;
+    int         m_sourceHeight  = 0;
+    /** Source strides (0 = use width/width/2 as contiguous). Set from decoder when non-contiguous. */
+    int         m_srcStrideY    = 0;
+    int         m_srcStrideU    = 0;
+    int         m_srcStrideV    = 0;
+    int         m_fd            = -1;
+    int         m_index         = -1;
+    bool        m_isTransformed = false;
+    int         m_targetWidth   = 0;
+    int         m_targetHeight  = 0;
+    NvBufSurfaceLayout m_sourceLayout = NVBUF_LAYOUT_PITCH;
+    NvBufSurfaceLayout m_targetLayout = NVBUF_LAYOUT_PITCH;
+    NvBufSurfaceColorFormat m_sourceColorFormat = NVBUF_COLOR_FORMAT_NV12;
+    NvBufSurfaceColorFormat m_targetColorFormat = NVBUF_COLOR_FORMAT_NV12;
+    void *meta = nullptr;
+    int64_t pts = 0;
+
+    std::unique_ptr<std::shared_ptr<fdWrapper>> m_fdWrapperObj;
+    EncoderMsgType m_encoderMsgType = Buffer;
+    std::atomic<bool> m_eos;
+} typedef RawFrameParams;
+
+typedef struct _FrameParams
+{
+    std::string          m_media;
+    std::string          m_codec;
+    unsigned char*  m_buffer;
+    ssize_t         m_size;
+    bool            m_needParsing;
+    uint32_t        m_width;
+    uint32_t        m_height;
+    struct timeval  m_presentationTime;
+    int64_t         m_serverPts;
+    int64_t         m_serverFrameId;
+    void*           m_extdata;
+    uint32_t        m_frameNum;
+    struct timeval  m_latencyStartTime;
+
+    _FrameParams()
+        : m_media("")
+        , m_codec ("")
+        , m_buffer (nullptr)
+        , m_size (0)
+        , m_needParsing (true)
+        , m_width (1920)
+        , m_height (1080)
+        , m_presentationTime ({})
+        , m_serverPts (0)
+        , m_serverFrameId (-1)
+        , m_extdata(nullptr)
+        , m_frameNum(0)
+        , m_latencyStartTime ({std::numeric_limits<time_t>::max(), std::numeric_limits<time_t>::max()})
+        {
+        }
+} FrameParams;
+
+class IMediaDataConsumer : public std::enable_shared_from_this<IMediaDataConsumer>
+{
+    public:
+        // Default constructor - should be avoided, use named constructor instead
+        IMediaDataConsumer() : m_consumerName("UnknownConsumer")
+        {
+            m_transcodeStats.setElementName(m_consumerName);
+        }
+
+        // Constructor with consumer name - preferred way
+        explicit IMediaDataConsumer(const std::string& consumerName) : m_consumerName(consumerName)
+        {
+            m_transcodeStats.setElementName(m_consumerName);
+        }
+
+        std::shared_ptr<IMediaDataConsumer> getself()
+        {
+            try
+            {
+                return shared_from_this();
+            }
+            catch (const std::bad_weak_ptr& e)
+            {
+                // LOG(error) << "Bad Weak pointer error: " << e.what() << endl;
+            }
+            return std::shared_ptr<IMediaDataConsumer>(nullptr);
+        }
+
+            virtual ~IMediaDataConsumer()
+            {
+                m_transcodeStats.printTotalStats();
+                m_transcodeStats.clearQueue();
+            }
+
+        virtual void onFrame(FrameParams& frame_params) { /* Default no-op: consumers that only accept raw frames keep this empty. */ }
+        virtual void onFrame(std::shared_ptr<RawFrameParams> frame_data) { /* Default no-op: consumers that only accept encoded frames keep this empty. */ }
+
+        virtual eMediaType getConsumerMediaType() { return m_mediaType; }
+        virtual void setConsumerMediaType(eMediaType media_type) { m_mediaType = media_type; }
+
+        std::vector<uint8_t> parseAndCreateFrame(FrameParams& params, bool *retIDR = nullptr);
+        bool isSpsAvailable();
+        bool isPpsAvailable();
+        bool isSpsPpsAvailable();
+
+        virtual void setWebrtcBroadcaster(webrtc::VideoBroadcaster* broadcaster) { /* Default no-op: only WebRTC-backed consumers need a broadcaster. */ }
+        virtual void onLastFrame() { /* Default no-op: consumers with no end-of-stream work keep this empty. */ }
+        virtual void reset() { /* Default no-op: stateless consumers have nothing to reset. */ }
+        /* Update start time for overlay */
+        virtual void updateStartTime(std::string start_time) { /* Default no-op: only overlay-capable consumers track a start time. */ }
+        /* Set decoder frame size provides original resolution decoded */
+        virtual void setOriginalFrameSize(int w, int h) { /* Default no-op: consumers that do not rescale ignore the source resolution. */ }
+        virtual void setOriginalFrameSize() { /* Default no-op: consumers that do not rescale ignore the source resolution. */ }
+        virtual void setIPCMeta() { /* Default no-op: only IPC-backed consumers carry shared-memory metadata. */ }
+        virtual void getwebRTCFeedback(int* qp, int* bitrate, double* frame_rate) { /* Default no-op: only WebRTC-backed consumers report encoder feedback. */ }
+        void startStatsProcessing()
+        {
+            m_transcodeStats.startProcessing();
+        }
+        virtual void setConsumerType(ConsumerType type)
+        {
+            m_consumerType = type;
+        }
+        /* Whether this consumer takes a decoded picture and encodes it itself.
+         * The WebRTC sink always does. The DASH packager does only where there
+         * is no hardware encoder to have produced an encoded frame further up,
+         * so it answers for itself rather than being inferred from its type -
+         * inferring it fed decoded pictures to a packager that wanted an
+         * encoded stream and published nothing. */
+        virtual bool wantsDecodedPictures() const
+        {
+            return m_consumerType == ConsumerType::webrtcConsumer;
+        }
+
+        /* How long a segment this consumer publishes, in seconds, or zero when
+         * it does not publish segments at all. An encoder feeding it has to
+         * emit a keyframe at that spacing, because a segment can only end on
+         * one: left to the WebRTC keyframe interval, which counts frames rather
+         * than seconds, a video wall composed at eight frames a second produced
+         * a keyframe every 3.75 s and therefore four second segments whatever
+         * DASH asked for. */
+        virtual unsigned publishedSegmentSeconds() const
+        {
+            return 0;
+        }
+
+        virtual ConsumerType getConsumerType()
+        {
+            return m_consumerType;
+        }
+
+        // Get consumer name
+        virtual std::string getConsumerName() const
+        {
+            return m_consumerName;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Writer lifecycle methods - default no-op implementations
+        // ─────────────────────────────────────────────────────────────
+        virtual bool start() { return true; }
+        virtual void stop() { /* Default no-op: consumers with no writer lifecycle keep this empty. */ }
+        virtual void sendEOS() { /* Default no-op: consumers that emit no end-of-stream marker keep this empty. */ }
+        virtual bool waitForCompletion(int64_t /*timeout_secs*/) { return true; }
+        virtual bool hasError() const { return false; }
+        virtual std::shared_ptr<IMediaDataConsumer> getAudioConsumer() { return nullptr; }
+        virtual GstElement* getPipeline() const { return nullptr; }
+
+        // Get actual first frame PTS in milliseconds (for remux mode filename correction)
+        // Returns -1 if not available/not tracked
+        virtual int64_t getActualStartPtsMs() const { return -1; }
+
+        // Get actual last frame PTS in milliseconds (offset from file start, i.e.
+        // FIXED_TS_OFFSET already subtracted).
+        // Returns -1 if not available/not tracked.
+        virtual int64_t getActualEndPtsMs() const { return -1; }
+
+        bool m_startConsuming = false;
+        CodecStats   m_transcodeStats;
+    private:
+        std::vector<uint8_t>    m_spsCfg;
+        std::vector<uint8_t>    m_ppsCfg;
+        std::vector<uint8_t>    m_vpsCfg;
+        eMediaType m_mediaType {MediaTypeVideo};
+        ConsumerType m_consumerType {encoder};
+        std::string m_consumerName;
+};

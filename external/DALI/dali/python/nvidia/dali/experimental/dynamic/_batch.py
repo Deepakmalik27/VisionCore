@@ -1,0 +1,1009 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import importlib.util
+from typing import TYPE_CHECKING, Any
+from collections.abc import Iterator, Sequence
+
+import nvidia.dali.backend as _backend
+import nvidia.dali._tensor_formatting as _tensor_formatting
+from ._nvtx import NVTXRange
+from nvidia.dali._typing import BatchLike, TensorLike
+
+if TYPE_CHECKING:
+    from . import _invocation
+from . import _eval_mode, _stream as _stream_module
+from ._eval_context import EvalContext as _EvalContext
+from ._arithmetic import _arithm_op, transparent_arithmetic
+from ._device import Device, DeviceLike
+from ._device import device as _device
+from ._tensor import Tensor, _array_from_python, _is_full_slice
+from ._tensor import as_tensor as _as_tensor
+from ._tensor import tensor as _tensor
+from ._type import DType, DTypeLike
+from ._type import dtype as _dtype
+from .capture._invariant import unwrap_invariant_args
+
+
+def _backend_device(backend: _backend.TensorListCPU | _backend.TensorListGPU) -> Device:
+    if isinstance(backend, _backend.TensorListCPU):
+        return Device.CPU
+    elif isinstance(backend, _backend.TensorListGPU):
+        return Device("gpu", backend.device_id())
+    else:
+        raise ValueError(f"Unsupported backend type: {type(backend)}")
+
+
+def _is_tensor_type(x):
+    from . import _batch
+
+    if isinstance(x, _batch.Batch):
+        raise ValueError("A list of Batch objects is not a valid argument type")
+    if isinstance(x, Tensor):
+        return True
+    if hasattr(x, "__array__"):
+        return True
+    if hasattr(x, "__cuda_array_interface__"):
+        return True
+    if hasattr(x, "__dlpack__"):
+        return True
+    return False
+
+
+def _get_batch_size(x):
+    if isinstance(x, Batch):
+        return x.batch_size
+    if isinstance(x, (_backend.TensorListCPU, _backend.TensorListGPU)):
+        return len(x)
+    return None
+
+
+class BatchedSlice:
+    def __init__(self, batch: "Batch"):
+        self._batch = batch
+
+    def __getitem__(self, ranges: Any) -> "Batch":
+        if not isinstance(ranges, tuple):
+            ranges = (ranges,)
+        if len(ranges) == 0:
+            return self._batch
+
+        if all(_is_full_slice(r) for r in ranges):
+            return self._batch
+
+        args = {}
+        d = 0
+        for i, r in enumerate(ranges):
+            if r is Ellipsis:
+                d = self._batch.ndim - len(ranges) + i + 1
+            elif isinstance(r, slice):
+                if r.start is not None:
+                    args[f"lo_{d}"] = r.start
+                if r.stop is not None:
+                    args[f"hi_{d}"] = r.stop
+                if r.step is not None:
+                    args[f"step_{d}"] = r.step
+                d += 1
+            else:
+                args[f"at_{d}"] = r
+                d += 1
+
+        from . import _tensor_subscript
+
+        return _tensor_subscript(self._batch, **args)
+
+
+class _TensorList:
+    # `_TensorList` is what you get from `batch.tensors`.
+    # `_TensorList` is private because it's never meant to be constructed by the user and merely
+    # serves as an indexable proxy for tensor access. It's not a plain Python list because the
+    # individual `Tensor` objects are created on demand - for example, if your Batch is a result
+    # of running an operator, it will wrap a TensorListCPU/GPU. Accessing a single sample will
+    # create just one Tensor object, not `batch_size` of them. One can imagine that at least some
+    # users will use 0-th tensor to inspect some properties (instead of doing it on the arguably
+    # less familiar batch level) and `_TensorList` will facilitate that without the overhead of
+    # going over the entire batch. Returning a regular Python list would require us to eagerly
+    # populate it - and even worse, we'd have to copy it each time, because otherwise a user
+    # could try something like `batch.tensors.append(T)` which would make the list inconsistent.
+
+    def __init__(self, batch: "Batch", indices: list[int] | range | None = None):
+        self._batch = batch
+        self._indices = range(batch.batch_size) if indices is None else indices
+
+    def __getitem__(self, selection: int | slice | list[int]):
+        return self.select(selection)
+
+    def __len__(self):
+        return len(self._indices)
+
+    def select(self, selection):
+        """
+        Selects a range of samples.
+
+        The result of this function is either a :class:`_TensorList` (if `selection` is a `slice` or
+        a `list`) or a :class:`Tensor` if `selection` is a number.
+        """
+        if selection == slice(None, None, None):
+            return self
+        if isinstance(selection, slice):
+            return _TensorList(self._batch, self._indices[selection])
+        elif isinstance(selection, list):
+            return _TensorList(self._batch, [self._indices[i] for i in selection])
+        else:
+            return self._batch.select(self._indices[selection])
+
+    def tolist(self):
+        return [self._batch._get_tensor(i) for i in self._indices]
+
+    def as_batch(self, copy: bool = False):
+        """
+        Converts the list of tensors to a :class:`Batch` object.
+        """
+        if len(self._indices) == 0:
+            # an empty list carries no element type, take it from the source batch
+            return Batch([], dtype=self._batch.dtype, device=self._batch.device)
+        return batch(self) if copy else as_batch(self)  # type: ignore
+
+
+@transparent_arithmetic
+class Batch:
+    """A Batch object.
+
+    This class represents a batch of tensors usable with DALI dynamic API. The tensors in the batch
+    have the same element type, layout and number of dimensions, but can differ in shape.
+
+    A :class:`Batch` can contain:
+
+    * a single buffer and shape, owned by DALI, representing consecutive tensors
+    * a list of :class:`Tensor` objects.
+    * a result of a lazy evaluation of a DALI operator.
+
+    In case of lazy evaluation, the operations are executed only after an attempt is made to access
+    the tensor data or properties which cannot be obtained without running the underlying operation.
+
+    .. warning::
+        :class:`Batch` objects should not be constructed directly, use :func:`batch` or
+        :func:`as_batch` instead.
+
+    The batch object can be created either from an existing object, passed as `tensors` or
+    from an invocation result.
+    Unless explicitly requested with the `copy` parameter, this constructor will make best
+    effort to avoid the copy.
+
+    Parameters
+    ----------
+    tensors : TensorLike, default: None
+        The data to construct the batch from. It can be a list of tensors, a TensorList,
+        or other supported types. If None, the batch is constructed from an invocation result.
+        Supported types are:
+
+        - a list of tensor-like objects; the objects need to have matching number of dimensions,
+          data types and layouts,
+        - a tensor-like object; the outermost dimension is interpreted as the batch dimension
+        - a dali.backend.TensorListCPU or dali.backend.TensorListGPU
+    dtype : DType, default: None
+        The desired data type of the batch. If not specified, the data type is inferred
+        from the input tensors. If specified, the input tensors are cast to the desired
+        data type. The `dtype` is required if `tensors` are an empty list.
+    device : Device or str, optional, default: None
+        The device on which the batch should reside (e.g., "cpu" or "gpu").
+        If not specified, the device is inferred from the input tensors.
+    layout : str, optional, default: None
+        The layout string describing the dimensions of the batch (e.g., "HWC").
+        If not specified, the layout is inferred from the input tensors.
+    invocation_result : _invocation.InvocationResult, default: None
+        The result of a DALI operator invocation, used for lazy evaluation.
+    copy : bool, optional, default: False
+        If True, the input tensors are copied. If False, the constructor will avoid
+        copying data when possible.
+    """
+
+    def __init__(
+        self,
+        tensors: BatchLike | None = None,
+        dtype: DTypeLike | None = None,
+        device: DeviceLike | None = None,
+        layout: str | None = None,
+        invocation_result: "_invocation.InvocationResult | None" = None,
+        copy: bool = False,
+    ):
+        tensors, dtype, device, layout = unwrap_invariant_args(tensors, dtype, device, layout)
+        assert isinstance(layout, str) or layout is None
+        if device is not None and not isinstance(device, Device):
+            device = _device(device)
+        self._wraps_external_data = False
+        self._tensors = None  # The list of Tensor objects that comprise the batch.
+        # This list is populated lazily when the batch contains a TensorList
+        # or when it is a result of a batch operator invocation.
+        self._storage = None  # The backing storage of the batch, TensorListCPU or TensorListGPU.
+        self._dtype = None
+        self._device = None
+        self._invocation_result = None  # The result of a DALI operator invocation.
+        copied = False
+
+        if dtype is not None and not isinstance(dtype, DType):
+            dtype = _dtype(dtype)
+
+        if tensors is not None:
+            if isinstance(tensors, (_backend.TensorListCPU, _backend.TensorListGPU)):
+                backend_dev = _backend_device(tensors)
+                if (
+                    (device is None or device == backend_dev)
+                    and (dtype is None or dtype.type_id == tensors.dtype)
+                    and (layout is None or layout == tensors.layout())
+                ):
+                    self._storage = tensors
+                    self._device = backend_dev
+                    self._layout = tensors.layout()
+                    self._dtype = _dtype(tensors.dtype)
+                else:
+                    tmp = Batch(tensors)
+                    if device is not None and device != tmp.device:
+                        tmp = tmp.to_device(device)
+                        copied = True
+                    if dtype is not None and dtype != tmp.dtype:
+                        from . import cast
+
+                        tmp = cast(tmp, dtype=dtype, device=device)
+                        copied = True
+                    self._assign(tmp)
+                    if self._storage and layout:
+                        self._storage.set_layout(layout)
+            elif _is_tensor_type(tensors):
+                batch_layout = "N" + layout if layout else None
+                if copy:
+                    t = _tensor(tensors, dtype=dtype, device=device, layout=batch_layout)
+                else:
+                    t = _as_tensor(tensors, dtype=dtype, device=device, layout=batch_layout)
+                if t.ndim == 0:
+                    raise ValueError("Cannot create a batch from a scalar")
+                if dtype is None:
+                    dtype = t.dtype
+                if device is None:
+                    device = t.device
+                if layout is None:
+                    layout = t.layout
+                if t._storage is not None:
+                    if isinstance(t._storage, _backend.TensorCPU):
+                        self._storage = _backend.TensorListCPU(t._storage, layout=layout)
+                    elif isinstance(t._storage, _backend.TensorGPU):
+                        self._storage = _backend.TensorListGPU(t._storage, layout=layout)
+                    else:
+                        raise ValueError(f"Unsupported device type: {t.device.device_type}")
+                else:
+                    self._tensors = [t[i] for i in range(t.shape[0])]
+
+                self._wraps_external_data = t._wraps_external_data
+                self._dtype = dtype
+
+            else:
+                # Materialise first so len() and indexing work for any iterable.
+                tensors_list = tensors if isinstance(tensors, Sequence) else list(tensors)
+                fast_path_used = False
+
+                def assign_fast_path_storage(storage, dev, wraps_external_data):
+                    nonlocal device, dtype, layout, fast_path_used
+                    self._storage = storage
+                    self._device = dev
+                    self._dtype = DType.from_type_id(storage.dtype)
+                    self._layout = storage.layout() or ""
+                    self._wraps_external_data = wraps_external_data
+                    device = self._device
+                    dtype = self._dtype
+                    layout = self._layout
+                    fast_path_used = True
+
+                # DLPack fast path: list of external tensors (e.g. PyTorch tensors).
+                # Build TensorListGPU/TensorListCPU directly in C++, skipping per-sample
+                # Python Tensor wrappers.
+                # Require every element to support DLPack so we never start consuming
+                # capsules in C++ only to discover a non-DLPack element halfway through.
+                if not fast_path_used and (
+                    dtype is None
+                    and len(tensors_list) > 0
+                    and all(
+                        not isinstance(t, Tensor) and hasattr(t, "__dlpack_device__")
+                        for t in tensors_list
+                    )
+                ):
+                    dl_dev_type, dl_dev_id = tensors_list[0].__dlpack_device__()
+                    if int(dl_dev_type) == 2:  # kDLCUDA - GPU
+                        if device is None or (
+                            device.device_type == "gpu" and device.device_id == dl_dev_id
+                        ):
+                            ctx = _EvalContext.current()
+                            cuda_stream = (
+                                ctx.cuda_stream
+                                if ctx.device_id == dl_dev_id
+                                else _stream_module.stream(device_id=dl_dev_id)
+                            )
+                            try:
+                                storage = _backend.TensorListGPU.from_dlpack_list(
+                                    tensors_list,
+                                    layout=layout or None,
+                                    stream=cuda_stream,
+                                    contiguous=False,
+                                )
+                            except (TypeError, ValueError):
+                                pass  # fall through to slow path
+                            else:
+                                assign_fast_path_storage(storage, Device("gpu", dl_dev_id), True)
+                    elif int(dl_dev_type) in (1, 3):  # kDLCPU or kDLCUDAHost (pinned)
+                        if device is None or device.device_type == "cpu":
+                            try:
+                                storage = _backend.TensorListCPU.from_dlpack_list(
+                                    tensors_list,
+                                    layout=layout or None,
+                                    contiguous=False,
+                                )
+                            except (TypeError, ValueError, BufferError):
+                                pass  # fall through to slow path
+                            else:
+                                assign_fast_path_storage(storage, Device.CPU, True)
+
+                if not fast_path_used:
+                    self._tensors = []
+                    for i, t in enumerate(tensors_list):
+                        if t is None:
+                            raise TypeError(
+                                f"Tensors must be array-like types or numbers. "
+                                f"Got `None` at index {i}"
+                            )
+                        sample = Tensor(t, dtype=dtype, device=device, layout=layout)
+                        if dtype is None:
+                            dtype = sample.dtype
+                        if device is None:
+                            device = sample.device
+                        if layout is None:
+                            layout = sample.layout
+                        self._tensors.append(sample)
+                        if sample._wraps_external_data:
+                            self._wraps_external_data = True
+                        else:
+                            if not isinstance(t, Tensor) or t._storage is not sample._storage:
+                                copied = True
+                    if dtype is None:
+                        # We would have set dtype in the 1st iteration, so the only way it can
+                        # be None is if the `_tensors` are empty.
+                        assert len(self._tensors) == 0
+                        raise ValueError("Element type must be specified if the list is empty")
+                    if device is None:
+                        device = Device.CPU
+                    if layout is None:
+                        layout = ""
+                    self._device = device
+                    self._layout = layout
+                    self._dtype = dtype
+                if self._tensors is not None and len(self._tensors) == 0:
+                    with device:
+                        t = Tensor([], dtype=dtype, device=device).evaluate()
+                        if self._device.device_type == "cpu":
+                            backend_type = _backend.TensorListCPU
+                        elif self._device.device_type == "gpu":
+                            backend_type = _backend.TensorListGPU
+                        else:
+                            raise ValueError(
+                                f"Internal error: "
+                                f"Unsupported device type: {self._device.device_type}"
+                            )
+                        self._storage = backend_type(t._storage, layout=layout)
+
+        if self._dtype is None:
+            if self._storage is not None:
+                self._dtype = DType.from_type_id(self._storage.dtype)
+            else:
+                self._dtype = dtype
+        if self._device is None:
+            if self._storage is not None:
+                self._device = _backend_device(self._storage)
+            else:
+                self._device = device
+        self._layout = layout
+        if self._invocation_result is None:
+            self._invocation_result = invocation_result
+        else:
+            assert invocation_result is None or invocation_result is self._invocation_result
+        self._ndim = None
+        if self._tensors and self._tensors[0]._shape:
+            self._ndim = len(self._tensors[0]._shape)
+
+        if copy and not copied:
+            dev = self.to_device(self.device, force_copy=True)
+            if dtype is not None and dev.dtype != dtype:
+                from . import cast
+
+                dev = cast(dev, dtype=dtype, device=device)
+            self._assign(dev.evaluate())
+            copied = True
+        else:
+            if self._dtype is not None and dtype is not None and self._dtype != dtype:
+                from . import cast
+
+                self._assign(cast(self, dtype=dtype, device=device))
+
+        if _eval_mode.EvalMode.current().value > _eval_mode.EvalMode.eager.value:
+            self.evaluate()
+
+    def _is_external(self) -> bool:
+        return self._wraps_external_data
+
+    @staticmethod
+    @NVTXRange("broadcast", category="batch")
+    def broadcast(
+        sample: TensorLike,
+        batch_size: int,
+        device: DeviceLike | None = None,
+        dtype: DTypeLike | None = None,
+    ) -> "Batch":
+        """
+        Creates a batch by repeating a single `sample` `batch_size` times.
+
+        This function returns a batch obtained by repeating the sample `sample` `batch_size` times.
+        Optionally, the result may be placed on the specified device (otherwise it will inherit the
+        device from the `sample` argument) or converted to the desired data type.
+
+        This function yields result equivalent to
+        ``as_batch([tensor(sample, dtype=dtype, device=device)] * batch_size)``
+        but is much more efficient.
+        """
+        sample, batch_size, device, dtype = unwrap_invariant_args(sample, batch_size, device, dtype)
+        if isinstance(sample, Batch):
+            raise ValueError("Cannot broadcast a Batch")
+        if not _is_tensor_type(sample):
+            import numpy as np
+
+            arr, converted_dtype_id = _array_from_python(sample, dtype)
+            # Materialize Python constants contiguously for bulk CPU/GPU transfers.
+            arr = np.repeat(arr[np.newaxis], batch_size, axis=0)
+            tl = _backend.TensorListCPU(arr)
+            if converted_dtype_id is not None:
+                tl.reinterpret(converted_dtype_id)
+            return Batch(tl, device=device)
+        t = _as_tensor(sample, device=device, dtype=dtype).evaluate()
+        tl_type = (
+            _backend.TensorListGPU if t.device.device_type == "gpu" else _backend.TensorListCPU
+        )
+        return Batch(tl_type.broadcast(t._storage, batch_size))
+
+    @property
+    def dtype(self) -> DType:
+        """
+        The element type of the tensors in the batch.
+        """
+        if self._dtype is None:
+            if self._storage is not None:
+                self._dtype = DType.from_type_id(self._storage.dtype)
+            elif self._invocation_result is not None:
+                self._dtype = _dtype(self._invocation_result.dtype)
+            elif self._tensors:
+                self._dtype = self._tensors[0].dtype
+            else:
+                raise ValueError("Cannot establish the number of dimensions of an empty Batch")
+        return self._dtype
+
+    @property
+    def device(self) -> Device:
+        """
+        The device on which the batch resides (or will reside, in case of lazy evaluation).
+        """
+        if self._device is None:
+            if self._invocation_result is not None:
+                self._device = self._invocation_result.device
+            elif self._tensors:
+                self._device = self._tensors[0].device
+            else:
+                raise ValueError("Cannot establish the number of dimensions of an empty Batch")
+        return self._device
+
+    @property
+    def layout(self) -> str | None:
+        """
+        The layout of tensors in the batch.
+
+        The "batch dimension" (commonly denoted as N) is not included - a batch of HWC images
+        will have HWC layout, not NHWC.
+        """
+        if self._layout is None:
+            if self._invocation_result is not None:
+                self._layout = self._invocation_result.layout
+            elif self._storage is not None:
+                self._layout = self._storage.layout()
+                if self._layout == "" and self.ndim != 0:
+                    self._layout = None
+            elif self._tensors:
+                self._layout = self._tensors[0].layout
+            else:
+                raise ValueError("Cannot establish the number of dimensions of an empty Batch")
+        # Use "" to indicate that the layout has been checked and is empty, but still return None
+        # to avoid situations where we return a string with a length that doesn't match the number
+        # of dimensions.
+        return self._layout or None
+
+    @property
+    def ndim(self) -> int:
+        """
+        The number of dimensions of the samples in the batch.
+
+        The "batch dimension" is not included - e.g. a batch of HWC is still a 3D object.
+        """
+        if self._ndim is None:
+            if self._storage is not None:
+                self._ndim = self._storage.ndim()
+            elif self._invocation_result is not None:
+                self._ndim = self._invocation_result.ndim
+            elif self._tensors:  # not None and not empty
+                self._ndim = self._tensors[0].ndim
+            else:
+                raise ValueError("Cannot establish the number of dimensions of an empty Batch")
+        return self._ndim
+
+    @property
+    def tensors(self):
+        """
+        Returns an indexable list of :class:`Tensor` objects that comprise the batch.
+        """
+        return _TensorList(self)
+
+    def to_device(self, device: DeviceLike, force_copy: bool = False) -> "Batch":
+        """
+        Returns the data batch on the specified device.
+
+        If the batch already resides on the device specified, the function will return `self`
+        unless a copy is explicitly requested by passing ``force_copy=True``
+        """
+        if device is not None and not isinstance(device, Device):
+            device = _device(device)
+        if self.device == device and not force_copy:
+            return self
+        else:
+            copy_dev = device if device.device_type == "gpu" else self.device
+            with copy_dev:
+                from . import copy
+
+                return copy(self, device=device)
+
+    def cpu(self) -> "Batch":
+        """
+        Returns the batch on the CPU. If it's already there, this function returns `self`.
+        """
+        return self.to_device(Device.CPU)
+
+    def gpu(self, index: int | None = None) -> "Batch":
+        """
+        Returns the batch on the GPU. If it's already there, this function returns `self`.
+
+        If index is not specified, the current CUDA device is used.
+        """
+        return self.to_device(Device("gpu", index))
+
+    def _assign(self, other: "Batch"):
+        if other is self:
+            return
+        self._device = other._device
+        self._dtype = other._dtype
+        self._layout = other._layout
+        self._storage = other._storage
+        if other._tensors is not None:
+            self._tensors = [t for t in other._tensors]  # copy the list
+        else:
+            self._tensors = None
+        self._invocation_result = other._invocation_result
+        self._wraps_external_data = other._wraps_external_data
+
+    @property
+    def slice(self):
+        """Interface for samplewise slicing.
+
+        Regular slicing selects samples first and then slices each sample with common
+        slicing parameters.
+
+        Samplewise slicing interface allows the slicing parmaters to be batches (with the same
+        number of samples) and the slicing parameters are applied to respective samples.
+
+        ::
+
+            start = Batch([1, 2, 3])
+            stop = Batch([4, 5, 6])
+            step = Batch([1, 1, 2])
+            sliced = input.slice[start, stop, step]
+            # the result is equivalent to
+            sliced = Batch([
+                sample[start[i]:stop[i]:step[i]]
+                for i, sample in enumerate(input)
+            ])
+
+        If the slicing parameters are not batches, they are broadcast to all samples.
+        """
+        return BatchedSlice(self)
+
+    def __iter__(self) -> Iterator[Tensor]:
+        """
+        Iterates over tensors in the batch.
+        """
+        return iter(self.tensors)
+
+    def __bool__(self):
+        raise TypeError(
+            "A Batch cannot be converted to `bool`. "
+            "Use `batch_size` to check whether the batch is empty."
+        )
+
+    def select(self, sample_range) -> "Batch | Tensor":
+        """
+        Selects a range of samples.
+
+        The result of this function is either a :class:`Batch` (if `sample_range` is a `slice` or a
+        `list`) or a :class:`Tensor` if `sample_range` is a number.
+        """
+        r = sample_range
+        if r is ...:
+            return self
+        if isinstance(r, (slice, list)):
+            tensors = self.tensors[r]
+            if len(tensors) == 0:
+                return Batch([], dtype=self.dtype, device=self.device)
+            return Batch(tensors)
+        else:
+            return self._get_tensor(r)
+
+    def _get_tensor(self, i) -> Tensor:
+        if self._tensors is None:
+            self._tensors: list[Tensor | None] = [None] * self.batch_size
+
+        t = self._tensors[i]
+        if t is None:
+            # Without deferred execution, t.evaluate() requires self._tensors[i] to be assigned
+            # Do assignment and evaluation in two steps
+            with _eval_mode.EvalMode.deferred:
+                t = self._tensors[i] = Tensor(batch=self, index_in_batch=i)
+            if self._storage:
+                t._storage = self._storage[i]
+            if _eval_mode.EvalMode.current().value > _eval_mode.EvalMode.eager.value:
+                t.evaluate()
+
+        return t
+
+    def _plain_slice(self, ranges):
+        def _is_batch(x):
+            return _get_batch_size(x) is not None
+
+        for r in ranges:
+            is_batch_arg = _is_batch(r)
+            if isinstance(r, slice):
+                if _is_batch(r.start) or _is_batch(r.stop) or _is_batch(r.step):
+                    is_batch_arg = True
+            if is_batch_arg:
+                raise ValueError(
+                    "Cannot use a batch as an index or slice. in ``Batch.__getitem__``.\n"
+                    "Use ``.slice`` property to perform samplewise slicing."
+                )
+        return self.slice.__getitem__(ranges)
+
+    @property
+    def batch_size(self) -> int:
+        """
+        The number of tensors in the batch.
+        """
+        if self._storage is not None:
+            return len(self._storage)
+        elif self._tensors is not None:
+            return len(self._tensors)
+        elif self._invocation_result is not None:
+            return self._invocation_result.batch_size
+        else:
+            raise ValueError("Neither tensors nor invocation result are set")
+
+    @property
+    def shape(self):
+        """
+        The shape of the batch.
+
+        Returns the list of shapes of individual samples.
+
+        Example::
+
+            >>> import nvidia.dali.experimental.dynamic as ndd
+            >>> import numpy as np
+            >>> t0 = ndd.tensor(np.zeros((480, 640, 3)))
+            >>> t1 = ndd.tensor(np.zeros((720, 1280, 1)))
+            >>> b = ndd.as_batch([t0, t1])
+            >>> print(b.shape)
+            [(480, 640, 3), (720, 1280, 1)]
+        """
+        if self._invocation_result is not None:
+            return self._invocation_result.shape
+        if self._storage is not None:
+            return self._storage.shape()
+        else:
+            assert self._tensors is not None
+            return [t.shape for t in self._tensors]
+
+    def __repr__(self) -> str:
+        return _tensor_formatting.format_batch(
+            self.evaluate(), show_data=True, adapter=_tensor_formatting.DynamicBatchAdapter()
+        )
+
+    def torch(self, copy: bool | None = None, pad: bool = False):
+        """
+        Returns ``self`` as a PyTorch tensor.
+        Requires ``self`` to be dense and PyTorch to be installed.
+
+        Parameters
+        ----------
+        copy : bool, optional, default: None
+            An optional boolean value indicating how to handle copying.
+            None - avoid copy if possible
+            True - always copy
+            False - raise error if copy cannot be avoided
+
+        pad : bool, default: False
+            If `True`, the tensors in the batch will be padded before being stacked into one tensor.
+            If `False`, an error is raised if the batch has a non-uniform shape.
+        """
+        if importlib.util.find_spec("torch") is None:
+            raise RuntimeError("Batch.torch() requires PyTorch to be installed.")
+
+        if copy is False and not self.evaluate()._storage.is_dense_tensor():
+            raise ValueError("This batch cannot be converted to a tensor without a copy.")
+
+        return _as_tensor(self, pad=pad).torch(copy)
+
+    def evaluate(self):
+        """
+        Evaluates the underlying lazy expression, if any.
+
+        If the batch is a result of a lazy evaluation, calling `evaluate` will cause the expression
+        to be evaluated. If the batch already contains concrete data, this function has no effect.
+
+        The behavior of this function is affected by the current evaluation context and current
+        device. See :class:`EvalContext` and :class:`Device` for details.
+
+        The function returns `self`.
+        """
+        if self._storage is None:
+            # TODO(michalz): Consider thread-safety
+            if self._invocation_result is not None:
+                self._storage = self._invocation_result.value()
+            else:
+                with self._device:
+                    if self._device.device_type == "cpu":
+                        backend_type = _backend.TensorListCPU
+                    elif self._device.device_type == "gpu":
+                        backend_type = _backend.TensorListGPU
+                    else:
+                        raise ValueError(
+                            f"Internal error: "
+                            f"Unsupported device type: {self._device.device_type}"
+                        )
+                    self._storage = backend_type(
+                        [t.evaluate()._storage for t in self._tensors],
+                        self.layout,
+                        contiguous=False,
+                    )
+        return self
+
+    def __add__(self, other):
+        return _arithm_op("add", self, other)
+
+    def __radd__(self, other):
+        return _arithm_op("add", other, self)
+
+    def __sub__(self, other):
+        return _arithm_op("sub", self, other)
+
+    def __rsub__(self, other):
+        return _arithm_op("sub", other, self)
+
+    def __mul__(self, other):
+        return _arithm_op("mul", self, other)
+
+    def __rmul__(self, other):
+        return _arithm_op("mul", other, self)
+
+    def __pow__(self, other):
+        return _arithm_op("pow", self, other)
+
+    def __rpow__(self, other):
+        return _arithm_op("pow", other, self)
+
+    def __truediv__(self, other):
+        return _arithm_op("fdiv", self, other)
+
+    def __rtruediv__(self, other):
+        return _arithm_op("fdiv", other, self)
+
+    def __floordiv__(self, other):
+        return _arithm_op("div", self, other)
+
+    def __rfloordiv__(self, other):
+        return _arithm_op("div", other, self)
+
+    def __neg__(self):
+        return _arithm_op("minus", self)
+
+    # Short-circuiting the execution, unary + is basically a no-op
+    def __pos__(self):
+        return self
+
+    def __eq__(self, other):
+        return _arithm_op("eq", self, other)
+
+    def __ne__(self, other):
+        return _arithm_op("neq", self, other)
+
+    def __lt__(self, other):
+        return _arithm_op("lt", self, other)
+
+    def __le__(self, other):
+        return _arithm_op("leq", self, other)
+
+    def __gt__(self, other):
+        return _arithm_op("gt", self, other)
+
+    def __ge__(self, other):
+        return _arithm_op("geq", self, other)
+
+    def __and__(self, other):
+        return _arithm_op("bitand", self, other)
+
+    def __rand__(self, other):
+        return _arithm_op("bitand", other, self)
+
+    def __or__(self, other):
+        return _arithm_op("bitor", self, other)
+
+    def __ror__(self, other):
+        return _arithm_op("bitor", other, self)
+
+    def __xor__(self, other):
+        return _arithm_op("bitxor", self, other)
+
+    def __rxor__(self, other):
+        return _arithm_op("bitxor", other, self)
+
+    def __mod__(self, other):
+        return _arithm_op("mod", self, other)
+
+    def __rmod__(self, other):
+        return _arithm_op("mod", other, self)
+
+    def __abs__(self):
+        from . import math
+
+        return math.abs(self)
+
+    def __invert__(self):
+        return _arithm_op("bitnot", self)
+
+    def __lshift__(self, other):
+        return _arithm_op("lshift", self, other)
+
+    def __rlshift__(self, other):
+        return _arithm_op("lshift", other, self)
+
+    def __rshift__(self, other):
+        return _arithm_op("rshift", self, other)
+
+    def __rrshift__(self, other):
+        return _arithm_op("rshift", other, self)
+
+
+def batch(
+    tensors: BatchLike,
+    dtype: DTypeLike | None = None,
+    device: DeviceLike | None = None,
+    layout: str | None = None,
+) -> Batch:
+    """Constructs a :class:`Batch` object.
+
+    Constructs a batch by copying the input tensors and optionally converting them to the desired
+    data type and storing on the specified device.
+
+    Parameters
+    ----------
+    tensors : TensorLike, default: None
+        The data to construct the batch from. Can be a list of tensors, a TensorList,
+        or other supported types.
+        Supported types are:
+
+        - a :class:`Batch` object; the batch is copied and the data is converted and moved to the
+          specified device, if necessary
+        - a list of tensor-like objects; the objects need to have matching number of dimensions,
+          data types and layouts,
+        - a tensor-like object; the outermost dimenion is interpreted as the batch dimension
+        - a dali.backend.TensorListCPU or dali.backend.TensorListGPU
+    dtype : DType, default: None
+        The desired data type of the batch. If not specified, the data type is inferred
+        from the input tensors. If specified, the input tensors are cast to the desired data type.
+        The `dtype` is required if tensors are an empty list.
+    device : Device or str, optional, default: None
+        The device on which the batch should reside (e.g., "cpu" or "gpu").
+        If not specified, the device is inferred from the input tensors.
+    layout : str, optional, default: None
+        The layout string describing the dimensions of the batch (e.g., "HWC").
+        If not specified, the layout is inferred from the input tensors.
+    """
+    if isinstance(tensors, Batch):
+        tensors, dtype, device, layout = unwrap_invariant_args(tensors, dtype, device, layout)
+        b = tensors.to_device(device or tensors.device, force_copy=True)
+        if dtype is not None and b.dtype != dtype:
+            from . import cast
+
+            b = cast(b, dtype=dtype, device=device)
+        if layout is not None and layout != b.layout:
+            from . import reshape
+
+            b = reshape(b, layout=layout)  # TODO(michalz): optimize
+        return b.evaluate()
+    else:
+        return Batch(tensors, dtype=dtype, device=device, layout=layout, copy=True)
+
+
+def as_batch(
+    tensors: BatchLike,
+    dtype: DTypeLike | None = None,
+    device: DeviceLike | None = None,
+    layout: str | None = None,
+) -> Batch:
+    """Constructs a :class:`Batch` object, avoiding the copy.
+
+    Constructs a batch by viewing the input tensors as a batch. If the input tensors do not
+    reside on the specified device or do not match the desired type, the data will be converted
+    and/or copied, as necessary.
+
+    Parameters
+    ----------
+    tensors : TensorLike, default: None
+        The data to construct the batch from. It can be a list of tensors, a TensorList,
+        or other supported types. In general, the input tensors must be kept alive by the caller
+        until the batch is no longer needed.
+        Supported types are:
+
+        - a :class:`Batch` object; the batch is copied and the data is converted and moved to the
+          specified device, if necessary
+        - a list of tensor-like objects; the objects need to have matching number of dimensions,
+          data types and layouts,
+        - a tensor-like object; the outermost dimenion is interpreted as the batch dimension
+        - a dali.backend.TensorListCPU or dali.backend.TensorListGPU
+    dtype : DType, default: None
+        The desired data type of the batch. If not specified, the data type is inferred
+        from the input tensors. If specified, the input tensors are cast to the desired data type.
+        The `dtype` is required if `tensors` are an empty list.
+    device : Device or str, optional, default: None
+        The device on which the batch should reside (e.g., "cpu" or "gpu").
+        If not specified, the device is inferred from the input tensors.
+    layout : str, optional, default: None
+        The layout string describing the dimensions of the batch (e.g., "HWC").
+        If not specified, the layout is inferred from the input tensors.
+    """
+    if isinstance(tensors, Batch):
+        tensors, dtype, device, layout = unwrap_invariant_args(tensors, dtype, device, layout)
+        b = tensors
+        if device is not None:
+            b = tensors.to_device(device)
+        if dtype is not None and b.dtype != dtype:
+            from . import cast
+
+            b = cast(b, dtype=dtype, device=device)
+        if layout is not None and layout != b.layout:
+            from . import reshape
+
+            return reshape(b, layout=layout)  # TODO(michalz): optimize
+        else:
+            return b
+    else:
+        return Batch(tensors, dtype=dtype, device=device, layout=layout)
+
+
+__all__ = ["Batch", "batch", "as_batch"]

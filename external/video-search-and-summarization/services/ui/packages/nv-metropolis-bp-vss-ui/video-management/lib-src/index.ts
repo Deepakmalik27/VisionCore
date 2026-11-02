@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+export { VideoManagementComponent } from './VideoManagementComponent';
+export type {
+  VideoManagementComponentProps,
+  VideoManagementSidebarControlHandlers,
+  VideoManagementData,
+  ChatSidebarQueryContext,
+} from './types';
+export * from './rtspStream';

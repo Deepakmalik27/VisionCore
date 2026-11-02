@@ -1,0 +1,175 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# As-is routes from templates/vss-ingress.yaml for verification mode with the
+# default global.useReleaseNamePrefix=false. Service names are unprefixed.
+# The Ingress name stays <RELEASE_NAME>-vss-ingress: the chart always prefixes
+# that object, and it is the same object Helm owns. Set vssIngress.enabled=false
+# before applying, or the two controllers fight over one Ingress.
+#
+# Main host matches the quick start: vss-alerts.<EXTERNAL_HOST>.nip.io.
+# Kibana and NVStreamer are separate hosts. behavior-analytics is verification
+# only; real-time sets vss-behavior-analytics.enabled=false, so delete that path
+# before applying this file to a real-time install.
+#
+# Regenerate rather than hand-editing:
+#   helm template <RELEASE_NAME> ./dev-profile-alerts \
+#     -f ./dev-profile-alerts/values-verification.yaml \
+#     --set-string global.externalHost=vss-alerts.<EXTERNAL_HOST>.nip.io \
+#     --show-only templates/vss-ingress.yaml
+#
+# Prefix-stripping routes are in vss-ingress-example-rewrites.yaml. Apply both
+# only when the chart Ingress is disabled. That second object is named
+# <RELEASE_NAME>-vss-ingress-rewrites and does not replace this one.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: <RELEASE_NAME>-vss-ingress
+  namespace: <NAMESPACE>
+spec:
+  ingressClassName: haproxy
+  rules:
+  - host: vss-alerts.<EXTERNAL_HOST>.nip.io
+    http:
+      paths:
+      - path: /api/chat
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent-ui
+            port:
+              number: 3000
+      - path: /api/agent
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent-ui
+            port:
+              number: 3000
+      - path: /api/vss-chat
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent-ui
+            port:
+              number: 3000
+      - path: /api/proxy
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent-ui
+            port:
+              number: 3000
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent
+            port:
+              number: 8000
+      - path: /chat
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent
+            port:
+              number: 8000
+      - path: /websocket
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent
+            port:
+              number: 8000
+      - path: /static
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent
+            port:
+              number: 8000
+      - path: /docs
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent
+            port:
+              number: 8000
+      - path: /redoc
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent
+            port:
+              number: 8000
+      - path: /generate
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent
+            port:
+              number: 8000
+      - path: /openapi.json
+        pathType: Exact
+        backend:
+          service:
+            name: vss-agent
+            port:
+              number: 8000
+      - path: /vst
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-vios-ingress
+            port:
+              number: 30888
+      # Verification only. Real-time disables vss-behavior-analytics; delete
+      # this path before applying the file to a real-time install.
+      - path: /behavior-analytics
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-behavior-analytics
+            port:
+              number: 8080
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-agent-ui
+            port:
+              number: 3000
+
+  - host: kibana.vss-alerts.<EXTERNAL_HOST>.nip.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kibana
+            port:
+              number: 5601
+  - host: streamer.vss-alerts.<EXTERNAL_HOST>.nip.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-vios-nvstreamer
+            port:
+              number: 31000

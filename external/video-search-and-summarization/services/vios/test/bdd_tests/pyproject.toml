@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[tool.poetry]
+name = "vst-bdd-tests"
+version = "0.1.0"
+description = "VST API BDD Tests with Parallelism Support"
+license = "Apache-2.0"
+authors = ["VST Team"]
+readme = "README.md"
+packages = [{include = "tests"}, {include = "scripts"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0.0"
+pytest = "^9.1.1"
+pytest-bdd = "^8.1.0"
+pytest-xdist = "^3.8.0"
+pytest-html = "^4.1.1"
+pytest-repeat = "^0.9.3"
+pytest-csv = "^3.0.0"
+requests = "^2.34.2"
+aiohttp = "^3.14.3"
+aiortc = "^1.6.0"
+websockets = "^12.0"
+httpx = "^0.28.0"
+pydantic = "^2.0"
+minio = "^7.2"
+PyYAML = "^6.0"
+pynvml = "^12.0"
+# Live bbox overlay (GAP-051): Redis nv.Frame publisher + protobuf serialize.
+protobuf = "^5.28.0"
+redis = "^5.0.0"
+playwright = "^1.61.0"
+
+# Security floors for transitive packages identified by the VIOS NSPECT report.
+cryptography = "^50.0.0"
+idna = "^3.18"
+Mako = "^1.3.12"
+PyJWT = "^2.13.0"
+pyOpenSSL = "^26.3.0"
+python-dotenv = "^1.2.2"
+python-multipart = "^0.0.32"
+starlette = "^1.3.1"
+urllib3 = "^2.7.0"
+
+[tool.poetry.group.dev.dependencies]
+black = "^26.3.1"
+flake8 = "^6.1.0"
+mypy = "^1.7.1"
+
+[tool.poetry.scripts]
+setup-system-deps = "scripts.setup_deps:main"
+check-deps = "scripts.setup_deps:check_dependencies"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "--color=yes",
+    "--junitxml=reports/junit.xml",
+    "--html=reports/report.html",
+    "--self-contained-html",
+    "--csv=reports/test_results.csv"
+]
+markers = [
+    "slow: marks tests as slow",
+    "api: marks tests as API tests",
+    "upload: marks tests as upload tests",
+    "download: marks tests as download tests",
+    "picture: marks tests as picture tests",
+    "notification: marks tests as notification tests",
+    "webhook: marks tests as webhook notification tests",
+    "webrtc: marks tests as WebRTC tests",
+    "perf: marks tests as performance tests",
+    "unit_test: marks tests as unit tests (API endpoint validation)",
+    "live_stream: marks tests for the live stream service",
+    "replay_stream: marks tests for the replay stream service",
+    "rtsp_proxy: marks tests for the RTSP proxy service",
+    "sensor_management: marks tests for the sensor management service",
+    "storage_management: marks tests for the storage management service",
+    "stream_recorder: marks tests for the stream recorder service",
+    "longrun: marks tests that run for an extended period (skipped by default unless -m longrun is passed)",
+    "needs_iptables: marks tests that require iptables / privileged runner",
+    "needs_h265: marks tests that require an H.265 source",
+    "needs_bbox_metadata: marks tests that require live Redis protobuf bbox metadata (or stored metadata for GAP-050/052)",
+    "ui: marks browser UI tests (skipped by default unless -m ui is passed)"
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.pytest_cache
+  | build
+  | dist
+)/
+'''

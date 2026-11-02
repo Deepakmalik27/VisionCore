@@ -1,0 +1,449 @@
+"""Spec-fixture tests for the public-API ``PublicEvent`` model."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import pytest
+
+from uiprotect.data.public_bootstrap import _merge
+from uiprotect.data.public_event import (
+    PUBLIC_EVENT_TYPES,
+    PublicEvent,
+    PublicEventMetadata,
+    PublicFingerprintMetadata,
+    PublicNfcMetadata,
+)
+from uiprotect.data.types import (
+    AlarmHubTamperStatus,
+    EventButtonType,
+    EventType,
+    ModelType,
+    MountType,
+    RelayInputCircuitState,
+    SensorAlarmType,
+    SensorExtremeMetricType,
+    SensorStatusType,
+    SmartDetectObjectType,
+    SmokeTestSource,
+)
+
+# The wire values of the spec's ``event`` ``oneOf``, in spec order. Committed as
+# a literal on purpose: ``scripts/validate_spec.py::check_event_types`` compares
+# ``PUBLIC_EVENT_TYPES`` against a fetched spec, but the spec is gitignored and
+# only the nightly cron fetches it, so this list is the only pin CI ever sees.
+_ALL_EVENT_TYPES = [
+    "ring",
+    "sensorExtremeValues",
+    "sensorWaterLeak",
+    "sensorTamper",
+    "sensorBatteryLow",
+    "sensorAlarm",
+    "sensorVape",
+    "sensorOpened",
+    "sensorClosed",
+    "sensorSmokeTest",
+    "sensorSmokeBatteryLow",
+    "sensorSmokeNeedsCleaning",
+    "sensorSmokeFault",
+    "sensorCoFault",
+    "sensorSmokeEndOfLife",
+    "sensorMotion",
+    "sensorButtonPressed",
+    "lightMotion",
+    "motion",
+    "smartAudioDetect",
+    "smartDetectZone",
+    "smartDetectLine",
+    "smartDetectLoiterZone",
+    "relayInputChanged",
+    "cameraDigitalInputChanged",
+    "alarmHubMotion",
+    "alarmHubEntryOpened",
+    "alarmHubEntryClosed",
+    "alarmHubSmoke",
+    "alarmHubGlassBreak",
+    "alarmHubButtonPress",
+    "alarmHubTamper",
+    "alarmHubDeviceTamper",
+    "alarmHubRelaySwitched",
+    "alarmHubBatteryLow",
+    "alarmHubBatteryConnected",
+    "nfcCardScanned",
+    "fingerprintIdentified",
+]
+
+
+def test_public_event_types_matches_wire_pin() -> None:
+    assert {t.value for t in PUBLIC_EVENT_TYPES} == set(_ALL_EVENT_TYPES)
+    assert len(_ALL_EVENT_TYPES) == len(set(_ALL_EVENT_TYPES)) == 38
+
+
+def _minimal(type_str: str, **extra: object) -> dict[str, object]:
+    return {
+        "id": "evt-1",
+        "modelKey": "event",
+        "type": type_str,
+        "start": 1735689600000,
+        "device": "aabbccddeeff00112233aabb",
+        **extra,
+    }
+
+
+@pytest.mark.parametrize("type_str", _ALL_EVENT_TYPES)
+def test_every_public_event_type_parses(type_str: str) -> None:
+    event = PublicEvent.from_unifi_dict(**_minimal(type_str))
+    assert event.id == "evt-1"
+    assert event.model is ModelType.EVENT
+    assert event.type.value == type_str
+    assert event.device_id == "aabbccddeeff00112233aabb"
+    assert isinstance(event.start, datetime)
+
+
+def test_event_envelope_fields() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "smartDetectZone",
+            end=1735689601000,
+            smartDetectTypes=["person"],
+        )
+    )
+    assert event.end is not None and isinstance(event.end, datetime)
+    assert event.smart_detect_types == [SmartDetectObjectType.PERSON]
+
+
+def test_unknown_smart_detect_type_dropped() -> None:
+    """A runtime-generated smart detect type in an event payload is dropped, not fatal."""
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "smartDetectZone",
+            smartDetectTypes=["person", "linecrossing_basic"],
+        )
+    )
+    assert event.smart_detect_types == [SmartDetectObjectType.PERSON]
+
+
+def test_sensor_extreme_metric_enum_resolves() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "sensorExtremeValues",
+            metadata={
+                "sensorType": {"text": "co2"},
+                "sensorValue": {"text": 22.5},
+                "status": {"text": "high"},
+            },
+        )
+    )
+    assert event.metadata is not None
+    assert event.metadata.sensor_type is SensorExtremeMetricType.CO2
+    assert event.metadata.sensor_value == 22.5
+    assert event.metadata.status is SensorStatusType.HIGH
+
+
+def test_alarm_type_enum_resolves() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("sensorAlarm", metadata={"alarmType": {"text": "glassBreak"}})
+    )
+    assert event.metadata is not None
+    assert event.metadata.alarm_type is SensorAlarmType.GLASS_BREAK
+
+
+def test_relay_input_state_enum_resolves() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "relayInputChanged",
+            metadata={
+                "inputState": {"text": "circuitOpen"},
+                "inputChannel": {"text": "0"},
+            },
+        )
+    )
+    assert event.metadata is not None
+    assert event.metadata.input_state is RelayInputCircuitState.CIRCUIT_OPEN
+    assert event.metadata.input_channel == "0"
+
+
+def test_camera_digital_input_token_round_trips() -> None:
+    """``cameraDigitalInputChanged`` carries ``inputToken`` in a text envelope."""
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "cameraDigitalInputChanged",
+            metadata={
+                "inputState": {"text": "circuitClosed"},
+                "inputToken": {"text": "AlarmIn_0"},
+                "inputChannel": {"text": "0"},
+            },
+        )
+    )
+    assert event.type is EventType.CAMERA_DIGITAL_INPUT_CHANGED
+    assert event.metadata is not None
+    assert event.metadata.input_token == "AlarmIn_0"  # noqa: S105 — ONVIF token
+    assert event.metadata.input_state is RelayInputCircuitState.CIRCUIT_CLOSED
+    assert event.unifi_dict()["metadata"] == {
+        "inputState": {"text": "circuitClosed"},
+        "inputToken": {"text": "AlarmIn_0"},
+        "inputChannel": {"text": "0"},
+    }
+
+
+def test_alarm_hub_device_tamper_parses() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("alarmHubDeviceTamper", metadata={"status": {"text": "tampered"}})
+    )
+    assert event.type is EventType.ALARM_HUB_DEVICE_TAMPER
+
+
+def test_smoke_test_source_enum_resolves_flat() -> None:
+    """``sensorSmokeTest`` ``metadata.source`` is a flat string, not enveloped."""
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("sensorSmokeTest", metadata={"source": "local"})
+    )
+    assert event.metadata is not None
+    assert event.metadata.source is SmokeTestSource.LOCAL
+
+
+@pytest.mark.parametrize(
+    ("type_str", "metadata", "field", "enum_cls"),
+    [
+        (
+            "sensorExtremeValues",
+            {"sensorType": {"text": "unobtanium"}},
+            "sensor_type",
+            SensorExtremeMetricType,
+        ),
+        (
+            "sensorAlarm",
+            {"alarmType": {"text": "unobtanium"}},
+            "alarm_type",
+            SensorAlarmType,
+        ),
+        (
+            "relayInputChanged",
+            {"inputState": {"text": "unobtanium"}},
+            "input_state",
+            RelayInputCircuitState,
+        ),
+        (
+            "sensorSmokeTest",
+            {"source": "unobtanium"},
+            "source",
+            SmokeTestSource,
+        ),
+    ],
+)
+def test_unmodelled_enum_value_coerces_to_unknown(
+    type_str: str,
+    metadata: dict[str, object],
+    field: str,
+    enum_cls: type,
+) -> None:
+    event = PublicEvent.from_unifi_dict(**_minimal(type_str, metadata=metadata))
+    assert event.metadata is not None
+    assert getattr(event.metadata, field) is enum_cls.UNKNOWN
+
+
+def test_button_enum_resolves() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("sensorButtonPressed", metadata={"button": {"text": "panic"}})
+    )
+    assert event.metadata is not None
+    assert event.metadata.button is EventButtonType.PANIC
+
+
+@pytest.mark.parametrize("type_str", ["sensorButtonPressed", "alarmHubButtonPress"])
+def test_main_button_enum_resolves(type_str: str) -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(type_str, metadata={"button": {"text": "main"}})
+    )
+    assert event.metadata is not None
+    assert event.metadata.button is EventButtonType.MAIN
+
+
+def test_nox_sensor_extreme_metric_enum_resolves() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "sensorExtremeValues",
+            metadata={
+                "sensorType": {"text": "nox"},
+                "sensorValue": {"text": 1.5},
+                "status": {"text": "high"},
+            },
+        )
+    )
+    assert event.metadata is not None
+    assert event.metadata.sensor_type is SensorExtremeMetricType.NOX
+
+
+@pytest.mark.parametrize("status", ["tampered", "restored"])
+def test_alarm_hub_tamper_status_modelled(status: str) -> None:
+    """``tamper_status`` types ``alarmHubDeviceTamper`` status from the wire string."""
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "alarmHubDeviceTamper",
+            metadata={
+                "status": {"text": status},
+                "deviceId": {"text": "aabbccddeeff00112233aabb"},
+                "deviceName": {"text": "Alarm Hub"},
+                "userName": "admin",
+            },
+        )
+    )
+    assert event.metadata is not None
+    assert event.metadata.status is SensorStatusType.UNKNOWN
+    assert event.metadata.status_text == status
+    assert event.metadata.user_name == "admin"
+    assert event.tamper_status is AlarmHubTamperStatus(status)
+    assert event.tamper_status is not AlarmHubTamperStatus.UNKNOWN
+    assert event.sensor_status is None
+    assert event.unifi_dict()["metadata"] == {
+        "status": {"text": status},
+        "deviceId": {"text": "aabbccddeeff00112233aabb"},
+        "deviceName": {"text": "Alarm Hub"},
+        "userName": "admin",
+    }
+
+
+def test_sensor_status_accessor() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("sensorExtremeValues", metadata={"status": {"text": "high"}})
+    )
+    assert event.sensor_status is SensorStatusType.HIGH
+    assert event.tamper_status is None
+
+
+def test_alarm_hub_input_status_kept_as_text() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("alarmHubMotion", metadata={"status": {"text": "alarm"}})
+    )
+    assert event.metadata is not None
+    assert event.metadata.status_text == "alarm"
+    assert event.sensor_status is None
+    assert event.tamper_status is None
+    assert event.unifi_dict()["metadata"] == {"status": {"text": "alarm"}}
+
+
+@pytest.mark.parametrize(
+    "metadata", [None, {"deviceId": {"text": "aabbccddeeff00112233aabb"}}]
+)
+def test_status_accessors_without_status(metadata: dict[str, object] | None) -> None:
+    for type_str in ("alarmHubDeviceTamper", "sensorExtremeValues"):
+        event = PublicEvent.from_unifi_dict(**_minimal(type_str, metadata=metadata))
+        assert event.tamper_status is None
+        assert event.sensor_status is None
+
+
+def test_status_text_survives_partial_update() -> None:
+    """A partial update frame without ``type`` refreshes ``status_text``."""
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("alarmHubDeviceTamper", metadata={"status": {"text": "tampered"}})
+    )
+    merged = _merge(
+        event,
+        {
+            "id": "evt-1",
+            "modelKey": "event",
+            "metadata": {"status": {"text": "restored"}},
+        },
+        set(),
+    )
+    assert merged is event
+    assert event.tamper_status is AlarmHubTamperStatus.RESTORED
+
+
+def test_metadata_unifi_dict_honours_status_exclude() -> None:
+    metadata = PublicEventMetadata.from_unifi_dict(
+        status={"text": "tampered"},
+        deviceName={"text": "Alarm Hub"},
+    )
+    assert metadata.unifi_dict(exclude={"status"}) == {
+        "deviceName": {"text": "Alarm Hub"}
+    }
+
+
+def test_alarm_hub_tamper_status_unknown_value() -> None:
+    assert AlarmHubTamperStatus("unobtanium") is AlarmHubTamperStatus.UNKNOWN
+
+
+def test_mount_type_enum_resolves() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("sensorOpened", metadata={"sensorMountType": {"text": "garage"}})
+    )
+    assert event.metadata is not None
+    assert event.metadata.sensor_mount_type is MountType.GARAGE
+
+
+def test_sensor_battery_percentage_number_envelope() -> None:
+    """``sensorBatteryPercentage`` uses a ``{"number": ...}`` envelope, not ``text``."""
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "sensorBatteryLow",
+            metadata={"sensorBatteryPercentage": {"number": 95}},
+        )
+    )
+    assert event.metadata is not None
+    assert event.metadata.sensor_battery_percentage == 95
+
+
+def test_alarm_hub_string_metadata_collapses() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal(
+            "alarmHubMotion",
+            metadata={
+                "pin": {"text": "0"},
+                "deviceId": {"text": "hub-1"},
+                "deviceName": {"text": "Front Door"},
+            },
+        )
+    )
+    assert event.metadata is not None
+    assert event.metadata.pin == "0"
+    assert event.metadata.device_id == "hub-1"
+    assert event.metadata.device_name == "Front Door"
+
+
+def test_nfc_and_fingerprint_submodels() -> None:
+    nfc = PublicEvent.from_unifi_dict(
+        **_minimal("nfcCardScanned", metadata={"nfc": {"ulpId": "ulp-1"}})
+    )
+    assert nfc.metadata is not None
+    assert isinstance(nfc.metadata.nfc, PublicNfcMetadata)
+    assert nfc.metadata.nfc.ulp_id == "ulp-1"
+
+    fp = PublicEvent.from_unifi_dict(
+        **_minimal("fingerprintIdentified", metadata={"fingerprint": {"ulpId": None}})
+    )
+    assert fp.metadata is not None
+    assert isinstance(fp.metadata.fingerprint, PublicFingerprintMetadata)
+    assert fp.metadata.fingerprint.ulp_id is None
+
+
+def test_malformed_envelope_without_text_is_dropped() -> None:
+    """A ``{...}`` value missing its ``text``/``number`` key is discarded, not raised."""
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("sensorAlarm", metadata={"alarmType": {"unexpected": "x"}})
+    )
+    assert event.metadata is not None
+    assert event.metadata.alarm_type is None
+
+
+def test_metadata_round_trips_and_strips_none() -> None:
+    md = PublicEventMetadata(
+        sensor_type=SensorExtremeMetricType.CO2,
+        sensor_value=22.5,
+        status=SensorStatusType.HIGH,
+        sensor_battery_percentage=95,
+    )
+    wire = md.unifi_dict()
+    assert wire == {
+        "sensorType": {"text": "co2"},
+        "sensorValue": {"text": 22.5},
+        "status": {"text": "high"},
+        "sensorBatteryPercentage": {"number": 95},
+    }
+
+
+def test_event_round_trips_metadata() -> None:
+    event = PublicEvent.from_unifi_dict(
+        **_minimal("sensorAlarm", metadata={"alarmType": {"text": "smoke"}})
+    )
+    assert event.unifi_dict()["metadata"]["alarmType"] == {"text": "smoke"}

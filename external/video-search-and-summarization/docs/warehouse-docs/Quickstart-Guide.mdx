@@ -1,0 +1,1176 @@
+---
+title: "Quickstart"
+description: ""
+position: 4
+---
+This guide provides a comprehensive step-by-step walkthrough to help you quickly set up and start using the Warehouse Blueprint.
+
+The Warehouse Blueprint is a video analytics solution that supports real-time object detection, tracking, and analytics. It offers two message broker options to accommodate different deployment scenarios:
+
+- **Kafka**: High-throughput message broker optimized for datacenter deployments with robust persistence and scalability.
+- **Redis Streams**: Lightweight message broker ideal for edge deployments with minimal memory footprint and low-latency requirements.
+
+Choose the message broker based on your deployment environment: Kafka for centralized datacenter installations, or Redis for distributed edge locations where resources are constrained.
+
+## Components Overview
+
+The high-level diagram illustrates the components of the Warehouse Blueprint. The diagram features the 2D, 3D, or MV3DT blueprint. The Agent communicates with the Blueprint's data services through APIs.
+
+The following diagram shows the major components of the Warehouse Blueprint:
+
+![Major components of Warehouse Blueprint](../assets/images/major_components_of_warehouse_blueprint.png)
+
+Camera streams are ingested by VST/VMS, processed by RT-CV (perception) and Behavior Analytics microservices, with CV metadata and alerts published to the Message Bus and persisted via Storage Services.
+
+The following diagram shows how AI Agents interact with the Warehouse Blueprint:
+
+![Agent interaction with Warehouse Blueprint](../assets/images/agent_interaction_with_warehouse_blueprint.png)
+
+The Agent orchestrates MCP servers for Video IO, Video Analytics, and Report Generation, leveraging Nemotron (LLM) and Cosmos-Reason (RTVI-VLM) inference microservices.
+
+## Prerequisites
+
+Before you begin, ensure all of the prerequisites are met. See [Prerequisites](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/prerequisites) for more details.
+
+## Deployment Options
+
+The Warehouse Blueprint offers flexible deployment options with the following profiles:
+
+| Profile Type | Features | Constraints |
+| --- | --- | --- |
+| 2D Vision AI Profile | 2D single-camera detection, tracking, and analytics | Model trained on real-world data |
+| 2D Vision AI with Agents Profile | 2D single-camera detection, tracking, analytics, and VSS agent integration | Model trained on real and synthetic data |
+| 3D Vision AI Profile | 3D multi-camera detection, tracking, and analytics | Model trained on synthetic data, recommended for simulated environments |
+| MV3DT Vision AI Profile | 3D multi-camera detection, tracking, and analytics using RT-DETR + MV3DT | RT-DETR model trained on real-world data, MV3DT distributed 3D tracking via camera projection matrices, appearance ReID re-association on by default |
+
+## Supported GPU Hardware
+
+See [Hardware Profiles and Deployment Paths](#hardware-profile-configuration) for supported profiles, published performance, and GPU placement.
+
+[NVIDIA Certified GPU Servers and Workstations](https://marketplace.nvidia.com/en-us/enterprise/qualified-system-catalog/?limit=15)
+
+## Download Warehouse Artifacts
+
+This section guides you through the steps to download the Warehouse Blueprint artifacts.
+
+### Setup NGC Access
+
+```bash
+# Setup NGC access
+export NGC_CLI_API_KEY=<NGC_CLI_API_KEY>
+export NGC_CLI_ORG='nvstaging'
+```
+
+#### Download the Deployment Package
+
+Perform this on the machine where you intend to deploy the blueprint.
+
+<Note>
+**Git LFS required:** The repository uses Git LFS for large files. Install it before cloning or pulling. For example, on Ubuntu/Debian: `sudo apt-get install git-lfs`. On other systems, see [Git LFS installation](https://git-lfs.com/).
+</Note>
+
+```bash
+git clone --branch "${VSS_DOCS_GIT_REF:-develop}" https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization.git
+cd video-search-and-summarization
+git lfs install
+git lfs pull
+cd deploy/docker
+# This is the path to the deploy/docker directory. Set VSS_APPS_DIR in industry-profiles/warehouse-operations/overrides.env.
+#VSS_APPS_DIR="/path/to/deploy/docker"
+```
+
+### Warehouse App Data
+
+Warehouse App Data contains sample videos, playback data, runtime directories, and the sample-data license. Calibration files and configuration templates come from the repository. Perception models are downloaded from NGC during deployment using `models-download.json`; TensorRT engines are built on first run and cached under `$VSS_DATA_DIR/models/`. MV3DT Compose also stages CLIP-ReID (`reid_model.onnx`, 1280-D) and SigLIP 2 (`siglip_v2_vdeployable_v2.0`) under `$VSS_DATA_DIR/models/reid` on first boot.
+
+The package includes the following MP4 datasets at 1920x1080 and 30 FPS:
+
+The repository includes 2D, 3D, and MV3DT calibration for `nv-warehouse-4cams`, `warehouse-loading-dock-3cams-synthetic`, and `warehouse-4cams-20mx20m-synthetic`, so any of these three datasets can be used with any Warehouse analytics mode. Set `NUM_STREAMS` to the camera count shown below.
+
+| Dataset | Cameras | Duration | Scene Details |
+| --- | --- | --- | --- |
+| `nv-warehouse-4cams` | 4 | Approximately 10 minutes per camera (600 seconds) | Real-world high-angle aisle footage with racks, palletized inventory, workers in safety vests, boxes, shrink-wrapped pallets, forklift activity, and pallet movement. |
+| `warehouse-loading-dock-3cams-synthetic` | 3 | 4 minutes per camera (240 seconds) | Synthetic loading dock footage with overhead views, loading bays, yellow-and-black floor safety zones, boxes on pallets, and forklift equipment. |
+| `warehouse-4cams-20mx20m-synthetic` | 4 | 5 minutes per camera (300 seconds) | Synthetic 20mx20m 3D warehouse scene with overlapping corner-mounted camera views, numbered zones, palletized boxes, forklifts, workers, safety boundaries, and barriers. Used for multi-camera tracking, spatial analytics, and cross-camera object re-identification. |
+
+<Note>
+The package also includes degraded synthetic loading-dock footage (`warehouse-loading-dock-3cams-degraded-synthetic`, 3 cameras) with low-light and lower-quality camera visuals. It can be used the same way as a custom dataset, with calibration the same as `warehouse-loading-dock-3cams-synthetic`.
+</Note>
+
+<Note>
+After extracting the package, set `VSS_DATA_DIR` in `industry-profiles/warehouse-operations/overrides.env` to point to the extracted data directory.
+
+If you use your own videos or RTSP streams, they must have a resolution of `1920 x 1080` and be encoded without B-frames.
+
+To check for and remove B-frames, see [the FAQ guidance](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/operations-monitoring-troubleshooting-faq-known-limitations/faq#my-videos-produce-incorrect-timestamps-for-messages-or-are-processed-over-an-extended-duration).
+
+For custom video inputs, provide time-synchronized MP4 videos encoded without B-frames that are at least 60 seconds long and all videos should have the same duration.
+
+The tracklet-based AMC method relies heavily on moving people in the input videos. Ensure that the videos contain a sufficient number of clearly visible moving people.
+</Note>
+
+```bash
+ngc registry resource download-version "nvstaging/vss-warehouse/vss-warehouse-app-data:v3.3.0-09152026"
+
+# OR Manually download the tar file from NGC
+# URL https://catalog.ngc.nvidia.com/orgs/nvstaging/teams/vss-warehouse/resources/vss-warehouse-app-data?version=v3.3.0-09152026
+
+# Extract the package
+
+cd vss-warehouse-app-data_vv3.3.0-09152026
+tar -xvf vss-warehouse-app-data.tar.gz
+
+# Set permissions
+
+sudo chmod -R 777 /path/to/vss-warehouse-app-data
+
+# This is the path to the extracted data directory. Set VSS_DATA_DIR in industry-profiles/warehouse-operations/overrides.env.
+#VSS_DATA_DIR="/path/to/vss-warehouse-app-data"
+```
+
+## Deploy Warehouse Blueprint
+
+### Configure Environment settings
+
+This section explains the most commonly edited variables in `industry-profiles/warehouse-operations/.env` and `overrides.env`.
+
+#### Deployment Selection
+
+Select the deployment profile, message broker, and deployment size below. Update the corresponding existing values in `industry-profiles/warehouse-operations/overrides.env`; do not append duplicate keys. Keep the shipped `COMPOSE_PROFILES_WH_*` definitions and update the `COMPOSE_PROFILES` selector that follows them. The three datasets with repository calibration can be selected independently of the analytics mode; set `NUM_STREAMS` to the selected dataset's camera count. For 3D, also set `DATASET_TYPE` as described under Common Variables.
+
+<Note>
+**Default deployment:** The shipped `overrides.env` selects the **2D Vision AI profile with Kafka and the extended service set** (`MODE=2d`, `BP_PROFILE=bp_wh_kafka`). It includes ELK, Video Analytics API, and monitoring, but no agents, LLM, or RT-VLM.
+</Note>
+
+<Tabs>
+<Tab title="2D + Agents">
+
+```ini
+MODE=2d
+BP_PROFILE=bp_wh
+STREAM_TYPE=kafka
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_2D}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+<Tab title="2D">
+<Tabs>
+<Tab title="Kafka">
+<Tabs>
+<Tab title="Extended">
+
+```ini
+MODE=2d
+BP_PROFILE=bp_wh_kafka
+STREAM_TYPE=kafka
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_KAFKA_2D}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+<Tab title="Minimal">
+
+```ini
+MODE=2d
+BP_PROFILE=bp_wh_kafka
+STREAM_TYPE=kafka
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_KAFKA_2D_MINIMAL}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="Redis">
+<Tabs>
+<Tab title="Extended">
+
+```ini
+MODE=2d
+BP_PROFILE=bp_wh_redis
+STREAM_TYPE=redis
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_REDIS_2D}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+<Tab title="Minimal">
+
+```ini
+MODE=2d
+BP_PROFILE=bp_wh_redis
+STREAM_TYPE=redis
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_REDIS_2D_MINIMAL}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+</Tabs>
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="3D">
+<Tabs>
+<Tab title="Kafka">
+<Tabs>
+<Tab title="Extended">
+
+```ini
+MODE=3d
+BP_PROFILE=bp_wh_kafka
+STREAM_TYPE=kafka
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_KAFKA_3D}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+<Tab title="Minimal">
+
+```ini
+MODE=3d
+BP_PROFILE=bp_wh_kafka
+STREAM_TYPE=kafka
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_KAFKA_3D_MINIMAL}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="Redis">
+<Tabs>
+<Tab title="Extended">
+
+```ini
+MODE=3d
+BP_PROFILE=bp_wh_redis
+STREAM_TYPE=redis
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_REDIS_3D}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+<Tab title="Minimal">
+
+```ini
+MODE=3d
+BP_PROFILE=bp_wh_redis
+STREAM_TYPE=redis
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_REDIS_3D_MINIMAL}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+</Tabs>
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="MV3DT">
+<Tabs>
+<Tab title="Kafka">
+<Tabs>
+<Tab title="Extended">
+
+```ini
+MODE=mv3dt
+BP_PROFILE=bp_wh_kafka
+STREAM_TYPE=kafka
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_KAFKA_MV3DT}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+<Tab title="Minimal">
+
+```ini
+MODE=mv3dt
+BP_PROFILE=bp_wh_kafka
+STREAM_TYPE=kafka
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_KAFKA_MV3DT_MINIMAL}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="Redis">
+<Tabs>
+<Tab title="Extended">
+
+```ini
+MODE=mv3dt
+BP_PROFILE=bp_wh_redis
+STREAM_TYPE=redis
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_REDIS_MV3DT}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+<Tab title="Minimal">
+
+```ini
+MODE=mv3dt
+BP_PROFILE=bp_wh_redis
+STREAM_TYPE=redis
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_REDIS_MV3DT_MINIMAL}
+
+# Warehouse profiles use SDRC.
+VST_USE_SDRC=true
+STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+</Tabs>
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="Auto-Calibration">
+
+```ini
+MODE=auto-calibration
+BP_PROFILE=bp_wh_auto_calib
+COMPOSE_PROFILES=${COMPOSE_PROFILES_WH_AUTO_CALIB}
+
+# Auto-calibration does not use SDRC.
+# Comment out these existing lines in overrides.env:
+# VST_USE_SDRC=true
+# STREAM_PROCESSOR_MODULE_ENDPOINT=http://sdr-controller:10000
+# VST_NGINX_MODE=vst-sdrc
+```
+</Tab>
+</Tabs>
+
+<Note>
+**Extended and minimal deployments**
+
+Minimal deployments are available for the Kafka and Redis 2D, 3D, and MV3DT profiles and are recommended on resource-constrained edge systems. They exclude ELK (Elasticsearch, Logstash, and Kibana), Video Analytics API, HAProxy, monitoring, and import helpers.
+
+In the VIOS (VST) UI, metadata for live streams is read from Kafka or Redis, while metadata for recorded streams is read from Elasticsearch. Because Elasticsearch is not deployed in a minimal configuration, bounding boxes do not appear for recorded streams.
+</Note>
+
+<Note>
+**Auto-calibration GPU requirement**
+
+The auto-calibration profile requires an NVIDIA GPU with a hardware encoder (NVENC). See the [Auto Calibration system requirements](/system-components/calibration/auto-calibration/getting-started#prerequisites) before selecting `MODE=auto-calibration`.
+</Note>
+
+<a id="hardware-profile-configuration"></a>
+<a id="deployment-paths-and-services"></a>
+
+#### Hardware Profiles and Deployment Paths
+
+Run `nvidia-smi -L` to identify the GPU model, then use the hardware tab below to set `HARDWARE_PROFILE` and the GPU placement for your deployment path.
+
+Set the common deployment variables in `industry-profiles/warehouse-operations/overrides.env`:
+
+| Variable | Description |
+| --- | --- |
+| `VSS_APPS_DIR` | **Required.** Absolute path to this repository's `deploy/docker` directory. |
+| `VSS_DATA_DIR` | **Required.** Absolute path to the extracted warehouse application data directory. |
+| `HOST_IP` | **Required.** Host IP address of the machine where the blueprint is deployed. For cloud VMs, use the private instance IP and set `EXTERNAL_IP` to the public IP or hostname. |
+| `EXTERNAL_IP` | Required only when clients cannot reach `HOST_IP`; used for externally reachable service URLs. |
+| `SAMPLE_VIDEO_DATASET` | Dataset to process. The repository contains 2D, 3D, and MV3DT calibration for the three datasets listed above. `warehouse-loading-dock-3cams-degraded-synthetic` is used the same way as a custom dataset; see the note above. |
+| `NUM_STREAMS` | Number of concurrent streams to process. This must match the camera count of `SAMPLE_VIDEO_DATASET`; it is not selected by system architecture. When NVStreamer is the sensor source, the VSS Configurator also waits until this many streams appear before registering cameras with VST. See [NVStreamer Settings](/system-components/configuration/vss-configurator#nvstreamer-settings). |
+| `DATASET_TYPE` | Used by the Blueprint in 3D mode to select the Sparse4D model and associated files for `real` or `synthetic` data. Use `real` for `nv-warehouse-4cams` and `synthetic` for the two synthetic datasets with repository calibration. |
+
+<Warning>
+`industry-profiles/warehouse-operations/overrides.env` is tracked by Git. Do
+not write API keys or other credentials into it. For a remote LLM, export the
+credential in the shell that runs Docker Compose:
+
+```bash
+# NVIDIA-hosted endpoint
+export NVIDIA_API_KEY="<api-key>"
+
+# OpenAI endpoint (use this instead of NVIDIA_API_KEY)
+# export OPENAI_API_KEY="<api-key>"
+```
+
+The existing `NVIDIA_API_KEY=${NVIDIA_API_KEY:-}` and
+`OPENAI_API_KEY=${OPENAI_API_KEY:-}` entries in `overrides.env` pass the
+exported value to the deployment without storing it in the repository.
+</Warning>
+
+Container image coordinates are centralized in `containers.env` and loaded by the deployment command. In your hardware tab:
+
+1. Copy the settings from **Hardware Profile** into `industry-profiles/warehouse-operations/overrides.env`. For GB300 and DGX-SPARK, also export the SBSA image-tag suffix as described in the hardware tab.
+2. Choose exactly one deployment path and copy its settings into the same file.
+
+**Default container image tag**
+
+`containers.env` uses `VSS_CONTAINER_TAG` as the default tag for all images.
+Export the tag selected for this documentation branch before choosing a hardware
+layout:
+
+```bash
+export VSS_CONTAINER_TAG="${VSS_DOCS_IMAGE_TAG:-develop-latest}"
+```
+
+Any service-specific image tag or tag suffix shown inside a hardware tab
+supersedes or augments this common default. Use the SBSA settings shown in the
+GB300 and DGX Spark tabs when deploying on those platforms.
+
+
+<Tabs>
+<Tab title="RTXPRO6000BW">
+<Tabs>
+<Tab title="Hardware Profile">
+
+**Published performance**
+
+| Workload | Streams | Input frame rate |
+| --- | ---: | ---: |
+| 2D | 16 | 30 FPS |
+| 3D | 19 | 30 FPS |
+| MV3DT | 18 | 30 FPS |
+
+```ini
+# Use RTXPRO6000BW-SE instead for RTX PRO 6000 Blackwell Server Edition.
+HARDWARE_PROFILE=RTXPRO6000BW
+```
+</Tab>
+<Tab title="Vision AI only">
+
+```ini
+# One GPU: use bp_wh_kafka or bp_wh_redis with MODE=2d, 3d, or mv3dt.
+RT_CV_DEVICE_ID=0
+LLM_MODE=none
+```
+</Tab>
+<Tab title="Agents + Remote LLM">
+
+```ini
+# Two GPUs: bp_wh with MODE=2d; RT-CV and RT-VLM remain local.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=1
+LLM_MODE=remote
+
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Agents + Local LLM">
+
+```ini
+# Three GPUs: bp_wh with MODE=2d; RT-CV, RT-VLM, and the LLM are local.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=1
+LLM_DEVICE_ID=2
+LLM_MODE=local
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="RTXPRO4500BW">
+<Tabs>
+<Tab title="Hardware Profile">
+
+**Published performance**
+
+Published performance figures are not currently listed for this hardware profile.
+
+```ini
+HARDWARE_PROFILE=RTXPRO4500BW
+
+# Required when this profile runs bp_wh with local RTVI-VLM.
+RTVI_VLM_MAX_MODEL_LEN=18000
+```
+</Tab>
+<Tab title="Vision AI only">
+
+```ini
+# One GPU: use bp_wh_kafka or bp_wh_redis with MODE=2d, 3d, or mv3dt.
+RT_CV_DEVICE_ID=0
+LLM_MODE=none
+```
+</Tab>
+<Tab title="Agents + Remote LLM">
+
+```ini
+# Two GPUs: bp_wh with MODE=2d; RT-CV and RT-VLM remain local.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=1
+LLM_MODE=remote
+
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Agents + Local LLM">
+
+```ini
+# Three GPUs: bp_wh with MODE=2d; RT-CV, RT-VLM, and the LLM are local.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=1
+LLM_DEVICE_ID=2
+LLM_MODE=local
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="GB300">
+<Tabs>
+<Tab title="Hardware Profile">
+
+**Published performance**
+
+Published performance figures are not currently listed for this hardware profile.
+
+Before deployment, run the following command to export the SBSA image-tag suffix:
+
+```bash
+export VSS_CONTAINER_TAG_SUFFIX="-sbsa"
+```
+
+In `industry-profiles/warehouse-operations/overrides.env`, set:
+
+```ini
+HARDWARE_PROFILE=GB300
+```
+</Tab>
+<Tab title="Vision AI only">
+
+```ini
+# One GPU: use bp_wh_kafka or bp_wh_redis with MODE=2d, 3d, or mv3dt.
+RT_CV_DEVICE_ID=0
+LLM_MODE=none
+```
+</Tab>
+<Tab title="Agents + Remote LLM">
+
+```ini
+# One GPU: bp_wh with MODE=2d; RT-CV and RT-VLM share the GB300.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=0
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.2
+RTVI_VLLM_ATTENTION_BACKEND=TRITON_ATTN
+LLM_MODE=remote
+
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Agents + Local LLM">
+
+```ini
+# One GPU: bp_wh with MODE=2d; RT-CV, RT-VLM, and the LLM share the GB300.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=0
+LLM_DEVICE_ID=0
+SHARED_LLM_VLM_DEVICE_ID=0
+LLM_MODE=local_shared
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.2
+RTVI_VLLM_ATTENTION_BACKEND=TRITON_ATTN
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="H100">
+<Tabs>
+<Tab title="Hardware Profile">
+
+**Published performance**
+
+| Workload | Streams | Input frame rate |
+| --- | ---: | ---: |
+| 2D | 26 | 30 FPS |
+| 3D | 16 | 30 FPS |
+| MV3DT | 13 | 30 FPS |
+
+```ini
+# The current Warehouse configurator maps H100 NVL and H100 SXM HBM3
+# to the same H100 profile key; variant-specific profile names are not defined.
+HARDWARE_PROFILE=H100
+```
+</Tab>
+<Tab title="Vision AI only">
+
+```ini
+# One GPU: use bp_wh_kafka or bp_wh_redis with MODE=2d, 3d, or mv3dt.
+RT_CV_DEVICE_ID=0
+LLM_MODE=none
+```
+</Tab>
+<Tab title="Agents + Remote LLM">
+
+```ini
+# Two GPUs: bp_wh with MODE=2d; RT-CV and RT-VLM remain local.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=1
+LLM_MODE=remote
+
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Agents + Local LLM">
+
+```ini
+# Three GPUs: bp_wh with MODE=2d; RT-CV, RT-VLM, and the LLM are local.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=1
+LLM_DEVICE_ID=2
+LLM_MODE=local
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="L40S">
+<Tabs>
+<Tab title="Hardware Profile">
+
+**Published performance**
+
+| Workload | Streams | Input frame rate |
+| --- | ---: | ---: |
+| 2D | 12 | 30 FPS |
+| 3D | 6 | 30 FPS |
+| MV3DT | 7 | 30 FPS |
+
+```ini
+HARDWARE_PROFILE=L40S
+```
+</Tab>
+<Tab title="Vision AI only">
+
+```ini
+# One GPU: use bp_wh_kafka or bp_wh_redis with MODE=2d, 3d, or mv3dt.
+RT_CV_DEVICE_ID=0
+LLM_MODE=none
+```
+</Tab>
+<Tab title="Agents + Remote LLM">
+
+```ini
+# Two GPUs: bp_wh with MODE=2d; RT-CV and RT-VLM remain local.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=1
+LLM_MODE=remote
+
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Agents + Local LLM">
+
+```ini
+# Three GPUs: bp_wh with MODE=2d; RT-CV, RT-VLM, and the LLM are local.
+RT_CV_DEVICE_ID=0
+RT_VLM_DEVICE_ID=1
+LLM_DEVICE_ID=2
+LLM_MODE=local
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="IGX-THOR">
+
+**Published performance**
+
+| Workload | Streams | Input frame rate |
+| --- | ---: | ---: |
+| 2D | 7 | 30 FPS |
+| 3D | 7 | 15 FPS |
+| MV3DT | 4 | 30 FPS |
+
+```ini
+# The bp_wh agent profile is not supported on IGX-THOR.
+# Use bp_wh_kafka or bp_wh_redis with MODE=2d, 3d, or mv3dt.
+HARDWARE_PROFILE=IGX-THOR
+RT_CV_DEVICE_ID=0
+LLM_MODE=none
+```
+
+</Tab>
+<Tab title="DGX-SPARK">
+
+**Published performance**
+
+| Workload | Streams | Input frame rate |
+| --- | ---: | ---: |
+| 2D | 7 | 30 FPS |
+| 3D | 7 | 15 FPS |
+| MV3DT | 4 | 30 FPS |
+
+Before deployment, run the following command to export the SBSA image-tag suffix:
+
+```bash
+export VSS_CONTAINER_TAG_SUFFIX="-sbsa"
+```
+
+In `industry-profiles/warehouse-operations/overrides.env`, set:
+
+```ini
+# The bp_wh agent profile is not supported on DGX-SPARK.
+# Use bp_wh_kafka or bp_wh_redis with MODE=2d, 3d, or mv3dt.
+HARDWARE_PROFILE=DGX-SPARK
+RT_CV_DEVICE_ID=0
+LLM_MODE=none
+```
+
+</Tab>
+</Tabs>
+
+<Note>
+`HARDWARE_PROFILE` also selects the per-GPU stream cap and any required DeepStream latency, tracker, and frame-interval tuning through the VSS Configurator. Do not copy those generated settings into `overrides.env`.
+</Note>
+
+<Note>
+To update an existing hardware profile or add a GPU that is not listed above, see [Adding a New Hardware Profile](/system-components/configuration/vss-configurator#adding-a-new-hardware-profile) in the [VSS Configurator](/system-components/configuration/vss-configurator) documentation.
+</Note>
+
+<Note>
+**Switch between Kafka and Redis**
+
+With `ENABLE_PROFILE_CONFIGURATOR=true`, the VSS Configurator uses `STREAM_TYPE` to toggle Kafka or Redis settings for these services:
+
+- DeepStream perception: updates broker connection string, broker config file, and protocol library.
+- Behavior Analytics: updates source and sink type to `kafka` or `redisStream`.
+- VST: updates notification message broker consumer settings.
+- Video Analytics API: sets `kafka.brokers` to `["localhost:9092"]` for Kafka or `null` for Redis.
+
+For the common configuration pattern and examples of file updates automated by the VSS Configurator, see [VSS Configurator commons and profiles](/system-components/configuration/vss-configurator#two-part-structure-commons-profiles).
+</Note>
+
+#### Elasticsearch ILM policy retention period
+
+<Note>
+Elasticsearch data is cleaned up every 4 hours as part of the ILM policy provided as part of the blueprint.
+</Note>
+
+To increase the retention period, adjust index lifecycle (ILM) time by setting `ELASTICSEARCH_ILM_MIN_AGE` in `industry-profiles/warehouse-operations/.env` (for example `12h` or `1d`). This value is passed to the Elasticsearch init container when ILM policies are applied.
+
+**Default:** `4h`
+
+```bash
+ELASTICSEARCH_ILM_MIN_AGE=4h
+```
+
+For how ILM policies are defined and other tuning options, see [ELK (Elasticsearch, Logstash, Kibana)](/system-components/middleware/database/elk).
+
+#### NIM Deployment Modes
+
+The following modes apply to the `LLM_MODE` environment variable.
+
+| NIM | Required Settings | Description |
+| --- | --- | --- |
+| `local` | \| `MODE=2d` \| `BP_PROFILE=bp_wh` \| `NGC_CLI_API_KEY` | Download and run NIMs locally (requires additional GPU resources), Run LLM on a dedicated GPU device. |
+| `remote` | \| `MODE=2d` \| `BP_PROFILE=bp_wh` \| `LLM_BASE_URL` \| `NVIDIA_API_KEY` | \| Use remote NIM endpoints (no additional GPU resources required). \| Obtain a valid `NVIDIA_API_KEY` via https://build.nvidia.com/explore/discover or via the NVIDIA Developer Program website. |
+| `none` | \| `MODE=2d/3d/mv3dt` with `BP_PROFILE=bp_wh_kafka/bp_wh_redis` \| `MODE=auto-calibration` with `BP_PROFILE=bp_wh_auto_calib` | Deploy Vision AI or auto-calibration without agents. NIM is not required for `bp_wh_kafka`, `bp_wh_redis`, or `bp_wh_auto_calib`. |
+
+<Note>
+The Warehouse Blueprint uses `rtvi-vlm` for VLM inference. Configure `RTVI_VLM_ENDPOINT`, `RTVI_VLM_MODEL_PATH`, and `RTVI_VLM_MODEL_TO_USE` in `industry-profiles/warehouse-operations/overrides.env`. The shared `RTVI_VLM_BASE_URL` default is defined in `services/rtvi/rtvi.env` and normally does not need to be changed.
+The `bp_wh` agent profile that deploys RTVI-VLM is not supported on IGX-THOR or DGX-SPARK.
+For details on the RTVI-VLM microservice (configuration, supported models, and APIs), see [Real-Time VLM](/system-components/vision-microservices/real-time-vlm).
+</Note>
+
+#### Model Configuration
+
+| Variable | Description |
+| --- | --- |
+| LLM_NAME | Model selection for the agent when NIM is enabled |
+
+<Note>
+For the full set of variables (ports, agent settings, VST adaptor, calibration, etc.), use the inline comments in the shipped `industry-profiles/warehouse-operations/.env`.
+</Note>
+
+### Deploy the Blueprint
+
+<Warning>
+Ensure `industry-profiles/warehouse-operations/.env` and `overrides.env` are configured for your deployment before proceeding. Review the Deployment Selection and environment settings sections above.
+</Warning>
+
+**Deploy Warehouse Blueprint**
+
+```bash title="Deploy Warehouse Blueprint"
+cd /path/to/deploy/docker
+
+# Log in to the NGC container registry.
+docker login \
+    --username '$oauthtoken' \
+    --password "${NGC_CLI_API_KEY}" \
+    nvcr.io
+
+# Start the blueprint.
+docker compose -f compose.yml \
+    --env-file containers.env \
+    --env-file industry-profiles/warehouse-operations/.env \
+    --env-file industry-profiles/warehouse-operations/overrides.env \
+    up --detach --pull always --force-recreate --build
+```
+
+<Note>
+Initialization of some components might take a while, especially the first time, because large container images will be pulled.
+</Note>
+
+<Note>
+Before updating the Warehouse configuration or running `docker compose up`, check whether containers from a previous deployment are still present:
+
+```bash
+docker ps -a
+```
+
+No containers belonging to the previous deployment should be present before starting a new deployment. Stale containers from a previous deployment can cause silent errors. For example, already-running containers can create the false impression that a new deployment has started successfully.
+</Note>
+
+### Verify Deployment
+
+1. Verify if containers are in running state:
+
+**Verify deployment**
+
+```bash title="Verify deployment"
+docker ps
+docker compose ls
+```
+
+2. Check to make sure streams were properly added to VST. To do so, navigate to the VST UI (see endpoint below) and check the Dashboard to confirm your streams are in a healthy state. If you do not see them there, check NVStreamer or your source to make sure they are active.
+
+3. Check vss-rtvi-cv FPS to make sure DeepStream is running properly. View the vss-rtvi-cv logs by running the below command and looking for FPS lines in the logs. Ensure it is running at the desired FPS. If this is lower than expected, make sure your GPU is not oversaturated.
+
+```bash
+# For 2D/3D Vision AI Profile
+docker logs -f vss-rtvi-cv
+
+# For MV3DT Vision AI Profile
+docker logs -f vss-rtvi-cv-mv3dt
+```
+
+On first MV3DT boot, wait for appearance ReID before expecting perception FPS. Models download in the one-shot `vss-reid-embed-init-mv3dt` container (exit `0`), then etcd, MinIO, and Milvus must be healthy, then:
+
+```bash
+docker logs -f vss-reid-embed-mv3dt
+curl -sf http://localhost:8088/health/ready
+```
+
+The 300s figure on the ReID health check is a start grace period, not a maximum. Retries continue after that, so first-boot engine build can take longer. Perception does not start until the probe succeeds.
+
+4. Check Kibana for indexed analytics data and alerts. Go to the endpoint listed below and navigate to the dashboard.
+
+5. Check the VSS UI (see endpoint below) and test a few prompts after the system is up for a few minutes and a few alerts are present.
+
+For detailed testing and validation steps, refer to:
+
+- [2D Vision AI Profile](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/2-d-vision-ai-profile#testing-and-validation)
+- [2D Vision AI with Agents Profile](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/2-d-vision-ai-with-agents-profile#testing-and-validation)
+- [3D Vision AI Profile](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/3-d-vision-ai-profile#testing-and-validation)
+- [MV3DT Vision AI Profile](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/mv-3-dt-vision-ai-profile#testing-and-validation)
+- [Troubleshooting Guide](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/operations-monitoring-troubleshooting-faq-known-limitations/troubleshooting-guide)
+
+## Service Access Points
+
+Once deployed, the following service access points are available:
+
+| Service | URL |
+| --- | --- |
+| VSS-UI (2D Vision AI with Agents Profile) | `http://<HOST_IP>:7777` |
+| Kibana-UI(2D/3D/MV3DT) | `http://<HOST_IP>:7777/kibana` |
+| VST-UI(2D/3D/MV3DT) | `http://<HOST_IP>:30888/vst` |
+| NvStreamer-UI(2D/3D/MV3DT) | `http://<HOST_IP>:31000` |
+| Auto-Calibration UI (2D/3D/MV3DT auto-calibration profiles only) | `http://<HOST_IP>:5000` |
+| Phoenix-UI (Telemetry)(2D Vision AI with Agents Profile) | `http://<HOST_IP>:7777/phoenix` |
+
+<Note>
+- The Phoenix UI is only available when agent telemetry is enabled. For how to enable telemetry and inspect traces, see [VSS Agents Observability](/vision-agent/vss-agents/observability).
+- Observability stack access details (Grafana, Prometheus, and exporters) are documented in [Observability](/system-components/middleware/observability).
+</Note>
+
+| Service | Access Point |
+| --- | --- |
+| Video-Analytics-API | `http://<HOST_IP>:8081` |
+| VA-MCP (2D Vision AI with Agents Profile) | `http://<HOST_IP>:9901` |
+| LLM-NIM | `http://<HOST_IP>:30081` |
+
+## Teardown the Deployment
+
+To stop and remove the Warehouse Blueprint deployment:
+
+```bash
+# Stop the running deployment
+cd /path/to/deploy/docker
+docker compose -f compose.yml \
+    --env-file containers.env \
+    --env-file industry-profiles/warehouse-operations/.env \
+    --env-file industry-profiles/warehouse-operations/overrides.env \
+    down
+
+# Alternatively to remove all the containers, images and volume
+docker compose -f compose.yml \
+    --env-file containers.env \
+    --env-file industry-profiles/warehouse-operations/.env \
+    --env-file industry-profiles/warehouse-operations/overrides.env \
+    down -v --rmi all
+
+# Tear down all dangling volumes
+
+docker volume ls -q -f "dangling=true" | xargs docker volume rm
+
+# Cleanup all data (from deployments directory)
+
+bash scripts/cleanup_all_datalog.sh -e industry-profiles/warehouse-operations/overrides.env
+```
+
+<Warning>
+The `down -v --rmi all` command removes this Compose project's non-external volumes and service images. The dangling-volume command is host-wide and can remove unused volumes created by other Docker projects. `cleanup_all_datalog.sh` deletes Warehouse runtime data and generated artifacts selected by the env file; by default, it restores original files from the oldest configurator backups and then deletes the backup files. Deleted volume and runtime data cannot be recovered unless it was backed up. Use these cleanup commands only after confirming their scope; omit them when you only need to stop the Warehouse deployment.
+</Warning>
+
+## Customization
+
+The Blueprint supports several levels of customization, including but not limited to adding new cameras and updating models.
+For details, refer to the following sections under the Blueprint deep dive pages:
+
+* [2D Vision AI Profile Customization](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/2-d-vision-ai-profile#customization)
+* [2D Vision AI with Agents Profile Customization](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/2-d-vision-ai-with-agents-profile#customization)
+* [3D Vision AI Profile Customization](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/3-d-vision-ai-profile#customization)
+* [MV3DT Vision AI Profile Customization](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/mv-3-dt-vision-ai-profile#customization)
+
+## Warehouse Blueprint Skill
+
+Agent Skills are reusable capabilities that coding agents such as Claude Code or Codex
+can load to deploy and operate the VSS Blueprint from natural-language requests. For the
+Warehouse Blueprint, use the `vss-build-vision-ai` Skill. It treats Warehouse as a
+pre-built industry blueprint: it selects a supported Warehouse variant, validates the
+host and app data, generates a self-contained deployment, brings up the stack, and
+monitors readiness without requiring the operator to memorize every deployment command.
+
+For the complete VSS Skills catalog and installation model, see
+[Agent Skills](/vision-agent/agent-skills).
+
+<Note>
+The screenshots show an example 2D Kafka deployment in a coding agent. Hardware selections,
+versions, and diagnostic results are specific to that host; follow the current
+[Prerequisites](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/prerequisites) for your deployment.
+</Note>
+
+### Installing Skills
+
+Install the Skills the same way as any other VSS Agent Skill. See [Installing Skills](/vision-agent/agent-skills#installing-skills) for the full installation flow.
+
+After installation, start a new coding-agent session before invoking the Skill by name.
+
+### Deploy the Warehouse Blueprint
+
+1. Ask your coding agent to deploy the Warehouse Blueprint. For example:
+
+   ```text
+   Deploy Warehouse in 2D mode.
+   Deploy the VSS Warehouse Blueprint on this host.
+   Deploy Warehouse with the bp_wh profile, the in-stack VSS Agent, and a remote LLM.
+   Deploy Warehouse in 3D mode with Kafka, using the extended profile.
+   Deploy Warehouse in auto-calibration mode for warehouse-loading-dock-3cams-synthetic.
+   ```
+
+   Select the deployment variant, service set, and dataset when prompted, and provide any missing credentials.
+
+   <Frame caption="Select the Warehouse deployment and provide the required inputs.">
+     <img src="../assets/images/vss-warehouse-skill/warehouse-skill-deploy-blueprint.png" alt="Coding agent collects the deployment variant, dataset, and NGC credentials" />
+   </Frame>
+
+2. Review the proposed architecture and generated configuration.
+
+   <Frame caption="Review the services, data flow, and GPU placement.">
+     <img src="../assets/images/vss-warehouse-skill/warehouse-skill-dry-run.png" alt="Warehouse 2D Kafka architecture and staged deployment configuration" />
+   </Frame>
+
+3. Review the pre-flight results and resolve any blockers before deployment. In this example, the NGC key must be replaced.
+
+   <Frame caption="Check host prerequisites, app data, calibration, and credentials.">
+     <img src="../assets/images/vss-warehouse-skill/warehouse-skill-preflight.png" alt="Pre-flight results identify an invalid NGC key as a deployment blocker" />
+   </Frame>
+
+4. Let the Skill deploy the stack and verify container health, active camera streams, and analytics output.
+
+   <Frame caption="Confirm that the deployment is running and producing data.">
+     <img src="../assets/images/vss-warehouse-skill/warehouse-skill-deployment-successful.png" alt="Deployment verification shows running services, four active streams, and analytics data" />
+   </Frame>
+
+After the stack is running, use the Warehouse Blueprint VIOS UI and Kibana UI to verify that the deployment is serving data. Kibana is not available in minimal deployments.
+
+<Frame caption="Verify camera streams in the VIOS UI.">
+  <img src="../assets/images/vss-warehouse-skill/warehouse-skill-vios-ui.png" alt="Warehouse camera streams in the VIOS UI" />
+</Frame>
+
+<Frame caption="Verify analytics output in Kibana.">
+  <img src="../assets/images/vss-warehouse-skill/warehouse-skill-kibana.png" alt="Warehouse Blueprint Kibana dashboard after deployment" />
+</Frame>
+
+### How the Skill Configures and Runs the Deployment
+
+For the Warehouse Blueprint, `vss-build-vision-ai` loads
+`skills/vss-build-vision-ai/references/profiles/warehouse.md` in the VSS Blueprint
+repository. That reference owns the Warehouse-specific decisions the Skill makes on the
+operator's behalf:
+
+* **Profile variants** - selects `bp_wh` for `MODE=2d` only,
+  `bp_wh_kafka` or `bp_wh_redis` for `MODE=2d|3d|mv3dt`, or `bp_wh_auto_calib` for
+  `MODE=auto-calibration`, along with the matching Compose profile list. Dataset
+  selection is independent of the analytics mode. For `MODE=3d`, confirm that the
+  generated `override.env` sets `DATASET_TYPE` to the family described under Common
+  Variables. See
+  [Deployment Selection](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/quickstart#deployment-selection).
+* **Minimal vs extended** - for `bp_wh_kafka` and `bp_wh_redis`, chooses whether to
+  deploy ELK, Video Analytics API, and monitoring on top of the core CV pipeline. See
+  the Minimal Profile section above for the comparison.
+* **GPU layout** - maps services to host GPU device IDs:
+
+  * `RT_CV_DEVICE_ID` - GPU for RT-CV/perception.
+  * `RT_VLM_DEVICE_ID` - GPU for `rtvi-vlm` in the `bp_wh` 2D agent profile.
+  * `LLM_DEVICE_ID` - GPU for the LLM in `bp_wh` 2D agent profile when using `LLM_MODE=local`. This setting is not used when `LLM_MODE=remote` or `LLM_MODE=none`.
+* **LLM placement** - for the `bp_wh` 2D agent profile, keeps a local LLM when
+  requested or selected by default and sizing permits it. It uses a remote endpoint
+  only when the operator requests one or approves it after local sizing fails. For
+  `bp_wh_kafka` and `bp_wh_redis` in 2D, 3D, or MV3DT mode, and for
+  `bp_wh_auto_calib` in auto-calibration mode, it sets `LLM_MODE=none`.
+* **App data** - asks the operator for an existing Warehouse app-data location or,
+  when explicitly selected, downloads the NGC resource. It sets `VSS_DATA_DIR` to
+  the extracted `vss-warehouse-app-data` directory and blocks deployment unless
+  the required directories exist and the selected dataset directory is non-empty.
+* **Calibration** - uses repository calibration for the three shipped datasets. A
+  custom dataset requires calibration generated with `vss-generate-video-calibration`
+  or a separate `MODE=auto-calibration` build, placed at the mode-specific repository
+  path before an analytics build is deployed.
+* **Container image tag** - runs a release's images when you name an image tag in
+  the prompt, or when `VSS_CONTAINER_TAG` is already exported. Otherwise it uses the
+  `containers.env` default. See
+  [Container image tag](/vision-agent/build-vision-ai-skill#container-image-tag).
+* **Build and validate** - writes `_builds/<name>/override.env`, `compose.yml`,
+  `configurator.env`, and `resolved.yml`. The Skill resolves the Warehouse env layers
+  into `resolved.yml`, then validates the resolved services, images, bind mounts,
+  mode/profile/service selection, calibration presence, stream count, and GPU placement.
+* **Bring up and monitor** - refreshes registry images and deploys only the standalone
+  `_builds/<name>/resolved.yml`. It accepts running services and successful one-shot
+  containers, probes selected endpoints, checks active-source liveness, and checks
+  MV3DT BEV Fusion health when applicable before reporting success.
+
+### Debugging and Updating Skills
+
+For deployment or runtime failures, consult the Skill's
+`references/troubleshooting.md`. Warehouse-specific configuration, validation, and
+readiness checks are defined in `references/profiles/warehouse.md`.
+
+After updating the repository, follow [Updating Skills](/vision-agent/agent-skills#updating-skills) and start a new coding-agent session.
+
+### Related Documentation
+
+* [Agent Skills](/vision-agent/agent-skills) - VSS Skills catalog, installation, usage, and update flow.
+
+## Brev Launchable
+
+Launchables are a part of [NVIDIA Brev](https://developer.nvidia.com/brev#section-browse-launchables) that deliver preconfigured, fully optimized compute and software environments.
+
+This deployment uses the Docker Compose deployment method to set up the Warehouse Blueprint.
+
+[Link to GitHub Repository](https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization) used in this launchable.
+
+[Launch Blueprint](https://brev.nvidia.com/launchable/deploy?launchableID=env-2tYIjRXL4eMCbH9Az8mJC5WPAI4)
+
+### Prerequisites
+
+#### Host System Prerequisites
+
+Brev Launchable takes care of the host requirements.
+
+#### Obtain NGC API Key
+
+Follow [How to get an NVIDIA NGC API key](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/operations-monitoring-troubleshooting-faq-known-limitations/faq#how-to-get-an-nvidia-ngc-api-key).
+
+### Deployment Profiles
+
+The launchable notebook uses the same `MODE` and `BP_PROFILE` values described in the [Deployment Selection](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/quickstart#deployment-selection) section above. It derives `STREAM_TYPE` from `BP_PROFILE`: `bp_wh_redis` uses Redis, and the other profiles use Kafka.
+
+The notebook selects a default dataset and stream count for each mode and profile. To select a different dataset, set `SAMPLE_VIDEO_DATASET` in Section 1 and update the existing `NUM_STREAMS` value in `industry-profiles/warehouse-operations/overrides.env` to match the dataset's camera count before running Section 9. For 3D, also set `DATASET_TYPE` to `real` or `synthetic` for the selected dataset.
+
+See [Deployment Options](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/quickstart#deployment-options) for full details on each profile.
+
+### Steps to Launch the Blueprint
+
+1. Go to the [Launchable page](https://brev.nvidia.com/launchable/deploy?launchableID=env-2tYIjRXL4eMCbH9Az8mJC5WPAI4).
+
+    ![Brev Launchable configuration page for the Warehouse Blueprint](../assets/images/cloud/brev_launchable.png)
+
+2. Click **Deploy Launchable** in the upper-right corner.
+3. Click **Go to Instance Page**.
+4. After the instance is enabled, click **Open Notebook**.
+
+    ![Warehouse Brev Launchable Notebook](../assets/images/cloud/brev_notebook_button.png)
+
+   Close any warning dialogs that appear in JupyterLab.
+
+5. Open a terminal in JupyterLab and check out the [repository reference selected for this documentation build](https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization/tree/${VSS_DOCS_GIT_REF:-develop}) before opening the warehouse launchable notebook:
+
+   ```bash
+   cd ~/video-search-and-summarization
+   git fetch origin "${VSS_DOCS_GIT_REF:-develop}"
+   git checkout --detach FETCH_HEAD
+   ```
+
+6. Navigate to and open the `video-search-and-summarization/deploy/docker/scripts/deploy_warehouse_launchable.ipynb` notebook. If it is already open, close and reopen it after checking out the reference so it loads the selected version.
+
+   The Compose files ship in-tree in the `video-search-and-summarization` repository—there is no separate Compose archive to download. On Brev, the repository is cloned onto the instance automatically; set `DEPLOY_SOURCE_PATH` in Section 1 to that path (typically `~/video-search-and-summarization`).
+7. In Section 1, set `NGC_CLI_API_KEY` and select `MODE`, `BP_PROFILE`, and `HARDWARE_PROFILE`.
+8. Run each cell in order and use the URLs printed by Section 11. The notebook prints only the URLs available for the selected profile.
+
+<Note>
+The complete setup takes around 20 minutes on first run as it downloads containers, pulls warehouse app data from NGC, and (for perception) compiles the TensorRT engine. Subsequent runs are faster — images stay cached locally and the engine is cached under `$VSS_DATA_DIR/models/`.
+</Note>
+
+### Accessing the UI
+
+Section 11 of the notebook prints the URLs available for the selected profile:
+
+- **Agent UI** → `<secure_link>` directly (the HAProxy ingress serves the Agent UI at the root path)
+- **Kibana** → `<secure_link>/kibana/` (requires an extended `COMPOSE_PROFILES_WH_*` service list without the `_MINIMAL` suffix)
+- **VIOS (VST) UI** → `<secure_link>/vst/`
+
+<Note>
+For VIOS video playback through a Brev secure link, set **Streaming Protocol** to **DASH** instead of **WebRTC** in the VIOS UI.
+</Note>
+
+For the full set of service access points (including direct ports for Video Analytics API, VA-MCP, and NIM endpoints), see [Service Access Points](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/quickstart#service-access-points).

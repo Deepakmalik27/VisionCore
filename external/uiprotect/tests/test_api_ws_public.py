@@ -1,0 +1,1479 @@
+"""Tests for Public API Websockets (Events and Devices)."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, patch
+
+import aiohttp
+import orjson
+import pytest
+
+from uiprotect.api import (
+    PRIVATE_WS_HEARTBEAT,
+    PUBLIC_WS_HEARTBEAT,
+    BaseApiClient,
+)
+from uiprotect.data import NvrArmModeStatus, PublicBootstrap, PublicNVR
+from uiprotect.data.websocket import WSAction, WSSubscriptionMessage
+from uiprotect.exceptions import NotAuthorized
+from uiprotect.websocket import WebsocketState
+
+if TYPE_CHECKING:
+    from uiprotect import ProtectApiClient
+
+
+def create_mock_ws_message(data: str, msg_type: int = 1) -> MagicMock:
+    """Create a mock websocket message with the given data."""
+    msg = MagicMock()
+    msg.type = msg_type  # WSMsgType.TEXT by default
+    msg.data = data
+    return msg
+
+
+@pytest.mark.asyncio()
+async def test_subscribe_events_websocket(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test subscribing to events websocket."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    # Subscribe
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    assert len(protect_client._events_ws_subscriptions) == 1
+    assert protect_client._events_ws_subscriptions[0] == capture_ws
+
+    # Unsubscribe
+    unsub()
+
+    assert len(protect_client._events_ws_subscriptions) == 0
+
+
+@pytest.mark.asyncio()
+async def test_subscribe_devices_websocket(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test subscribing to devices websocket."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    # Subscribe
+    unsub = protect_client.subscribe_devices_websocket(capture_ws)
+
+    assert len(protect_client._devices_ws_subscriptions) == 1
+    assert protect_client._devices_ws_subscriptions[0] == capture_ws
+
+    # Unsubscribe
+    unsub()
+
+    assert len(protect_client._devices_ws_subscriptions) == 0
+
+
+@pytest.mark.asyncio()
+async def test_subscribe_events_websocket_state(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test subscribing to events websocket state changes."""
+    protect_client = protect_client_no_debug
+
+    states: list[WebsocketState] = []
+
+    def capture_state(state: WebsocketState) -> None:
+        states.append(state)
+
+    # Subscribe
+    unsub = protect_client.subscribe_events_websocket_state(capture_state)
+
+    assert len(protect_client._events_ws_state_subscriptions) == 1
+    assert protect_client._events_ws_state_subscriptions[0] == capture_state
+
+    # Unsubscribe
+    unsub()
+
+    assert len(protect_client._events_ws_state_subscriptions) == 0
+
+
+@pytest.mark.asyncio()
+async def test_subscribe_devices_websocket_state(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test subscribing to devices websocket state changes."""
+    protect_client = protect_client_no_debug
+
+    states: list[WebsocketState] = []
+
+    def capture_state(state: WebsocketState) -> None:
+        states.append(state)
+
+    # Subscribe
+    unsub = protect_client.subscribe_devices_websocket_state(capture_state)
+
+    assert len(protect_client._devices_ws_state_subscriptions) == 1
+    assert protect_client._devices_ws_state_subscriptions[0] == capture_state
+
+    # Unsubscribe
+    unsub()
+
+    assert len(protect_client._devices_ws_state_subscriptions) == 0
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_add(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """
+    Test processing events websocket message with ADD action.
+
+    Without a materialised public bootstrap, events are not cached — the
+    subscription message carries ``new_obj=None`` and callers must use
+    ``changed_data``.
+    """
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client_no_debug.subscribe_events_websocket(capture_ws)
+
+    msg = create_mock_ws_message(
+        '{"type":"add","item":{"id":"test-event-123","modelKey":"event","type":"motion","start":1234567890}}'
+    )
+
+    protect_client_no_debug._process_events_ws_message(msg)
+
+    assert len(messages) == 1
+    assert messages[0].action == WSAction.ADD
+    assert messages[0].changed_data["id"] == "test-event-123"
+    assert messages[0].changed_data["modelKey"] == "event"
+    # No cache materialised → no cached object built.
+    assert messages[0].new_obj is None
+    assert messages[0].new_update_id == "test-event-123"
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_update(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing events websocket message with UPDATE action."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    # Create a mock websocket message
+    msg = MagicMock()
+    msg.type = 1  # WSMsgType.TEXT
+    msg.data = '{"type":"update","item":{"id":"test-event-123","modelKey":"event","end":1234567900}}'
+
+    protect_client._process_events_ws_message(msg)
+
+    assert len(messages) == 1
+    assert messages[0].action == WSAction.UPDATE
+    assert messages[0].changed_data["id"] == "test-event-123"
+    assert messages[0].changed_data["end"] == 1234567900
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_devices_ws_message_update(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing devices websocket message with UPDATE action."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_devices_websocket(capture_ws)
+
+    # Create a mock websocket message
+    msg = MagicMock()
+    msg.type = 1  # WSMsgType.TEXT
+    msg.data = '{"type":"update","item":{"id":"test-sensor-123","modelKey":"sensor","leakDetectedAt":null}}'
+
+    protect_client._process_devices_ws_message(msg)
+
+    assert len(messages) == 1
+    assert messages[0].action == WSAction.UPDATE
+    assert messages[0].changed_data["id"] == "test-sensor-123"
+    assert messages[0].changed_data["modelKey"] == "sensor"
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_remove(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing events websocket message with REMOVE action."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    # Create a mock websocket message
+    msg = MagicMock()
+    msg.type = 1  # WSMsgType.TEXT
+    msg.data = '{"type":"remove","item":{"id":"test-event-123","modelKey":"event"}}'
+
+    protect_client._process_events_ws_message(msg)
+
+    assert len(messages) == 1
+    assert messages[0].action == WSAction.REMOVE
+    assert messages[0].changed_data["id"] == "test-event-123"
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_invalid_json(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing events websocket message with invalid JSON."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    # Create a mock websocket message with invalid JSON
+    msg = MagicMock()
+    msg.type = 1  # WSMsgType.TEXT
+    msg.data = "invalid json"
+
+    # Should not raise exception, just log error
+    protect_client._process_events_ws_message(msg)
+
+    assert len(messages) == 0
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_missing_type(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing events websocket message with missing type."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    # Create a mock websocket message without type
+    msg = MagicMock()
+    msg.type = 1  # WSMsgType.TEXT
+    msg.data = '{"item":{"id":"test-event-123","modelKey":"event"}}'
+
+    protect_client._process_events_ws_message(msg)
+
+    assert len(messages) == 0
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_unknown_model(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing events websocket message with unknown model type."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    # Create a mock websocket message with unknown model
+    msg = MagicMock()
+    msg.type = 1  # WSMsgType.TEXT
+    msg.data = '{"type":"add","item":{"id":"test-123","modelKey":"unknownModel"}}'
+
+    protect_client._process_events_ws_message(msg)
+
+    assert len(messages) == 0
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_object_creation_failure(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing events websocket message when object creation fails."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    # Create a mock websocket message with invalid data that will cause object creation to fail
+    msg = create_mock_ws_message(
+        '{"type":"add","item":{"id":"test-event-123","modelKey":"event","invalid_field":"bad_data"}}'
+    )
+
+    # Patch create_from_unifi_dict to raise an exception
+    with patch(
+        "uiprotect.api.create_from_unifi_dict",
+        side_effect=Exception("Object creation failed"),
+    ):
+        protect_client._process_events_ws_message(msg)
+
+    assert len(messages) == 1
+    assert messages[0].action == WSAction.ADD
+    assert messages[0].changed_data["id"] == "test-event-123"
+
+    # Object creation should have failed gracefully
+    assert messages[0].new_obj is None
+    assert messages[0].old_obj is None
+
+    # But other data should still be set
+    assert messages[0].new_update_id == "test-event-123"
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_without_cache_emits_none_obj_events(
+    protect_client: ProtectApiClient,
+) -> None:
+    """
+    Without a materialised cache, event add/update messages emit ``new_obj=None``.
+
+    The raw payload is still forwarded via ``changed_data`` so subscribers
+    can react without opting into the :class:`PublicBootstrap` event cache.
+    """
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    msg = create_mock_ws_message(
+        '{"type":"add","item":{"id":"test-event-123","modelKey":"event","invalid_field":"bad_data"}}'
+    )
+
+    protect_client._process_events_ws_message(msg)
+
+    assert len(messages) == 1
+    assert messages[0].action == WSAction.ADD
+    assert messages[0].changed_data["id"] == "test-event-123"
+    assert messages[0].new_obj is None
+    assert messages[0].old_obj is None
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_non_text(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing events websocket message with non-text type."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_events_websocket(capture_ws)
+
+    # Create a mock websocket message with binary type
+    msg = MagicMock()
+    msg.type = 2  # WSMsgType.BINARY
+    msg.data = b"binary data"
+
+    protect_client._process_events_ws_message(msg)
+
+    assert len(messages) == 0
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("new_obj", "old_obj", "use_debug"),
+    [
+        (None, None, False),  # Basic test without objects
+        (MagicMock(model="event", id="test-1"), None, False),  # With new_obj
+        (None, MagicMock(model="event", id="test-2"), False),  # With old_obj
+        (
+            MagicMock(model="event", id="test-3"),
+            None,
+            True,
+        ),  # Debug logging with new_obj
+        (
+            None,
+            MagicMock(model="event", id="test-4"),
+            True,
+        ),  # Debug logging with old_obj
+        (None, None, True),  # Debug logging without objects
+    ],
+)
+async def test_emit_events_message(
+    protect_client_no_debug: ProtectApiClient,
+    protect_client: ProtectApiClient,
+    new_obj: MagicMock | None,
+    old_obj: MagicMock | None,
+    use_debug: bool,
+) -> None:
+    """Test emitting events messages with various configurations."""
+    client = protect_client if use_debug else protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = client.subscribe_events_websocket(capture_ws)
+
+    # Create a test message
+    test_msg = WSSubscriptionMessage(
+        action=WSAction.ADD
+        if new_obj
+        else WSAction.REMOVE
+        if old_obj
+        else WSAction.UPDATE,
+        new_update_id="test-123",
+        changed_data={"id": "test-event", "type": "motion"},
+        new_obj=new_obj,
+        old_obj=old_obj,
+    )
+
+    if use_debug:
+        with patch("uiprotect.api._LOGGER") as mock_logger:
+            mock_logger.isEnabledFor.return_value = True
+            client.emit_events_message(test_msg)
+
+            # Verify debug log was called
+            assert mock_logger.debug.call_count >= 1
+            call_args = mock_logger.debug.call_args[0]
+            assert "emitting events message" in call_args[0]
+    else:
+        client.emit_events_message(test_msg)
+
+    assert len(messages) == 1
+    assert messages[0] == test_msg
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("new_obj", "old_obj", "use_debug"),
+    [
+        (None, None, False),  # Basic test without objects
+        (MagicMock(model="camera", id="test-1"), None, False),  # With new_obj
+        (None, MagicMock(model="camera", id="test-2"), False),  # With old_obj
+        (
+            MagicMock(model="camera", id="test-3"),
+            None,
+            True,
+        ),  # Debug logging with new_obj
+        (
+            None,
+            MagicMock(model="camera", id="test-4"),
+            True,
+        ),  # Debug logging with old_obj
+        (None, None, True),  # Debug logging without objects
+    ],
+)
+async def test_emit_devices_message(
+    protect_client_no_debug: ProtectApiClient,
+    protect_client: ProtectApiClient,
+    new_obj: MagicMock | None,
+    old_obj: MagicMock | None,
+    use_debug: bool,
+) -> None:
+    """Test emitting devices messages with various configurations."""
+    client = protect_client if use_debug else protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = client.subscribe_devices_websocket(capture_ws)
+
+    # Create a test message
+    test_msg = WSSubscriptionMessage(
+        action=WSAction.UPDATE
+        if new_obj
+        else WSAction.REMOVE
+        if old_obj
+        else WSAction.ADD,
+        new_update_id="test-456",
+        changed_data={"id": "test-device", "name": "Test Camera"},
+        new_obj=new_obj,
+        old_obj=old_obj,
+    )
+
+    if use_debug:
+        with patch("uiprotect.api._LOGGER") as mock_logger:
+            mock_logger.isEnabledFor.return_value = True
+            client.emit_devices_message(test_msg)
+
+            # Verify debug log was called
+            assert mock_logger.debug.call_count >= 1
+            call_args = mock_logger.debug.call_args[0]
+            assert "emitting devices message" in call_args[0]
+    else:
+        client.emit_devices_message(test_msg)
+
+    assert len(messages) == 1
+    assert messages[0] == test_msg
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_events_websocket_multiple_subscriptions(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test multiple subscriptions and unsubscriptions for events websocket."""
+    protect_client = protect_client_no_debug
+
+    messages1: list[WSSubscriptionMessage] = []
+    messages2: list[WSSubscriptionMessage] = []
+
+    def capture_ws1(message: WSSubscriptionMessage) -> None:
+        messages1.append(message)
+
+    def capture_ws2(message: WSSubscriptionMessage) -> None:
+        messages2.append(message)
+
+    # Subscribe both
+    unsub1 = protect_client.subscribe_events_websocket(capture_ws1)
+    unsub2 = protect_client.subscribe_events_websocket(capture_ws2)
+
+    assert len(protect_client._events_ws_subscriptions) == 2
+
+    # Unsubscribe first
+    unsub1()
+
+    assert len(protect_client._events_ws_subscriptions) == 1
+    assert protect_client._events_ws_subscriptions[0] == capture_ws2
+
+    # Unsubscribe second
+    unsub2()
+
+    assert len(protect_client._events_ws_subscriptions) == 0
+
+
+@pytest.mark.asyncio()
+async def test_devices_websocket_multiple_subscriptions(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test multiple subscriptions and unsubscriptions for devices websocket."""
+    protect_client = protect_client_no_debug
+
+    messages1: list[WSSubscriptionMessage] = []
+    messages2: list[WSSubscriptionMessage] = []
+
+    def capture_ws1(message: WSSubscriptionMessage) -> None:
+        messages1.append(message)
+
+    def capture_ws2(message: WSSubscriptionMessage) -> None:
+        messages2.append(message)
+
+    # Subscribe both
+    unsub1 = protect_client.subscribe_devices_websocket(capture_ws1)
+    unsub2 = protect_client.subscribe_devices_websocket(capture_ws2)
+
+    assert len(protect_client._devices_ws_subscriptions) == 2
+
+    # Unsubscribe first
+    unsub1()
+
+    assert len(protect_client._devices_ws_subscriptions) == 1
+    assert protect_client._devices_ws_subscriptions[0] == capture_ws2
+
+    # Unsubscribe second
+    unsub2()
+
+    assert len(protect_client._devices_ws_subscriptions) == 0
+
+
+@pytest.mark.asyncio()
+async def test_process_devices_ws_message_add(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test processing devices websocket message with ADD action."""
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_devices_websocket(capture_ws)
+
+    # Create a mock websocket message
+    msg = MagicMock()
+    msg.type = 1  # WSMsgType.TEXT
+    msg.data = '{"type":"add","item":{"id":"test-camera-123","modelKey":"camera","name":"Test Camera"}}'
+
+    protect_client._process_devices_ws_message(msg)
+
+    assert len(messages) == 1
+    assert messages[0].action == WSAction.ADD
+    assert messages[0].changed_data["id"] == "test-camera-123"
+    assert messages[0].changed_data["modelKey"] == "camera"
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_events_websocket_exception_handling(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test that exceptions in event callbacks don't crash the system."""
+    protect_client = protect_client_no_debug
+
+    call_count = 0
+
+    def raising_callback(message: WSSubscriptionMessage) -> None:
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("Test exception")
+
+    unsub = protect_client.subscribe_events_websocket(raising_callback)
+
+    # Create a test message
+    test_msg = WSSubscriptionMessage(
+        action=WSAction.ADD,
+        new_update_id="test-123",
+        changed_data={"id": "test-event", "modelKey": "event"},
+    )
+
+    # Should not raise, just log the exception
+    protect_client.emit_events_message(test_msg)
+
+    assert call_count == 1
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_devices_websocket_exception_handling(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test that exceptions in device callbacks don't crash the system."""
+    protect_client = protect_client_no_debug
+
+    call_count = 0
+
+    def raising_callback(message: WSSubscriptionMessage) -> None:
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("Test exception")
+
+    unsub = protect_client.subscribe_devices_websocket(raising_callback)
+
+    # Create a test message
+    test_msg = WSSubscriptionMessage(
+        action=WSAction.UPDATE,
+        new_update_id="test-456",
+        changed_data={"id": "test-sensor", "modelKey": "sensor"},
+    )
+
+    # Should not raise, just log the exception
+    protect_client.emit_devices_message(test_msg)
+
+    assert call_count == 1
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_events_ws_url(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test events websocket URL property."""
+    protect_client = protect_client_no_debug
+
+    # Get the events websocket URL
+    events_url = protect_client.events_ws_url
+
+    # Verify it's a string and contains the expected path
+    assert isinstance(events_url, str)
+    assert "/proxy/protect/integration/v1/subscribe/events" in events_url
+    assert events_url.startswith("https://")
+
+
+@pytest.mark.asyncio()
+async def test_devices_ws_url(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test devices websocket URL property."""
+    protect_client = protect_client_no_debug
+
+    # Get the devices websocket URL
+    devices_url = protect_client.devices_ws_url
+
+    # Verify it's a string and contains the expected path
+    assert isinstance(devices_url, str)
+    assert "/proxy/protect/integration/v1/subscribe/devices" in devices_url
+    assert devices_url.startswith("https://")
+
+
+@pytest.mark.asyncio()
+async def test_get_events_websocket(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test getting events websocket instance."""
+    protect_client = protect_client_no_debug
+
+    # Get the websocket instance (should create it if not exists)
+    ws = protect_client._get_events_websocket()
+
+    # Verify it's the same instance when called again
+    ws2 = protect_client._get_events_websocket()
+    assert ws is ws2
+
+
+@pytest.mark.asyncio()
+async def test_get_devices_websocket(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test getting devices websocket instance."""
+    protect_client = protect_client_no_debug
+
+    # Get the websocket instance (should create it if not exists)
+    ws = protect_client._get_devices_websocket()
+
+    # Verify it's the same instance when called again
+    ws2 = protect_client._get_devices_websocket()
+    assert ws is ws2
+
+
+@pytest.mark.asyncio()
+async def test_websockets_use_heartbeat(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Every WS is created with a keepalive heartbeat."""
+    protect_client = protect_client_no_debug
+
+    assert protect_client._get_events_websocket().heartbeat == PUBLIC_WS_HEARTBEAT
+    assert protect_client._get_devices_websocket().heartbeat == PUBLIC_WS_HEARTBEAT
+    assert protect_client._get_websocket().heartbeat == PRIVATE_WS_HEARTBEAT
+
+
+@pytest.mark.asyncio()
+async def test_on_events_websocket_state_change(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test events websocket state change handler."""
+    protect_client = protect_client_no_debug
+
+    states: list[WebsocketState] = []
+
+    def capture_state(state: WebsocketState) -> None:
+        states.append(state)
+
+    # Subscribe to state changes
+    unsub = protect_client.subscribe_events_websocket_state(capture_state)
+
+    # Simulate state changes
+    protect_client._on_events_websocket_state_change(WebsocketState.CONNECTED)
+    assert len(states) == 1
+    assert states[0] == WebsocketState.CONNECTED
+
+    protect_client._on_events_websocket_state_change(WebsocketState.DISCONNECTED)
+    assert len(states) == 2
+    assert states[1] == WebsocketState.DISCONNECTED
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_on_devices_websocket_state_change(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test devices websocket state change handler."""
+    protect_client = protect_client_no_debug
+
+    states: list[WebsocketState] = []
+
+    def capture_state(state: WebsocketState) -> None:
+        states.append(state)
+
+    # Subscribe to state changes
+    unsub = protect_client.subscribe_devices_websocket_state(capture_state)
+
+    # Simulate state changes
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert len(states) == 1
+    assert states[0] == WebsocketState.CONNECTED
+
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    assert len(states) == 2
+    assert states[1] == WebsocketState.DISCONNECTED
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_on_events_websocket_state_change_multiple_subscribers(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test events websocket state change with multiple subscribers."""
+    protect_client = protect_client_no_debug
+
+    states1: list[WebsocketState] = []
+    states2: list[WebsocketState] = []
+
+    def capture_state1(state: WebsocketState) -> None:
+        states1.append(state)
+
+    def capture_state2(state: WebsocketState) -> None:
+        states2.append(state)
+
+    # Subscribe both
+    unsub1 = protect_client.subscribe_events_websocket_state(capture_state1)
+    unsub2 = protect_client.subscribe_events_websocket_state(capture_state2)
+
+    # Simulate state change
+    protect_client._on_events_websocket_state_change(WebsocketState.CONNECTED)
+
+    assert len(states1) == 1
+    assert len(states2) == 1
+    assert states1[0] == WebsocketState.CONNECTED
+    assert states2[0] == WebsocketState.CONNECTED
+
+    unsub1()
+    unsub2()
+
+
+@pytest.mark.asyncio()
+async def test_on_devices_websocket_state_change_multiple_subscribers(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test devices websocket state change with multiple subscribers."""
+    protect_client = protect_client_no_debug
+
+    states1: list[WebsocketState] = []
+    states2: list[WebsocketState] = []
+
+    def capture_state1(state: WebsocketState) -> None:
+        states1.append(state)
+
+    def capture_state2(state: WebsocketState) -> None:
+        states2.append(state)
+
+    # Subscribe both
+    unsub1 = protect_client.subscribe_devices_websocket_state(capture_state1)
+    unsub2 = protect_client.subscribe_devices_websocket_state(capture_state2)
+
+    # Simulate state change
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+
+    assert len(states1) == 1
+    assert len(states2) == 1
+    assert states1[0] == WebsocketState.CONNECTED
+    assert states2[0] == WebsocketState.CONNECTED
+
+    unsub1()
+    unsub2()
+
+
+@pytest.mark.asyncio()
+async def test_on_events_websocket_state_change_exception_handling(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test that exceptions in state change callbacks don't crash the system."""
+    protect_client = protect_client_no_debug
+
+    call_count = 0
+
+    def raising_callback(state: WebsocketState) -> None:
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("Test exception")
+
+    unsub = protect_client.subscribe_events_websocket_state(raising_callback)
+
+    # Should not raise, just log the exception
+    protect_client._on_events_websocket_state_change(WebsocketState.CONNECTED)
+
+    assert call_count == 1
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_on_devices_websocket_state_change_exception_handling(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test that exceptions in state change callbacks don't crash the system."""
+    protect_client = protect_client_no_debug
+
+    call_count = 0
+
+    def raising_callback(state: WebsocketState) -> None:
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("Test exception")
+
+    unsub = protect_client.subscribe_devices_websocket_state(raising_callback)
+
+    # Should not raise, just log the exception
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+
+    assert call_count == 1
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_on_events_websocket_state_change_debug_logging(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test events websocket state change with debug logging enabled."""
+    states: list[WebsocketState] = []
+
+    def capture_state(state: WebsocketState) -> None:
+        states.append(state)
+
+    # Subscribe to state changes
+    unsub = protect_client.subscribe_events_websocket_state(capture_state)
+
+    # Simulate different state changes with debug logging
+    protect_client._on_events_websocket_state_change(WebsocketState.CONNECTED)
+    assert len(states) == 1
+    assert states[0] == WebsocketState.CONNECTED
+
+    protect_client._on_events_websocket_state_change(WebsocketState.DISCONNECTED)
+    assert len(states) == 2
+    assert states[1] == WebsocketState.DISCONNECTED
+
+    protect_client._on_events_websocket_state_change(WebsocketState.CONNECTED)
+    assert len(states) == 3
+    assert states[2] == WebsocketState.CONNECTED
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_on_devices_websocket_state_change_debug_logging(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test devices websocket state change with debug logging enabled."""
+    states: list[WebsocketState] = []
+
+    def capture_state(state: WebsocketState) -> None:
+        states.append(state)
+
+    # Subscribe to state changes
+    unsub = protect_client.subscribe_devices_websocket_state(capture_state)
+
+    # Simulate different state changes with debug logging
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert len(states) == 1
+    assert states[0] == WebsocketState.CONNECTED
+
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    assert len(states) == 2
+    assert states[1] == WebsocketState.DISCONNECTED
+
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert len(states) == 3
+    assert states[2] == WebsocketState.CONNECTED
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_auth_public_api_websocket_with_api_key(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test authentication for public API websocket with API key."""
+    protect_client = protect_client_no_debug
+
+    # Set an API key for testing
+    protect_client._api_key = "test-api-key-12345"
+
+    headers = await protect_client._auth_public_api_websocket()
+
+    assert headers is not None
+    assert "X-API-KEY" in headers
+    assert headers["X-API-KEY"] == "test-api-key-12345"
+
+
+@pytest.mark.asyncio()
+async def test_auth_public_api_websocket_without_api_key(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test authentication for public API websocket without API key raises error."""
+    protect_client = protect_client_no_debug
+
+    # Ensure API key is None
+    protect_client._api_key = None
+
+    with pytest.raises(NotAuthorized, match="API key is required"):
+        await protect_client._auth_public_api_websocket()
+
+
+@pytest.mark.asyncio()
+async def test_auth_public_api_websocket_force_param(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test authentication for public API websocket with force parameter."""
+    protect_client = protect_client_no_debug
+
+    # Set an API key for testing
+    protect_client._api_key = "test-api-key-force"
+
+    # Test with force=True
+    headers_forced = await protect_client._auth_public_api_websocket(force=True)
+
+    assert headers_forced is not None
+    assert "X-API-KEY" in headers_forced
+    assert headers_forced["X-API-KEY"] == "test-api-key-force"
+
+    # Test with force=False
+    headers_not_forced = await protect_client._auth_public_api_websocket(force=False)
+
+    assert headers_not_forced is not None
+    assert "X-API-KEY" in headers_not_forced
+    assert headers_not_forced["X-API-KEY"] == "test-api-key-force"
+
+
+@pytest.mark.asyncio()
+async def test_get_last_update_id_bootstrap_none(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _get_last_update_id when bootstrap is None."""
+    protect_client = protect_client_no_debug
+
+    # Ensure bootstrap is None
+    protect_client._bootstrap = None
+
+    result = protect_client._get_last_update_id()
+
+    assert result is None
+
+
+@pytest.mark.asyncio()
+async def test_process_devices_ws_message_exception_handling(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test exception handling in _process_devices_ws_message."""
+    protect_client = protect_client_no_debug
+
+    # Create valid data structure that will pass initial checks
+    valid_data = {
+        "type": "update",
+        "item": {
+            "modelKey": "camera",
+            "id": "test-id",
+        },
+    }
+
+    # Create a mock WSMessage
+    mock_msg = MagicMock(spec=aiohttp.WSMessage)
+    mock_msg.type = aiohttp.WSMsgType.TEXT
+    mock_msg.data = orjson.dumps(valid_data)
+
+    # Patch orjson.loads to raise an exception during processing
+    with (
+        patch(
+            "uiprotect.api.orjson.loads",
+            side_effect=Exception("Test JSON parsing exception"),
+        ),
+        patch("uiprotect.api._LOGGER") as mock_logger,
+    ):
+        # This should catch the exception and log it
+        protect_client._process_devices_ws_message(mock_msg)
+
+        # Verify that exception was logged
+        mock_logger.exception.assert_called_once()
+        call_args = mock_logger.exception.call_args
+        assert (
+            "Error processing public API devices websocket message" in call_args[0][0]
+        )
+
+
+@pytest.mark.asyncio()
+async def test_base_api_client_events_websocket_state_change_debug(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test BaseApiClient._on_events_websocket_state_change debug logging."""
+    protect_client = protect_client_no_debug
+
+    # Call the BaseApiClient method directly (not the overridden one)
+    with patch("uiprotect.api._LOGGER") as mock_logger:
+        mock_logger.isEnabledFor.return_value = True
+
+        # Call the base class method directly
+        BaseApiClient._on_events_websocket_state_change(
+            protect_client, WebsocketState.CONNECTED
+        )
+
+        # Verify debug log was called
+        mock_logger.debug.assert_called_once()
+        call_args = mock_logger.debug.call_args
+        assert "Events websocket state changed" in call_args[0][0]
+        assert WebsocketState.CONNECTED in call_args[0]
+
+
+@pytest.mark.asyncio()
+async def test_base_api_client_devices_websocket_state_change_debug(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test BaseApiClient._on_devices_websocket_state_change debug logging."""
+    protect_client = protect_client_no_debug
+
+    # Call the BaseApiClient method directly (not the overridden one)
+    with patch("uiprotect.api._LOGGER") as mock_logger:
+        mock_logger.isEnabledFor.return_value = True
+
+        # Call the base class method directly
+        BaseApiClient._on_devices_websocket_state_change(
+            protect_client, WebsocketState.DISCONNECTED
+        )
+
+        # Verify debug log was called
+        mock_logger.debug.assert_called_once()
+        call_args = mock_logger.debug.call_args
+        assert "Devices websocket state changed" in call_args[0][0]
+        assert WebsocketState.DISCONNECTED in call_args[0]
+
+
+@pytest.mark.asyncio()
+async def test_process_devices_ws_message_non_text_debug(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _process_devices_ws_message debug logging for non-text messages."""
+    protect_client = protect_client_no_debug
+
+    # Create a non-text WebSocket message (e.g., BINARY)
+    mock_msg = MagicMock(spec=aiohttp.WSMessage)
+    mock_msg.type = aiohttp.WSMsgType.BINARY
+
+    with patch("uiprotect.api._LOGGER") as mock_logger:
+        # Process the non-text message
+        protect_client._process_devices_ws_message(mock_msg)
+
+        # Verify debug log was called
+        mock_logger.debug.assert_called_once()
+        call_args = mock_logger.debug.call_args
+        assert "Ignoring non-text websocket message" in call_args[0][0]
+        assert aiohttp.WSMsgType.BINARY in call_args[0]
+
+
+@pytest.mark.asyncio()
+async def test_process_devices_ws_message_invalid_data_debug(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _process_devices_ws_message debug logging for invalid data."""
+    protect_client = protect_client_no_debug
+
+    # Create a message with missing required fields
+    invalid_data = {
+        "type": "update",
+        # Missing "item" or "item.modelKey"
+    }
+
+    mock_msg = MagicMock(spec=aiohttp.WSMessage)
+    mock_msg.type = aiohttp.WSMsgType.TEXT
+    mock_msg.data = orjson.dumps(invalid_data)
+
+    with patch("uiprotect.api._LOGGER") as mock_logger:
+        # Process the invalid message
+        protect_client._process_devices_ws_message(mock_msg)
+
+        # Verify debug log was called
+        mock_logger.debug.assert_called_once()
+        call_args = mock_logger.debug.call_args
+        assert "Invalid public API websocket message" in call_args[0][0]
+
+
+@pytest.mark.asyncio()
+async def test_process_devices_ws_message_unknown_model_debug(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _process_devices_ws_message debug logging for unknown model type."""
+    protect_client = protect_client_no_debug
+
+    # Create a message with an unknown model type
+    unknown_model_data = {
+        "type": "update",
+        "item": {
+            "modelKey": "unknown_model_type_xyz",
+            "id": "test-id",
+        },
+    }
+
+    mock_msg = MagicMock(spec=aiohttp.WSMessage)
+    mock_msg.type = aiohttp.WSMsgType.TEXT
+    mock_msg.data = orjson.dumps(unknown_model_data)
+
+    with patch("uiprotect.api._LOGGER") as mock_logger:
+        # Process the message with unknown model
+        protect_client._process_devices_ws_message(mock_msg)
+
+        # Verify debug log was called
+        mock_logger.debug.assert_called_once()
+        call_args = mock_logger.debug.call_args
+        assert "Unknown model type in public API message" in call_args[0][0]
+        assert "unknown_model_type_xyz" in call_args[0]
+
+
+@pytest.mark.asyncio()
+async def test_process_devices_ws_message_without_cache_emits_none_obj(
+    protect_client: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Without a materialised public bootstrap, ``new_obj`` is ``None``.
+
+    The public devices WS handler no longer eagerly constructs model
+    instances via ``create_from_unifi_dict`` — consumers that haven't opted
+    into :meth:`update_public` must use ``changed_data`` (the raw payload).
+    """
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_devices_websocket(capture_ws)
+
+    msg = create_mock_ws_message(
+        '{"type":"add","item":{"id":"test-device-123","modelKey":"camera","invalid_field":"bad_data"}}'
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        protect_client._process_devices_ws_message(msg)
+
+    assert len(messages) == 1
+    assert messages[0].action == WSAction.ADD
+    assert messages[0].changed_data["id"] == "test-device-123"
+    assert messages[0].new_obj is None
+    assert messages[0].old_obj is None
+
+    unsub()
+
+
+_NVR_ID = "66d025b301ebc903e80003ec"
+
+_NVR_ADD_PAYLOAD = {
+    "type": "add",
+    "item": {
+        "id": _NVR_ID,
+        "modelKey": "nvr",
+        "name": "Test NVR",
+        "doorbellSettings": {
+            "defaultMessageText": "WELCOME",
+            "defaultMessageResetTimeoutMs": 60000,
+            "customMessages": [],
+            "customImages": [],
+        },
+    },
+}
+
+_ARM_MODE_ARMED = {
+    "status": "armed",
+    "armProfileId": "profile-abc",
+    "armedAt": 1700000000000,
+    "willBeArmedAt": None,
+    "breachDetectedAt": None,
+    "breachEventCount": 0,
+    "breachTriggerEventId": None,
+    "breachEventId": None,
+}
+
+
+@pytest.mark.asyncio()
+async def test_nvr_ws_add_populates_public_bootstrap(
+    protect_client: ProtectApiClient,
+) -> None:
+    """NVR add message via devices WS creates a PublicNVR in the bootstrap."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    assert pb.nvr is None
+
+    msg = create_mock_ws_message(orjson.dumps(_NVR_ADD_PAYLOAD).decode())
+    protect_client._process_devices_ws_message(msg)
+
+    assert isinstance(pb.nvr, PublicNVR)
+    assert pb.nvr.id == _NVR_ID
+    assert pb.nvr.name == "Test NVR"
+
+
+@pytest.mark.asyncio()
+async def test_nvr_ws_add_with_arm_mode_populates_arm_mode(
+    protect_client: ProtectApiClient,
+) -> None:
+    """NVR add with armMode → pb.arm_mode is populated via PublicNVR.arm_mode."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+
+    payload = dict(_NVR_ADD_PAYLOAD)
+    payload["item"] = dict(payload["item"])
+    payload["item"]["armMode"] = _ARM_MODE_ARMED
+
+    msg = create_mock_ws_message(orjson.dumps(payload).decode())
+    protect_client._process_devices_ws_message(msg)
+
+    assert pb.arm_mode is not None
+    assert pb.arm_mode.status == NvrArmModeStatus.ARMED
+    assert pb.arm_mode.arm_profile_id == "profile-abc"
+
+
+@pytest.mark.asyncio()
+async def test_nvr_ws_update_arm_mode_merges_into_nvr(
+    protect_client: ProtectApiClient,
+) -> None:
+    """NVR update diff with armMode updates pb.nvr.arm_mode in place."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+
+    # Prime the cache with an add that has no armMode (older firmware without alarm manager support).
+    msg_add = create_mock_ws_message(orjson.dumps(_NVR_ADD_PAYLOAD).decode())
+    protect_client._process_devices_ws_message(msg_add)
+    assert pb.nvr is not None
+    assert pb.arm_mode is None
+
+    # Now receive an update diff that includes armMode (newer firmware with alarm manager support).
+    update_payload = {
+        "type": "update",
+        "item": {
+            "id": _NVR_ID,
+            "modelKey": "nvr",
+            "armMode": _ARM_MODE_ARMED,
+        },
+    }
+    msg_update = create_mock_ws_message(orjson.dumps(update_payload).decode())
+    protect_client._process_devices_ws_message(msg_update)
+
+    assert pb.arm_mode is not None
+    assert pb.arm_mode.status == NvrArmModeStatus.ARMED
+    assert pb.arm_mode.arm_profile_id == "profile-abc"
+
+
+@pytest.mark.asyncio()
+async def test_nvr_ws_update_without_arm_mode_leaves_existing_arm_mode(
+    protect_client: ProtectApiClient,
+) -> None:
+    """NVR update diff WITHOUT armMode (v7.0) leaves existing arm_mode untouched."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+
+    # Prime with armed NVR.
+    add_payload = dict(_NVR_ADD_PAYLOAD)
+    add_payload["item"] = dict(add_payload["item"])
+    add_payload["item"]["armMode"] = _ARM_MODE_ARMED
+    protect_client._process_devices_ws_message(
+        create_mock_ws_message(orjson.dumps(add_payload).decode())
+    )
+    assert pb.arm_mode is not None
+    assert pb.arm_mode.status == NvrArmModeStatus.ARMED
+
+    # Receive a v7.0-style update that does NOT include armMode.
+    update_payload = {
+        "type": "update",
+        "item": {"id": _NVR_ID, "modelKey": "nvr", "name": "Renamed NVR"},
+    }
+    protect_client._process_devices_ws_message(
+        create_mock_ws_message(orjson.dumps(update_payload).decode())
+    )
+
+    # name updated, arm_mode unchanged.
+    assert pb.nvr.name == "Renamed NVR"
+    assert pb.arm_mode.status == NvrArmModeStatus.ARMED
+
+
+@pytest.mark.asyncio()
+async def test_nvr_ws_update_arm_mode_emits_subscription_message(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Subscribers receive a WSSubscriptionMessage with the updated PublicNVR as new_obj."""
+    protect_client._public_bootstrap = PublicBootstrap()
+
+    # Prime.
+    protect_client._process_devices_ws_message(
+        create_mock_ws_message(orjson.dumps(_NVR_ADD_PAYLOAD).decode())
+    )
+
+    messages: list[WSSubscriptionMessage] = []
+    unsub = protect_client.subscribe_devices_websocket(messages.append)
+
+    update_payload = {
+        "type": "update",
+        "item": {"id": _NVR_ID, "modelKey": "nvr", "armMode": _ARM_MODE_ARMED},
+    }
+    protect_client._process_devices_ws_message(
+        create_mock_ws_message(orjson.dumps(update_payload).decode())
+    )
+
+    assert len(messages) == 1
+    msg = messages[0]
+    assert msg.action == WSAction.UPDATE
+    assert isinstance(msg.new_obj, PublicNVR)
+    assert msg.new_obj.arm_mode is not None
+    assert msg.new_obj.arm_mode.status == NvrArmModeStatus.ARMED
+
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_nvr_ws_unknown_arm_mode_status_does_not_raise(
+    protect_client: ProtectApiClient,
+) -> None:
+    """
+    Forward-compat: an unknown armMode status from a newer firmware must not
+    raise a ValidationError — it should coerce to NvrArmModeStatus.UNKNOWN.
+    """
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+
+    payload = dict(_NVR_ADD_PAYLOAD)
+    payload["item"] = dict(payload["item"])
+    payload["item"]["armMode"] = {
+        **_ARM_MODE_ARMED,
+        "status": "totally_new_status_from_future_firmware",
+    }
+
+    msg = create_mock_ws_message(orjson.dumps(payload).decode())
+    # Must not raise.
+    protect_client._process_devices_ws_message(msg)
+
+    assert pb.arm_mode is not None
+    assert pb.arm_mode.status == NvrArmModeStatus.UNKNOWN

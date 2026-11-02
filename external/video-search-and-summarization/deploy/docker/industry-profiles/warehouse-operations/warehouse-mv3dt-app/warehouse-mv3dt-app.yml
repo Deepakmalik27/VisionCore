@@ -1,0 +1,334 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+include:
+
+services:
+  vss-behavior-analytics-mv3dt:
+    extends:
+      file: ${VSS_APPS_DIR}/services/analytics/behavior-analytics/compose.yml
+      service: vss-behavior-analytics-base
+    profiles: ["vss-behavior-analytics-mv3dt"]
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/resources/calibration.json
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json:/resources/vss-behavior-analytics-config.json
+    container_name: vss-behavior-analytics-mv3dt
+    networks:
+      default:
+        aliases:
+          - vss-behavior-analytics
+    command: python3 apps/analytics/main_analytics_3d_app.py --config /resources/vss-behavior-analytics-config.json --calibration /resources/calibration.json
+    depends_on:
+      broker-health-check:
+        condition: service_completed_successfully
+      bp-configurator-mv3dt:
+        condition: service_healthy
+
+  vss-behavior-analytics-playback-mv3dt:
+    extends:
+      file: ${VSS_APPS_DIR}/services/analytics/behavior-analytics/compose.yml
+      service: vss-behavior-analytics-base
+    profiles: ["vss-behavior-analytics-playback-mv3dt"]
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json:/resources/vss-behavior-analytics-config.json
+      - $VSS_DATA_DIR/playback/warehouse_20x20_playback.txt:/opt/mdx/playback/warehouse_20x20_playback.txt
+    container_name: vss-behavior-analytics-playback-mv3dt
+    command: python3 apps/playback/playback_frames.py --config /resources/vss-behavior-analytics-config.json --playback-filepath /opt/mdx/playback/warehouse_20x20_playback.txt
+
+  bp-configurator-mv3dt:
+    extends:
+      file: ${VSS_APPS_DIR}/services/configurators/vss-configurator/docker-compose.yaml
+      service: bp-configurator-base
+    container_name: vss-configurator-mv3dt
+    networks:
+      default:
+        aliases:
+          - vss-configurator
+    profiles: !override ["bp-configurator-mv3dt"]
+    environment:
+      PROFILE_CONFIG_FILE: $VSS_APPS_DIR/industry-profiles/warehouse-operations/blueprint-configurator/blueprint_config.yml
+      DS_CONFIG_DIR: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/deepstream/configs
+      NVSTREAMER_CONFIG_DIR: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/nvstreamer/configs
+      RECOMPUTE_BEV_CENTERS_ENABLED: true
+      SENSOR_FILE_PATH: ${SENSOR_FILE_PATH:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/camera_configs/camera_info.json}
+      CHECK_SENSOR_IN_CALIBRATION_FILE: true
+      ENABLE_SENSOR_CONFIGURATOR: true
+      CALL_SENSOR_ADD_API: true
+      SEND_CONFIG_TO_SDR: true
+      ENABLE_CALIBRATION_PROCESS: true
+    env_file:
+      - ${VSS_APPS_DIR}/containers.env
+      - ${BP_CONFIGURATOR_BASE_ENV_FILE:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/.env}
+      - ${BP_CONFIGURATOR_ENV_FILE:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/overrides.env}
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations:$VSS_APPS_DIR/industry-profiles/warehouse-operations:rw
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET:/opt/data
+    depends_on:
+      broker-health-check:
+        condition: service_completed_successfully
+
+  kibana-init-container-mv3dt:
+    build:
+      context: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app
+      dockerfile: Dockerfiles/kibana-dashboard.Dockerfile
+    profiles: ["kibana-init-container-mv3dt"]
+    container_name: vss-kibana-init-mv3dt
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/kibana-dashboard/warehouse-mv3dt-kibana-objects.ndjson:/opt/vss/kibana-objects.ndjson
+    command: bash /opt/vss/init-scripts/kibana-import-dashboard.sh
+    depends_on:
+      kibana:
+        condition: service_healthy
+
+  import-calibration-output-container-mv3dt:
+    build:
+      context: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app
+      dockerfile: Dockerfiles/import-calibration.Dockerfile
+    profiles: ["import-calibration-output-container-mv3dt"]
+    container_name: vss-import-calibration-output-mv3dt
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/opt/vss/calibration.json
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/images:/opt/vss/images/
+    command: bash /opt/vss/init-scripts/calibration-import.sh
+    restart: on-failure:5
+    depends_on:
+      bp-configurator-mv3dt:
+        condition: service_healthy
+
+  # One-shot: populates $VSS_DATA_DIR/models/reid with the SigLIP secondary
+  # embedding model (NGC) and the CLIP-ReID tracker ONNX.
+  reid-embed-init-mv3dt:
+    image: ${VSS_REID_EMBED_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/reid-embed}:${VSS_REID_EMBED_TAG:-develop-latest}
+    profiles: ["reid-embed-init-mv3dt"]
+    container_name: vss-reid-embed-init-mv3dt
+    restart: "no"
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              device_ids: ["${RT_CV_DEVICE_ID:-0}"]
+    working_dir: /opt/storage/reid
+    volumes:
+      - $VSS_DATA_DIR/models/reid:/opt/storage/reid:rw
+      - $VSS_APPS_DIR/services/rtvi/reid-embed:/opt/scripts:ro
+    environment:
+      NGC_CLI_API_KEY: ${NGC_CLI_API_KEY}
+    command:
+      - bash
+      - /opt/scripts/download-embedding-models.sh
+      - --secondary
+      - --clipreid
+
+  # ── ReID embedding service stack ────────────────────────────────────────────────
+  reid-etcd-mv3dt:
+    image: quay.io/coreos/etcd:v3.7.3
+    profiles: ["reid-etcd-mv3dt"]
+    container_name: vss-reid-etcd-mv3dt
+    networks:
+      default:
+        aliases:
+          - reid-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: etcd -advertise-client-urls=http://reid-etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  reid-minio-mv3dt:
+    image: cgr.dev/chainguard/minio:latest@sha256:6a1d0b45c8669726bba580ced0bfa4cb9fdeed1ed636dfabd81d1577beb6937b
+    profiles: ["reid-minio-mv3dt"]
+    container_name: vss-reid-minio-mv3dt
+    networks:
+      default:
+        aliases:
+          - reid-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MC_HOST_local: http://localhost:${MINIO_PORT:-9000}
+    command: server /data --console-address ":${MINIO_CONSOLE_PORT:-9001}" --address ":${MINIO_PORT:-9000}"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  reid-milvus-mv3dt:
+    image: milvusdb/milvus:v2.5.12
+    profiles: ["reid-milvus-mv3dt"]
+    container_name: vss-reid-milvus-mv3dt
+    networks:
+      default:
+        aliases:
+          - reid-milvus
+    depends_on:
+      reid-etcd-mv3dt:
+        condition: service_healthy
+      reid-minio-mv3dt:
+        condition: service_healthy
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: reid-etcd:2379
+      MINIO_ADDRESS: reid-minio:${MINIO_PORT:-9000}
+    command: ["milvus", "run", "standalone"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+  reid-embed-mv3dt:
+    image: ${VSS_REID_EMBED_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/reid-embed}:${VSS_REID_EMBED_TAG:-develop-latest}
+    profiles: ["reid-embed-mv3dt"]
+    container_name: vss-reid-embed-mv3dt
+    networks:
+      default:
+        aliases:
+          - reid-embed
+    # On the bridge the service is no longer on the host's loopback, so publish it
+    # for host-side probes and scrapers.
+    ports:
+      - ${REID_SERVICE_HOST_PORT:-8088}:${REID_SERVICE_PORT:-8088}
+    restart: unless-stopped
+    runtime: nvidia
+    ipc: host
+    depends_on:
+      reid-milvus-mv3dt:
+        condition: service_healthy
+      reid-embed-init-mv3dt:
+        condition: service_completed_successfully
+      broker-health-check:
+        condition: service_completed_successfully
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    # Passthrough mount: the same absolute path inside and out, so the model
+    # paths below resolve identically on both sides.
+    volumes:
+      - "${MOUNT_DIR:-$VSS_DATA_DIR/models/reid}:${MOUNT_DIR:-$VSS_DATA_DIR/models/reid}:${MOUNT_OPTS:-rw}"
+    environment:
+      - REID_SERVICE_PORT=${REID_SERVICE_PORT:-8088}
+      - MESSAGE_BROKER=${MESSAGE_BROKER:-${STREAM_TYPE:-kafka}}
+      - KAFKA_CONSUMER_SERVER=${KAFKA_CONSUMER_SERVER:-kafka:29092}
+      - KAFKA_CONSUMER_TOPIC=${KAFKA_CONSUMER_TOPIC:-mdx-raw}
+      - KAFKA_PRODUCER_SERVER=${KAFKA_PRODUCER_SERVER:-kafka:29092}
+      - KAFKA_PRODUCER_TOPIC=${KAFKA_PRODUCER_TOPIC:-mdx-compressed-embeddings}
+      - REDIS_CONSUMER_SERVER=${REDIS_CONSUMER_SERVER:-redis:6379}
+      - REDIS_CONSUMER_TOPIC=${REDIS_CONSUMER_TOPIC:-mdx-raw}
+      # Must match payloadkey in ds-redis-config.txt on the consumer side and
+      # data_field in the logstash redis pipeline on the producer side; 
+      - REDIS_CONSUMER_PAYLOAD_KEY=${REDIS_CONSUMER_PAYLOAD_KEY:-value}
+      - REDIS_PRODUCER_SERVER=${REDIS_PRODUCER_SERVER:-redis:6379}
+      - REDIS_PRODUCER_TOPIC=${REDIS_PRODUCER_TOPIC:-mdx-compressed-embeddings}
+      - REDIS_PRODUCER_PAYLOAD_KEY=${REDIS_PRODUCER_PAYLOAD_KEY:-value}
+      - MILVUS_HOST=${MILVUS_HOST:-reid-milvus}
+      - ENABLE_COMPRESSION=${ENABLE_COMPRESSION:-True}
+      - COMPRESSION_INTERVAL_SEC=${COMPRESSION_INTERVAL_SEC:-1}
+      - ENABLE_SECONDARY_EMBEDDING=${ENABLE_SECONDARY_EMBEDDING:-True}
+      - SECONDARY_EMBEDDING_MODEL=${SECONDARY_EMBEDDING_MODEL:-siglip2}
+      - SECONDARY_EMBEDDING_ONNX_MODEL_PATH=${SECONDARY_EMBEDDING_ONNX_MODEL_PATH:-${MOUNT_DIR:-$VSS_DATA_DIR/models/reid}/siglip_v2_vdeployable_v2.0/siglip_v2_v2.0.onnx}
+      - VIOS_SERVER=${VIOS_SERVER:-vst-ingress:${VST_PORT:-30888}}
+      - PYTHONUNBUFFERED=1
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${REID_SERVICE_PORT:-8088}/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 300s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  vss-rtvi-cv-bev-fusion:
+    extends:
+      file: $VSS_APPS_DIR/services/rtvi/rtvi-cv/rtvi-cv-mv3dt/compose.yaml
+      service: measurement-fusion
+    image: ${VSS_RT_CV_MV3DT_BEV_FUSION_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/vss-rt-cv-mv3dt-bev-fusion}:${VSS_RT_CV_MV3DT_BEV_FUSION_TAG:-develop-latest}
+    profiles: ["vss-rtvi-cv-bev-fusion"]
+    depends_on:
+      broker-health-check:
+        condition: service_completed_successfully
+
+  vss-rtvi-cv-mv3dt:
+    extends:
+      file: $VSS_APPS_DIR/services/rtvi/rtvi-cv/rtvi-cv-mv3dt/compose.yaml
+      service: perception
+    image: ${VSS_RT_CV_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/vss-rt-cv}:${VSS_RT_CV_TAG:-develop-latest}
+    user: "0:0"
+    profiles: ["vss-rtvi-cv-mv3dt"]
+    container_name: vss-rtvi-cv-mv3dt
+
+    volumes:
+      - $VSS_DATA_DIR/models/:/opt/storage/
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/models-download.json:/opt/config/models-download.json:ro
+      - $VSS_APPS_DIR/services/rtvi/rtvi-cv/download-models.sh:/opt/scripts/download-models.sh:ro
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/camInfo/:/tmp/camInfo/
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/deepstream/init-scripts/ds-start-mv3dt.sh:/opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/ds-start-mv3dt.sh
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/deepstream/configs:/opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/configs
+
+    environment:
+      INSTANCE_ID: "0"
+      DS_HTTP_PORT: "9000"
+      BATCH_SIZE: "${NUM_STREAMS:-4}"
+      MAX_BATCH_SIZE: "${NUM_STREAMS:-4}"
+      MQTT_HOST: "${MQTT_HOST:-mosquitto}"
+      MQTT_PORT: "${MQTT_PORT:-1883}"
+      DEEPSTREAM_ENABLE_SENSOR_ID_EXTRACTION: "0"
+      STREAM_TYPE: ${STREAM_TYPE}
+      GST_ENABLE_CUSTOM_PARSER_MODIFICATIONS: 1
+      OTEL_SERVICE_NAME: "rtvi-cv-mv3dt"
+      OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-true}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-otlp}
+      NGC_CLI_API_KEY: ${NGC_CLI_API_KEY}
+      MODELS_MANIFEST_PATH: /opt/config/models-download.json
+      MODELS_DEST_ROOT: /opt/storage
+      STORAGE_UID: ${STORAGE_UID:-1001}
+      STORAGE_GID: ${STORAGE_GID:-1001}
+      DS_MODEL_DOWNLOAD: auto
+      DOWNLOAD_MODELS_SCRIPT: /opt/scripts/download-models.sh
+    command: ["./ds-start-mv3dt.sh"]
+    depends_on:
+      bp-configurator-mv3dt:
+        condition: service_healthy
+      sensor-ms-mv3dt:
+        condition: service_started
+      broker-health-check:
+        condition: service_completed_successfully
+      vss-rtvi-cv-bev-fusion:
+        condition: service_healthy
+      reid-embed-init-mv3dt:
+        condition: service_completed_successfully
+      reid-embed-mv3dt:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy

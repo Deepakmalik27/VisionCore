@@ -1,0 +1,93 @@
+# Copyright (c) 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+
+
+def get_include_dir():
+    """Get the path to the directory containing C++ header files.
+
+    Returns:
+        String representing the path to the include directory
+    """
+    # Import inside the function to avoid circular import as dali imports sysconfig
+    import nvidia.dali as dali
+
+    package_dir = os.path.realpath(os.path.dirname(dali.__file__))
+    package_include_dir = os.path.join(package_dir, "include")
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        conda_prefix = os.path.realpath(conda_prefix)
+        # An active Conda environment may import DALI from another location.
+        # Use its headers only when it also supplies the imported package.
+        package_is_in_conda_prefix = os.path.commonpath((package_dir, conda_prefix)) == conda_prefix
+    else:
+        package_is_in_conda_prefix = False
+
+    # Conda packages headers separately in libdali-devel. Fall back to the
+    # package-bundled headers when that optional package is not installed.
+    if package_is_in_conda_prefix and os.path.isdir(os.path.join(conda_prefix, "include", "dali")):
+        return os.path.join(conda_prefix, "include")
+
+    return package_include_dir
+
+
+def get_lib_dir():
+    """Get the path to the directory containing DALI library.
+
+    Returns:
+        String representing the path to the library directory
+    """
+    import nvidia.dali as dali
+
+    # Unlike headers, Conda's bindings package keeps prebuilt DALI libraries
+    # alongside the Python package.
+    return os.path.dirname(dali.__file__)
+
+
+def get_include_flags():
+    """Get the include flags for custom operators
+
+    Returns:
+        The compilation flags
+    """
+    flags = []
+    flags.append("-I%s" % get_include_dir())
+    return flags
+
+
+def get_compile_flags():
+    """Get the compilation flags for custom operators
+
+    Returns:
+        The compilation flags
+    """
+    import nvidia.dali.backend as b
+
+    flags = []
+    flags.append("-I%s" % get_include_dir())
+    flags.append("-D_GLIBCXX_USE_CXX11_ABI=%d" % b.GetCxx11AbiFlag())
+    return flags
+
+
+def get_link_flags():
+    """Get the link flags for custom operators
+
+    Returns:
+        The link flags
+    """
+    flags = []
+    flags.append("-L%s" % get_lib_dir())
+    flags.append("-ldali")
+    return flags

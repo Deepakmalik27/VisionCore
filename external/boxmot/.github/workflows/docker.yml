@@ -1,0 +1,261 @@
+name: Docker Image CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Commit SHA to rebuild and smoke-test'
+        required: true
+        type: string
+      release_tag:
+        description: 'Exact v-prefixed release tag to validate'
+        required: true
+        type: string
+      push_images:
+        description: 'Push validated images to Docker Hub'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      source_base:
+        description: 'Published base revision when source_ref is an unpublished candidate'
+        required: false
+        type: string
+        default: ''
+      source_bundle:
+        description: 'Same-run artifact containing release-source.bundle'
+        required: false
+        type: string
+        default: ''
+      source_ref:
+        description: 'Commit SHA to build and smoke-test'
+        required: true
+        type: string
+      release_tag:
+        description: 'Exact v-prefixed release tag being gated'
+        required: true
+        type: string
+      push_images:
+        description: 'Push validated images to Docker Hub'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      DOCKERHUB_USERNAME:
+        description: 'Docker Hub username; only required when push_images is true'
+        required: false
+      DOCKERHUB_TOKEN:
+        description: 'Docker Hub token; only required when push_images is true'
+        required: false
+  release:
+    types: [published]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: cli-cpu
+            repository: boxmot/boxmot
+            tag_suffix: -cpu
+          - target: service-cpu
+            repository: boxmot/boxmot-service
+            tag_suffix: ''
+
+    steps:
+      # Bootstrap from workflow code, including when manually rebuilding older source.
+      - name: Bootstrap release checkout action
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+
+      - name: Checkout repository
+        uses: ./.github/actions/checkout-release-source
+        with:
+          source_sha: ${{ inputs.source_base || inputs.source_ref || github.event.release.tag_name }}
+          candidate_sha: ${{ inputs.source_bundle && inputs.source_ref || '' }}
+          source_bundle: ${{ inputs.source_bundle }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: github.event_name == 'release' || inputs.push_images
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Validate release version
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_ref }}
+          PUSH_IMAGES: ${{ inputs.push_images }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "Release tag must use the v<version> form, got $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+          version=$(python3 -c 'import tomllib, sys; data = tomllib.loads(open("pyproject.toml","r", encoding="utf-8").read()); sys.stdout.write(data["project"]["version"])')
+          release_version=${RELEASE_TAG#v}
+          if [ "$release_version" != "$version" ]; then
+            echo "Release tag $RELEASE_TAG does not match project version $version" >&2
+            exit 1
+          fi
+          source_sha=$(git rev-parse HEAD)
+          if [ -n "$EXPECTED_SOURCE_SHA" ] && [ "$source_sha" != "$EXPECTED_SOURCE_SHA" ]; then
+            echo "Checked out $source_sha instead of requested release commit $EXPECTED_SOURCE_SHA" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$PUSH_IMAGES" = "true" ]; then
+            if ! tag_sha=$(git rev-list -n 1 "$RELEASE_TAG" 2>/dev/null); then
+              echo "Manual publishing requires the existing tag $RELEASE_TAG" >&2
+              exit 1
+            fi
+            if [ "$source_sha" != "$tag_sha" ]; then
+              echo "Manual publishing requires $RELEASE_TAG to point at $source_sha" >&2
+              exit 1
+            fi
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.target }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          target: ${{ matrix.target }}
+          load: true
+          tags: |
+            ${{ matrix.repository }}:${{ env.VERSION }}${{ matrix.tag_suffix }}
+            ${{ matrix.repository }}:latest${{ matrix.tag_suffix }}
+            ${{ matrix.repository }}:sha-${{ env.SOURCE_SHA }}${{ matrix.tag_suffix }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+
+      - name: Smoke test release package and command surface
+        run: |
+          python_args=(-I - --check-trackers --check-cli-help)
+          case "${{ matrix.target }}" in
+            # Service images deliberately run their copied source via PYTHONPATH.
+            service-*) python_args=(-) ;;
+          esac
+          docker run --rm --interactive --workdir /tmp \
+            ${{ matrix.repository }}:${{ env.VERSION }}${{ matrix.tag_suffix }} \
+            python "${python_args[@]}" --expected-version "${{ env.VERSION }}" < tests/ci/release_contract.py
+
+      - name: Smoke test CPU CLI image
+        if: matrix.target == 'cli-cpu'
+        run: |
+          docker run --rm ${{ matrix.repository }}:${{ env.VERSION }}${{ matrix.tag_suffix }} boxmot --help
+          docker run --rm ${{ matrix.repository }}:${{ env.VERSION }}${{ matrix.tag_suffix }} \
+            python -c 'import torch; assert torch.version.cuda is None, f"expected a CPU-only PyTorch build, got CUDA {torch.version.cuda!r}"'
+
+      - name: Smoke test prebuilt native tracker
+        if: matrix.target == 'cli-cpu'
+        run: |
+          docker run --rm --interactive --workdir /tmp \
+            ${{ matrix.repository }}:${{ env.VERSION }}${{ matrix.tag_suffix }} \
+            python -I - <<'PY'
+          import ctypes
+          import shutil
+
+          import torch
+
+          from boxmot import create_tracker
+          from boxmot.native import _common as native_common
+          from boxmot.native.trackers.bytetrack import ensure_bytetrack_cpp_library
+          from boxmot.structures import Boxes, Detections, Tracks
+          from boxmot.trackers import TrackerSpec
+
+          assert shutil.which("cmake") is None, "runtime image must not contain the native build toolchain"
+          assert shutil.which("g++") is None, "runtime image must not contain the native build toolchain"
+          for component in ("reid", "botsort", "bytetrack", "occluboost", "ocsort", "sfsort"):
+              filename = native_common.library_filename(component)
+              path = native_common.installed_library_candidates(component, filename)[0]
+              assert path.is_file(), path
+              assert "site-packages" in path.resolve().parts
+              ctypes.CDLL(str(path))
+          library = ensure_bytetrack_cpp_library()
+          assert library.is_file()
+          assert "site-packages" in library.resolve().parts
+
+          tracker = create_tracker(
+              TrackerSpec(name="bytetrack", backend="cpp", geometry="aabb", per_class=False)
+          )
+          detections = Detections(
+              sample_id="docker-native-smoke",
+              geometry=Boxes(torch.tensor([[10.0, 12.0, 30.0, 52.0]], dtype=torch.float32)),
+              scores=torch.tensor([0.95], dtype=torch.float32),
+              class_ids=torch.tensor([0], dtype=torch.int64),
+          )
+          tracks = tracker.update(detections)
+          assert isinstance(tracks, Tracks)
+          assert tracks.sample_id == detections.sample_id
+          tracker.reset()
+          tracker.close()
+          PY
+
+      - name: Smoke test CPU service image
+        if: matrix.target == 'service-cpu'
+        run: |
+          docker run --rm --interactive \
+            ${{ matrix.repository }}:${{ env.VERSION }}${{ matrix.tag_suffix }} \
+            python - <<'PY'
+          import importlib.metadata
+
+          import torch
+
+          from boxmot.engine.service.config import ServiceSettings
+
+          settings = ServiceSettings.from_env()
+          packages = {
+              distribution.metadata["Name"].lower()
+              for distribution in importlib.metadata.distributions()
+          }
+          assert torch.version.cuda is None, (
+              f"expected a CPU-only PyTorch build, got CUDA {torch.version.cuda!r}"
+          )
+          assert not any(name.startswith("nvidia-") for name in packages), packages
+          assert packages.isdisjoint({"cuda-bindings", "cuda-toolkit", "triton"})
+          assert settings.profile == "cpu"
+          assert settings.tracker_type == "bytetrack"
+          PY
+          docker run --detach \
+            --name boxmot-service-cpu-smoke \
+            --publish 8000:8000 \
+            ${{ matrix.repository }}:${{ env.VERSION }}${{ matrix.tag_suffix }}
+          service_ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:8000/healthz > /dev/null; then
+              service_ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$service_ready" != true ]; then
+            docker logs boxmot-service-cpu-smoke
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            --request POST \
+            --url http://127.0.0.1:8000/v1/streams/smoke-camera/sessions/smoke-run/frames \
+            --header 'content-type: application/json' \
+            --data '{"frame_id":0,"width":640,"height":480,"frame_rate":30,"box_type":"aabb","detections":[[100.0,100.0,200.0,300.0,0.9,0]]}' \
+            > /dev/null
+
+      - name: Stop CPU service smoke container
+        if: always() && matrix.target == 'service-cpu'
+        run: docker rm --force boxmot-service-cpu-smoke || true
+
+      - name: Push ${{ matrix.target }} image tags
+        if: success() && (github.event_name == 'release' || inputs.push_images)
+        run: |
+          docker push ${{ matrix.repository }}:${{ env.VERSION }}${{ matrix.tag_suffix }}
+          docker push ${{ matrix.repository }}:latest${{ matrix.tag_suffix }}
+          docker push ${{ matrix.repository }}:sha-${{ env.SOURCE_SHA }}${{ matrix.tag_suffix }}

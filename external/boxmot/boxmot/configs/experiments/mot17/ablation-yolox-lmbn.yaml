@@ -1,0 +1,14 @@
+dataset:
+  ref: mot17
+  split: ablation
+
+detector:
+  ref: yolox-x-mot17
+  checkpoint: ablation
+
+reid:
+  ref: lmbn-n-duke
+
+evaluation:
+  class_map:
+    pedestrian: person

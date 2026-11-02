@@ -1,0 +1,445 @@
+---
+title: "Custom Dataset"
+description: ""
+position: 3
+---
+## Assumptions
+
+Auto Calibration makes several assumptions about input data structure. Ensure that
+these requirements are met before deploying the service or recording footage.
+
+### Tracklet-Based Calibration: Input Video Requirements
+
+The tracklet-based AMC method estimates camera parameters by detecting and tracking
+**people** in the footage, then matching their trajectories (**tracklets**) across
+camera views. Calibration quality depends heavily on the input video content.
+
+> **Note:** These requirements apply to the tracklet-based AMC method.
+> They do not apply to the VGGT model-based calibration method.
+
+**Video content (required for AMC)**
+
+- **Moving people**: People must be clearly visible and moving throughout the
+  clip. AMC relies on PeopleNet detection and 3D tracking of people.
+- **Scene coverage**: Trajectories should span as much of each camera's field of
+  view as possible. More unique walkers and broader coverage produce more usable
+  tracklets.
+- **Recommended headcount**: Aim for at least **10 unique individuals** walking
+  through the monitored area during the recording window; more is better for
+  multi-camera overlap.
+
+**Video duration**
+
+- **Recommended**: **Five minutes or longer** per camera. There is no strict
+  minimum, but longer clips help the tracker build stable trajectories. Short
+  clips often fail during multi-view tracklet matching.
+
+**Resolution and format**
+
+- **Resolution**: **1920 × 1080**
+- **Format** (file upload): MP4. Auto Calibration does not support video formats that are not
+  supported by DeepStream.
+
+**Multi-camera specifics**
+
+- **Camera count**: Two or more time-synchronized videos or RTSP streams; one
+  video or stream is supported for single-camera calibration.
+- **Time synchronization**: All cameras must cover the same time window. Use
+  synchronized clips or one combined RTSP capture for every stream.
+- **FOV order**: List cameras in overlapping-FOV order:
+  `cam_00` overlaps `cam_01`, `cam_01` overlaps `cam_02`, and so on.
+- **FOV overlap**: Aim for at least **30% overlap** between consecutive camera
+  pairs. Insufficient overlap reduces matched tracklets and can cause failure.
+
+**Tracklet thresholds**
+
+AMC filters and matches tracklets before multi-view calibration:
+
+- **Minimum tracklet length**: 90 frames, approximately three seconds at 30 fps.
+- **Minimum matched tracklets** (multi-camera): Six cross-camera correspondences
+  per camera pair, or three in the robust two-view fallback.
+
+If videos lack enough moving people or are too short, calibration may fail during
+detection, tracking, or tracklet matching. See [Troubleshooting](/system-components/calibration/auto-calibration/troubleshooting).
+
+## VGGT Camera-Group Suitability
+
+VGGT estimates camera geometry from the visual content of multiple views. It
+does not require AMC's moving-person trajectories. In VSS, use a multi-camera
+project with the [common input preparation](#input-requirements). VSS uses
+[alignment data](#alignment-data-alignment_datajson) during layout post-processing
+to place VGGT results on the floor map; this file is not an input to the VGGT model.
+
+To improve the conditions for calibration, choose views with clear shared scene
+context:
+
+- **Recognizable shared structure**: Prefer views of distinctive structures,
+  corners, equipment, and surrounding geometry. Confirm that shared features
+  refer to the same physical locations across views.
+- **Connections throughout the group**: Inspect how every camera relates to the
+  other views. Little recognizable shared content, or content visible only
+  through heavy occlusion, can make placement ambiguous. The group need not share
+  a single point visible in every camera. For VSS's [floor-map alignment](#alignment-data-alignment_datajson),
+  the first two reference views need shared points that can also be located on the map.
+- **Distinguishing context**: Take extra care with repeated aisles, identical
+  racks or boxes, repeated floor markings, and visually similar zones. Include
+  context that distinguishes these regions.
+- **Clear footage**: Use sharp, well-exposed, rectified footage with fixed cameras.
+  Preserve the synchronization requirements and favor footage in which shared
+  scene structure is visible.
+
+For example, two warehouse zones may contain identical sets of parallel
+rectangular floor markings and similar boxes. Views showing only those features
+may be difficult to place in the correct zone. Include distinctive shared context
+and follow the [geometry troubleshooting workflow](/system-components/calibration/auto-calibration/troubleshooting#vggt-completes-but-camera-placement-or-roi-projection-is-incorrect)
+if camera placement is incorrect.
+
+## Lens Distortion Output (`distortion.yaml`)
+
+Auto Calibration supports input videos with lens distortion. Distortion handling is a
+dedicated **Step 4: Rectification** stage with Auto Rectification, Manual
+Rectification, or **Videos Are Rectified** paths. AMC and VGGT consume staged
+`rectified.mp4` and `rectified.jpg` files; they do not perform implicit
+rectification during calibration.
+
+When Auto or Manual Rectification generates linear media, the pipeline:
+
+1. Estimates or accepts per-camera distortion parameters: `model`, `k1`, and
+   `k2` when the model is `radial`.
+2. Writes rectified videos/stills and the canonical `distortion.yaml` under
+   `single_view_results/cam_XX/`.
+3. Unlocks alignment and calibration after rectification reaches `COMPLETED`.
+
+Use **Videos Are Rectified** when the inputs are already linear. This stages the
+source videos as linear media and clears prior distortion caches.
+
+**Important for downstream applications**
+
+Rectified videos are not automatically substituted for original camera feeds.
+Exported calibration JSON and MV3DT ZIP files describe cameras in rectified
+(undistorted) image space. Downstream applications must either use Auto Calibration-generated
+rectified videos or apply the model-specific remapping below to raw
+frames. Do not assume that `cv2.undistort()` is valid for every model.
+
+**Output location**
+
+```text
+<project_output>/single_view_results/cam_00/distortion.yaml
+<project_output>/single_view_results/cam_00/geocalib_distortion.yaml
+<project_output>/single_view_results/cam_00/rectified.mp4
+<project_output>/single_view_results/cam_00/rectified.jpg
+```
+
+**`geocalib_distortion.yaml` format**
+
+When Auto Rectification estimates distortion, GeoCalib may write:
+
+```yaml
+model: simple_divisional    # or simple_radial, radial
+k1: -1.2345678e-06          # Auto Calibration pixel-centered convention
+k1_geocalib: -4.5678901e-03 # GeoCalib normalized-coordinate value
+focal_length: 1269.0
+source: geocalib
+k2: ...                     # present only when model is radial
+```
+
+### Distortion model
+
+Auto Calibration supports:
+
+- `simple_divisional` — default
+- `simple_radial`
+- `radial`
+
+Each camera's `distortion.yaml` records the selected model and coefficients:
+
+```yaml
+model: simple_divisional
+k1: ...
+```
+
+The `radial` model also includes `k2`. Coefficient meanings depend on the model;
+in particular, `simple_divisional.k1` is not an OpenCV radial coefficient.
+Parameters use full-resolution pixel coordinates:
+
+```text
+cx = width // 2
+cy = height // 2
+```
+
+#### Reproducing Auto Calibration rectification
+
+Auto Calibration computes model-specific destination-to-source maps and uses
+`cv2.remap()` only to resample the image. For each rectified output pixel
+`(x, y)`:
+
+```text
+dx = x - cx
+dy = y - cy
+r² = dx² + dy²
+
+simple_radial:
+s = 1 + k1*r²
+
+radial:
+s = 1 + k1*r² + k2*r⁴
+
+simple_divisional:
+s = (1 - sqrt(max(0, 1 - 4*k1*r²))) / (2*k1*r²)
+s = 1 when |2*k1*r²| is near zero
+
+source_x = cx + s*dx
+source_y = cy + s*dy
+```
+
+Use `source_x` and `source_y` as OpenCV remap coordinates:
+
+```python
+rectified = cv2.remap(
+    distorted,
+    map_x.astype(np.float32),
+    map_y.astype(np.float32),
+    interpolation=cv2.INTER_LINEAR,
+    borderMode=cv2.BORDER_CONSTANT,
+)
+```
+
+`cv2.remap()` maps destination pixels to source pixels, so evaluate the
+equations on the rectified output grid. Prefer Auto Calibration-generated rectified video
+directly; do not undistort it again. If processing raw video, read the model and
+all applicable coefficients from `distortion.yaml`, and do not pass
+`simple_divisional` coefficients to `cv2.undistort()`.
+
+Apply coefficients at the original image resolution, preferably before resizing.
+When **Videos Are Rectified** is selected, rectification is bypassed and
+`distortion.yaml` is not required. Repeating rectification invalidates downstream
+calibration and post-processing outputs.
+
+For a custom dataset, you should prepare the following items:
+
+- **Input videos or RTSP streams** — Camera video files **or** time-synchronized RTSP streams
+- **A floor map** — Layout/map image of the surveillance area (PNG)
+- **Alignment data** — `alignment_data.json` (upload or create in the UI; see [Alignment Data](#alignment-data-alignment_datajson))
+- **Layout Pixels Per Meter** — Number of pixels per meter in the layout floor map. Initialize this on [Step 3: Parameters](/system-components/calibration/auto-calibration/workflow-steps#step-3-parameters) (Floor-plan to 3D scale) or under [Configuring Settings](/system-components/calibration/auto-calibration/workflow-steps#configuring-settings).
+- **Ground truth data (optional)** — For calibration evaluation
+- **Rectified / linear media** — Complete [Step 4: Rectification](/system-components/calibration/auto-calibration/workflow-steps#step-4-rectification) (Auto, Manual, or Videos Are Rectified) before alignment and calibration
+
+## Input Requirements
+
+**Video input (file upload or RTSP)**
+
+- **Formats** (file upload): MP4. Auto Calibration does **not** support video formats that are not supported by DeepStream.
+- **Resolution**: **1920 × 1080** is required for uploaded videos (matches the workflow and evaluation pipeline)
+- **Camera count**: One video or stream for **single-camera** calibration; **two or more** for multi-camera
+- **Time synchronization**: All multi-camera videos or RTSP streams must cover the **same time window**—use one combined RTSP **Capture and add to project** for every stream, or upload clips that were recorded in sync. Staggered or later-added streams break calibration.
+- **Order**: List or upload streams in **order of overlapping field of view (FOV)** (first = first camera in the overlap chain), whether using files or RTSP URLs.
+
+**Single-camera datasets**
+
+A valid single-camera project needs:
+
+- One synchronized video (or one RTSP URL)
+- One layout/map image
+- `alignment_data.json` with at least **4** point sets; each set has **two** `[x, y]` pairs (camera + layout/BEV)—see [Alignment Data](#alignment-data-alignment_datajson)
+
+**Multi-camera datasets**
+
+- Two or more time-synchronized videos or RTSP streams
+- One layout/map image
+- `alignment_data.json` with at least **4** point sets; each set has exactly **three** `[x, y]` pairs: Camera 0, Camera 1, and layout/BEV (see [Alignment Data](#alignment-data-alignment_datajson))
+
+Users should pay close attention to upload and stream order, as this order implicitly determines camera pairing. For optimal results, consecutive camera pairs should have a significant amount of overlapping Field of View (FOV).
+
+## Alignment Data (alignment_data.json)
+
+Alignment data maps corresponding points between the calibration's reference camera views and the layout (bird's eye view). Prepare or create this file before running calibration.
+
+**Requirements**
+
+- Minimum **4** complete point sets
+- Layout coordinates are always pixel positions on the layout / BEV image
+- **Camera coordinate space depends on how you provide the file** (see below)
+
+**Multi-camera** — three `[x, y]` pairs per set (camera 0, camera 1, layout):
+
+```json
+[
+  [[x0_cam0, y0_cam0], [x0_cam1, y0_cam1], [x0_layout, y0_layout]],
+  [[x1_cam0, y1_cam0], [x1_cam1, y1_cam1], [x1_layout, y1_layout]]
+]
+```
+
+**Single-camera** — two `[x, y]` pairs per set (camera, layout):
+
+```json
+[
+  [[x0_cam, y0_cam], [x0_layout, y0_layout]],
+  [[x1_cam, y1_cam], [x1_layout, y1_layout]]
+]
+```
+
+For projects with more than two cameras, the format remains exactly three pairs per point set: Camera 0, Camera 1, and layout. Do not extend a point set with coordinates from additional cameras.
+
+**Coordinate space (important)**
+
+| How you provide alignment | Expected camera coordinates | What the microservice does |
+|---|---|---|
+| **UI file upload** (`Upload alignment_data.json`) | **Original / pre-rectification** (distorted) pixel space | Uploads with `coord_space=original`; converts to rectified space after Step 4 when needed |
+| **Interactive draw / save** in the Manual Alignment tool | **Rectified / linear** pixel space | Saves with `coord_space=rectified` (points are clicked on rectified frames) |
+| **API upload** | Follow the `coord_space` query parameter you pass (`original` or `rectified`) | Converts only when `coord_space=original` |
+
+Do **not** upload already-rectified camera points through the UI file-upload path — that triggers a second conversion and corrupts alignment. For interactive creation and the on-disk rectified alignment used by calibration, points must match the **rectified / linear** frames from Step 4. See [Step 5: Manual Alignment](/system-components/calibration/auto-calibration/workflow-steps#step-5-manual-alignment).
+
+## Guidelines for Input Videos to Achieve Optimal Calibration Results
+
+To ensure the most accurate camera calibration, careful consideration should be given to how the input videos provided. The following points detail how to maximize the quality of the calibration outcome.
+
+### 1. Minimizing Lens Distortion
+
+The current calibration methodology performs best when input videos are "linear," meaning they exhibit no lens distortion. Use **Step 4: Rectification** (Auto or Manual) when distortion is present, or **Videos Are Rectified** when footage is already linear. While the tool can handle minor distortion after rectification, optimal results are achieved when the staged linear media has negligible residual distortion.
+
+### 2. Maximizing Camera Overlap
+
+Accurate calibration requires a significant degree of overlap between the fields of view of the different cameras. It is essential to maximize the overlap between cameras as much as possible.
+
+### 3. Leveraging Unique Scene Features
+
+The presence of diverse and unique objects in the input videos contributes significantly to calibration accuracy. Our automatic calibration tool specifically utilizes people moving within the field of view, so videos with many moving people are ideal. The trajectories of these moving subjects should cover the Field of View (FOV) as broadly as possible.
+
+Additionally, large, unique objects can enhance accuracy. For instance, in a setting like a warehouse with multiple cameras, views can become challenging due to repetitive elements (e.g., similar racks). In such environments, large, distinct objects, like forklifts, are beneficial for better calibration accuracy.
+
+## Ground Truth Data Format
+
+If you want to evaluate the camera calibration results using ground truth data, you should have a ZIP file containing the following data files:
+
+- `calibration.json`
+- `ground_truth.json`
+
+### calibration.json
+
+This file has camera parameters including intrinsic and extrinsic parameters. The JSON schema definition for calibration is as follows:
+
+```json
+{
+   "sensors": [
+       {
+           "id": "Camera",
+           "intrinsicMatrix": [
+               [1269.00511584492, -3.730349362740526e-14, 959.9999999999999],
+               [0.0, 1269.0051158449194, 539.9999999999999],
+               [0.0, 0.0, 0.9999999999999998]
+           ],
+           "extrinsicMatrix": [
+               [0.9999941499743863, 0.0020258073539418126, 0.00275610623331978, 7.506433779240641],
+               [0.00329149786382878, -0.3506837842628175, -0.9364881470135763, 1.2002890745303207],
+               [-0.0009306228113685242, 0.936491740251709, -0.3506884006942753, 11.111379874347342]
+           ],
+           "attributes": [
+               {"name": "frameWidth", "value": 1920},
+               {"name": "frameHeight", "value": 1080}
+           ],
+           "cameraMatrix": [
+               [1268.1042942335746, 901.6028305375089, -333.16335175660936, 20192.627546980937],
+               [3.6743913098523424, 60.686023462551134, -1377.7799858632666, 7523.318108219307],
+               [-0.0009306228113685238, 0.9364917402517088, -0.35068840069427526, 11.111379874347342]
+           ]
+       },
+       {
+           "id": "Camera_01",
+           "intrinsicMatrix": [
+               [1099.498973963849, -4.707345624410664e-14, 960.0],
+               [0.0, 1099.4989739638488, 539.9999999999998],
+               [0.0, 0.0, 1.0]
+           ],
+           "extrinsicMatrix": [
+               [-0.9999609312669344, -0.008839453589732555, 5.147844000033541e-11, -7.521032053009582],
+               [-0.004417374837733223, 0.4997143960386968, -0.866178970647073, -0.1501353870483639],
+               [0.007656548785712605, -0.8661451301323095, -0.49973392001021566, 10.265551144735602]
+           ],
+           "attributes": [
+               {"name": "frameWidth", "value": 1920},
+               {"name": "frameHeight", "value": 1080}
+           ],
+           "cameraMatrix": [
+               [-1092.1057310976453, -841.2182950793291, -479.7445631532065, 1585.5620735129166],
+               [-0.7223627574165982, 81.71709544806465, -1222.2192063010361, 5378.3239141418835],
+               [0.0076565487857126035, -0.8661451301323094, -0.4997339200102156, 10.2655511447356]
+           ]
+       }
+   ]
+}
+```
+
+**Parameter Descriptions:**
+
+| Parameter | Description |
+|---|---|
+| `id` | Unique string identifier for the sensor (e.g., Camera, Camera_01, Camera_02, …). **Must match exactly** the camera keys used under `2d bounding box visible` in `ground_truth.json` for that sensor—mismatched IDs will break evaluation. |
+| `intrinsicMatrix` | 3×3 camera intrinsic parameter matrix. Follows the same definition in [OpenCV documentation](https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html). |
+| `extrinsicMatrix` | 3×4 camera extrinsic parameter matrix. Follows the same definition in [OpenCV documentation](https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html). |
+| `cameraMatrix` | 3×4 combined camera projection matrix. Follows the same definition in [OpenCV documentation](https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html). |
+| `attributes` | Array of name-value pairs for additional sensor attributes. `frameHeight`: image height resolution, `frameWidth`: image width resolution. |
+
+### ground_truth.json
+
+This file has object information including 3D locations and bounding boxes. The JSON schema definition for ground truth object data is as follows:
+
+```json
+{
+    "0": [
+        {
+            "object id": 0,
+            "object type": "person",
+            "object name": "male_adult_police_04",
+            "3d location": [-7.82265567779541, 4.5983476638793945, -9.851457150045206e-11],
+            "2d bounding box visible": {
+                "Camera": [912, 362, 955, 507],
+                "Camera_01": [960, 664, 1062, 941]
+            }
+        },
+        {
+            "object id": 2,
+            "object type": "person",
+            "object name": "female_adult_police_01",
+            "3d location": [-17.455900192260742, 15.370429992675781, 0.02103900909423828],
+            "2d bounding box visible": {
+                "Camera": [447, 245, 470, 276]
+            }
+        },
+        {
+            "object id": 4,
+            "object type": "person",
+            "object name": "female_adult_police_03",
+            "3d location": [-13.054417610168457, 2.3046987056732178, 0.02103901281952858],
+            "2d bounding box visible": {
+                "Camera": [391, 418, 443, 576],
+                "Camera_01": [1668, 481, 1805, 688],
+                "Camera_02": [1084, 398, 1125, 530]
+            }
+        }
+    ],
+    "1": [
+        {
+            "object id": 0,
+            "object type": "person",
+            "object name": "male_adult_police_04",
+            "3d location": [-7.822440147399902, 4.597992420196533, -1.1969732149896828e-10],
+            "2d bounding box visible": {
+                "Camera": [912, 362, 955, 507],
+                "Camera_01": [960, 664, 1062, 609]
+            }
+        }
+    ]
+}
+```
+
+**Parameter Descriptions:**
+
+| Parameter | Description |
+|---|---|
+| frame index | Video frame index (0, 1, …) — the top-level keys |
+| `object id` | Object index (integer value) |
+| `object type` | Object class (person, fork lift, etc.) |
+| `object name` | Unique object name |
+| `3d location` | Object's 3D location in meters [x, y, z] |
+| `2d bounding box visible` | 2D bounding boxes in each camera view [x_min, y_min, x_max, y_max] |

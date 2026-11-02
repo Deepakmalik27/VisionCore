@@ -1,0 +1,68 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * common
+ *
+ * Shared components and utilities for the UI monorepo.
+ * Use this package across all apps (nv-metropolis-bp-vss-ui, vss-chat, etc.)
+ */
+
+// Components
+export { VideoModal } from './components/VideoModal';
+export type { VideoModalProps } from './components/VideoModal';
+export { VideoModalTooltip } from './components/VideoModalTooltip';
+export type { VideoModalTooltipProps } from './components/VideoModalTooltip';
+
+export { UploadFilesDialog } from './components/UploadFilesDialog';
+export type {
+  UploadFilesDialogFileItem,
+  UploadFilesDialogEntry,
+  UploadFilesDialogProps,
+  UploadFilesDialogHandle,
+  UploadFilesDialogMetadataConfig,
+  UploadFilesDialogOptions,
+} from './components/UploadFilesDialog';
+
+export { UploadProgressPopup } from './components/UploadProgressPopup';
+export type {
+  UploadFileStatus,
+  UploadProgressFileItem,
+  UploadProgressPopupProps,
+} from './components/UploadProgressPopup';
+
+export { UploadSuccessPopup } from './components/UploadSuccessPopup';
+export type {
+  UploadResultItem,
+  UploadSuccessPopupProps,
+} from './components/UploadSuccessPopup';
+export type {
+  UploadFileConfigTemplate,
+  UploadFileFieldConfig,
+} from './types/uploadFileConfig';
+
+// Hooks
+export { useVideoModal } from './hooks/useVideoModal';
+export type {
+  VideoModalState,
+  VideoModalData,
+  AlertLike,
+  UseVideoModalOptions,
+} from './hooks/useVideoModal';
+
+// Utils
+export { copyToClipboard } from './utils/clipboard';
+export { formatTimestamp } from './utils/formatters';
+export { uploadFileChunked } from './utils/videoUpload';
+export type { FileUploadResult } from './utils/videoUpload';
+export { chunkedUpload, CHUNK_SIZE_BYTES, MAX_CHUNK_RETRIES } from './utils/chunkedUpload';
+export type { ChunkedUploadOptions, ChunkedUploadResponse } from './utils/chunkedUpload';
+export { checkVideoUrl, fetchVideoUrlFromVst, replaceVideoUrlBase } from './utils/videoModal';
+export type { FetchVideoUrlParams } from './utils/videoModal';
+export {
+  VSS_UI_ARTIFACT_CLOSE,
+  VSS_UI_ARTIFACT_MAX_LENGTH,
+  VSS_UI_ARTIFACT_OPEN,
+  VSS_UI_ARTIFACT_VERSION,
+  extractVssUiArtifacts,
+} from './utils/vssUiArtifacts';
+export type { VssUiArtifact } from './utils/vssUiArtifacts';

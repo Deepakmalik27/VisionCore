@@ -1,0 +1,324 @@
+# Track
+
+`track` runs a source through engine-owned perception, tracking, and output
+sinks. It also replays saved TrackR-CNN detections with their KITTI images.
+
+```bash
+boxmot track \
+  --source video.mp4 \
+  --detector yolov8n \
+  --reid osnet_x0_25_msmt17 \
+  --tracker botsort \
+  --save
+```
+
+## Saved TrackR-CNN detections
+
+Pass all three input directories to replay KITTI TrackR-CNN predictions and
+evaluate the resulting tracks against MOTS instance annotations:
+
+```bash
+boxmot track \
+  --tracker maf_hda \
+  --detections ./kitti-mots/predictions/trackrcnn/training \
+  --images ./kitti/training/image_02 \
+  --instances ./kitti/instances \
+  --split val \
+  --sequence 0002
+```
+
+This path defaults to the Python MAF-HDA tracker and tracks cars and pedestrians
+separately. It writes MOTS tracks, metrics, and run metadata under
+`runs/trackrcnn/<split>`; `--project` changes the output root. Live source,
+perception, and display options do not apply to these saved inputs. Install the
+`mots` extra for mask decoding and metrics. See the
+[MAF-HDA example](../trackers/maf_hda.md#evaluate-trackr-cnn-detections-on-kitti-mots)
+for input layout and tracker configuration details.
+
+## Device selection
+
+Use `--device cpu`, `--device mps`, or `--device cuda:N` to select one execution
+device. `cuda` selects `cuda:0`; a numeric string such as `0` is equivalent to
+`cuda:0`. Tracking, materialization, ReID inference, and export share these
+selectors and reject GPU lists such as `0,1`. Explicit accelerator requests
+validate availability and the selected index before model loading.
+
+CUDA indices refer to the GPUs visible to the current process. BoxMOT preserves
+`CUDA_VISIBLE_DEVICES`; it does not rewrite the variable to select a device.
+See [CUDA device indices](../guides/troubleshooting.md#cuda-device-index-is-unavailable)
+when launching with an external visibility mask.
+
+The selected backend must also support the device. For example, ONNX ReID
+rejects MPS, and TensorRT ReID requires an explicit CUDA device. See
+[ReID and acceleration](../guides/troubleshooting.md#reid-and-acceleration).
+
+## Inference sources
+
+Sources may be images, directories, finite videos, webcams, or URLs. The source
+owns OpenCV capture, BGR-to-RGB conversion, stride, timestamps, reconnect
+policy, and stable sequence/frame identity. A runner resets state between
+sequences and forwards each `PipelineResult` to configured rendering, video,
+MOT text, JSON, composite, or null sinks.
+
+The nine Python box trackers support EdgeTAM mask guidance on incoming frames,
+including webcams and RTSP streams. Select an algorithm with `--tracker`:
+
+```bash
+boxmot track --tracker botsort --tracker-backend python --asso-func iou --source 0 \
+  --edgetam --mask-guidance-weights edgetam.pt --mask-guidance-max-objects 96 \
+  --device cuda:0 --show
+```
+
+Guidance is off by default. `--edgetam` enables it with the default `edgetam.pt`
+checkpoint; `--mask-guidance-weights` selects another path. Weights alone do
+not enable it, and `--no-edgetam` disables it even when weights are supplied.
+
+EdgeTAM uses the frame delivered to the tracker without preloading the source.
+Install it with `uv sync --extra cpu --extra yolo --group mask-guidance`, or
+select `--extra cu130` for CUDA. The full checkpoint downloads into `./models`
+on first use. MPS automatically uses FP16 weights, autocast, and mask-memory
+features. CPU uses FP32; capable CUDA devices use BF16 autocast, otherwise FP32.
+Propagation batches up to four compatible objects per call. Masks stay on the
+inference device for reseeding; matching transfers only small integer overlap
+counts to the CPU. Rendering creates CPU masks lazily when requested. Initial
+prompts remain individual.
+The tracker YAML's `edgetam.max_objects` cap defaults to 96; an explicit
+`--mask-guidance-max-objects` overrides it independently of the batch size. Set the cap, mask coverage/fill
+thresholds, and prompt overlap gate through `--tracker-config`; see
+[guidance settings and tuning](../tasks/masks.md#tracker-yaml-and-tuning).
+Identities outside that budget continue ordinary association with the selected tracker.
+Processing speed depends on the detector, EdgeTAM, and device; accepting a live
+stream does not guarantee camera-rate throughput. See
+[temporal mask guidance](../tasks/masks.md#use-temporal-masks-in-association)
+for the tracker list and configuration. Guidance requires AABB, IoU association,
+and `per_class=False`; native C++, EagerMOT, and MafHda do not support this cue.
+
+With guidance enabled, `--show` previews propagated masks tinted by track ID,
+and `--save` includes them in the annotated video. Masks appear after
+confirmation and next-frame propagation; objects without guidance have no
+propagated overlay. Retained lost identities can keep a visible mask during
+recovery. See [mask visualization](../tasks/masks.md#view-propagated-masks) for
+the overlay lifecycle and its distinction from detection masks.
+
+## Geometry
+
+Select a fixed tracker geometry with `--geometry aabb|obb`. Detector output and
+tracker mode must agree:
+
+```bash
+boxmot track \
+  --source aerial.mp4 \
+  --detector yolo11n-obb.pt \
+  --geometry obb \
+  --tracker ocsort
+```
+
+Canonical OBB angles are radians and remain unwrapped for temporal continuity.
+Pipeline values remain typed; `to_obb_rows()` produces the 9-column output
+layout when an external boundary needs it.
+
+## Masks and appearance
+
+The [tracker input matrix](../trackers/index.md#input-support) compares supported
+geometry and required or optional cues. The resolved tracker declares whether
+it needs embeddings, masks, or frame pixels. The pipeline adds only missing
+requirements:
+
+- A detector-native mask or embedding payload is preserved.
+- A configured segmentor supplies absent masks when required or explicitly
+  requested with `--segmentor`.
+- A configured appearance encoder runs only when embeddings are needed and
+  absent.
+- Without an external encoder, a ReID-enabled tracker adapter receives the
+  `Frame` and extracts its private embeddings internally.
+- Transitive requirements are honored: a mask-aware encoder triggers
+  segmentation first.
+
+Generate masks from detection boxes with the built-in EdgeTAM YAML:
+
+```bash
+boxmot track --source video.mp4 --detector yolo26n --tracker bytetrack \
+  --segmentor boxmot/configs/segmentors/edgetam.yaml --device cpu --save
+```
+
+`--segmentor` produces detection-aligned masks. Add `--edgetam`
+to enable temporal masks for a supported Python box tracker too. Matching EdgeTAM
+weights, device, and precision share one model within the tracking run; image
+and propagation state stay separate. The supplied YAML uses FP32; select
+`precision: fp16` for sharing with guidance on MPS or `precision: bf16` on a
+capable CUDA device.
+See [mask generation](../tasks/masks.md#generate-masks-with-edgetam) for the
+segmentor interface and threshold semantics.
+
+MafHda requires AABB detections, nonempty full-frame masks aligned to those
+detections, and the current image on every update. Trackers with `use_embeddings`
+consume an upstream payload when available. For a non-empty
+batch without embeddings, every ReID-enabled tracker adapter can instead lazily
+generate them from the supplied `Frame`; attached embeddings bypass internal
+inference, and empty batches do not initialize the model. Native adapters pass
+the resulting features to the model-free C++ tracker library through its typed
+ABI.
+
+Tracker-private embeddings are used only for association. Requesting
+`PipelineOutputs(embeddings=True)` still requires a detector-provided payload
+or an external appearance encoder because the private matrix is not added to
+the returned `Detections`.
+
+## Sequence state
+
+A `TrackingPipeline` processes exactly one sequence. When frame indices are
+present, they must increase. Reset the pipeline before starting another
+sequence. The runner handles this for engine-owned sources; embedded Python
+callers invoke `pipeline.reset()` themselves.
+
+## Reuse tracker settings
+
+Load a scalar tracker YAML, a built-in preset, or the `calibrated.yaml` saved by
+[Kalman calibration](eval.md#kalman-calibration) with `--tracker-config`:
+
+```bash
+boxmot track \
+  --source video.mp4 \
+  --tracker botsort \
+  --tracker-config path/to/kf-tuning/calibrated.yaml
+```
+
+The file overlays built-in tracker defaults and must match the selected
+tracker when it declares a `tracker` name. Explicit `--asso-func` overrides
+the loaded value. Saved `kalman.variable_dt`, `kalman.noise.time_unit`, and `kalman.noise.reference_dt_s`
+settings preserve the calibrated timing contract. A conflicting timing flag,
+such as `--fixed-dt` with a seconds-based calibration, is rejected. Timestamps
+alone do not enable variable timing; the default remains fixed-step prediction.
+
+## Choose Kalman timing and adaptation
+
+`kalman.variable_dt` and `kalman.adaptive_kf` control different behavior and default to
+`False`. Variable timing uses capture intervals to update the transition matrix
+`F(dt)` and process covariance `Q(dt)` without learning noise parameters.
+Adaptive filtering learns process noise from each track's prediction errors;
+it does not learn measurement noise or add an acceleration model.
+
+Use these starting points, then compare tracking accuracy on representative
+sequences:
+
+| Scenario | `kalman.variable_dt` | `kalman.adaptive_kf` |
+| --- | --- | --- |
+| Regular capture intervals with validated fixed noise settings | `False` | `False` |
+| Dropped frames or irregular capture intervals | `True` | `False` initially |
+| Regular intervals, but long tracks alternate between smooth motion and unpredictable maneuvers | `False` | Consider `True` |
+| Irregular intervals and changing motion predictability | `True` | Consider `True` |
+
+Both features are experimental. Variable timing supports Python ByteTrack,
+BotSort, StrongSort, OcSort, DeepOcSort, HybridSort, BoostTrack, and OccluBoost.
+Online adaptation is available in Python BoostTrack and OccluBoost. Native
+backends do not support these modes.
+
+For irregular capture intervals, start with `--variable-dt` and leave
+adaptation disabled:
+
+```bash
+boxmot track --source video.mp4 --tracker bytetrack --variable-dt
+```
+
+The source supplies timestamps and the tracker computes
+`dt = current_timestamp - previous_timestamp` internally. Use capture/media
+timestamps, not elapsed inference time. Slow or uneven processing does not
+require variable timing if every frame of a constant-rate recording is still
+processed. Missing detections alone do not require it when updates continue
+regularly with empty detections. A nominal-FPS timestamp fallback cannot
+recover unrecorded capture gaps. See [Python timing](../python/index.md#elapsed-time)
+for supplying timestamps directly; track lifetimes such as `max_age` still
+count updates in either mode.
+
+To also test adaptation, save this runtime configuration as
+`boosttrack-adaptive.yaml`:
+
+```yaml
+tracker: boosttrack
+kalman:
+  variable_dt: true
+  adaptive_kf: true
+```
+
+```bash
+boxmot track --source video.mp4 --tracker boosttrack --tracker-config boosttrack-adaptive.yaml
+```
+
+Adaptation uses up to 30 measurement corrections per track and starts after
+15 corrections. Initialization and prediction-only updates do not count, so
+short tracks may never leave warmup. Detection jitter, wrong associations, and
+imperfect camera compensation can distort the estimated process noise.
+Adaptation alone does not account for irregular capture intervals.
+
+If annotated recordings are available, first use
+[`--calibrate-kf`](eval.md#kalman-calibration) to estimate baseline noise in the
+chosen timing mode. Compare adaptation enabled and disabled on separate
+evaluation sequences, keeping each configuration's timing and adaptation
+settings consistent between calibration, evaluation, and deployment.
+
+## Python
+
+Use factories and structures when composing a pipeline:
+
+```python
+from boxmot import create_tracker
+from boxmot.pipelines import TrackingPipeline
+from boxmot.trackers import TrackerSpec
+
+tracker = create_tracker(TrackerSpec(name="bytetrack", geometry="aabb"))
+pipeline = TrackingPipeline(detector=detector, tracker=tracker)
+
+for frame in frames:  # Sequence[boxmot.structures.Frame]
+    result = pipeline.step(frame)
+    consume(frame, result.tracks)
+```
+
+For externally supplied detections, construct the pipeline with
+`detector=None` and call `step_detections(frame, detections)`.
+
+For an appearance-enabled tracker adapter, `TrackingPipeline` may omit `reid`;
+the tracker then extracts missing embeddings from each live frame. Pass a
+shared encoder as `reid` when the detections returned in `PipelineResult` must
+include embeddings or when several consumers reuse the same encoder.
+
+A standalone box-only tracker may instead receive an exact NumPy AABB6 or OBB7
+matrix directly and returns packed `float64` AABB8 or OBB9 rows. Use
+`Detections` for `Tracks`, embeddings, masks, sample metadata, and all pipeline
+calls.
+
+## Working with results
+
+`PipelineResult` contains exactly `detections` and `tracks`. Geometry lives in
+`result.tracks.geometry.values`; IDs, scores, classes, and detection indices are
+separate aligned tensors. Timing is runner metadata keyed by sample ID, not a
+result field.
+
+## Shutdown report
+
+Normal completion, `q`/Escape in the display window, and Ctrl-C all close the
+source and output sinks before showing the final Rich report. The report keeps
+partial measurements from an interrupted frame and separates detector and
+ReID preprocessing, inference, and postprocessing. It also reports component
+totals, source acquisition, pipeline enrichment and validation, tracker
+association/update, rendering, sink I/O, residual overhead, and overall
+latency with totals, per-frame averages, and FPS.
+
+When `--save` and `--show` are used together, the video writer and display
+share one rendered frame rather than rendering the same result twice.
+
+## Native trackers
+
+Select a registered native implementation with `--tracker-backend cpp`.
+Factory validation rejects unsupported masks, per-class mode, or geometry
+before tracking starts. Native and Python implementations share the structured
+public contract. ReID-enabled native adapters generate missing embeddings from
+the frame just like their Python counterparts; the underlying C++ tracker
+libraries consume the resulting typed buffers and do not load models.
+
+## Arguments
+
+::: mkdocs-click
+    :module: boxmot.engine.commands.track
+    :command: track
+    :prog_name: boxmot track
+    :depth: 0

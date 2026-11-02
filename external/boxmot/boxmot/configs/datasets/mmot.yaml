@@ -1,0 +1,38 @@
+id: mmot
+
+format:
+  layout: mot
+  box_type: obb
+
+storage:
+  root: data
+
+default_split: train
+
+splits:
+  train:
+    path: train/npy
+    annotations: train/mot
+    has_ground_truth: true
+  test:
+    path: test/npy
+    annotations: test/mot
+    has_ground_truth: true
+
+resources:
+  dataset:
+    type: per_split
+    uris:
+      train: hf://Lekim89/mmot/train
+      test: hf://Lekim89/mmot/test
+
+classes:
+  target:
+    car: 0
+    bike: 1
+    pedestrian: 2
+    van: 3
+    truck: 4
+    bus: 5
+    tricycle: 6
+    awning-bike: 7

@@ -1,0 +1,752 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+import typer
+from rich.progress import Progress
+
+from .. import data as d
+from ..api import ProtectApiClient
+from ..cli import base
+from ..data import DEFAULT, DEFAULT_TYPE
+from ..data.public_devices import PublicCamera
+
+app = typer.Typer(rich_markup_mode="rich")
+
+ARG_DEVICE_ID = typer.Argument(None, help="ID of camera to select for subcommands")
+
+# ``--reset-time`` has to carry three states -- omitted (use the NVR default),
+# "forever", and a timestamp -- so the option is a string parsed by hand. The
+# formats are the ones typer's ``datetime`` option type accepted before.
+_RESET_TIME_NEVER = "never"
+_RESET_TIME_FORMATS = ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S")
+
+
+@dataclass
+class CameraContext(base.CliContext):
+    devices: dict[str, d.Camera | PublicCamera]
+    device: d.Camera | PublicCamera | None = None
+
+
+ALL_COMMANDS, DEVICE_COMMANDS = base.init_common_commands(app)
+
+
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context, device_id: str | None = ARG_DEVICE_ID) -> None:
+    """
+    Camera device CLI.
+
+    Returns full list of Cameras without any arguments passed.
+    """
+    devices = base.device_map(ctx, "cameras")
+    context = CameraContext(
+        protect=ctx.obj.protect,
+        device=None,
+        devices=devices,
+        output_format=ctx.obj.output_format,
+    )
+    ctx.obj = context
+
+    if device_id is not None and device_id not in ALL_COMMANDS:
+        if (device := devices.get(device_id)) is None:
+            typer.secho("Invalid camera ID", fg="red")
+            raise typer.Exit(1)
+        ctx.obj.device = device
+
+    if not ctx.invoked_subcommand:
+        if device_id in ALL_COMMANDS:
+            ctx.invoke(ALL_COMMANDS[device_id], ctx)
+            return
+
+        if ctx.obj.device is not None:
+            base.json_output(base.camera_dict(ctx.obj.device))
+            return
+
+        base.json_output({k: base.camera_dict(v) for k, v in ctx.obj.devices.items()})
+
+
+@app.command()
+def privacy_mode(
+    ctx: typer.Context,
+    enabled: bool | None = typer.Argument(None),
+) -> None:
+    """
+    Returns/sets library managed privacy mode.
+
+    Does not change the microphone sensitivity or recording mode.
+    It must be changed separately.
+    """
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+    if enabled is None:
+        base.json_output(obj.is_privacy_on)
+        return
+    base.run(ctx, obj.set_privacy(enabled))
+
+
+@app.command()
+def chime_type(ctx: typer.Context, value: d.ChimeType | None = None) -> None:
+    """Returns/sets the current chime type if the camera has a chime."""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+    if not obj.feature_flags.has_chime:
+        typer.secho("Camera does not have a chime", fg="red")
+        raise typer.Exit(1)
+
+    if value is None:
+        if ctx.obj.output_format == base.OutputFormatEnum.JSON:
+            base.json_output(obj.chime_type)
+        elif obj.chime_type is not None:
+            typer.echo(obj.chime_type.name)
+        return
+
+    base.run(ctx, obj.set_chime_type(value))
+
+
+@app.command()
+def save_snapshot(
+    ctx: typer.Context,
+    output_path: Path = typer.Argument(..., help="JPEG format"),
+    width: int | None = typer.Option(None, "-w", "--width"),
+    height: int | None = typer.Option(None, "-h", "--height"),
+    dt: datetime | None = typer.Option(None, "-t", "--timestamp"),
+    package: bool = typer.Option(False, "-p", "--package", help="Get package camera"),
+) -> None:
+    """
+    Takes snapshot of camera.
+
+    If you specify a timestamp, they are approximate. It will not export with down to the second
+    accuracy so it may be +/- a few seconds.
+
+    Timestamps use your locale timezone. If it is not configured correctly,
+    it will default to UTC. You can override your timezone with the
+    TZ environment variable.
+    """
+    base.require_device_id(ctx, public_ok=package)
+
+    if package:
+        snapshot = _get_package_snapshot(ctx, width, height, dt)
+    else:
+        obj: d.Camera = ctx.obj.device
+        if dt is not None:
+            local_tz = datetime.now(UTC).astimezone().tzinfo
+            dt = dt.replace(tzinfo=local_tz)
+        snapshot = base.run(ctx, obj.get_snapshot(width, height, dt=dt))
+
+    if snapshot is None:
+        typer.secho("Could not get snapshot", fg="red")
+        raise typer.Exit(1)
+
+    Path(output_path).write_bytes(snapshot)
+
+
+@app.command()
+def save_video(
+    ctx: typer.Context,
+    output_path: Path = typer.Argument(..., help="MP4 format"),
+    start: datetime = typer.Argument(...),
+    end: datetime = typer.Argument(...),
+    channel: int = typer.Option(
+        0,
+        "-c",
+        "--channel",
+        min=0,
+        max=3,
+        help="0 = High, 1 = Medium, 2 = Low, 3 = Package",
+    ),
+    fps: int | None = typer.Option(
+        None,
+        "--fps",
+        min=1,
+        max=40,
+        help="Export as timelapse. 4 = 60x, 8 = 120x, 20 = 300x, 40 = 600x",
+    ),
+) -> None:
+    """
+    Exports video of camera.
+
+    Exports are approximate. It will not export with down to the second
+    accuracy so it may be +/- a few seconds.
+
+    Uses your locale timezone. If it is not configured correctly,
+    it will default to UTC. You can override your timezone with the
+    TZ environment variable.
+    """
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    local_tz = datetime.now(UTC).astimezone().tzinfo
+    start = start.replace(tzinfo=local_tz)
+    end = end.replace(tzinfo=local_tz)
+
+    with Progress() as pb:
+        task_id = pb.add_task("(1/2) Exporting", total=100)
+
+        async def callback(step: int, current: int, total: int) -> None:
+            pb.update(
+                task_id,
+                total=total,
+                completed=current,
+                description="(2/2) Downloading",
+            )
+
+        base.run(
+            ctx,
+            obj.get_video(
+                start,
+                end,
+                channel,
+                output_file=output_path,
+                progress_callback=callback,
+                fps=fps,
+            ),
+        )
+
+
+@app.command()
+def play_audio(
+    ctx: typer.Context,
+    url: str = typer.Argument(..., help="URL or path to audio file"),
+) -> None:
+    """Plays audio file on camera speaker."""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+    base.run(ctx, obj.play_audio(url))
+
+
+@app.command()
+def smart_detects(
+    ctx: typer.Context,
+    values: list[d.SmartDetectObjectType] = typer.Argument(
+        None,
+        help="Set to [] to empty list of detect types.",
+    ),
+    add: bool = typer.Option(False, "-a", "--add", help="Add values instead of set"),
+    remove: bool = typer.Option(
+        False,
+        "-r",
+        "--remove",
+        help="Remove values instead of set",
+    ),
+) -> None:
+    """Returns/set smart detect types for camera."""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    if add and remove:
+        typer.secho("Add and remove are mutually exclusive", fg="red")
+        raise typer.Exit(1)
+
+    if not obj.feature_flags.has_smart_detect:
+        typer.secho("Camera does not support smart detections", fg="red")
+        raise typer.Exit(1)
+
+    if len(values) == 0:
+        if ctx.obj.output_format == base.OutputFormatEnum.JSON:
+            base.json_output(obj.smart_detect_settings.object_types)
+        else:
+            for value in obj.smart_detect_settings.object_types:
+                typer.echo(value.value)
+        return
+
+    if len(values) == 1 and values[0] == "[]":
+        values = []
+
+    for value in values:
+        if value not in obj.feature_flags.smart_detect_types:
+            typer.secho(f"Camera does not support {value}", fg="red")
+            raise typer.Exit(1)
+
+    if add:
+        values = list(set(obj.smart_detect_settings.object_types) | set(values))
+    elif remove:
+        values = list(set(obj.smart_detect_settings.object_types) - set(values))
+
+    protect: ProtectApiClient = ctx.obj.protect
+    base.run(
+        ctx,
+        protect.update_camera_public(obj.id, smart_detect_object_types=values),
+    )
+
+
+@app.command()
+def smart_audio_detects(
+    ctx: typer.Context,
+    values: list[d.SmartDetectAudioType] = typer.Argument(
+        None,
+        help="Set to [] to empty list of detect types.",
+    ),
+    add: bool = typer.Option(False, "-a", "--add", help="Add values instead of set"),
+    remove: bool = typer.Option(
+        False,
+        "-r",
+        "--remove",
+        help="Remove values instead of set",
+    ),
+) -> None:
+    """Returns/set smart detect types for camera."""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    if add and remove:
+        typer.secho("Add and remove are mutually exclusive", fg="red")
+        raise typer.Exit(1)
+
+    if not obj.feature_flags.has_smart_detect:
+        typer.secho("Camera does not support smart detections", fg="red")
+        raise typer.Exit(1)
+
+    obj.smart_detect_settings.audio_types = obj.smart_detect_settings.audio_types or []
+    obj.smart_detect_settings.audio_types = obj.smart_detect_settings.audio_types or []
+
+    if len(values) == 0:
+        if ctx.obj.output_format == base.OutputFormatEnum.JSON:
+            base.json_output(obj.smart_detect_settings.audio_types)
+        else:
+            for value in obj.smart_detect_settings.audio_types:
+                typer.echo(value.value)
+        return
+
+    if len(values) == 1 and values[0] == "[]":
+        values = []
+
+    for value in values:
+        if (
+            obj.feature_flags.smart_detect_audio_types is None
+            or value not in obj.feature_flags.smart_detect_audio_types
+        ):
+            typer.secho(f"Camera does not support {value}", fg="red")
+            raise typer.Exit(1)
+
+    if add:
+        values = list(set(obj.smart_detect_settings.audio_types) | set(values))
+    elif remove:
+        values = list(set(obj.smart_detect_settings.audio_types) - set(values))
+
+    protect: ProtectApiClient = ctx.obj.protect
+    base.run(
+        ctx,
+        protect.update_camera_public(obj.id, smart_detect_audio_types=values),
+    )
+
+
+@app.command()
+def set_motion_detection(ctx: typer.Context, enabled: bool) -> None:
+    """Sets motion detection on camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_motion_detection(enabled))
+
+
+@app.command()
+def set_recording_mode(ctx: typer.Context, mode: d.RecordingMode) -> None:
+    """Sets recording mode on camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_recording_mode(mode))
+
+
+@app.command()
+def set_ir_led_mode(ctx: typer.Context, mode: d.IRLEDMode) -> None:
+    """Sets IR LED mode on camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_ir_led_model(mode))
+
+
+@app.command()
+def set_status_light(ctx: typer.Context, enabled: bool) -> None:
+    """Sets status indicicator light on camera"""
+    base.require_device_id(ctx, public_ok=True)
+    obj = base.public_device(ctx, PublicCamera)
+
+    base.run(ctx, obj.set_status_light(enabled))
+
+
+@app.command()
+def set_hdr(ctx: typer.Context, mode: d.PublicHdrMode) -> None:
+    """Sets HDR (High Dynamic Range) mode on camera"""
+    base.require_device_id(ctx, public_ok=True)
+    obj = base.public_device(ctx, PublicCamera)
+
+    base.run(ctx, obj.set_hdr_mode(mode))
+
+
+@app.command()
+def set_color_night_vision(ctx: typer.Context, enabled: bool) -> None:
+    """Sets Color Night Vision on camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_color_night_vision(enabled=enabled))
+
+
+@app.command()
+def set_person_track(ctx: typer.Context, enabled: bool) -> None:
+    """Sets person tracking on camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    if not obj.feature_flags.is_ptz:
+        typer.secho("Camera does not support person tracking", fg="red")
+        raise typer.Exit(1)
+
+    base.run(ctx, (obj.set_person_track(enabled=enabled)))
+
+
+@app.command()
+def set_video_mode(ctx: typer.Context, mode: d.VideoMode) -> None:
+    """Sets video mode on camera"""
+    base.require_device_id(ctx, public_ok=True)
+    obj = base.public_device(ctx, PublicCamera)
+
+    base.run(ctx, obj.set_video_mode(mode))
+
+
+@app.command()
+def set_camera_zoom(
+    ctx: typer.Context,
+    level: int = typer.Argument(..., min=0, max=100),
+) -> None:
+    """Sets zoom level for camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_camera_zoom(level))
+
+
+@app.command()
+def set_wdr_level(
+    ctx: typer.Context,
+    level: int = typer.Argument(..., min=0, max=3),
+) -> None:
+    """Sets WDR (Wide Dynamic Range) on camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_wdr_level(level))
+
+
+@app.command()
+def set_mic_volume(
+    ctx: typer.Context,
+    level: int = typer.Argument(..., min=0, max=100),
+) -> None:
+    """Sets the mic sensitivity level on camera"""
+    base.require_device_id(ctx, public_ok=True)
+    obj = base.public_device(ctx, PublicCamera)
+
+    base.run(ctx, obj.set_mic_volume(level))
+
+
+@app.command()
+def set_speaker_volume(
+    ctx: typer.Context,
+    level: int = typer.Argument(..., min=0, max=100),
+) -> None:
+    """Sets the speaker output volume on camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_speaker_volume(level))
+
+
+@app.command()
+def set_volume(
+    ctx: typer.Context,
+    level: int = typer.Argument(..., min=0, max=100),
+) -> None:
+    """Sets the general volume level on camera"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_volume(level))
+
+
+@app.command()
+def set_ring_volume(
+    ctx: typer.Context,
+    level: int = typer.Argument(..., min=0, max=100),
+) -> None:
+    """Sets the doorbell ring volume"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_ring_volume(level))
+
+
+@app.command()
+def set_system_sounds(ctx: typer.Context, enabled: bool) -> None:
+    """Sets system sound playback through speakers"""
+    base.require_device_id(ctx)
+    obj: d.Camera = ctx.obj.device
+
+    base.run(ctx, obj.set_system_sounds(enabled))
+
+
+@app.command()
+def set_osd_name(ctx: typer.Context, enabled: bool) -> None:
+    """Sets whether camera name is in the On Screen Display"""
+    base.require_device_id(ctx, public_ok=True)
+    obj = base.public_device(ctx, PublicCamera)
+
+    base.run(ctx, obj.set_osd_name(enabled))
+
+
+@app.command()
+def set_osd_date(ctx: typer.Context, enabled: bool) -> None:
+    """Sets whether current date is in the On Screen Display"""
+    base.require_device_id(ctx, public_ok=True)
+    obj = base.public_device(ctx, PublicCamera)
+
+    base.run(ctx, obj.set_osd_date(enabled))
+
+
+@app.command()
+def set_osd_logo(ctx: typer.Context, enabled: bool) -> None:
+    """Sets whether the UniFi logo is in the On Screen Display"""
+    base.require_device_id(ctx, public_ok=True)
+    obj = base.public_device(ctx, PublicCamera)
+
+    base.run(ctx, obj.set_osd_logo(enabled))
+
+
+@app.command()
+def set_osd_bitrate(ctx: typer.Context, enabled: bool) -> None:
+    """Sets whether camera bitrate is in the On Screen Display"""
+    base.require_device_id(ctx, public_ok=True)
+    obj = base.public_device(ctx, PublicCamera)
+
+    base.run(ctx, obj.set_osd_nerd_mode(enabled))
+
+
+@app.command()
+def set_lcd_text(
+    ctx: typer.Context,
+    text_type: d.DoorbellMessageType | None = typer.Argument(
+        None,
+        help="No value sets it back to the global default doorbell message.",
+    ),
+    text: str | None = typer.Argument(
+        None,
+        help="Only for CUSTOM_MESSAGE text type",
+    ),
+    reset_at: str | None = typer.Option(
+        None,
+        "-r",
+        "--reset-time",
+        help=(
+            "When the message clears: a timestamp "
+            f"[{'|'.join(_RESET_TIME_FORMATS)}], or "
+            f'"{_RESET_TIME_NEVER}" to keep it until it is replaced. '
+            "Omit to use the NVR's default message timeout. "
+            "Does not apply to default message"
+        ),
+    ),
+) -> None:
+    """
+    Sets doorbell LCD text.
+
+    Uses your locale timezone. If it is not configured correctly,
+    it will default to UTC. You can override your timezone with the
+    TZ environment variable.
+    """
+    base.require_device_id(ctx, public_ok=True)
+
+    # The public setter rejects a reset time on a clear; say so here rather
+    # than dropping the option on the floor.
+    if text_type is None and reset_at is not None:
+        typer.secho("--reset-time does not apply when clearing the message", fg="red")
+        raise typer.Exit(1)
+
+    reset = _parse_reset_time(reset_at)
+    obj = base.public_device(ctx, PublicCamera)
+    base.run(ctx, obj.set_lcd_message(text_type, text, reset))
+
+
+@app.command()
+def create_rtsps_streams(
+    ctx: typer.Context,
+    qualities: list[str] = typer.Argument(
+        ...,
+        help="List of stream qualities to create (e.g., high medium low)",
+    ),
+) -> None:
+    """
+    Creates RTSPS streams for camera.
+
+    Available qualities are typically: high, medium, low, ultra.
+    Requires API key authentication and public API access.
+    """
+    base.require_device_id(ctx, public_ok=True)
+    obj: d.Camera | PublicCamera = ctx.obj.device
+    protect: ProtectApiClient = ctx.obj.protect
+
+    async def create_streams() -> None:
+        try:
+            result = await protect.create_camera_rtsps_streams(obj.id, qualities)
+        except Exception as e:
+            typer.secho(f"Error creating RTSPS streams: {e}", fg="red")
+            raise typer.Exit(1) from e
+        if result is None:
+            typer.secho("Failed to create RTSPS streams", fg="red")
+            raise typer.Exit(1)
+
+        if ctx.obj.output_format == base.OutputFormatEnum.JSON:
+            stream_data = {
+                quality: result.get_stream_url(quality)
+                for quality in result.get_available_stream_qualities()
+            }
+            base.json_output(stream_data)
+        else:
+            for quality in result.get_available_stream_qualities():
+                url = result.get_stream_url(quality)
+                typer.echo(f"{quality:10}\t{url}")
+
+    base.run(ctx, create_streams())
+
+
+@app.command()
+def get_rtsps_streams(ctx: typer.Context) -> None:
+    """
+    Gets existing RTSPS streams for camera.
+
+    Requires API key authentication and public API access.
+    """
+    base.require_device_id(ctx, public_ok=True)
+    obj: d.Camera | PublicCamera = ctx.obj.device
+    protect: ProtectApiClient = ctx.obj.protect
+
+    async def get_streams() -> None:
+        try:
+            result = await protect.get_camera_rtsps_streams(obj.id)
+            if result is None:
+                typer.secho("No RTSPS streams found or failed to retrieve", fg="yellow")
+                return
+
+            if ctx.obj.output_format == base.OutputFormatEnum.JSON:
+                stream_data = {
+                    quality: result.get_stream_url(quality)
+                    for quality in result.get_available_stream_qualities()
+                }
+                base.json_output(stream_data)
+            else:
+                available_qualities = result.get_available_stream_qualities()
+                if not available_qualities:
+                    typer.echo("No RTSPS streams available")
+                else:
+                    for quality in available_qualities:
+                        url = result.get_stream_url(quality)
+                        typer.echo(f"{quality:10}\t{url}")
+        except Exception as e:
+            typer.secho(f"Error getting RTSPS streams: {e}", fg="red")
+            raise typer.Exit(1) from e
+
+    base.run(ctx, get_streams())
+
+
+@app.command()
+def delete_rtsps_streams(
+    ctx: typer.Context,
+    qualities: list[str] = typer.Argument(
+        ...,
+        help="List of stream qualities to delete (e.g., high medium low)",
+    ),
+) -> None:
+    """
+    Deletes RTSPS streams for camera.
+
+    Requires API key authentication and public API access.
+    """
+    base.require_device_id(ctx, public_ok=True)
+    obj: d.Camera | PublicCamera = ctx.obj.device
+    protect: ProtectApiClient = ctx.obj.protect
+
+    async def delete_streams() -> None:
+        try:
+            result = await protect.delete_camera_rtsps_streams(obj.id, qualities)
+        except Exception as e:
+            typer.secho(f"Error deleting RTSPS streams: {e}", fg="red")
+            raise typer.Exit(1) from e
+        if not result:
+            typer.secho(
+                f"Failed to delete RTSPS streams: {', '.join(qualities)}", fg="red"
+            )
+            raise typer.Exit(1)
+        typer.secho(
+            f"Successfully deleted RTSPS streams: {', '.join(qualities)}",
+            fg="green",
+        )
+
+    base.run(ctx, delete_streams())
+
+
+@app.command("disable-mic-permanently")
+def disable_mic_permanently(
+    ctx: typer.Context,
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the interactive confirmation prompt",
+    ),
+) -> None:
+    """Permanently disable the camera microphone (irreversible)."""
+    base.require_device_id(ctx, public_ok=True)
+    obj: d.Camera | PublicCamera = ctx.obj.device
+
+    if not yes and not typer.confirm(
+        f"Permanently disable the microphone on {obj.id}? "
+        "This cannot be undone without resetting the camera."
+    ):
+        typer.secho("Aborted.", fg="yellow")
+        raise typer.Exit(1)
+
+    async def _disable() -> None:
+        await ctx.obj.protect.disable_camera_mic_permanently_public(obj.id)
+
+    base.run(ctx, _disable())
+
+
+def _get_package_snapshot(
+    ctx: typer.Context,
+    width: int | None,
+    height: int | None,
+    dt: datetime | None,
+) -> bytes | None:
+    """Package-camera snapshot from the public API, which takes no size or time."""
+    if width is not None or height is not None or dt is not None:
+        typer.secho(
+            "--width, --height and --timestamp do not apply to --package", fg="red"
+        )
+        raise typer.Exit(1)
+    obj = base.public_device(ctx, PublicCamera)
+    if not obj.has_package_camera:
+        typer.secho("Camera does not have package camera", fg="red")
+        raise typer.Exit(1)
+    protect: ProtectApiClient = ctx.obj.protect
+    return base.run(ctx, protect.get_public_api_camera_snapshot(obj.id, package=True))
+
+
+def _parse_reset_time(reset_at: str | None) -> datetime | DEFAULT_TYPE | None:
+    """Resolve ``--reset-time`` to the NVR default, "forever", or a timestamp."""
+    if reset_at is None:
+        return DEFAULT
+    if reset_at.casefold() == _RESET_TIME_NEVER:
+        return None
+    local_tz = datetime.now(UTC).astimezone().tzinfo
+    for fmt in _RESET_TIME_FORMATS:
+        try:
+            return datetime.strptime(reset_at, fmt).replace(tzinfo=local_tz)
+        except ValueError:
+            continue
+    formats = ", ".join(repr(fmt) for fmt in _RESET_TIME_FORMATS)
+    raise typer.BadParameter(
+        f"{reset_at!r} is not {_RESET_TIME_NEVER!r} and does not match "
+        f"the formats {formats}"
+    )

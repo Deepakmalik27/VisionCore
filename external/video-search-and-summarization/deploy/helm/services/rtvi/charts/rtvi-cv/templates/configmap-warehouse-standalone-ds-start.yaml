@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Warehouse 2D/3D use the shared ds-start.sh (same contract as Compose / alerts / search).
+# MV3DT keeps a dedicated startup script ConfigMap.
+
+{{- if and .Values.enabled (or (eq .Values.profileMode "standalone-2d") (eq .Values.profileMode "standalone-3d")) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vss-rtvi-cv.fullname" . }}-warehouse-standalone-ds-start
+  labels:
+    {{- include "vss-rtvi-cv.labels" . | nindent 4 }}
+data:
+  ds-start.sh: |
+{{ .Files.Get "files/ds-start.sh" | nindent 4 }}
+  download-models.sh: |
+{{ .Files.Get "files/download-models.sh" | nindent 4 }}
+  setup-tracker-reid.sh: |
+{{ .Files.Get "files/setup-tracker-reid.sh" | nindent 4 }}
+  {{- if .Values.downloadModelsFromNgc }}
+  models-download.json: |
+    {
+      "downloads": [
+{{- range $i, $m := .Values.ngcModelsToDownload }}
+        {
+          "model": {{ $m.model | quote }},
+          "sourcePath": {{ $m.sourcePath | quote }},
+          "destPath": {{ $m.destPath | quote }},
+          "org": {{ $m.org | default $.Values.ngcOrg | quote }}
+          {{- if $m.artifact }},
+          "artifact": {{ $m.artifact | quote }}
+          {{- end }}
+        }{{ if lt (add $i 1) (len $.Values.ngcModelsToDownload) }},{{ end }}
+{{- end }}
+      ]
+    }
+  {{- end }}
+{{- end }}

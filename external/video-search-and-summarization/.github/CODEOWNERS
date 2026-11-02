@@ -1,0 +1,81 @@
+# CODEOWNERS — VSS Blueprint
+#
+# Default: all PRs require review from VSS-developers.
+# Refine per-directory owners as teams are onboarded.
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default — all files
+* @NVIDIA-AI-Blueprints/VSS-developers
+
+# Component ownership — per-directory owners.
+# Placed BEFORE the OSRB block below so dependency/license files (lockfiles,
+# manifests, Dockerfiles) inside these directories still route to
+# VSS_OSRB_Approvers — CODEOWNERS is last-match-wins, so the OSRB rules that
+# follow take precedence over these directory rules for those specific files.
+/skills/                @NVIDIA-AI-Blueprints/VSS-Skill-Developers
+/services/agent/        @NVIDIA-AI-Blueprints/VSS-Agent-Developers
+
+# CI, workflows, and repository automation.
+# A workflow edit can silently disable a gate for every PR in the repo
+# without failing anything, so these need maintainer review rather than the
+# default `*` owner. Last-match-wins means this REPLACES VSS-developers for
+# .github rather than adding to it.
+/.github/               @NVIDIA-AI-Blueprints/vss-maintainers
+
+# Lockfiles and 3rd-party license inventory.
+# Resolved-dependency state is the authoritative record of which packages
+# (and which licenses) ship in VSS, so OSRB must approve any change.
+# CODEOWNERS is last-match-wins, so these rules override the default
+# `*` owner above for the listed paths only.
+uv.lock                 @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+package-lock.json       @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+yarn.lock               @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+pnpm-lock.yaml          @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+poetry.lock             @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+pdm.lock                @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+Pipfile.lock            @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+Cargo.lock              @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+go.sum                  @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+Gemfile.lock            @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+LICENSE-3rd-party.txt   @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+
+# Dependency manifests.
+# A manifest can change without an accompanying lockfile update (version-range
+# bumps, new direct deps, removed deps), and the next time the lock regenerates
+# it can pull in new transitive packages and licenses. Gate the manifests too
+# so OSRB sees the change at the point it is introduced, not weeks later when
+# someone else regenerates the lock.
+pyproject.toml          @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+requirements*.txt       @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+setup.py                @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+setup.cfg               @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+Pipfile                 @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+package.json            @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+go.mod                  @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+Cargo.toml              @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+Gemfile                 @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+
+# The OSRB approved baseline and its module mapping.
+# These are the trust anchor of the state comparison: `approved.csv` is what the
+# repo's dependency inventory is judged against, and `module_map.py` decides
+# which repo paths each OSRB module covers. Weakening either silently weakens
+# every verdict the comparison produces, and no automated check can catch that
+# -- a scan cannot validate its own baseline. Route both to OSRB.
+/.github/osrb/approved.csv   @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+/.github/osrb/module_map.py  @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+
+# Dockerfiles.
+# A Dockerfile pins the base image, installs system packages (apt/yum), and
+# pulls in toolchain components that don't show up in language-level manifests.
+# Each of those is a dependency from OSRB's perspective — base-image licenses,
+# distro-package licenses, embedded binaries — so route Dockerfile changes
+# through OSRB the same way language manifests are routed.
+#
+# Patterns cover the three naming variants seen in-tree:
+#   Dockerfile                       (services/{agent,ui,video-analytics-api}/...)
+#   *.Dockerfile                     (deploy/.../Dockerfiles/*.Dockerfile, aarch64.Dockerfile)
+#   Dockerfile.*                     (Dockerfile.base, Dockerfile.dev, etc.)
+Dockerfile              @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+*.Dockerfile            @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers
+Dockerfile.*            @NVIDIA-AI-Blueprints/VSS_OSRB_Approvers

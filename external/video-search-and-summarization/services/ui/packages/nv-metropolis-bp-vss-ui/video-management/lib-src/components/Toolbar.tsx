@@ -1,0 +1,411 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+import React, { useRef, useState, useEffect, useLayoutEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { Button, Switch, TextInput } from '@nvidia/foundations-react-core';
+
+const DISPLAY_FILTER_MENU_Z_INDEX = 10600;
+
+interface ToolbarProps {
+  searchQuery: string;
+  onSearchChange: (value: string) => void;
+  onSearch: () => void;
+  showVideos: boolean;
+  showRtsps: boolean;
+  onShowVideosChange: (value: boolean) => void;
+  onShowRtspsChange: (value: boolean) => void;
+  onFilesSelected: (files: File[]) => void;
+  onAddRtspClick: () => void;
+  selectedCount: number;
+  onDeleteSelected: () => void;
+  isDeleting?: boolean;
+  enableAddRtspButton?: boolean;
+  /** State of the "Enable video upload" switch; the "Upload Video" button is shown only while it is on. */
+  enableVideoUpload?: boolean;
+  onEnableVideoUploadChange: (value: boolean) => void;
+  /** Called when user clicks "Upload Video" — opens the upload dialog directly (bypasses native file picker). */
+  onUploadClick?: () => void;
+  /** Only show Video option when API returned at least one video stream */
+  hasVideoStreams?: boolean;
+  /** Only show RTSP option when API returned at least one RTSP stream */
+  hasRtspStreams?: boolean;
+  /**
+   * A dialog is already open. The RTSP and delete dialogs overlay only the pane below
+   * this toolbar, so its buttons stay clickable; disable them so a second dialog cannot
+   * be opened on top of the first.
+   */
+  isDialogOpen?: boolean;
+  /** Vertical stack for the app left sidebar; horizontal bar is the standalone header. */
+  layout?: 'horizontal' | 'sidebar';
+}
+
+export const Toolbar: React.FC<ToolbarProps> = ({
+  searchQuery,
+  onSearchChange,
+  onSearch,
+  showVideos,
+  showRtsps,
+  onShowVideosChange,
+  onShowRtspsChange,
+  onFilesSelected,
+  onAddRtspClick,
+  selectedCount,
+  onDeleteSelected,
+  isDeleting = false,
+  enableAddRtspButton = true,
+  enableVideoUpload = true,
+  onEnableVideoUploadChange,
+  onUploadClick,
+  hasVideoStreams = true,
+  hasRtspStreams = true,
+  isDialogOpen = false,
+  layout = 'horizontal',
+}) => {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const filterTriggerRef = useRef<HTMLDivElement>(null);
+  const filterMenuRef = useRef<HTMLDivElement>(null);
+  const [isFilterDropdownOpen, setIsFilterDropdownOpen] = useState(false);
+  const [filterMenuPosition, setFilterMenuPosition] = useState<{ top: number; left: number } | null>(null);
+
+  const updateFilterMenuPosition = useCallback(() => {
+    if (!filterTriggerRef.current) return;
+    const rect = filterTriggerRef.current.getBoundingClientRect();
+    setFilterMenuPosition({ top: rect.bottom + 4, left: rect.left });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!isFilterDropdownOpen) {
+      setFilterMenuPosition(null);
+      return;
+    }
+    updateFilterMenuPosition();
+  }, [isFilterDropdownOpen, updateFilterMenuPosition]);
+
+  useEffect(() => {
+    if (!isFilterDropdownOpen) return;
+    const onScrollOrResize = () => updateFilterMenuPosition();
+    window.addEventListener('scroll', onScrollOrResize, true);
+    window.addEventListener('resize', onScrollOrResize);
+    return () => {
+      window.removeEventListener('scroll', onScrollOrResize, true);
+      window.removeEventListener('resize', onScrollOrResize);
+    };
+  }, [isFilterDropdownOpen, updateFilterMenuPosition]);
+
+  // Close dropdown when clicking outside (menu is portaled to document.body)
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (filterTriggerRef.current?.contains(target)) return;
+      if (filterMenuRef.current?.contains(target)) return;
+      setIsFilterDropdownOpen(false);
+    };
+
+    if (isFilterDropdownOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isFilterDropdownOpen]);
+
+  const handleUploadClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      onFilesSelected(Array.from(files));
+    }
+    // Reset input so same file can be selected again
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      onSearch();
+    }
+  };
+
+  // Existing videos stay listed whether or not upload is switched on.
+  const showVideoOption = hasVideoStreams;
+  const showRtspOption = enableAddRtspButton && hasRtspStreams;
+  const showDisplayFilter = showVideoOption || showRtspOption;
+
+  const getFilterLabel = () => {
+    const hasVideo = showVideoOption && showVideos;
+    const hasRtsp = showRtspOption && showRtsps;
+    if (hasVideo && hasRtsp) return 'Video, RTSP';
+    if (hasVideo) return 'Video';
+    if (hasRtsp) return 'RTSP';
+    return 'Select File Type';
+  };
+
+  const displayCheckboxes = (
+    <>
+      {showVideoOption && (
+        <label className="flex items-center gap-2 px-1 py-1.5 w-full text-left cursor-pointer">
+          <input
+            type="checkbox"
+            checked={showVideos}
+            onChange={() => onShowVideosChange(!showVideos)}
+            onClick={(e) => e.stopPropagation()}
+            className="sr-only"
+            aria-label="Video"
+          />
+          <span
+            className={`w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0 ${
+              showVideos
+                ? 'bg-green-600 dark:bg-green-600 border-green-600 dark:border-green-600'
+                : 'bg-white dark:bg-black border-gray-300 dark:border-gray-500'
+            }`}
+            aria-hidden
+          >
+            {showVideos && (
+              <svg className="w-3 h-3 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            )}
+          </span>
+          <span className="text-sm text-gray-700 dark:text-gray-300">Video</span>
+        </label>
+      )}
+      {showRtspOption && (
+        <label className="flex items-center gap-2 px-1 py-1.5 w-full text-left cursor-pointer">
+          <input
+            type="checkbox"
+            checked={showRtsps}
+            onChange={() => onShowRtspsChange(!showRtsps)}
+            onClick={(e) => e.stopPropagation()}
+            className="sr-only"
+            aria-label="RTSP"
+          />
+          <span
+            className={`w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0 ${
+              showRtsps
+                ? 'bg-green-600 dark:bg-green-600 border-green-600 dark:border-green-600'
+                : 'bg-white dark:bg-black border-gray-300 dark:border-gray-500'
+            }`}
+            aria-hidden
+          >
+            {showRtsps && (
+              <svg className="w-3 h-3 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            )}
+          </span>
+          <span className="text-sm text-gray-700 dark:text-gray-300">RTSP</span>
+        </label>
+      )}
+    </>
+  );
+
+  const videoUploadSwitch = (
+    <Switch
+      data-testid="video-upload-toggle"
+      slotLabel="Enable video upload"
+      checked={enableVideoUpload}
+      onCheckedChange={onEnableVideoUploadChange}
+      disabled={isDialogOpen}
+    />
+  );
+
+  const deleteButton = (
+    <Button
+      kind="secondary"
+      onClick={onDeleteSelected}
+      disabled={selectedCount === 0 || isDeleting || isDialogOpen}
+      className={layout === 'sidebar' ? 'w-full' : 'shrink-0'}
+    >
+      {isDeleting ? (
+        <svg
+          className="animate-spin"
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+        >
+          <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+          <path d="M12 2a10 10 0 0 1 10 10" strokeOpacity="1" />
+        </svg>
+      ) : (
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="shrink-0"
+          aria-hidden
+        >
+          <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" />
+          <line x1="15" y1="9" x2="9" y2="15" />
+          <line x1="9" y1="9" x2="15" y2="15" />
+        </svg>
+      )}
+      {isDeleting ? 'Deleting...' : 'Delete Selected'}
+    </Button>
+  );
+
+  if (layout === 'sidebar') {
+    return (
+      <div
+        data-testid="video-management-sidebar-controls"
+        className="flex flex-col gap-3 px-3 pt-2 pb-3"
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".mp4,.mkv"
+          onChange={handleFileInputChange}
+          className="hidden"
+        />
+        {videoUploadSwitch}
+        {enableVideoUpload && (
+          <Button kind="primary" onClick={onUploadClick ?? handleUploadClick} disabled={isDialogOpen} className="w-full">
+            + Upload Video
+          </Button>
+        )}
+        {enableAddRtspButton && (
+          <Button kind="secondary" onClick={onAddRtspClick} disabled={isDialogOpen} className="w-full">
+            + Add RTSP
+          </Button>
+        )}
+        <div className="flex flex-col gap-2">
+          <TextInput
+            data-testid="search-video-input"
+            value={searchQuery}
+            onValueChange={(val: string) => onSearchChange(val)}
+            onKeyDown={handleSearchKeyDown}
+            placeholder="Search Files"
+            dismissible
+          />
+          <Button data-testid="search-video-button" kind="secondary" onClick={onSearch} className="w-full">
+            Search
+          </Button>
+        </div>
+        {showDisplayFilter && (
+          <fieldset className="flex flex-col gap-1 rounded-lg border border-gray-200 dark:border-gray-700 p-3 m-0 min-w-0">
+            <legend className="px-1 text-sm font-semibold text-gray-800 dark:text-gray-100">Display</legend>
+            {displayCheckboxes}
+          </fieldset>
+        )}
+        {deleteButton}
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-w-0 max-w-full overflow-x-auto overflow-y-clip border-b border-gray-200 dark:border-gray-800">
+      {/* One wrapping flex row — no flex-1 + justify-end strip */}
+      <div className="flex w-full min-w-0 flex-wrap items-center gap-x-3 gap-y-2 px-6 pt-6 pb-4">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".mp4,.mkv"
+          onChange={handleFileInputChange}
+          className="hidden"
+        />
+
+        {videoUploadSwitch}
+        {enableVideoUpload && (
+          <Button kind="primary" onClick={onUploadClick ?? handleUploadClick} disabled={isDialogOpen}>
+            + Upload Video
+          </Button>
+        )}
+        {enableAddRtspButton && (
+          <Button kind="secondary" onClick={onAddRtspClick} disabled={isDialogOpen}>
+            + Add RTSP
+          </Button>
+        )}
+
+        <div className="flex min-w-0 max-w-full items-center gap-2">
+          <div className="min-w-0 w-[min(100%,14rem)] max-w-sm sm:w-56">
+            <TextInput
+              data-testid="search-video-input"
+              value={searchQuery}
+              onValueChange={(val: string) => onSearchChange(val)}
+              onKeyDown={handleSearchKeyDown}
+              placeholder="Search Files"
+              dismissible
+            />
+          </div>
+          <Button
+            data-testid="search-video-button"
+            kind="secondary"
+            onClick={onSearch}
+            className="shrink-0"
+          >
+            Search
+          </Button>
+        </div>
+
+        {showDisplayFilter && (
+          <div className="relative flex shrink-0 flex-wrap items-center gap-2">
+            <label htmlFor="display-filter-toggle" className="text-sm font-medium text-gray-700 dark:text-gray-300">
+              Display:
+            </label>
+            <div className="relative" ref={filterTriggerRef}>
+              <Button
+                kind="tertiary"
+                id="display-filter-toggle"
+                onClick={() => setIsFilterDropdownOpen(!isFilterDropdownOpen)}
+                aria-expanded={isFilterDropdownOpen}
+                aria-haspopup="true"
+                aria-label={`Display file type: ${getFilterLabel()}`}
+                className="flex items-center gap-2 pr-3" // Add `gap` for spacing between text and chevron, `pr-7` for chevron padding
+              >
+                <span className="truncate">{getFilterLabel()}</span>
+                <span className="ml-2" /> {/* Ensures space after the text */}
+                <svg
+                  className={`absolute right-2 w-4 h-4 transition-transform ${isFilterDropdownOpen ? 'rotate-180' : ''}`}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#76b900"
+                  strokeWidth="2"
+                  aria-hidden
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </Button>
+
+              {isFilterDropdownOpen &&
+                filterMenuPosition &&
+                typeof document !== 'undefined' &&
+                createPortal(
+                  <div
+                    ref={filterMenuRef}
+                    role="group"
+                    aria-label="Display file type"
+                    className="w-40 rounded-md border shadow-lg py-1 bg-white dark:bg-black border-gray-200 dark:border-gray-600"
+                    style={{
+                      position: 'fixed',
+                      top: filterMenuPosition.top,
+                      left: filterMenuPosition.left,
+                      zIndex: DISPLAY_FILTER_MENU_Z_INDEX,
+                    }}
+                  >
+                    {displayCheckboxes}
+                  </div>,
+                  document.body
+                )}
+            </div>
+          </div>
+        )}
+
+        {deleteButton}
+      </div>
+    </div>
+  );
+};

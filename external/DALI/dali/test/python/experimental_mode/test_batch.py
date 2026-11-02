@@ -1,0 +1,698 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import numpy as np
+import nvidia.dali as dali
+import nvidia.dali.backend as _b
+import nvidia.dali.experimental.dynamic as ndd
+import test_tensor
+from ndd_utils import eval_modes
+from nose2.tools import params
+from nose_utils import SkipTest, assert_raises, attr
+
+
+def asnumpy(batch_or_tensor):
+    if isinstance(batch_or_tensor, ndd.Batch):
+        return [test_tensor.asnumpy(t) for t in batch_or_tensor.tensors]
+    else:
+        return test_tensor.asnumpy(batch_or_tensor)
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_construction(device_type):
+    t0 = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32)
+    t1 = np.array([[7, 8, 9], [10, 11, 12]], dtype=np.int32)
+
+    b = ndd.batch(
+        [
+            t0,
+            t1,
+        ],
+        device=ndd.Device(device_type),
+        layout="AB",
+    )
+
+    assert isinstance(b, ndd.Batch)
+    assert b.device.device_type == device_type
+    assert b.layout == "AB"
+    assert np.array_equal(asnumpy(b.tensors[0]), t0)
+    assert np.array_equal(asnumpy(b.tensors[1]), t1)
+    # check that modifying the original arrays doesn't affect the batch
+    t0[0, 0] += 1
+    t1[0, 0] += 1
+    assert not np.array_equal(asnumpy(b.tensors[0]), t0)
+    assert not np.array_equal(asnumpy(b.tensors[1]), t1)
+
+    b.evaluate()
+    assert b._storage.layout() == "AB"
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_from_empty_list(device_type):
+    with assert_raises(ValueError, glob="Element type"):
+        ndd.batch([], device=device_type)
+    b = ndd.batch([], dtype=ndd.int32, device=device_type)
+    assert isinstance(b, ndd.Batch)
+    assert b.dtype == ndd.int32
+    assert b.shape == []
+    assert b.ndim == 0
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_tensor_as_batch(device_type: str):
+    tensor = ndd.ones(shape=(2, 5, 5), dtype=ndd.float32).to_device(device_type)
+    ref_sample = tensor[0].cpu()
+    batch1 = ndd.as_batch(tensor)
+    batch2 = ndd.batch(tensor)
+
+    for batch in (batch1, batch2):
+        assert batch.batch_size == 2
+        assert batch.dtype == ref_sample.dtype
+        assert batch.shape == batch.batch_size * [ref_sample.shape]
+        for sample in batch:
+            assert np.array_equal(sample.cpu(), ref_sample)
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_as_batch(device_type):
+    t0 = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32)
+    t1 = np.array([[7, 8, 9], [10, 11, 12]], dtype=np.int32)
+
+    b0 = ndd.batch(
+        [
+            t0,
+            t1,
+        ],
+        device=ndd.Device(device_type),
+        layout="AB",
+    )
+
+    b1 = ndd.batch(b0)
+    b2 = ndd.as_batch(b0)
+    assert b1.dtype == b0.dtype
+    assert b1.shape == b0.shape
+    assert b1.layout == b0.layout
+    assert b2.dtype == b0.dtype
+    assert b2.shape == b0.shape
+    assert b2.layout == b0.layout
+
+    assert not b1.tensors[0]._is_same_tensor(b0.tensors[0])
+    assert b2.tensors[0]._is_same_tensor(b0.tensors[0])
+
+    b3 = ndd.as_batch(b0, dtype=ndd.float32)
+    assert b3.dtype == ndd.float32
+    assert b3.shape == b0.shape
+    assert b3.layout == b0.layout
+
+
+@eval_modes()
+def test_broadcast():
+    a = np.array([1, 2, 3])
+    b = ndd.Batch.broadcast(a, 5).evaluate()
+    for i, t in enumerate(b._storage):
+        assert np.array_equal(np.array(t), a)
+
+
+@eval_modes()
+@params(((1 << 31) - 1, ndd.int32), (1 << 31, ndd.uint32))
+def test_broadcast_int_dtype(value, dtype):
+    batch = ndd.Batch.broadcast(value, 5)
+    assert batch.dtype == dtype
+    assert all(sample.item() == value for sample in batch.tensors)
+
+
+@eval_modes()
+@params((1 << 32, 1 << 32), ([0, 5_000_000_000], 5_000_000_000))
+def test_broadcast_int_overflow(data, faulty_value):
+    with assert_raises(OverflowError, glob=f"*{faulty_value}*out of range for uint32*"):
+        ndd.Batch.broadcast(data, 5)
+
+
+def batch_equal(a, b):
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if not np.array_equal(x, y):
+            return False
+    return True
+
+
+@eval_modes()
+@attr("pytorch")
+@params(("cpu",), ("cuda",))
+def test_batch_construction_with_torch_tensor(device_type):
+    import torch
+
+    data = torch.tensor([[1, 2, 3], [4, 5, 6]], device=device_type, dtype=torch.int32)
+    b = ndd.as_batch(data)
+    assert b.device == ndd.Device("gpu" if device_type == "cuda" else device_type)
+    assert b.dtype == ndd.int32
+    assert b.batch_size == 2
+    assert b.ndim == 1
+    assert b.shape == [(3,), (3,)]
+    assert b.layout is None
+    ref = torch.from_dlpack(ndd.as_tensor(b).evaluate()._storage)
+    assert torch.equal(data[0], ref[0])
+    assert torch.equal(data[1], ref[1])
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_construction_from_list_of_dali_tensors(device_type):
+    """Batch from a list of evaluated ndd.Tensor objects preserves device, dtype, layout, shape,
+    and values."""
+    data = [
+        ndd.tensor(np.array([i, i + 1, i + 2], dtype=np.int32), device=device_type, layout="X")
+        for i in range(4)
+    ]
+    b = ndd.as_batch(data)
+    b.evaluate()
+    assert b.device == ndd.Device(device_type)
+    assert b.dtype == ndd.int32
+    assert b.layout == "X"
+    assert b.batch_size == 4
+    assert b.ndim == 1
+    assert b.shape == [(3,)] * 4
+    for i, t in enumerate(b.tensors):
+        expected = np.array([i, i + 1, i + 2], dtype=np.int32)
+        assert np.array_equal(asnumpy(t), expected)
+
+
+@eval_modes(ndd.EvalMode.deferred, ndd.EvalMode.eager)
+@params(("cpu",), ("gpu",))
+def test_as_batch_does_not_eagerly_create_storage(device_type):
+    # as_batch over a list of evaluated ndd.Tensors must not eagerly allocate a TensorList:
+    # the per-sample Tensor objects can still be retrieved via .tensors and the backing
+    # storage is materialised lazily only when required. Each per-sample Tensor must also
+    # share its underlying storage with the corresponding input tensor (no copy).
+    # The sync_* eval modes are excluded because they explicitly evaluate the Batch at the
+    # end of construction.
+    data = [
+        ndd.tensor(np.array([i, i + 1, i + 2], dtype=np.int32), device=device_type, layout="X")
+        for i in range(4)
+    ]
+    for t in data:
+        t.evaluate()
+    b = ndd.as_batch(data)
+    assert b._storage is None
+    extracted = [b.tensors[i] for i in range(4)]
+    assert b._storage is None
+    for i, t in enumerate(extracted):
+        assert t._storage is data[i]._storage
+        assert np.array_equal(asnumpy(t), np.array([i, i + 1, i + 2], dtype=np.int32))
+
+
+@eval_modes()
+@attr("pytorch")
+def test_batch_construction_from_list_of_torch_gpu_tensors():
+    """Fast path: list of PyTorch GPU tensors goes through C++ TensorListGPU bulk constructor."""
+    import torch
+
+    data = [torch.tensor([i, i + 1, i + 2], device="cuda", dtype=torch.int32) for i in range(4)]
+    b = ndd.as_batch(data)
+    b.evaluate()
+    assert b.device == ndd.Device("gpu")
+    assert b.dtype == ndd.int32
+    assert b.batch_size == 4
+    assert b.ndim == 1
+    assert b.shape == [(3,)] * 4
+    for i, t in enumerate(b.tensors):
+        expected = torch.tensor([i, i + 1, i + 2], dtype=torch.int32)
+        assert torch.equal(torch.from_dlpack(t.evaluate()._storage).cpu(), expected)
+
+
+@eval_modes()
+@attr("pytorch")
+def test_batch_construction_from_list_of_torch_gpu_tensors_with_layout():
+    """Fast path: layout parameter is forwarded correctly to the bulk constructor."""
+    import torch
+
+    data = [torch.ones(3, 4, dtype=torch.float32, device="cuda") * i for i in range(3)]
+    b = ndd.as_batch(data, layout="HW")
+    b.evaluate()
+    assert b.layout == "HW"
+    assert b.batch_size == 3
+    assert b.shape == [(3, 4)] * 3
+    for i, t in enumerate(b.tensors):
+        expected = np.ones((3, 4), dtype=np.float32) * i
+        assert np.array_equal(asnumpy(t), expected)
+
+
+@eval_modes()
+@attr("pytorch")
+def test_batch_construction_from_list_of_torch_gpu_tensors_dtype_fallback():
+    """When dtype is specified the fast path is skipped; slow path handles type conversion."""
+    import torch
+
+    data = [torch.tensor([1, 2, 3], device="cuda", dtype=torch.int32)]
+    b = ndd.as_batch(data, dtype=ndd.float32)
+    b.evaluate()
+    assert b.dtype == ndd.float32
+    assert b.batch_size == 1
+    assert np.array_equal(asnumpy(b.tensors[0]), np.array([1, 2, 3], dtype=np.float32))
+
+
+@eval_modes()
+@attr("pytorch")
+def test_batch_construction_from_list_of_torch_cpu_tensors():
+    """CPU torch tensors trigger the CPU DLPack fast path via TensorListCPU.from_dlpack_list."""
+    import torch
+
+    data = [torch.tensor([i, i + 1, i + 2], dtype=torch.int32) for i in range(3)]
+    b = ndd.as_batch(data)
+    b.evaluate()
+    assert b.device == ndd.Device("cpu")
+    assert b.dtype == ndd.int32
+    assert b.batch_size == 3
+    assert b.shape == [(3,)] * 3
+    for i, t in enumerate(b.tensors):
+        expected = np.array([i, i + 1, i + 2], dtype=np.int32)
+        assert np.array_equal(asnumpy(t), expected)
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_construction_with_tensor(device_type):
+    t = ndd.tensor(np.array([1, 2, 3], dtype=np.uint8), device=device_type, layout="X")
+    b = ndd.Batch([t])
+    assert b.device == ndd.Device(device_type)
+    assert b.dtype == ndd.uint8
+    assert b.layout == "X"
+    assert b.batch_size == 1
+    assert b.ndim == 1
+    assert b.shape == [(3,)]
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_construction_with_conversion(device_type):
+    data = [np.float64([1]), np.float64([1.25, 2.2, 0x1000001])]
+    data_i32 = [np.int32([1]), np.int32([1, 2, 0x1000001])]
+    data_fp32 = [np.float32([1]), np.float32([1.25, 2.2, 0x1000000])]
+    # loss of precision --------------------------^
+    orig = ndd.Batch(data, device=device_type).evaluate()
+    # convert from a list of tensors
+    i32 = ndd.Batch(data, device=device_type, dtype=ndd.int32).evaluate()
+    # convert from a TensorList object
+    fp32 = ndd.Batch(orig._storage, device=device_type, dtype=ndd.float32)
+    fp32.evaluate()
+    assert orig.dtype == ndd.float64
+    assert orig.device == ndd.Device(device_type)
+    assert orig._storage.dtype == ndd.float64.type_id
+    assert i32.dtype == ndd.int32
+    assert i32.device == ndd.Device(device_type)
+    assert i32._storage.dtype == ndd.int32.type_id
+    assert fp32.dtype == ndd.float32
+    assert fp32.device == ndd.Device(device_type)
+    assert fp32._storage.dtype == ndd.float32.type_id
+    assert batch_equal(data, asnumpy(orig))
+    assert batch_equal(data_i32, asnumpy(i32))
+    assert batch_equal(data_fp32, asnumpy(fp32))
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_properties_clone(device_type):
+    t = ndd.tensor(np.array([1, 2, 3], dtype=np.uint8))
+    src = ndd.Batch([t], device=device_type, layout="X")
+    b = ndd.batch(src)
+    assert b.device == ndd.Device(device_type)
+    assert b.dtype == ndd.uint8
+    assert b.layout == "X"
+    assert b.batch_size == 1
+    assert b.ndim == 1
+    assert b.shape == [(3,)]
+
+
+@eval_modes()
+def test_batch_subscript_broadcast():
+    b = ndd.as_batch(
+        [
+            ndd.tensor([[1, 2, 3], [4, 5, 6]], dtype=ndd.int32),
+            ndd.tensor([[7, 8, 9], [10, 11, 12]], dtype=ndd.int32),
+        ],
+        layout="XY",
+    )
+    b11 = b.slice[1, 1]
+    assert b11.layout is None
+    assert b11.dtype == ndd.int32
+    assert isinstance(b11, ndd.Batch)
+    assert asnumpy(b11.tensors[0]) == 5
+    assert asnumpy(b11.tensors[1]) == 11
+
+
+@eval_modes()
+def test_batch_partial_slice():
+    b = ndd.as_batch(
+        [
+            ndd.tensor([[1, 2, 3], [4, 5, 6]], dtype=ndd.int32),
+            ndd.tensor([[7, 8, 9], [10, 11, 12]], dtype=ndd.int32),
+        ],
+        layout="XY",
+    )
+    b11 = b.slice[..., 1]
+    assert b11.layout == "X"
+    assert b11.dtype == ndd.int32
+    assert isinstance(b11, ndd.Batch)
+    assert np.array_equal(asnumpy(b11.tensors[0]), np.array([2, 5], dtype=np.int32))
+    assert np.array_equal(asnumpy(b11.tensors[1]), np.array([8, 11], dtype=np.int32))
+
+
+@eval_modes()
+def test_batch_slice():
+    b = ndd.as_batch(
+        [
+            ndd.tensor([[1, 2, 3], [4, 5, 6]], dtype=ndd.uint16),
+            ndd.tensor([[7, 8, 9, 10], [11, 12, 13, 14]], dtype=ndd.uint16),
+        ],
+        layout="XY",
+    )
+    sliced = b.slice[..., 1:-1]
+    assert sliced.layout == "XY"
+    assert sliced.dtype == ndd.uint16
+    assert np.array_equal(asnumpy(sliced.tensors[0]), np.array([[2], [5]], dtype=np.uint16))
+    assert np.array_equal(asnumpy(sliced.tensors[1]), np.array([[8, 9], [12, 13]], dtype=np.uint16))
+
+
+@eval_modes()
+def test_batch_subscript_per_sample():
+    b = ndd.as_batch(
+        [
+            ndd.tensor([[1, 2, 3], [4, 5, 6]], dtype=ndd.int32),
+            ndd.tensor([[7, 8, 9, 10], [11, 12, 13, 14]], dtype=ndd.int32),
+        ]
+    )
+    # unzipped indices (1, 1), (0, 2)
+    i = ndd.as_batch([1, 0])
+    j = ndd.as_batch([1, 2])
+    b11 = b.slice[i, j]
+    assert isinstance(b11, ndd.Batch)
+    assert asnumpy(b11.tensors[0]) == 5
+    assert asnumpy(b11.tensors[1]) == 9
+
+
+def _sample_values(tensors):
+    return [int(asnumpy(t)) for t in tensors]
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_tensors_selection(device_type):
+    b = ndd.as_batch([10, 11, 12, 13, 14], dtype=ndd.int32, device=device_type)
+    assert _sample_values(b.tensors) == [10, 11, 12, 13, 14]
+
+    sub = b.tensors[1:3]
+    assert len(sub) == 2
+    assert _sample_values(sub) == [11, 12]
+    assert _sample_values(sub.tolist()) == [11, 12]
+    assert int(asnumpy(sub[0])) == 11
+    assert int(asnumpy(sub[-1])) == 12
+    assert _sample_values(sub[[1, 0]]) == [12, 11]
+    assert _sample_values(sub.as_batch()) == [11, 12]
+
+    assert _sample_values(b.tensors[[2, 0]]) == [12, 10]
+    assert len(b.tensors[3:3]) == 0
+    assert len(b.tensors[10:]) == 0
+    assert len(b.tensors[[]]) == 0
+    for copy in (False, True):
+        empty = b.tensors[3:3].as_batch(copy=copy)
+        assert empty.batch_size == 0
+        assert empty.dtype == ndd.int32
+        assert empty.device.device_type == device_type
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_select(device_type):
+    b = ndd.as_batch([10, 11, 12, 13, 14], dtype=ndd.int32, device=device_type)
+    assert int(asnumpy(b.select(2))) == 12
+
+    s = b.select(slice(1, 3))
+    assert isinstance(s, ndd.Batch)
+    assert s.batch_size == 2
+    assert _sample_values(s) == [11, 12]
+
+    s = b.select([4, 0])
+    assert s.batch_size == 2
+    assert _sample_values(s) == [14, 10]
+
+    empty = b.select(slice(3, 3))
+    assert empty.batch_size == 0
+    assert empty.dtype == ndd.int32
+    assert empty.device.device_type == device_type
+
+
+@eval_modes()
+def test_batch_to_gpu():
+    input = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32)
+    t_cpu = ndd.tensor(input)
+    t_gpu = t_cpu.gpu()
+    assert t_gpu.device == ndd.Device("gpu")
+    b_gpu = ndd.Batch([t_gpu])
+    b_gpu.evaluate()
+    assert b_gpu.device == ndd.Device("gpu")
+    assert b_gpu.dtype == ndd.int32
+    assert b_gpu.batch_size == 1
+    assert b_gpu.ndim == 2
+    assert b_gpu.shape == [(2, 3)]
+    assert np.array_equal(asnumpy(b_gpu.tensors[0]), input)
+
+
+@eval_modes()
+@attr("multi_gpu")
+def test_cross_device_copy():
+    if _b.GetCUDADeviceCount() < 2:
+        raise SkipTest("At least 2 devices needed for the test")
+    c0 = ndd.as_batch(
+        [
+            ndd.tensor([[1, 2, 3], [4, 5, 6]], dtype=ndd.int32),
+            ndd.tensor([[7, 8, 9, 10], [11, 12, 13, 14]], dtype=ndd.int32),
+        ]
+    )
+    g0 = c0.to_device("gpu:0")
+    g1 = g0.to_device("gpu:1")
+    c1 = g1.cpu()
+    assert batch_equal(asnumpy(c0), asnumpy(c1))
+    g0 = g1.to_device("gpu:0")
+    c0 = g0.cpu()
+    assert batch_equal(asnumpy(c0), asnumpy(c1))
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_from_enum_auto(device_type):
+    for value, type in [
+        (dali.types.INTERP_CUBIC, ndd.InterpType),
+        (dali.types.YCbCr, ndd.ImageType),
+        (dali.types.INT32, ndd.DataType),
+    ]:
+        t = ndd.Batch([value, value], device=device_type)
+        assert t.dtype == type
+        as_int = ndd.batch(t, dtype=ndd.int32, device="cpu")
+        assert as_int.tensors[0].item() == int(value)
+        assert as_int.tensors[1].item() == int(value)
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_from_enum_with_dtype(device_type):
+    for value, type in [
+        (dali.types.INTERP_CUBIC, ndd.InterpType),
+        (dali.types.YCbCr, ndd.ImageType),
+        (dali.types.INT32, ndd.DataType),
+    ]:
+        t = ndd.Batch([value, value], device=device_type, dtype=type)
+        assert t.dtype == type
+        as_int = ndd.batch(t, dtype=ndd.int32, device="cpu")
+        assert as_int.tensors[0].item() == int(value)
+        assert as_int.tensors[1].item() == int(value)
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_from_enum_value_and_dtype(device_type):
+    for value, type in [
+        (dali.types.INTERP_CUBIC, ndd.InterpType),
+        (dali.types.YCbCr, ndd.ImageType),
+        (dali.types.INT32, ndd.DataType),
+    ]:
+        t = ndd.Batch([int(value), int(value)], device=device_type, dtype=type)
+        assert t.dtype == type
+        as_int = ndd.batch(t, dtype=ndd.int32, device="cpu")
+        assert as_int.tensors[0].item() == int(value)
+        assert as_int.tensors[1].item() == int(value)
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_from_tensor_and_layout(device_type):
+    x = np.zeros((4, 100, 100, 3), dtype=np.uint8)
+    b = ndd.batch(x, layout="HWC", device=device_type)
+    assert b.layout == "HWC"
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_construction_from_list_of_dali_tensors_matching_dtype(device_type):
+    """An explicit dtype that matches the input ndd.Tensor dtype is accepted without conversion."""
+    data = [
+        ndd.tensor(np.array([i, i + 1, i + 2], dtype=np.int32), device=device_type)
+        for i in range(3)
+    ]
+    b = ndd.as_batch(data, dtype=ndd.int32)
+    b.evaluate()
+    assert b.dtype == ndd.int32
+    assert b.device == ndd.Device(device_type)
+    assert b.batch_size == 3
+    for i, t in enumerate(b.tensors):
+        assert np.array_equal(asnumpy(t), np.array([i, i + 1, i + 2], dtype=np.int32))
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_batch_construction_from_list_of_dali_tensors_dtype_mismatch(device_type):
+    """An explicit dtype that differs from the input ndd.Tensor dtype triggers type conversion."""
+    data = [
+        ndd.tensor(np.array([i, i + 1, i + 2], dtype=np.int32), device=device_type)
+        for i in range(3)
+    ]
+    b = ndd.as_batch(data, dtype=ndd.float32)
+    b.evaluate()
+    assert b.dtype == ndd.float32
+    assert b.device == ndd.Device(device_type)
+    assert b.batch_size == 3
+    for i, t in enumerate(b.tensors):
+        assert np.array_equal(asnumpy(t), np.array([i, i + 1, i + 2], dtype=np.float32))
+
+
+@eval_modes()
+@attr("pytorch")
+def test_batch_construction_gpu_dlpack_type_error_fallback():
+    """GPU DLPack TypeError (protocol mismatch) is caught; batch falls back to slow path via
+    __cuda_array_interface__. BufferError is intentionally not caught on GPU."""
+    import torch
+
+    class _TypeErrorDlpack:
+        def __init__(self, t):
+            self._t = t
+
+        @property
+        def __cuda_array_interface__(self):
+            return self._t.__cuda_array_interface__
+
+        def __dlpack__(self, **kwargs):
+            raise TypeError("DLPack stream keyword not supported")
+
+        def __dlpack_device__(self):
+            return (2, self._t.device.index)  # kDLCUDA
+
+    data = [
+        _TypeErrorDlpack(torch.tensor([i, i + 1, i + 2], device="cuda", dtype=torch.int32))
+        for i in range(3)
+    ]
+    b = ndd.as_batch(data)
+    b.evaluate()
+    assert b.device == ndd.Device("gpu")
+    assert b.dtype == ndd.int32
+    assert b.batch_size == 3
+    for i, t in enumerate(b.tensors):
+        assert np.array_equal(asnumpy(t), np.array([i, i + 1, i + 2], dtype=np.int32))
+
+
+@eval_modes()
+@attr("multi_gpu")
+@attr("cupy")
+def test_batch_construction_mixed_gpu_dlpack_value_error_fallback():
+    """from_dlpack_list raises ValueError for mixed-device tensors; batch falls back to slow
+    path."""
+    if _b.GetCUDADeviceCount() < 2:
+        raise SkipTest("At least 2 devices needed for the test")
+    import cupy as cp
+
+    with cp.cuda.Device(0):
+        t0 = cp.array([1, 2, 3], dtype=cp.int32)
+    with cp.cuda.Device(1):
+        t1 = cp.array([4, 5, 6], dtype=cp.int32)
+    data = [t0, t1]
+    b = ndd.as_batch(data)
+    b.evaluate()
+    assert b.device.device_type == "gpu"
+    assert b.device.device_id == 0  # slow path uses first tensor's device
+    assert b.dtype == ndd.int32
+    assert b.batch_size == 2
+    assert b.shape == [(3,), (3,)]
+    assert np.array_equal(asnumpy(b.tensors[0]), np.array([1, 2, 3], dtype=np.int32))
+    assert np.array_equal(asnumpy(b.tensors[1]), np.array([4, 5, 6], dtype=np.int32))
+
+
+@eval_modes()
+@attr("multi_gpu")
+def test_batch_construction_mixed_gpu_ndd_tensors():
+    """Batch from ndd.Tensors residing on different GPU devices uses the first tensor's device."""
+    if _b.GetCUDADeviceCount() < 2:
+        raise SkipTest("At least 2 devices needed for the test")
+
+    data = [
+        ndd.tensor(np.array([1, 2, 3], dtype=np.int32)).gpu(0).evaluate(),
+        ndd.tensor(np.array([4, 5, 6], dtype=np.int32)).gpu(1).evaluate(),
+    ]
+    b = ndd.as_batch(data)
+    b.evaluate()
+    assert b.device.device_type == "gpu"
+    assert b.device.device_id == 0  # slow path uses first tensor's device
+    assert b.dtype == ndd.int32
+    assert b.batch_size == 2
+    assert b.shape == [(3,), (3,)]
+    assert np.array_equal(asnumpy(b.tensors[0]), np.array([1, 2, 3], dtype=np.int32))
+    assert np.array_equal(asnumpy(b.tensors[1]), np.array([4, 5, 6], dtype=np.int32))
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_layout_change(device_type):
+    x = np.zeros((100, 100, 3), dtype=np.uint8)
+    a = ndd.batch([x] * 3, layout="HWC", device=device_type)
+    b = ndd.batch([x] * 3, device=device_type)
+    c = ndd.as_batch(a, layout="XYZ")
+    d = ndd.as_batch(b, layout="ABC")
+    e = ndd.batch(a, layout="XYZ")
+    f = ndd.batch(b, layout="ABC")
+    assert a.layout == "HWC"
+    assert b.layout is None
+    assert c.layout == "XYZ"
+    assert d.layout == "ABC"
+    assert c.device.device_type == device_type
+    assert d.device.device_type == device_type
+    assert e.layout == "XYZ"
+    assert f.layout == "ABC"
+    assert e.device.device_type == device_type
+    assert f.device.device_type == device_type
+
+
+@eval_modes()
+@params(("cpu",), ("gpu",))
+def test_bool_not_supported(device_type):
+    single = ndd.batch([1], device=device_type)
+    multi = ndd.batch([[1, 2], [3]], device=device_type)
+    lazy = single + 1
+    for b in (single, multi, lazy):
+        with assert_raises(TypeError, glob="*Batch cannot be converted to `bool`*"):
+            bool(b)
+        with assert_raises(TypeError, glob="*Batch cannot be converted to `bool`*"):
+            if b:
+                pass

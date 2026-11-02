@@ -1,0 +1,272 @@
+"""Validation and conversion at the public tracker boundary."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from boxmot.structures import Frame
+
+
+def resolve_sample_id(*sample_ids: str | None, frame_index: int) -> str:
+    """Resolve validated input identities, falling back to a sequence-local index."""
+    supplied = [sample_id for sample_id in sample_ids if sample_id is not None]
+    if supplied and any(sample_id != supplied[0] for sample_id in supplied[1:]):
+        raise ValueError(f"Frame and detections must identify the same sample, got {supplied!r}.")
+    return supplied[0] if supplied else f"tracker:{frame_index}"
+
+
+def prepare_frame(frame: Frame | np.ndarray | None) -> Frame | np.ndarray | None:
+    """Validate a canonical frame or normalize a uint8 HWC BGR image's strides."""
+
+    if frame is None:
+        return None
+    if isinstance(frame, Frame):
+        frame.validate()
+        return frame
+    if type(frame) is not np.ndarray:
+        raise TypeError(f"frame must be Frame, a plain numpy.ndarray, or None, got {type(frame).__name__}.")
+    if frame.dtype != np.uint8:
+        raise TypeError(f"NumPy frame must use uint8 pixels, got {frame.dtype}.")
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError(f"NumPy frame must have shape [H, W, 3] in BGR order, got {frame.shape}.")
+    if frame.shape[0] <= 0 or frame.shape[1] <= 0:
+        raise ValueError(f"NumPy frame height and width must be positive, got {frame.shape[:2]}.")
+    return np.ascontiguousarray(frame)
+
+
+def frame_image_size(frame: Frame | np.ndarray) -> tuple[int, int]:
+    """Return the height and width of a validated tracker image."""
+
+    return frame.image_size if isinstance(frame, Frame) else (int(frame.shape[0]), int(frame.shape[1]))
+
+
+@dataclass(frozen=True, slots=True)
+class NumPyDetectionRows:
+    """Validated arrays split from one packed detection row matrix."""
+
+    geometry: np.ndarray
+    scores: np.ndarray
+    class_ids: np.ndarray
+
+    def __len__(self) -> int:
+        return int(self.scores.shape[0])
+
+
+def parse_numpy_detection_rows(detections: np.ndarray, *, is_obb: bool) -> NumPyDetectionRows:
+    """Validate and split packed AABB6 or OBB7 rows for a configured tracker."""
+
+    if type(detections) is not np.ndarray:
+        raise TypeError(f"detections must be Detections or a plain numpy.ndarray, got {type(detections).__name__}.")
+
+    rows = _parse_numpy_detection_rows(
+        detections, geometry_columns=5 if is_obb else 4, geometry_name="OBB" if is_obb else "AABB"
+    )
+    geometry = rows.geometry
+    if len(geometry):
+        if is_obb and np.any(geometry[:, 2:4] <= 0):
+            raise ValueError("OBB detection rows must have positive width and height.")
+        if not is_obb and (np.any(geometry[:, 2] <= geometry[:, 0]) or np.any(geometry[:, 3] <= geometry[:, 1])):
+            raise ValueError("AABB detection rows must satisfy x2 > x1 and y2 > y1.")
+    return rows
+
+
+def parse_numpy_detection_rows_3d(detections: np.ndarray) -> NumPyDetectionRows:
+    """Validate camera-space ``x,y,z,yaw,length,width,height,conf,cls`` rows."""
+    if type(detections) is not np.ndarray:
+        raise TypeError(
+            f"detections_3d must be Detections3D or a plain numpy.ndarray, got {type(detections).__name__}."
+        )
+    rows = _parse_numpy_detection_rows(
+        detections,
+        geometry_columns=7,
+        geometry_name="3D",
+        canonical_input="canonical Detections and Detections3D inputs",
+    )
+    if len(rows.geometry) and np.any(rows.geometry[:, 4:] <= 0):
+        raise ValueError("3D detection rows must have positive length, width, and height.")
+    return rows
+
+
+def _parse_numpy_detection_rows(
+    detections: np.ndarray,
+    *,
+    geometry_columns: int,
+    geometry_name: str,
+    canonical_input: str = "Detections input for Tracks",
+) -> NumPyDetectionRows:
+    """Validate shared packed numeric rows before geometry-specific checks."""
+    expected_columns = geometry_columns + 2
+    if detections.ndim != 2 or detections.shape[1] != expected_columns:
+        raise ValueError(
+            f"{geometry_name} detection rows must have shape [N, {expected_columns}], got {detections.shape}."
+        )
+    if not (np.issubdtype(detections.dtype, np.integer) or np.issubdtype(detections.dtype, np.floating)):
+        raise TypeError(f"Detection rows must use a real numeric dtype, got {detections.dtype}.")
+    if detections.size and not np.isfinite(detections).all():
+        raise ValueError("Detection rows must contain only finite values.")
+    raw_scores = detections[:, geometry_columns]
+    if raw_scores.size and (np.any(raw_scores < 0) or np.any(raw_scores > 1)):
+        raise ValueError("Detection scores must be in the inclusive range [0, 1].")
+
+    max_exact_float64_integer = 2**53
+    class_values = detections[:, -1]
+    # Array validation pays off on larger batches; scalar checks avoid several
+    # temporary arrays for sparse frames, which commonly have only a few rows.
+    if class_values.size < 32:
+        max_int64 = np.iinfo(np.int64).max
+        for value in class_values.tolist():
+            class_id = int(value)
+            if class_id != value or class_id < 0 or class_id > max_int64:
+                raise ValueError("Detection class IDs must be non-negative integers.")
+            if class_id > max_exact_float64_integer:
+                raise ValueError(
+                    "Detection class IDs must be within the exact float64 integer range; "
+                    f"use {canonical_input}."
+                )
+    else:
+        invalid = class_values < 0
+        if np.issubdtype(class_values.dtype, np.floating):
+            invalid |= class_values != np.floor(class_values)
+            # The exclusive power-of-two bound is exactly representable, unlike
+            # int64.max when compared in float64. Strong float64 scalars also keep
+            # finite float16 inputs from overflowing during threshold conversion.
+            invalid |= class_values >= np.float64(2**63)
+            outside_exact_range = class_values > np.float64(max_exact_float64_integer)
+        else:
+            if np.issubdtype(class_values.dtype, np.unsignedinteger):
+                invalid |= class_values > np.uint64(np.iinfo(np.int64).max)
+            outside_exact_range = class_values > max_exact_float64_integer
+        rejected = invalid | outside_exact_range
+        if rejected.any():
+            # Preserve the scalar validator's first offending row and its error,
+            # even when later rows fail a different part of the class-ID contract.
+            first_rejected = int(rejected.argmax())
+            if invalid[first_rejected]:
+                raise ValueError("Detection class IDs must be non-negative integers.")
+            raise ValueError(
+                f"Detection class IDs must be within the exact float64 integer range; use {canonical_input}."
+            )
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        geometry = np.ascontiguousarray(detections[:, :geometry_columns], dtype=np.float32)
+        scores = np.ascontiguousarray(detections[:, geometry_columns], dtype=np.float32)
+    if geometry.size and not np.isfinite(geometry).all():
+        raise ValueError("Detection geometry must be representable as finite float32 values.")
+    if scores.size and not np.isfinite(scores).all():
+        raise ValueError("Detection scores must be representable as finite float32 values.")
+    return NumPyDetectionRows(
+        geometry=geometry,
+        scores=scores,
+        class_ids=np.array(class_values, dtype=np.int64, copy=True, order="C"),
+    )
+
+
+def pack_numpy_track_rows(
+    *,
+    geometry: np.ndarray,
+    track_ids: np.ndarray,
+    scores: np.ndarray,
+    class_ids: np.ndarray,
+    detection_indices: np.ndarray,
+    is_obb: bool,
+    detection_count: int,
+    owner: str,
+) -> np.ndarray:
+    """Validate split tracker output and pack float64 AABB8 or OBB9 rows."""
+
+    geometry_columns = 5 if is_obb else 4
+    geometry_name = "OBB" if is_obb else "AABB"
+    geometry_values = np.asarray(geometry)
+    if geometry_values.ndim != 2 or geometry_values.shape[1] != geometry_columns:
+        raise ValueError(
+            f"{owner} returned {geometry_name} geometry with shape {geometry_values.shape}; "
+            f"expected [M, {geometry_columns}]."
+        )
+    with np.errstate(over="ignore", invalid="ignore"):
+        # These columns are only read before final float64 packing, so strided
+        # float32 views need no intermediate contiguous allocation. Keep the
+        # existing scalar-score coercion of ascontiguousarray explicit.
+        geometry_values = np.asarray(geometry_values, dtype=np.float32)
+        score_values = np.atleast_1d(np.asarray(scores, dtype=np.float32))
+    if geometry_values.size and not np.isfinite(geometry_values).all():
+        raise ValueError(f"{owner} returned non-finite track geometry.")
+    if len(geometry_values):
+        if is_obb and np.any(geometry_values[:, 2:4] <= 0):
+            raise ValueError(f"{owner} returned OBB tracks without positive width and height.")
+        if not is_obb and (
+            np.any(geometry_values[:, 2] <= geometry_values[:, 0])
+            or np.any(geometry_values[:, 3] <= geometry_values[:, 1])
+        ):
+            raise ValueError(f"{owner} returned AABB tracks that do not satisfy x2 > x1 and y2 > y1.")
+
+    count = len(geometry_values)
+    if score_values.ndim != 1:
+        raise ValueError(f"{owner} returned scores with shape {score_values.shape}; expected [M].")
+    if len(score_values) != count:
+        raise ValueError(f"{owner} returned {len(score_values)} scores for {count} track rows.")
+    if score_values.size and not np.isfinite(score_values).all():
+        raise ValueError(f"{owner} returned non-finite track scores.")
+    if score_values.size and (np.any(score_values < 0) or np.any(score_values > 1)):
+        raise ValueError(f"{owner} returned track scores outside the inclusive range [0, 1].")
+
+    integer_columns: dict[str, np.ndarray] = {}
+    for name, values in (
+        ("track IDs", track_ids),
+        ("class IDs", class_ids),
+        ("detection indices", detection_indices),
+    ):
+        array = np.asarray(values)
+        if array.ndim != 1:
+            raise ValueError(f"{owner} returned {name} with shape {array.shape}; expected [M].")
+        if len(array) != count:
+            raise ValueError(f"{owner} returned {len(array)} {name} for {count} track rows.")
+        if array.dtype != np.dtype(np.int64):
+            if array.size and not np.isfinite(array).all():
+                raise ValueError(f"{owner} returned non-finite {name}.")
+            if array.size and not np.equal(array, np.floor(array)).all():
+                raise ValueError(f"{owner} returned non-integer {name}.")
+            if array.size and (np.any(array < np.iinfo(np.int64).min) or np.any(array > np.iinfo(np.int64).max)):
+                raise ValueError(f"{owner} returned {name} outside the int64 range.")
+        integer_columns[name] = np.asarray(array, dtype=np.int64)
+
+    track_id_values = integer_columns["track IDs"]
+    class_id_values = integer_columns["class IDs"]
+    detection_index_values = integer_columns["detection indices"]
+    if track_id_values.size and np.any(track_id_values < 0):
+        raise ValueError(f"{owner} returned negative track IDs.")
+    if track_id_values.size and len(np.unique(track_id_values)) != count:
+        raise ValueError(f"{owner} returned duplicate track IDs.")
+    if class_id_values.size and np.any(class_id_values < 0):
+        raise ValueError(f"{owner} returned negative class IDs.")
+    if detection_index_values.size and np.any(detection_index_values < -1):
+        raise ValueError(f"{owner} returned detection indices below -1.")
+    if detection_index_values.size and np.any(detection_index_values >= detection_count):
+        raise ValueError(f"{owner} returned a detection index outside the current batch.")
+
+    max_exact_float64_integer = 2**53
+    for name, values in integer_columns.items():
+        if values.size and (np.any(values < -max_exact_float64_integer) or np.any(values > max_exact_float64_integer)):
+            raise ValueError(
+                f"{owner} returned {name} outside the exact float64 integer range; use Detections input for Tracks."
+            )
+
+    rows = np.empty((count, geometry_columns + 4), dtype=np.float64)
+    rows[:, :geometry_columns] = geometry_values
+    rows[:, geometry_columns] = track_id_values
+    rows[:, geometry_columns + 1] = score_values
+    rows[:, geometry_columns + 2] = class_id_values
+    rows[:, geometry_columns + 3] = detection_index_values
+    return rows
+
+
+__all__ = (
+    "NumPyDetectionRows",
+    "frame_image_size",
+    "pack_numpy_track_rows",
+    "parse_numpy_detection_rows",
+    "parse_numpy_detection_rows_3d",
+    "prepare_frame",
+    "resolve_sample_id",
+)

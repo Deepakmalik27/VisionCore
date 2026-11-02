@@ -1,0 +1,414 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- $resources := deepCopy (.Values.resources | default dict) }}
+{{- $gpuResourceName := trim (.Values.gpuResourceName | default "") }}
+{{- if $gpuResourceName }}
+{{- $limits := $resources.limits | default dict }}
+{{- $requests := $resources.requests | default dict }}
+{{- $_ := unset $limits "nvidia.com/gpu" }}
+{{- $_ := unset $requests "nvidia.com/gpu" }}
+{{- $_ := set $limits $gpuResourceName 1 }}
+{{- $_ := set $requests $gpuResourceName 1 }}
+{{- $_ := set $resources "limits" $limits }}
+{{- $_ := set $resources "requests" $requests }}
+{{- end }}
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vss-rtvi-embed.fullname" . }}
+  labels:
+    {{- include "vss-rtvi-embed.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vss-rtvi-embed
+  {{- if or .Values.streamAffinity.enabled .Values.ingressTimeoutServer }}
+  annotations:
+  {{- if .Values.streamAffinity.enabled }}
+    # Stick-table stream affinity: the first request for a hashHeader value is
+    # balanced normally (controller default round-robin) and the chosen server
+    # is recorded in the table; every later request carrying the same value is
+    # routed to that server until the entry idles out. Requests without the
+    # header are balanced without sticking — no uuid fallback is needed (under
+    # the former hdr-hash balancing, header-less requests all hashed to one
+    # replica; under stick-tables they simply round-robin).
+    haproxy.org/backend-config-snippet: |
+      stick-table type string len 64 size {{ .Values.streamAffinity.tableSize }} expire {{ .Values.streamAffinity.tableExpire }}
+      stick on req.hdr({{ .Values.streamAffinity.hashHeader }}) if { req.hdr({{ .Values.streamAffinity.hashHeader }}) -m found }
+  {{- end }}
+  {{- with .Values.ingressTimeoutServer }}
+    # Server-side timeout for this backend. Set here rather than on the Ingress
+    # so a long embedding call does not raise the ceiling for every other route
+    # sharing the origin.
+    haproxy.org/timeout-server: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type | default "ClusterIP" }}
+  ports:
+    - name: http
+      port: {{ .Values.port }}
+      targetPort: {{ .Values.port }}
+      protocol: TCP
+  selector:
+    {{- include "vss-rtvi-embed.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: vss-rtvi-embed
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vss-rtvi-embed.fullname" . }}
+  labels:
+    {{- include "vss-rtvi-embed.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vss-rtvi-embed
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "vss-rtvi-embed.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: vss-rtvi-embed
+  template:
+    metadata:
+      labels:
+        {{- include "vss-rtvi-embed.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: vss-rtvi-embed
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $ips := .Values.imagePullSecrets | default (index (.Values.global | default dict) "imagePullSecrets") }}
+      {{- with $ips }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $wfk := .Values.waitForKafka | default dict }}
+      {{- $usesKafkaBus := or (eq (.Values.messageBus | default "") "kafka") (eq (.Values.errorBus | default "") "kafka") }}
+      {{- $waitKafka := and $usesKafkaBus (or (not (hasKey $wfk "enabled")) $wfk.enabled) }}
+      {{- if or $waitKafka .Values.clearCachedEnginesOnStart }}
+      initContainers:
+        {{- if $waitKafka }}
+        - name: wait-for-kafka
+          image: docker.io/library/busybox:1.38.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              KAFKA="{{ include "vss-rtvi-embed.kafkaBootstrap" . }}"
+              HOST="${KAFKA%%:*}"
+              PORT="${KAFKA##*:}"
+              echo "Waiting for Kafka at $KAFKA..."
+              until nc -z "$HOST" "$PORT" 2>/dev/null; do
+                echo "Kafka not ready, retrying in 10s..."
+                sleep 10
+              done
+              echo "Kafka is ready."
+        {{- end }}
+        {{- if .Values.clearCachedEnginesOnStart }}
+        - name: clear-rtvi-trt-cache
+          image: docker.io/library/busybox:1.38.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              echo "Clearing cached TensorRT/model artifacts...";
+              rm -rf /opt/nvidia/rtvi/.rtvi/ngc_model_cache/Cosmos-Embed1-448p || true;
+              find /opt/nvidia/rtvi/.rtvi/ngc_model_cache -type f
+              \( -name "*.engine" -o -name "*.plan" -o -name "*.onnx" \) -print -delete || true;
+              find /tmp/triton_model_repo -type f
+              \( -name "*.engine" -o -name "*.plan" -o -name "*.onnx" \) -print -delete || true;
+              chown -R 1001:1001 /opt/nvidia/rtvi/.rtvi/ngc_model_cache;
+              chown -R 1001:1001 /tmp/huggingface;
+              chown -R 1001:1001 /tmp/triton_model_repo;
+              echo "RTVI cache cleanup complete."
+          volumeMounts:
+            - name: ngc-model-cache
+              mountPath: /opt/nvidia/rtvi/.rtvi/ngc_model_cache
+            - name: hf-cache
+              mountPath: /tmp/huggingface
+            - name: triton-model-repo
+              mountPath: /tmp/triton_model_repo
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: vss-rtvi-embed
+          image: {{ include "vss-rtvi-embed.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.port }}
+              protocol: TCP
+          env:
+            {{- /*
+              NVIDIA_VISIBLE_DEVICES is emitted only when gpuDeviceId is set
+              and no gpuResourceName is configured. A MIG resource is assigned
+              by the NVIDIA device plugin, which injects the allocated device.
+              Otherwise, the empty default leaves the runtime setting intact.
+            */}}
+            {{- if and (eq $gpuResourceName "") .Values.gpuDeviceId }}
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: {{ .Values.gpuDeviceId | quote }}
+            {{- end }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            - name: MODEL_IMPLEMENTATION_PATH
+              value: {{ .Values.modelImplementationPath | quote }}
+            - name: MODEL_PATH
+              value: {{ .Values.modelPath | quote }}
+            - name: MODEL_REPOSITORY_SCRIPT_PATH
+              value: {{ .Values.modelRepositoryScriptPath | quote }}
+            - name: REMOTE_EMBED_ENDPOINT
+              value: {{ .Values.remoteEmbedEndpoint | default "" | quote }}
+            - name: REMOTE_EMBED_ENDPOINT_MODEL_NAME
+              value: {{ .Values.remoteEmbedEndpointModelName | default "nvidia/cosmos-embed1" | quote }}
+            {{- $remoteApiKey := .Values.remoteEmbedEndpointApiKeySecret | default dict }}
+            {{- $remoteApiKeyName := trim (default "" $remoteApiKey.name) }}
+            - name: REMOTE_EMBED_ENDPOINT_API_KEY
+              {{- if ne $remoteApiKeyName "" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $remoteApiKeyName | quote }}
+                  key: {{ $remoteApiKey.key | default "REMOTE_EMBED_ENDPOINT_API_KEY" | quote }}
+              {{- else }}
+              value: {{ .Values.remoteEmbedEndpointApiKey | default "" | quote }}
+              {{- end }}
+            - name: REMOTE_EMBED_ENDPOINT_TIMEOUT_SEC
+              value: {{ .Values.remoteEmbedEndpointTimeoutSec | default "300" | quote }}
+            - name: REMOTE_EMBED_ENDPOINT_BATCH_SIZE
+              value: {{ .Values.remoteEmbedEndpointBatchSize | default "64" | quote }}
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: {{ include "vss-rtvi-embed.kafkaBootstrap" . | quote }}
+            - name: MESSAGE_BUS
+              value: {{ .Values.messageBus | quote }}
+            - name: MESSAGE_BUS_TOPIC
+              value: {{ .Values.messageBusTopic | default "mdx-embed" | quote }}
+            - name: ERROR_BUS
+              value: {{ .Values.errorBus | quote }}
+            - name: REDIS_HOST
+              value: {{ include "vss-rtvi-embed.redisHost" . | quote }}
+            - name: REDIS_PORT
+              value: {{ .Values.redisPort | quote }}
+            - name: REDIS_DB
+              value: "0"
+            - name: REDIS_PASSWORD
+              value: ""
+            - name: ENABLE_OTEL_MONITORING
+              value: {{ .Values.enableOtelMonitoring | quote }}
+            - name: ENABLE_REDIS_ERROR_MESSAGES
+              value: {{ .Values.enableRedisErrorMessages | quote }}
+            - name: ENABLE_REQUEST_PROFILING
+              value: {{ .Values.enableRequestProfiling | quote }}
+            - name: INSTALL_PROPRIETARY_CODECS
+              value: {{ .Values.installProprietaryCodes | quote }}
+            - name: OTEL_TRACES_EXPORTER
+              value: {{ .Values.otelTracesExporter | quote }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otelExporterOtlpEndpoint | quote }}
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: {{ .Values.otelMetricExportInterval | quote }}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ .Values.otelResourceAttributes | quote }}
+            - name: FORCE_SW_AV1_DECODER
+              value: {{ .Values.forceSwAv1Decoder | default "" | quote }}
+            - name: NUM_GPUS
+              value: {{ .Values.numGpus | default "" | quote }}
+            - name: NUM_VLM_PROCS
+              value: {{ .Values.numVlmProcs | default "" | quote }}
+            - name: VLM_BATCH_SIZE
+              value: {{ .Values.vlmBatchSize | default "" | quote }}
+            - name: RTVI_RTSP_TIMEOUT
+              value: {{ .Values.rtspTimeout | default "" | quote }}
+            - name: RTVI_RTSP_LATENCY
+              value: {{ .Values.rtspLatency | default "" | quote }}
+            - name: NVIDIA_API_KEY
+              value: {{ .Values.nvidiaApiKey | default "NOAPIKEYSET" | quote }}
+            - name: NGC_API_KEY
+              value: {{ .Values.ngcApiKey | default "" | quote }}
+            {{- $hfTok := .Values.hfTokenSecret | default dict }}
+            {{- $hfTokName := trim (default "" $hfTok.name) }}
+            - name: HF_TOKEN
+              {{- if ne $hfTokName "" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $hfTokName | quote }}
+                  key: {{ $hfTok.key | default "HF_TOKEN" | quote }}
+              {{- else }}
+              value: {{ .Values.hfToken | default "" | quote }}
+              {{- end }}
+            - name: RTVI_RTSP_RECONNECTION_INTERVAL
+              value: {{ .Values.rtspReconnectionInterval | quote }}
+            - name: RTVI_RTSP_RECONNECTION_MAX_ATTEMPTS
+              value: {{ .Values.rtspReconnectionMaxAttempts | quote }}
+            - name: RTVI_RTSP_RECONNECTION_WINDOW
+              value: {{ .Values.rtspReconnectionWindow | quote }}
+            - name: RTVI_IPC_FRAME_COPY
+              value: {{ .Values.ipcFrameCopy | quote }}
+            - name: ASSET_DOWNLOAD_CONNECT_TIMEOUT
+              value: {{ .Values.assetDownloadConnectTimeout | default "10" | quote }}
+            - name: ASSET_DOWNLOAD_TOTAL_TIMEOUT
+              value: {{ .Values.assetDownloadTotalTimeout | default "300" | quote }}
+            - name: ASSET_DOWNLOAD_MAX_FILE_SIZE_GB
+              value: {{ .Values.assetDownloadMaxFileSizeGb | default 8 | quote }}
+            - name: ASSET_DOWNLOAD_SSL_SKIP_VERIFY_DOMAINS
+              value: {{ .Values.assetDownloadSslSkipVerifyDomains | default "" | quote }}
+            - name: ASSET_DOWNLOAD_MAX_REDIRECTS
+              value: {{ .Values.assetDownloadMaxRedirects | default "0" | quote }}
+            {{- $assetTok := .Values.assetDownloadAuthTokensSecret | default dict }}
+            {{- $assetTokName := trim (default "" $assetTok.name) }}
+            - name: ASSET_DOWNLOAD_AUTH_TOKENS
+              {{- if ne $assetTokName "" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $assetTokName | quote }}
+                  key: {{ $assetTok.key | default "ASSET_DOWNLOAD_AUTH_TOKENS" | quote }}
+              {{- else }}
+              value: {{ .Values.assetDownloadAuthTokens | default "" | quote }}
+              {{- end }}
+            - name: FILE_URL_ALLOWED_DIRS
+              value: {{ .Values.fileUrlAllowedDirs | default "" | quote }}
+            - name: MAX_ASSET_STORAGE_SIZE_GB
+              value: {{ .Values.maxAssetStorageSizeGb | default "" | quote }}
+            - name: ASSET_MAX_AGE_HOURS
+              value: {{ .Values.assetMaxAgeHours | default "0" | quote }}
+            - name: ERROR_MESSAGE_TOPIC
+              value: "vision-embed-errors"
+          startupProbe:
+            httpGet:
+              path: /v1/ready
+              port: {{ .Values.port }}
+            initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /v1/ready
+              port: {{ .Values.port }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /v1/ready
+              port: {{ .Values.port }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          resources:
+            {{- toYaml $resources | nindent 12 }}
+          volumeMounts:
+            - name: ngc-model-cache
+              mountPath: /opt/nvidia/rtvi/.rtvi/ngc_model_cache
+            - name: hf-cache
+              mountPath: /tmp/huggingface
+            - name: triton-model-repo
+              mountPath: /tmp/triton_model_repo
+            {{- if .Values.dshm.enabled }}
+            - name: dshm
+              mountPath: /dev/shm
+            {{- end }}
+            {{- if .Values.clipStorage.enabled }}
+            - name: clip-storage
+              mountPath: /home/vst/vst_release/streamer_videos
+            {{- end }}
+            {{- if .Values.ipcSocketHostPath }}
+            - name: ipc-socket-dir
+              mountPath: /run/rtvi-ipc
+            {{- end }}
+      volumes:
+        - name: ngc-model-cache
+          persistentVolumeClaim:
+            claimName: {{ include "vss-rtvi-embed.fullname" . }}-rtvi-ngc-cache
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: {{ include "vss-rtvi-embed.fullname" . }}-rtvi-hf-cache
+        - name: triton-model-repo
+          emptyDir: {}
+        {{- if .Values.dshm.enabled }}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.dshm.sizeLimit }}
+        {{- end }}
+        {{- if .Values.clipStorage.enabled }}
+        - name: clip-storage
+          {{- if .Values.clipStorage.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.clipStorage.existingClaim }}
+          {{- else if .Values.clipStorage.hostPath }}
+          hostPath:
+            path: {{ .Values.clipStorage.hostPath }}
+            type: DirectoryOrCreate
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.ipcSocketHostPath }}
+        - name: ipc-socket-dir
+          hostPath:
+            path: {{ .Values.ipcSocketHostPath | quote }}
+            type: Directory
+        {{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vss-rtvi-embed.fullname" . }}-rtvi-ngc-cache
+  labels:
+    {{- include "vss-rtvi-embed.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vss-rtvi-embed
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- $global := .Values.global | default dict }}
+  {{- $sc := .Values.persistence.storageClass | default (index $global "storageClass") }}
+  {{- with $sc }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.ngcModelCache.size }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vss-rtvi-embed.fullname" . }}-rtvi-hf-cache
+  labels:
+    {{- include "vss-rtvi-embed.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vss-rtvi-embed
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- $global := .Values.global | default dict }}
+  {{- $sc := .Values.persistence.storageClass | default (index $global "storageClass") }}
+  {{- with $sc }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.hfCache.size }}

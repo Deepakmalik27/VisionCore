@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sdrc.fullname" . }}
+  labels:
+    {{- include "sdrc.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "sdrc.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sdrc.selectorLabels" . | nindent 8 }}
+      {{- if .Values.config.rolloutVersion }}
+      annotations:
+        sdrc.nvidia.com/config-rollout-version: {{ .Values.config.rolloutVersion | quote }}
+      {{- end }}
+    spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ include "sdrc.serviceAccountName" . }}
+      {{- end }}
+      {{- $imagePullSecrets := .Values.imagePullSecrets | default .Values.global.imagePullSecrets }}
+      {{- with $imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $wait := .Values.waitForWorkloads | default dict }}
+      {{- if and $wait.enabled $wait.targets }}
+      # Compose parity with wait-for-docker-workloads.sh: SDRC must not consume
+      # the vst.event stream before the workloads it provisions can accept
+      # streams, or the camera events are acked and never redelivered.
+      initContainers:
+        - name: wait-for-workloads
+          image: {{ $wait.image | default "docker.io/library/busybox:1.38.0" | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              timeout={{ $wait.timeoutSeconds | default 1800 }}
+              elapsed=0
+              # Quote each host:port on its own. join|quote would make every
+              # target one shell word, so a second entry would never be probed.
+              for target in {{ range $wait.targets }}{{ include "sdrc.waitTarget" (dict "root" $ "target" .) | quote }} {{ end }}; do
+                host="${target%:*}"; port="${target##*:}"
+                echo "Waiting for workload ${host}:${port} ..."
+                until nc -z "${host}" "${port}"; do
+                  if [ "${elapsed}" -ge "${timeout}" ]; then
+                    echo "[ERROR] Timeout after ${timeout}s waiting for ${host}:${port}."
+                    echo "[ERROR] SDRC provisions this workload; starting without it would"
+                    echo "[ERROR] drop the VST camera events it needs. Check the workload."
+                    exit 1
+                  fi
+                  sleep 5
+                  elapsed=$((elapsed + 5))
+                done
+                echo "  ${host}:${port} is serving."
+              done
+              echo "All workloads are serving; starting SDRC."
+      {{- end }}
+      containers:
+        - name: sdrc
+          image: {{ include "sdrc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: controller
+              containerPort: {{ required "service.controller.port is required" .Values.service.controller.port | int }}
+              protocol: TCP
+            - name: sdrc-direct
+              containerPort: {{ required "service.sdrcDirectListener.port is required" .Values.service.sdrcDirectListener.port | int }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ required "service.envoyAdmin.port is required" .Values.service.envoyAdmin.port | int }}
+              protocol: TCP
+            - name: envoy-proxy
+              containerPort: {{ required "service.envoyProxy.port is required" .Values.service.envoyProxy.port | int }}
+              protocol: TCP
+            {{- range $idx, $listener := .Values.service.workloadListeners | default list }}
+            - name: {{ required (printf "service.workloadListeners[%d].name is required" $idx) (get $listener "name") }}
+              containerPort: {{ required (printf "service.workloadListeners[%d].targetPort or port is required" $idx) (default (get $listener "port") (get $listener "targetPort")) | int }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- include "sdrc.runtimeEnv" . | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: {{ include "sdrc.configMountPath" . | quote }}
+              subPath: {{ include "sdrc.configKey" . | quote }}
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "sdrc.configMapName" . }}
+{{- end }}

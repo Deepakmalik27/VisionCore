@@ -1,0 +1,239 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Docker Readme
+
+Uses standalone production build of the app.
+
+Uses custom-server.js to start the server.
+
+## Connect a profile to an existing agent harness
+
+Every Docker profile's checked-in `overrides.env` exposes the same
+`VSS_AGENT_*` settings. The adapter is disabled until both
+`VSS_AGENT_ADAPTER_ENABLED=true` and `VSS_AGENT_BACKEND_URL` are set. It only
+connects the UI to an existing harness; it does not provision or modify that
+harness.
+
+For `dev-profile.sh`, provide deployment values through the environment so the
+generated, ignored `generated.env` receives them:
+
+```bash
+export VSS_AGENT_ADAPTER_ENABLED=true
+export VSS_AGENT_BACKEND_PROTOCOL=openclaw-ws
+export VSS_AGENT_BACKEND_URL=ws://host.docker.internal:18789
+export VSS_AGENT_BACKEND_PATH=/
+export HITL_ENABLED=false
+
+./deploy/docker/scripts/dev-profile.sh up --profile base --hardware-profile H100
+```
+
+For direct Compose, copy the selected profile's `overrides.env` to the ignored
+`user-overrides.env` and set the same values there. OpenClaw uses
+`VSS_AGENT_BACKEND_PROTOCOL=openclaw-ws`, a `ws://` or `wss://` URL, and path
+`/`. Once the harness starts, enter the gateway token in the Web UI's
+**Connect NemoClaw chat** panel. The token stays in the browser tab session;
+the UI container does not need to be recreated. A server-provided
+`VSS_AGENT_BACKEND_TOKEN` remains supported for unattended deployments. Never
+commit a real harness token. The Compose service maps these
+host-side settings to the server-only `AGENT_*` variables shown below. Keep
+`HITL_ENABLED=false` for OpenClaw so follow-up questions complete as ordinary
+chat turns. The in-stack `vss-agent` defaults to `HITL_ENABLED=true` in Compose,
+which enables its structured interaction dialogs. Compose passes the selected
+value to both the agent and UI.
+
+.env sample to use for docker run when running the Metropolis BP VSS UI app:
+
+```
+PORT=3001
+
+RUN_APP_NAME=nv-metropolis-bp-vss-ui
+NEXT_PUBLIC_APP_TITLE=VSS BLUEPRINT
+NEXT_PUBLIC_APP_SUBTITLE=Warehouse
+
+# Optional backend-neutral run/event adapter embedded in the Next.js server.
+# The backend token may be supplied at runtime in the Web UI. For unattended
+# deployments it can still be server-only; never expose it through NEXT_PUBLIC_*.
+# When omitted, the UI uses the legacy chat-SSE backend settings below.
+AGENT_ADAPTER_ENABLED=true
+AGENT_BACKEND_PROTOCOL=openclaw-ws
+AGENT_BACKEND_URL=ws://host.docker.internal:18789
+AGENT_BACKEND_PATH=/
+# AGENT_BACKEND_TOKEN=replace-with-the-harness-token
+
+# Server-only targets used by the same-origin media and chat proxy routes.
+VSS_PROXY_BASE_URL=http://vss-haproxy-ingress:7777
+VSS_CHAT_BACKEND_MAIN=http://vss-agent:8000/chat/stream
+VSS_CHAT_BACKEND_SIDEBAR=http://vss-agent:8000/chat/stream
+
+NEXT_PUBLIC_ENABLE_CHAT_TAB=true
+NEXT_PUBLIC_WORKFLOW=Warehouse Management Agent
+NEXT_PUBLIC_WEBSOCKET_CHAT_COMPLETION_URL=ws://127.0.0.1:8000/websocket
+NEXT_PUBLIC_HTTP_CHAT_COMPLETION_URL=http://127.0.0.1:8000/chat/stream
+NEXT_PUBLIC_WEB_SOCKET_DEFAULT_ON=false
+NEXT_PUBLIC_CHAT_HISTORY_DEFAULT_ON=true
+NEXT_PUBLIC_RIGHT_MENU_OPEN=false
+NEXT_PUBLIC_ENABLE_INTERMEDIATE_STEPS=true
+NEXT_PUBLIC_ENABLE_HITL=false
+NEXT_PUBLIC_DARK_THEME_DEFAULT=true
+NEXT_PUBLIC_SHOW_THEME_TOGGLE_BUTTON=true
+NEXT_PUBLIC_SIDE_CHATBAR_COLLAPSED=true
+NEXT_PUBLIC_AGENT_API_URL_BASE=http://127.0.0.1:8000/api/v1
+NEXT_PUBLIC_CHAT_UPLOAD_FILE_ENABLE=true
+NEXT_PUBLIC_CHAT_INPUT_MIC_ENABLED=false
+NEXT_PUBLIC_CHAT_MESSAGE_EDIT_ENABLED=true
+NEXT_PUBLIC_CHAT_MESSAGE_SPEAKER_ENABLED=true
+NEXT_PUBLIC_CHAT_MESSAGE_COPY_ENABLED=true
+NEXT_PUBLIC_CHAT_UPLOAD_FILE_METADATA_ENABLED=false
+NEXT_PUBLIC_CHAT_UPLOAD_FILE_HIDDEN_MESSAGE_TEMPLATE=Can you show the video clip of the video {filenames} that I just uploaded?
+
+# Upload file config template JSON - Configure form fields for file upload
+# Format: {"fields": [<field1>, <field2>, ...]}
+# Each field object:
+#   - field-name: string - Name of the field (e.g., "embedding", "description")
+#   - field-type: "boolean" | "string" | "number" | "select" - Input type
+#   - field-default-value: any - Default value for the field
+#   - field-options: string[] - Options for select type (e.g., ["Type 1", "Type 2"])
+#   - changeable: boolean - Allow user to modify value (true=editable, false=readonly)
+#   - tooltip-info: string - Tooltip text on hover
+NEXT_PUBLIC_CHAT_UPLOAD_FILE_CONFIG_TEMPLATE_JSON='{
+    "fields": [
+        {
+            "field-name": "embedding",
+            "field-type": "boolean",
+            "field-default-value": true,
+            "changeable": false,
+            "tooltip-info": ""
+        }
+    ]
+}'
+
+# Custom Agent Parameters JSON - Configure dynamic form fields for chat request
+# Format: {"params": [<param1>, <param2>, ...]}
+# Each param object:
+#   - name: string - Parameter key sent to backend API (e.g., "llm_reasoning", "model")
+#   - label: string - Display label shown in the form UI
+#   - type: "boolean" | "string" | "number" | "select" - Input type
+#   - default-value: any - Initial value for the parameter
+#   - options: string[] - Options for select type (e.g., ["gpt-4", "gpt-3.5-turbo"])
+#   - changeable: boolean - Allow user to modify value (true=editable, false=readonly)
+#   - tooltip-info: string - Tooltip text on hover
+
+NEXT_PUBLIC_CHAT_API_CUSTOM_AGENT_PARAMS_JSON='{
+    "params": [
+        {
+            "name": "llm_reasoning",
+            "label": "LLM Reasoning",
+            "type": "boolean",
+            "default-value": false,
+            "changeable": true,
+            "tooltip-info": ""
+        },
+        {
+            "name": "vlm_reasoning",
+            "label": "VLM Reasoning",
+            "type": "boolean",
+            "default-value": false,
+            "changeable": true,
+            "tooltip-info": ""
+        }
+    ]
+}'
+
+# Sidebar chat instance — prefix NEXT_PUBLIC_SIDEBAR_CHAT_* (each falls back to main NEXT_PUBLIC_* above when unset).
+NEXT_PUBLIC_ENABLE_CHAT_SIDEBAR=false
+NEXT_PUBLIC_CHAT_SIDEBAR_OPEN_DEFAULT=false
+NEXT_PUBLIC_SIDEBAR_CHAT_WORKFLOW=Search Agent
+NEXT_PUBLIC_SIDEBAR_CHAT_WEBSOCKET_CHAT_COMPLETION_URL=ws://127.0.0.1:8000/websocket
+NEXT_PUBLIC_SIDEBAR_CHAT_HTTP_CHAT_COMPLETION_URL=http://127.0.0.1:8000/chat/stream
+NEXT_PUBLIC_SIDEBAR_CHAT_WEB_SOCKET_DEFAULT_ON=false
+NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_HISTORY_DEFAULT_ON=true
+NEXT_PUBLIC_SIDEBAR_CHAT_ENABLE_INTERMEDIATE_STEPS=true
+NEXT_PUBLIC_SIDEBAR_CHAT_DARK_THEME_DEFAULT=true
+NEXT_PUBLIC_SIDEBAR_CHAT_SIDE_CHATBAR_COLLAPSED=true
+NEXT_PUBLIC_SIDEBAR_CHAT_AGENT_API_URL_BASE=http://127.0.0.1:8000/api/v1
+NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_UPLOAD_FILE_ENABLE=true
+NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_INPUT_MIC_ENABLED=false
+NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_MESSAGE_EDIT_ENABLED=true
+NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_MESSAGE_SPEAKER_ENABLED=true
+NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_MESSAGE_COPY_ENABLED=true
+NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_UPLOAD_FILE_METADATA_ENABLED=false
+NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_UPLOAD_FILE_HIDDEN_MESSAGE_TEMPLATE=Can you show the video clip of the video {filenames} that I just uploaded?
+NEXT_PUBLIC_SIDEBAR_CHAT_SHOW_THEME_TOGGLE_BUTTON=false
+# Optional: NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_UPLOAD_FILE_CONFIG_TEMPLATE_JSON=...
+# Optional: NEXT_PUBLIC_SIDEBAR_CHAT_CHAT_API_CUSTOM_AGENT_PARAMS_JSON='...'
+
+NEXT_PUBLIC_ENABLE_ALERTS_TAB=true
+NEXT_PUBLIC_VST_API_URL=http://127.0.0.1:30888/vst/api
+NEXT_PUBLIC_MDX_WEB_API_URL=http://127.0.0.1:8081
+# Base URL of vss-alert-bridge, which manages Alert Rules for various scenarios (used by the Manage Alerts → Real-time Alerts editor). Include the API version prefix (e.g. /api/v1) so future server-side bumps (e.g. /api/v2) are a deploy-time change, not a UI change. Matches met-blueprints' NEXT_PUBLIC_ALERTS_API_URL.
+NEXT_PUBLIC_ALERTS_API_URL=http://127.0.0.1:9081/api/v1
+# Maximum number of incidents fetched per API request (applies to the initial load and each "Show more" page; allowed range 10–5000, default 100 when unset).
+NEXT_PUBLIC_ALERTS_TAB_ALERTS_FETCH_MAX_RESULT_SIZE=100
+NEXT_PUBLIC_ALERTS_TAB_ALERTS_FETCH_DEFAULT_TIME_WINDOW_IN_MINUTES=10
+NEXT_PUBLIC_ALERTS_TAB_DEFAULT_AUTO_REFRESH_IN_MILLISECONDS=1000
+NEXT_PUBLIC_ALERTS_TAB_VERIFIED_FLAG_DEFAULT=true
+# Manage Alerts rule kinds. If both are false, Manage Alerts is hidden.
+NEXT_PUBLIC_ALERTS_TAB_MANAGE_ALERTS_SUB_TAB_ENABLE_REALTIME_ALERTS=true
+NEXT_PUBLIC_ALERTS_TAB_MANAGE_ALERTS_SUB_TAB_ENABLE_CV_ALERTS_VERIFICATION=true
+NEXT_PUBLIC_ALERTS_TAB_ALERT_REPORT_PROMPT_TEMPLATE=Generate a report for incident '{incidentId}' with sensor id {sensorId}.
+# Max search time limit (0 = unlimited, or use: 10m, 2h, 3d, 1w, 2M, 1y)
+NEXT_PUBLIC_ALERTS_TAB_MAX_SEARCH_TIME_LIMIT=0
+NEXT_PUBLIC_ALERTS_TAB_MEDIA_WITH_OBJECTS_BBOX=true
+
+NEXT_PUBLIC_ENABLE_SEARCH_TAB=true
+NEXT_PUBLIC_SEARCH_TAB_MEDIA_WITH_OBJECTS_BBOX=true
+
+NEXT_PUBLIC_ENABLE_DASHBOARD_TAB=true
+NEXT_PUBLIC_DASHBOARD_TAB_KIBANA_BASE_URL=http://127.0.0.1:5601
+
+NEXT_PUBLIC_ENABLE_MAP_TAB=true
+NEXT_PUBLIC_MAP_URL=http://127.0.0.1:3002
+
+NEXT_PUBLIC_ENABLE_VIDEO_MANAGEMENT_TAB=true
+# Add RTSP button in Video Management tab (enabled by default, set to 'false' to hide)
+NEXT_PUBLIC_VIDEO_MANAGEMENT_TAB_ADD_RTSP_ENABLE=true
+# Starting position of the Enable video upload switch in the Video Management tab, which shows or hides the Upload Video button (on by default, set to 'false' to start it off)
+NEXT_PUBLIC_VIDEO_MANAGEMENT_VIDEO_UPLOAD_ENABLE=true
+```
+
+**Note:** RUN_APP_NAME should match the name of the app in the apps folder. Default is 'nv-metropolis-bp-vss-ui'.
+
+```bash
+# Build the Docker image from the parent directory
+docker build -t <image-name> -f Dockerfile .
+# OR
+# docker build -t <image-name> --build-arg BUILD_TYPE=prod -f Dockerfile .
+
+
+# Run the container with environment variables from .env
+# Ensure the .env file is present before running this command.
+# Skip --env-file .env if no overrides are needed.
+# For metropolis-spatial-ai deployment overrides refer to above .env sample section
+docker run --env-file <path-to-env-file> -p 3000:3000 <image-name>
+# OR pass environment variables as arguments
+# docker run -e NEXT_PUBLIC_WORKFLOW="Agent" -p 3000:3000 <image-name>
+```
+
+## Debug inside the container
+
+Create a debug container image:
+
+```
+docker build -t <image-name> --build-arg BUILD_TYPE=dev -f Dockerfile .
+```
+
+Since the resulting docker is a distroless docker image, if needed to run any commands to debug the container,
+you can use the following command:
+
+```
+docker run --entrypoint=sh --rm -it --env-file <path-to-env-file> -p 3000:3000 <image-name>
+```
+
+To start the app inside the debug container:
+
+```
+node custom-server.js
+```

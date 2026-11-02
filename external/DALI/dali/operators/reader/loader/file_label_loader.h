@@ -1,0 +1,393 @@
+// Copyright (c) 2017-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef DALI_OPERATORS_READER_LOADER_FILE_LABEL_LOADER_H_
+#define DALI_OPERATORS_READER_LOADER_FILE_LABEL_LOADER_H_
+
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#include <algorithm>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <string>
+#include <optional>
+#include <stdexcept>
+#include <tuple>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "dali/core/common.h"
+#include "dali/operators/reader/loader/discover_files.h"
+#include "dali/operators/reader/loader/filesystem.h"
+#include "dali/operators/reader/loader/loader.h"
+#include "dali/util/file.h"
+
+namespace dali {
+
+/**
+ * @brief A label value, stored in one of the types supported by the ``label_dtype`` argument.
+ */
+using FileLabel = std::variant<int32_t, int64_t, float>;
+
+/**
+ * @brief Returns the label type requested in the spec.
+ *
+ * If ``label_dtype`` is not specified, the labels are DALI_FLOAT when ``float_labels`` is
+ * provided and DALI_INT32 otherwise.
+ */
+inline DALIDataType GetFileLabelDType(const OpSpec &spec) {
+  DALIDataType dtype;
+  if (spec.TryGetArgument(dtype, "label_dtype"))
+    return dtype;
+  return spec.HasArgument("float_labels") ? DALI_FLOAT : DALI_INT32;
+}
+
+/**
+ * @brief Converts an integer label to the requested label type.
+ *
+ * Throws if the value is out of the range of the requested type.
+ */
+DLL_PUBLIC FileLabel MakeFileLabel(int64_t value, DALIDataType dtype);
+
+/**
+ * @brief Converts a floating point label to the requested label type.
+ *
+ * Throws if dtype is not a floating point type.
+ */
+DLL_PUBLIC FileLabel MakeFileLabel(float value, DALIDataType dtype);
+
+/**
+ * @brief Parses a label of the requested type from a null-terminated string.
+ *
+ * The whole string must be a valid representation of a value of the requested type.
+ *
+ * @return The parsed label or an empty optional if the string is malformed or the value
+ *         is out of range.
+ */
+DLL_PUBLIC std::optional<FileLabel> ParseFileLabel(const char *str, DALIDataType dtype);
+
+struct ImageLabelWrapper {
+  Tensor<CPUBackend> image;
+  FileLabel label;
+
+  // Deferred file read: If not null, means image was not read yet
+  std::unique_ptr<FileStream> file_stream;
+};
+
+
+
+template<bool supports_checkpointing>
+class DLL_PUBLIC FileLabelLoaderBase : public Loader<CPUBackend, ImageLabelWrapper,
+                                                     supports_checkpointing> {
+ public:
+  using Base = Loader<CPUBackend, ImageLabelWrapper, supports_checkpointing>;
+  explicit inline FileLabelLoaderBase(
+    const OpSpec& spec,
+    bool shuffle_after_epoch)
+    : Base(spec),
+      shuffle_after_epoch_(shuffle_after_epoch),
+      current_index_(0),
+      current_epoch_(0) {
+    int64_t seed_arg = kDaliDataloaderSeed;
+    bool has_seed_arg = spec.TryGetArgument(seed_arg, "shuffle_after_epoch_seed");
+    shuffle_after_epoch_seed_ = seed_arg;
+    if (has_seed_arg && !shuffle_after_epoch_) {
+      DALI_WARN("`shuffle_after_epoch_seed` has no effect when `shuffle_after_epoch` is False.");
+    }
+
+    vector<string> files;
+    vector<int64_t> labels;
+    vector<float> float_labels;
+
+    label_dtype_ = GetFileLabelDType(spec);
+    if (label_dtype_ != DALI_INT32 && label_dtype_ != DALI_INT64 && label_dtype_ != DALI_FLOAT)
+      throw std::invalid_argument(make_string("Unsupported ``label_dtype``: ", label_dtype_,
+                                              ". Supported types are: INT32, INT64 and FLOAT."));
+
+    has_files_arg_ = spec.TryGetRepeatedArgument(files, "files");
+    has_labels_arg_ = spec.TryGetRepeatedArgument(labels, "labels");
+    bool has_float_labels_arg = spec.TryGetRepeatedArgument(float_labels, "float_labels");
+    has_file_list_arg_ = spec.TryGetArgument(file_list_, "file_list");
+    has_file_root_arg_ = spec.TryGetArgument(file_root_, "file_root");
+    bool has_file_filters_arg =
+      spec.TryGetRepeatedArgument(file_discovery_opts_.file_filters, "file_filters");
+    bool has_dir_filters_arg =
+      spec.TryGetRepeatedArgument(file_discovery_opts_.dir_filters, "dir_filters");
+
+    // TODO(ksztenderski): CocoLoader inherits after FileLabelLoader and it doesn't work with
+    // GetArgument.
+    spec.TryGetArgument(file_discovery_opts_.case_sensitive_filter, "case_sensitive_filter");
+
+    DALI_ENFORCE(has_file_root_arg_ || has_files_arg_ || has_file_list_arg_,
+      "``file_root`` argument is required when not using ``files`` or ``file_list``.");
+
+    DALI_ENFORCE(has_files_arg_ + has_file_list_arg_ <= 1,
+      "File paths can be provided through ``files`` or ``file_list`` but not both.");
+
+    DALI_ENFORCE(has_files_arg_ || !has_labels_arg_,
+      "The argument ``labels`` is valid only when file paths "
+      "are provided as `files` argument.");
+
+    if (has_float_labels_arg && !has_files_arg_)
+      throw std::invalid_argument("The argument ``float_labels`` is valid only when file paths "
+                                  "are provided as ``files`` argument.");
+
+    if (has_labels_arg_ && has_float_labels_arg)
+      throw std::invalid_argument(
+          "The arguments ``labels`` and ``float_labels`` are mutually exclusive.");
+
+    if (has_float_labels_arg && label_dtype_ != DALI_FLOAT)
+      throw std::invalid_argument(make_string(
+          "The argument ``float_labels`` requires a floating point ``label_dtype``; got: ",
+          label_dtype_, ". Use ``labels`` to provide integer labels."));
+
+    DALI_ENFORCE(!has_file_filters_arg || file_discovery_opts_.file_filters.size() > 0,
+                 "``file_filters`` list cannot be empty.");
+    DALI_ENFORCE(!has_dir_filters_arg || file_discovery_opts_.dir_filters.size() > 0,
+                 "``dir_filters`` list cannot be empty.");
+
+    if (has_file_list_arg_) {
+      DALI_ENFORCE(!file_list_.empty(), "``file_list`` argument cannot be empty");
+      if (!has_file_root_arg_) {
+        auto idx = file_list_.rfind(filesystem::dir_sep);
+        if (idx != string::npos) {
+          file_root_ = file_list_.substr(0, idx);
+        }
+      }
+    }
+
+    if (has_files_arg_) {
+      DALI_ENFORCE(files.size() > 0, "``files`` specified an empty list.");
+      if (has_labels_arg_) {
+        DALI_ENFORCE(files.size() == labels.size(), make_string("Provided ", labels.size(),
+          " labels for ", files.size(), " files."));
+
+        for (int i = 0, n = files.size(); i < n; i++)
+          AddEntry({std::move(files[i])}, MakeFileLabel(labels[i], label_dtype_));
+      } else if (has_float_labels_arg) {
+        if (files.size() != float_labels.size())
+          throw std::invalid_argument(make_string("Provided ", float_labels.size(),
+                                                  " float labels for ", files.size(), " files."));
+
+        for (int i = 0, n = files.size(); i < n; i++)
+          AddEntry({std::move(files[i])}, MakeFileLabel(float_labels[i], label_dtype_));
+      } else {
+          for (int i = 0, n = files.size(); i < n; i++)
+            AddEntry({std::move(files[i])}, MakeFileLabel(int64_t{i}, label_dtype_));
+      }
+    }
+
+    /*
+     * Those options are mutually exclusive as `shuffle_after_epoch` will make every shard looks differently
+     * after each epoch so coexistence with `stick_to_shard` doesn't make any sense
+     * Still when `shuffle_after_epoch` we will set `stick_to_shard` internally in the FileLabelLoader so all
+     * DALI instances will do shuffling after each epoch
+     */
+    DALI_ENFORCE(!(shuffle_after_epoch_  && stick_to_shard_),
+                  "shuffle_after_epoch and stick_to_shard cannot be both true");
+    DALI_ENFORCE(!(shuffle_after_epoch_ && shuffle_),
+                  "shuffle_after_epoch and random_shuffle cannot be both true");
+    /*
+     * Imply `stick_to_shard` from  `shuffle_after_epoch`
+     */
+    if (shuffle_after_epoch_) {
+      stick_to_shard_ = true;
+    }
+    if (!dont_use_mmap_) {
+      mmap_reserver_ = FileStream::MappingReserver(
+                                  static_cast<unsigned int>(initial_buffer_fill_));
+    }
+    copy_read_data_ = dont_use_mmap_ || !mmap_reserver_.CanShareMappedData();
+  }
+
+  void PrepareEmpty(ImageLabelWrapper &tensor) override;
+  void ReadSample(ImageLabelWrapper &tensor) override;
+
+ protected:
+  Index SizeImpl() override;
+
+  void PrepareMetadataImpl() override {
+    if (file_label_entries_.empty()) {
+      if (!has_file_list_arg_ && !has_files_arg_) {
+        auto entries = discover_files(file_root_, file_discovery_opts_);
+        if (label_dtype_ == DALI_INT32) {
+          file_label_entries_ = std::move(entries);
+        } else {
+          for (auto &entry : entries) {
+            int64_t label = entry.label.value();
+            AddEntry(std::move(entry), MakeFileLabel(label, label_dtype_));
+          }
+        }
+      } else if (has_file_list_arg_) {
+        // load (path, label) pairs from list
+        std::ifstream s(file_list_);
+        DALI_ENFORCE(s.is_open(), "Cannot open: " + file_list_);
+
+        vector<char> line_buf(16 << 10);  // 16 kB should be more than enough for a line
+        char *line = line_buf.data();
+        for  (int n = 1; s.getline(line, line_buf.size()); n++) {
+          // parse the line backwards:
+          // - skip trailing whitespace
+          // - consume the label (the last whitespace-delimited token)
+          // - skip whitespace between the file name and the label
+          int i = strlen(line) - 1;
+
+          for (; i >= 0 && isspace(line[i]); i--) {}  // skip trailing spaces
+
+          int label_end = i + 1;
+
+          if (i < 0)  // empty line - skip
+            continue;
+
+          for (; i >= 0 && !isspace(line[i]); i--) {}  // skip
+
+          int label_start = i + 1;
+
+          for (; i >= 0 && isspace(line[i]); i--) {}
+
+          int name_end = i + 1;
+          DALI_ENFORCE(name_end > 0 && name_end < label_start && label_end > label_start,
+                       make_string("Incorrect format of the list file \"",  file_list_, "\":", n,
+                       " expected file name followed by a label; got: \"", line, "\"."));
+
+          line[label_end] = 0;
+          line[name_end] = 0;
+
+          const char *label_str = line + label_start;
+          auto label = ParseFileLabel(label_str, label_dtype_);
+          if (!label.has_value())
+            throw std::invalid_argument(make_string(
+                "Incorrect label in the list file \"", file_list_, "\":", n,
+                " expected a value of type ", label_dtype_, "; got: \"", label_str, "\"."));
+
+          AddEntry({std::string(line)}, *label);
+        }
+
+        DALI_ENFORCE(s.eof(), "Wrong format of file_list: " + file_list_);
+      }
+    }
+    DALI_ENFORCE(SizeImpl() > 0, "No files found.");
+
+    if (shuffle_) {
+      // seeded with hardcoded value to get
+      // the same sequence on every shard
+      std::mt19937 g(kDaliDataloaderSeed);
+      std::shuffle(file_label_entries_.begin(), file_label_entries_.end(), g);
+    }
+
+    if (IsCheckpointingEnabled() && shuffle_after_epoch_) {
+      // save initial order
+      // DO not call std::move on file_label_entries_, even though it is restored in Reset
+      // it may be needed if SizeImpl is called!
+      backup_file_label_entries_ = file_label_entries_;
+    }
+
+    Reset(true);
+  }
+
+  void Skip() override {
+    MoveToNextShard(++current_index_);
+  }
+
+  /**
+   * @brief Adds an entry with the given label.
+   *
+   * For INT32 labels, the label is stored directly in the entry. For other label types,
+   * the entry stores an index into `label_values_`.
+   */
+  void AddEntry(FileLabelEntry entry, const FileLabel &label) {
+    if (label_dtype_ == DALI_INT32) {
+      entry.label = std::get<int32_t>(label);
+    } else {
+      entry.label = static_cast<int>(label_values_.size());
+      label_values_.push_back(label);
+    }
+    file_label_entries_.push_back(std::move(entry));
+  }
+
+  FileLabel GetLabel(const FileLabelEntry &entry) const {
+    int label = entry.label.value();
+    if (label_dtype_ == DALI_INT32)
+      return label;
+    return label_values_[label];
+  }
+
+  void Reset(bool wrap_to_shard) override {
+    if (wrap_to_shard) {
+      current_index_ = start_index(virtual_shard_id_, num_shards_, SizeImpl());
+    } else {
+      current_index_ = 0;
+    }
+    current_epoch_++;
+
+    if (shuffle_after_epoch_) {
+      if (IsCheckpointingEnabled()) {
+        // With checkpointing enabled, dataset order must be easy to restore.
+        // The shuffling is run with different seed every epoch, so this doesn't impact
+        // the random distribution.
+        file_label_entries_ = backup_file_label_entries_;
+      }
+      uint64_t seed = static_cast<uint64_t>(shuffle_after_epoch_seed_)
+                    + (static_cast<uint64_t>(current_epoch_) << 32);
+      std::mt19937_64 g(seed);
+      std::shuffle(file_label_entries_.begin(), file_label_entries_.end(), g);
+    }
+  }
+
+  void RestoreStateImpl(const LoaderStateSnapshot &state) override {
+    current_epoch_ = state.current_epoch;
+  }
+
+  using Base::shard_id_;
+  using Base::virtual_shard_id_;
+  using Base::num_shards_;
+  using Base::stick_to_shard_;
+  using Base::shuffle_;
+  using Base::dont_use_mmap_;
+  using Base::initial_buffer_fill_;
+  using Base::copy_read_data_;
+  using Base::read_ahead_;
+  using Base::IsCheckpointingEnabled;
+  using Base::PrepareEmptyTensor;
+  using Base::MoveToNextShard;
+  using Base::ShouldSkipImage;
+
+  string file_root_, file_list_;
+  vector<FileLabelEntry> file_label_entries_;
+  vector<FileLabelEntry> backup_file_label_entries_;
+  DALIDataType label_dtype_ = DALI_INT32;
+  vector<FileLabel> label_values_;
+  FileDiscoveryOptions file_discovery_opts_;
+
+  bool has_files_arg_ = false;
+  bool has_labels_arg_ = false;
+  bool has_file_list_arg_ = false;
+  bool has_file_root_arg_ = false;
+
+  bool shuffle_after_epoch_;
+  int64_t shuffle_after_epoch_seed_;
+  Index current_index_;
+  int current_epoch_;
+  FileStream::MappingReserver mmap_reserver_;
+};
+
+using FileLabelLoader = FileLabelLoaderBase<true>;
+
+}  // namespace dali
+
+#endif  // DALI_OPERATORS_READER_LOADER_FILE_LABEL_LOADER_H_

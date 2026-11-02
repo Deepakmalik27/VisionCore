@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- define "vss-vios-sensor.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- $global := .Values.global | default dict }}
+{{- if and (hasKey .Values "useReleaseNamePrefix") (kindIs "bool" .Values.useReleaseNamePrefix) .Values.useReleaseNamePrefix }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- else if and (hasKey .Values "useReleaseNamePrefix") (kindIs "bool" .Values.useReleaseNamePrefix) (not .Values.useReleaseNamePrefix) }}
+{{- printf "%s" $name | trunc 63 | trimSuffix "-" }}
+{{- else if and (hasKey $global "useReleaseNamePrefix") (kindIs "bool" (index $global "useReleaseNamePrefix")) (index $global "useReleaseNamePrefix") }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s" $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{/* Base name for shared VST PVCs: must match vss-vios-streamprocessing.sharedVstClaim* (umbrella Helm .Release.Name). */}}
+{{- define "vss-vios-sensor.streamprocessingSharedPvcBase" -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- define "vss-vios-sensor.image" -}}
+{{- $global := .Values.global | default dict -}}
+{{- $prefix := index $global "container_prefix" | default "" -}}
+{{- $repository := .Values.image.repository -}}
+{{- if $prefix -}}
+{{- $repository = printf "%s/vss-vios-sensor" (trimSuffix "/" $prefix) -}}
+{{- end -}}
+{{- $tag := index $global "container_tag" | default .Values.image.tag -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end -}}
+{{/*
+  Whether a PEER's Service name carries the release prefix, resolved for that
+  peer alone. A peer is rendered by another subchart (vss-vios-streamprocessing,
+  or infra's sdrc) whose own local useReleaseNamePrefix this chart cannot see,
+  so the sensor's OWN flag says nothing about it. Precedence:
+    1. an explicit boolean in .Values.peerUseReleaseNamePrefix.<peer>, the way
+       to describe a mixed-prefix install (e.g. global true while the peer's
+       chart sets its local flag false);
+    2. an explicit boolean global.useReleaseNamePrefix;
+    3. false.
+  hasKey/kindIs, never coalesce: coalesce reads an explicit false as unset and
+  would re-apply the prefix, naming a Service that is never rendered.
+  Pass: dict "root" . "peer" "<key>"  -> "true" or "".
+*/}}
+{{- define "vss-vios-sensor.peerUsesReleasePrefix" -}}
+{{- $root := index . "root" -}}
+{{- $peers := $root.Values.peerUseReleaseNamePrefix | default dict -}}
+{{- $g := $root.Values.global | default dict -}}
+{{- $peer := index . "peer" -}}
+{{- if and (hasKey $peers $peer) (kindIs "bool" (index $peers $peer)) -}}
+{{- ternary "true" "" (index $peers $peer) -}}
+{{- else if and (hasKey $g "useReleaseNamePrefix") (kindIs "bool" (index $g "useReleaseNamePrefix")) -}}
+{{- ternary "true" "" (index $g "useReleaseNamePrefix") -}}
+{{- end -}}
+{{- end }}
+{{/* Matches charts/vios/charts/vios-postgres vss-vios-postgres.fullname (sibling subchart). */}}
+{{- define "vss-vios-sensor.postgresFullname" -}}
+{{- $g := .Values.global | default dict }}
+{{- if index $g "postgresServiceHost" }}{{ index $g "postgresServiceHost" }}
+{{- else }}
+{{- $name := "vss-vios-postgres" }}
+{{- $usePrefix := default false (coalesce .Values.useReleaseNamePrefix (index $g "useReleaseNamePrefix")) }}
+{{- if $usePrefix }}{{ printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- else }}{{ printf "%s" $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- define "vss-vios-sensor.postgresCmName" -}}
+{{- printf "%s-postgres-cm" (include "vss-vios-sensor.postgresFullname" .) }}
+{{- end }}
+{{/*
+Parent overlay ConfigMap for notification_config.json. global.vios.notificationConfigMapName
+(or the sensor-specific global.vios.sensorNotificationConfigMapName, or
+.Values.notificationConfigMapName) is the unprefixed logical name; prefixed
+the same way as peer services when useReleaseNamePrefix is true. Empty when
+this subchart sets notificationConfig so that inline override is not replaced
+by the parent overlay.
+*/}}
+{{- define "vss-vios-sensor.notificationConfigMapName" -}}
+{{- if not .Values.notificationConfig -}}
+{{- $g := .Values.global | default dict -}}
+{{- $viosGlobal := index $g "vios" | default dict -}}
+{{- $cm := .Values.notificationConfigMapName | default (index $viosGlobal "sensorNotificationConfigMapName" | default (index $viosGlobal "notificationConfigMapName" | default "")) -}}
+{{- if $cm -}}
+{{- $pfx := default false (coalesce .Values.useReleaseNamePrefix (index $g "useReleaseNamePrefix")) -}}
+{{- if $pfx -}}{{ printf "%s-%s" .Release.Name $cm | trunc 63 | trimSuffix "-" }}{{- else -}}{{ $cm }}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+{{- define "vss-vios-sensor.peerHost" -}}
+{{- $root := index . "root" -}}
+{{- $short := index . "short" -}}
+{{- $pfx := eq (include "vss-vios-sensor.peerUsesReleasePrefix" (dict "root" $root "peer" (index . "peer"))) "true" }}
+{{- if $pfx }}{{ printf "%s-%s" $root.Release.Name $short }}{{- else -}}{{ $short }}{{- end }}
+{{- end }}
+{{/*
+  Full VST ingress base URL (with scheme).
+*/}}
+{{- define "vss-vios-sensor.vstIngressEndpointUrl" -}}
+{{- $g := .Values.global | default dict }}
+{{- $pfx := default false (coalesce .Values.useReleaseNamePrefix (index $g "useReleaseNamePrefix")) }}
+{{- $eh := index $g "externalHost" | default "" | trim }}
+{{- $ep := index $g "vstExternalPort" | default (index $g "externalPort") | default "" | toString | trim }}
+{{- $es := index $g "externalScheme" | default "http" }}
+{{- $explicit := trim (default "" .Values.vstIngressEndpoint) }}
+{{- if ne $explicit "" }}
+{{- $explicit }}
+{{- else }}
+{{- $internal := printf "http://%s" (ternary (printf "%s-vss-vios-ingress:30888/vst" .Release.Name) "vss-vios-ingress:30888/vst" $pfx) }}
+{{- if ne $eh "" }}
+{{- if ne $ep "" }}
+{{- printf "%s://%s:%s/vst" $es $eh $ep }}
+{{- else }}
+{{- printf "%s://%s/vst" $es $eh }}
+{{- end }}
+{{- else }}
+{{- $internal }}
+{{- end }}
+{{- end }}
+{{- end }}

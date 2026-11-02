@@ -1,0 +1,79 @@
+# Evaluate ReID
+
+Use `eval-reid` to score one trained ReID checkpoint on one dataset's query/gallery split.
+
+## Examples
+
+!!! example
+
+    === "CLI"
+
+        Evaluate a checkpoint on Market1501:
+
+        ```bash
+        boxmot eval-reid \
+          --weights runs/reid_train/osnet_market/best.pt \
+          --dataset market1501 \
+          --data-dir /data/reid \
+          --device 0
+        ```
+
+        Save results to a custom directory:
+
+        ```bash
+        boxmot eval-reid \
+          --weights runs/reid_train/lmbn_joint/best.pt \
+          --dataset msmt17 \
+          --data-dir /data/reid \
+          --batch-size 128 \
+          --output runs/reid_eval
+        ```
+
+## What it does
+
+`eval-reid` loads a trained checkpoint, rebuilds the matching backbone, extracts query and gallery embeddings, computes the distance matrix, and reports ranking metrics.
+
+If the checkpoint stores the model architecture, you can omit `--model`. Otherwise pass the architecture explicitly.
+
+## Main outputs
+
+The command reports and saves:
+
+- `mAP`
+- `rank1`
+- `rank5`
+- `rank10`
+- measured inference latency, including milliseconds per batch and per image
+
+Latency measurement uses five warmup passes and 30 timed passes by default. Set
+`--latency-iters 0` to disable it.
+
+By default the JSON summary is written next to the checkpoint as
+`eval_<dataset>_<inference-feature>.json` when an inference feature is active,
+or as `eval_<dataset>.json` otherwise. With `--output`, the filename is
+`eval_<model>_<dataset>[_<inference-feature>].json`.
+
+## Dataset expectations
+
+`eval-reid` uses the same registered ReID datasets as training. The selected dataset must expose query and gallery splits under the dataset root passed to `--data-dir`.
+
+## Scope
+
+`eval-reid` is an engine-owned CLI workflow. Reusable evaluation and dataset
+code remains available from its `boxmot.reid` domain subpackages.
+
+## Related pages
+
+- [Train ReID](train.md)
+- [Compare ReID](compare-reid.md)
+- [Export](export.md)
+- [ReID Profiles](../config/reid.md)
+
+## CLI Arguments
+
+::: mkdocs-click
+    :module: boxmot.engine.commands.reid.evaluate
+    :command: eval_reid
+    :depth: 0
+    :style: table
+    :prog_name: boxmot eval-reid

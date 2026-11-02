@@ -1,0 +1,645 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+
+import makefun
+
+import nvidia.dali.backend as _b
+import nvidia.dali.ops as _legacy_ops
+import nvidia.dali.types
+from nvidia.dali import internal as _internal
+from nvidia.dali.fn import _to_snake_case
+from nvidia.dali.ops import _docs, _names
+
+from . import _device, _invocation, _op_filter, _ops, _type
+from ._batch import Batch
+from ._call_site import mark_transparent, resolve_callsite_frame
+from ._capture import _capture_intercept
+from ._eval_mode import EvalMode
+from ._nvtx import NVTXRange
+from ._source_analysis import constant_kwargs
+from ._tensor import Tensor
+from ._tensor import tensor as to_tensor
+from .capture._invariant import unwrap_invariant, unwrap_invariants
+
+
+def is_external(x):
+    if isinstance(x, Tensor):
+        return x._is_external()
+    if isinstance(x, Batch):
+        return x._is_external()
+    return False
+
+
+def _scalar_decay(x):
+    x = unwrap_invariants(x)
+    if isinstance(x, _device.Device):
+        return x.device_type
+    if isinstance(x, _type.DType):
+        return x.type_id
+    if x is str:
+        return nvidia.dali.types.STRING
+    if x is bool:
+        return nvidia.dali.types.BOOL
+    if x is int or x is float:
+        raise ValueError(
+            f"Do not use Python built-in type {x} as an argument. "
+            f"Use one of the DALI types instead."
+        )
+    return x
+
+
+_unsupported_args = {"bytes_per_sample_hint", "preserve"}
+
+
+def _find_or_create_module(root_module, module_path):
+    return _internal.get_submodule(root_module, module_path)
+
+
+def _scalar_arg_type_id(dtype_id):
+    if dtype_id == nvidia.dali.types.DALIDataType._INT32_VEC:
+        return nvidia.dali.types.INT32
+    elif dtype_id == nvidia.dali.types.DALIDataType._INT64_VEC:
+        return nvidia.dali.types.INT64
+    elif dtype_id == nvidia.dali.types.DALIDataType._FLOAT_VEC:
+        return nvidia.dali.types.FLOAT
+    elif dtype_id == nvidia.dali.types.DALIDataType._STRING_VEC:
+        return nvidia.dali.types.STRING
+    elif dtype_id == nvidia.dali.types.DALIDataType._BOOL_VEC:
+        return nvidia.dali.types.BOOL
+    else:
+        return dtype_id
+
+
+def _argument_type_conversion(dtype_id):
+    try:
+        return _type.dtype(_scalar_arg_type_id(dtype_id))
+    except KeyError:
+        return None
+
+
+def _promote_0d_cpu_tensor(value):
+    if not isinstance(value, Tensor):
+        return value
+    if value.device.device_type != "cpu" or value.ndim != 0:
+        return value
+    return value.item()
+
+
+def _get_module_name(module, legacy_op_class):
+    """
+    Replicates behaviour of _names._process_op_name() + _adjust_operator_module()
+    for the dynamic mode - changing the module attribute
+    to prevent Sphinx from autodocing the operator.
+    """
+    module_name = module.__name__
+    if legacy_op_class is not None and legacy_op_class.__module__.endswith("hidden"):
+        module_name += ".hidden"
+    return module_name
+
+
+def build_operator_class(schema):
+    """
+    Generates an Operator subclass based on a schema, fills the members and implements the __init__
+    and __call__ methods. Registers the class in the appropriate module.
+    """
+    class_name = schema.OperatorName()
+    module_path = schema.ModulePath()
+    is_reader = "readers" in module_path
+    if is_reader:
+        from .. import dynamic as parent
+
+        module = parent
+    else:
+        module = _ops
+    legacy_op_class = None
+    import nvidia.dali.ops
+
+    legacy_op_module = nvidia.dali.ops
+    for path_part in module_path:
+        legacy_op_module = getattr(legacy_op_module, path_part)
+    module = _find_or_create_module(module, module_path)
+
+    legacy_op_class = getattr(legacy_op_module, class_name)
+    base = _ops.Operator
+    if "readers" in module.__name__:
+        base = _ops.Reader
+    op_class = type(class_name, (base,), {})  # create a subclass
+    op_class._schema = schema
+    op_class._schema_name = schema.Name()
+    op_class._supported_backends = frozenset(schema.GetSupportedBackends())
+    if len(op_class._supported_backends) == 0:
+        # TFRecord is not present in schema registry because it uses Python proxy
+        if op_class._schema_name == "readers__TFRecord":
+            op_class._supported_backends = frozenset({"cpu"})
+        else:
+            raise RuntimeError(
+                f"Internal error: operator {op_class._schema_name} has an "
+                f"empty set of supported backends. Is it a Python-only operator?"
+            )
+    op_class._op_name = class_name
+    op_class._op_path = ".".join(module_path + [op_class._op_name])
+    op_class._is_reader = is_reader
+    if not is_reader:
+        op_class._fn_name = _to_snake_case(class_name)
+        op_class._fn_path = ".".join(module_path + [op_class._fn_name])
+    op_class._legacy_op = legacy_op_class
+    op_class._is_stateful = schema.IsStateful()
+    op_class._has_random_state_arg = schema.HasRandomStateArg()
+    op_class._generated = True
+    op_class.__init__ = build_constructor(schema, op_class)
+    op_class.__call__ = build_call_function(schema, op_class)
+    op_class.__module__ = _get_module_name(module, legacy_op_class)
+    op_class.__qualname__ = class_name
+    op_class._argument_conversion_map = {
+        arg: _argument_type_conversion(schema.GetArgumentType(arg))
+        for arg in schema.GetArgumentNames(include_hidden=True)
+    }
+    setattr(module, class_name, op_class)
+    return op_class
+
+
+def build_constructor(schema, op_class):
+    """
+    Generates __init__ method for an operator subclass. Allows for lazy OpSpec initialization based
+    on the provided arguments.
+
+    Operator._get() can be used instead of the constructor to utilize the instance caching.
+    """
+    stateful = op_class._is_stateful
+    is_reader = op_class._is_reader
+    function_name = "__init__"
+
+    init_args = []
+    used_kwargs = set()
+    tensor_arg_names = set()
+    for arg in schema.GetArgumentNames():
+        if arg in _unsupported_args:
+            continue
+        is_tensor = schema.IsTensorArgument(arg)
+        if schema.IsArgumentOptional(arg) or (is_tensor and not is_reader):
+            init_args.append(f"{arg}=None")
+        else:
+            init_args.append(arg)
+        used_kwargs.add(arg)
+        if is_tensor:
+            tensor_arg_names.add(arg)
+
+    if init_args:
+        init_args = ["*"] + init_args
+    if is_reader:
+        init_args.append("enable_checkpointing=False")
+
+    header_args = (
+        [
+            "self",
+            "max_batch_size=None",
+            "name=None",
+            'device="cpu"',
+            "num_inputs=None",
+        ]
+        + init_args
+        + ["_backend=None"]
+    )
+    header = f"__init__({', '.join(header_args)})"
+
+    # Note: Base __init__ will keep the **kwargs
+    def init(self, max_batch_size, name, **kwargs):
+        if is_reader:
+            actual_tensor_arg_names = set()
+            tensor_args = {}
+            for arg_name in tensor_arg_names:
+                arg = unwrap_invariant(kwargs.get(arg_name))
+                if arg is None:
+                    continue
+                actual_tensor_arg_names.add(arg_name)
+                if isinstance(arg, (int, float, bool, str, tuple, list)):
+                    continue
+                if isinstance(arg, Batch):
+                    raise ValueError("Readers cannot be constructed with batch keyword arguments")
+                dtype = op_class._argument_conversion_map[arg_name]
+                arg = _promote_0d_cpu_tensor(to_tensor(arg, dtype=dtype))
+                if isinstance(arg, (int, float, bool, str)):
+                    kwargs[arg_name] = arg
+                    continue
+                del kwargs[arg_name]
+                tensor_args[arg_name] = arg
+        kwargs = {k: _scalar_decay(v) for k, v in kwargs.items()}
+        op_class.__base__.__init__(self, max_batch_size, name, **kwargs)
+        if is_reader:  # Need to be done here not to be overridden by the constructor
+            self._tensor_arg_names = actual_tensor_arg_names
+            self._raw_tensor_args = tensor_args
+        if stateful:
+            self._call_id = 0
+
+    doc = _docs._docstring_generator_class(schema.Name(), api="dynamic", args=used_kwargs)
+    function = makefun.create_function(header, init, doc=doc)
+    function.__qualname__ = f"{op_class.__name__}.{function_name}"
+
+    return function
+
+
+def _get_inputs(schema):
+    inputs = []
+    min_inputs = schema.MinNumInput()
+    max_inputs = schema.MaxNumInput()
+    num_separate_inputs = min_inputs
+    if schema.HasInputDox() or max_inputs <= _docs._MAX_INPUT_SPELLED_OUT:
+        num_separate_inputs = max_inputs
+
+    for i in range(num_separate_inputs):
+        name = _names._get_input_name(schema, i)
+        if i < min_inputs:
+            inputs.append(name)
+        else:
+            inputs.append(f"{name}=None")
+
+    if inputs:
+        inputs.append("/")
+    if num_separate_inputs < max_inputs:
+        inputs.append("*inputs")
+    else:
+        inputs.append("*")
+    return inputs
+
+
+def _check_batch_size_available(op_class, batch_size):
+    if op_class._schema_name == "BatchPermutation" and batch_size is None:
+        raise ValueError(
+            "`batch_size` must be specified for dynamic `batch_permutation` "
+            "because it has no data inputs to infer the batch size from."
+        )
+
+
+def build_call_function(schema, op_class):
+    """
+    Generates __call__ method for an operator subclass.
+
+    The call function handles batch/sample distinction,
+    conversion of arguments to batch/tensor and RNG state for random ops.
+    It constructs the invocation object and runs it immediately or returns it for lazy evaluation
+    depending on the current evaluation mode.
+    """
+    stateful = op_class._is_stateful
+    has_random_state_arg = op_class._has_random_state_arg
+    call_args = []
+    used_kwargs = set()
+    for arg in schema.GetArgumentNames():
+        if arg in _unsupported_args:
+            continue
+        if not schema.IsTensorArgument(arg):
+            continue
+        call_args.append(f"{arg}=None")
+        used_kwargs.add(arg)
+
+    call_args = ["batch_size=None"] + call_args
+    internal_args = ["_process_params=True", "_caller_frame=None"]
+
+    # Add rng argument for random operators
+    if has_random_state_arg:
+        call_args.append("rng=None")
+        used_kwargs.add("rng")
+        internal_args.append("_random_state=None")
+        # Remove 'seed' from used_kwargs and signature_args if present
+        if "seed" in used_kwargs:
+            used_kwargs.remove("seed")
+
+    inputs = _get_inputs(schema)
+
+    header = f"__call__({', '.join(['self'] + inputs + call_args + internal_args)})"
+
+    nvtx_arg_shallowcopy = NVTXRange("__call__: shallowcopy", category="op_builder")
+    nvtx_construct_invocation = NVTXRange("__call__: construct Invocation", category="op_builder")
+
+    @mark_transparent
+    @NVTXRange(f"__call__: {op_class._op_name}", category="op_builder")
+    def call(
+        self, *raw_args, batch_size=None, _process_params=True, _caller_frame=None, **raw_kwargs
+    ):
+        batch_size = unwrap_invariant(batch_size)
+        self._pre_call(*raw_args, **raw_kwargs)
+
+        if op_class._is_reader and self._tensor_arg_names:
+            actual_kwargs = {
+                name for name, value in raw_kwargs.items() if unwrap_invariant(value) is not None
+            }
+            overlap = actual_kwargs & self._tensor_arg_names
+            if overlap:
+                raise ValueError(
+                    f"Keyword argument{'s'[:len(overlap) ^ 1]} {sorted(overlap)}"
+                    f" cannot be passed both in the constructor and __call__."
+                )
+            raw_kwargs = {**raw_kwargs, **self._raw_tensor_args}
+
+        if batch_size is None:
+            batch_size = _ops._infer_batch_size(*raw_args, **raw_kwargs)
+        is_batch = batch_size is not None
+
+        if _caller_frame is None and EvalMode.current().value <= EvalMode.eager.value:
+            _caller_frame = resolve_callsite_frame(depth_hint=4)
+
+        if _process_params:
+            inputs, kwargs = op_class._process_params(
+                self._backend,
+                self._device,
+                batch_size,
+                *raw_args,
+                **raw_kwargs,
+            )
+        else:
+            inputs = [inp for inp in raw_args if inp is not None]
+            kwargs = {name: value for name, value in raw_kwargs.items() if value is not None}
+
+        with nvtx_arg_shallowcopy:
+            inputs = [copy.copy(x) for x in inputs]
+            kwargs = {k: copy.copy(v) for k, v in kwargs.items()}
+
+        if stateful:
+            call_id = self._call_id
+            self._call_id += 1
+        else:
+            call_id = None
+        with nvtx_construct_invocation:
+            invocation = _invocation.Invocation(
+                self,
+                call_id,
+                inputs=inputs,
+                args=kwargs,
+                is_batch=is_batch,
+                batch_size=batch_size or 1,
+                previous_invocation=self._last_invocation,
+                caller_frame=_caller_frame,
+            )
+
+        if stateful:
+            self._last_invocation = invocation
+
+        has_external_inputs = any(is_external(x) for x in inputs) or any(
+            is_external(x) for x in kwargs.values()
+        )
+        invocation.apply_eval_policy(has_external_inputs)
+
+        ResultType = Batch if is_batch else Tensor
+
+        if len(invocation) == 1:
+            return ResultType(invocation_result=invocation[0])
+        elif self._output_names is None:
+            return tuple(ResultType(invocation_result=res) for res in invocation)
+        else:
+            return {
+                name: ResultType(invocation_result=res)
+                for name, res in zip(self._output_names, invocation)
+            }
+
+    doc = _docs._docstring_generator_call(schema.Name(), api="dynamic", args=used_kwargs)
+    function = mark_transparent(makefun.create_function(header, call, doc=doc))
+
+    return function
+
+
+def _next_pow2(x):
+    return 1 << (x - 1).bit_length()
+
+
+def _resolve_backend(
+    op_class, device, inputs, *, op_name: str | None = None
+) -> tuple[_device.Device, str]:
+    """Resolve device and backend from user arguments.
+
+    Returns (resolved_device, backend).
+    """
+    device = unwrap_invariant(device)
+    if device is None:
+
+        def infer_device():
+            for arg in inputs:
+                dev = _ops._get_input_device(unwrap_invariant(arg))
+                if dev is not None and dev.device_type == "gpu":
+                    return dev
+            return _device.Device.CPU
+
+        device = infer_device()
+        device_inferred = True
+    else:
+        if not isinstance(device, _device.Device):
+            device = _device.Device(device)
+        device_inferred = False
+
+    supported_backends = op_class._supported_backends
+    backend = device.device_type
+    if device.device_type not in supported_backends:
+        if len(supported_backends) == 1 and device_inferred:
+            # Maybe we got it wrong? Try the only device that's there
+            backend = next(iter(supported_backends))
+        # Now we want to call "mixed" operators "gpu" - but we still have distinct backends.
+        # Hardly any op has both "mixed" and "gpu", so we can just replace "gpu" with
+        # "mixed".
+        elif backend == "gpu" and "mixed" in supported_backends:
+            backend = "mixed"
+        elif not device_inferred:
+            name = op_name or op_class._schema.OperatorName()
+            raise ValueError(f'Invalid device "{device}" for operator `{name}`')
+        if device.device_type == "cpu" and backend in ["gpu", "mixed"]:
+            device = _device.Device("gpu")
+
+    return device, backend
+
+
+def build_fn_wrapper(op, fn_name=None, add_to_module=True):
+    """Generates main API entry point for a dynamic mode operator.
+
+    The implementation extracts the batch size and device if possible, gets the Operator instance,
+    and calls it to produce an Invocation object.
+
+    Parameters
+    ----------
+    op : ndd.Operator
+        The ndd "operator" class to wrap.
+    fn_name : str, optional
+        when provided, overrides the default function name
+    add_to_module : bool, default=True
+        If True (default), adds the function to the appropriate module;
+        if False, just returns the function.
+    """
+    schema = op._schema
+
+    if fn_name is None:  # for tests
+        fn_name = _to_snake_case(op._schema.OperatorName())
+    inputs = _get_inputs(schema)
+
+    fixed_args = []
+    tensor_args = []
+    signature_args = ["batch_size=None", "device=None"]
+    used_kwargs = {"batch_size", "device"}
+
+    for arg in op._schema.GetArgumentNames():
+        if arg in _unsupported_args:
+            continue
+        if op._schema.IsTensorArgument(arg):
+            tensor_args.append(arg)
+        else:
+            fixed_args.append(arg)
+        used_kwargs.add(arg)
+        if op._schema.IsArgumentOptional(arg):
+            signature_args.append(f"{arg}=None")
+        else:
+            signature_args.append(arg)
+
+    if op._has_random_state_arg:
+        tensor_args.append("rng")
+        used_kwargs.add("rng")
+        signature_args.append("rng=None")
+        # Remove 'seed' from used_kwargs and signature_args if present
+        if "seed" in used_kwargs:
+            used_kwargs.remove("seed")
+        signature_args = [arg for arg in signature_args if "seed" not in arg]
+
+    header = f"{fn_name}({', '.join(inputs + signature_args)})"
+
+    nvtx_get_instance_range = NVTXRange(f"get instance {op._op_name}", category="op_builder")
+
+    @mark_transparent
+    @NVTXRange(f"{fn_name}()", category="op_builder")
+    def fn_call(
+        *inputs, batch_size=None, device=None, _backend=None, _caller_frame=None, **raw_kwargs
+    ):
+        if batch_size is None:
+            batch_size = _ops._infer_batch_size(*inputs, **raw_kwargs)
+        _check_batch_size_available(op, batch_size)
+        max_batch_size = _next_pow2(batch_size or 1)
+
+        if _caller_frame is None:
+            _caller_frame = resolve_callsite_frame(depth_hint=3)
+
+        # TODO(michalz): utilize constant inputs
+        constant_args = constant_kwargs(_caller_frame, raw_kwargs)
+
+        init_args = {}
+        call_args = {}
+        for arg, value in raw_kwargs.items():
+            if arg == "max_batch_size":
+                continue
+            is_constant = arg in constant_args if constant_args is not None else False
+            if arg in fixed_args or is_constant:
+                value = _scalar_decay(value)
+                if value is not None:
+                    init_args[arg] = value
+            elif arg in tensor_args and not is_constant:
+                call_args[arg] = value
+
+        inputs, call_args = op._process_params(_backend, device, batch_size, *inputs, **call_args)
+
+        # Get or create the operator instance that matches the arguments
+        with nvtx_get_instance_range:
+            op_inst = op._get(
+                max_batch_size=max_batch_size,
+                name=None,
+                device=device,
+                num_inputs=len(inputs),
+                call_arg_names=tuple(call_args.keys()),
+                _backend=_backend,
+                inputs=inputs,
+                init_args=init_args,
+                call_args=call_args,
+            )
+
+        # Call the operator (the result is an Invocation object)
+        return op_inst(
+            *inputs,
+            batch_size=batch_size,
+            _process_params=False,
+            _caller_frame=_caller_frame,
+            **call_args,
+        )
+
+    fn_call = _capture_intercept(fn_call, op, op_name=fn_name)
+
+    doc = _docs._docstring_generator_fn(schema.Name(), api="dynamic", args=used_kwargs)
+    function = mark_transparent(makefun.create_function(header, fn_call, doc=doc))
+    function._op_class = op
+    function._schema = schema
+    function._schema_name = schema.Name()
+    function._generated = True
+
+    if add_to_module:
+        module_path = schema.ModulePath()
+        from .. import dynamic as parent
+
+        module = _internal.get_submodule(parent, module_path)
+        function.__module__ = _get_module_name(module, op._legacy_op)
+        setattr(module, fn_name, function)
+    return function
+
+
+def build_fn_wrappers(all_ops):
+    wrappers = []
+    for op in all_ops:
+        # Allow random operators to have functional wrappers even if stateful
+        if op._is_stateful and not op._has_random_state_arg:
+            continue
+
+        wrappers.append(build_fn_wrapper(op))
+    return wrappers
+
+
+def build_operators():
+    """Main entry point for dynamic mode operator discovery and construction.
+    Returns a tuple of all operator classes and functional wrappers."""
+    _all_ops = _legacy_ops._registry._all_registered_ops()
+    all_op_classes = []
+    aliases = {}
+    op_map = {}
+    for schema_name in _all_ops:
+        if not _op_filter.should_create_dynamic_op(schema_name):
+            continue
+
+        original_schema, schema = _b.GetSchemaAndTarget(schema_name)
+        if original_schema.AliasFor():
+            # An alias - it will reuse the class of the actual operator
+            aliases[schema_name] = schema.Name()
+            continue
+        cls = build_operator_class(schema)
+        all_op_classes.append(cls)
+        op_map[schema_name] = cls
+
+    # Protect from infinite recursion when calling to_device, which internally uses operator Copy.
+    op_map["Copy"]._input_device = (
+        lambda self, backend, index, op_device=None, actual_device=None: None
+    )
+
+    all_fn_wrappers = build_fn_wrappers(all_op_classes)
+    _expose_aliases(aliases, op_map, all_fn_wrappers)
+
+    return all_op_classes, all_fn_wrappers
+
+
+def _expose_aliases(aliases, op_map, fn_wrappers):
+    """Exposes the operator classes and functional wrappers under the alias names."""
+    from .. import dynamic as parent
+
+    fn_map = {fn._op_class: fn for fn in fn_wrappers}
+    for alias_name, actual_name in aliases.items():
+        op_class = op_map.get(actual_name)
+        if op_class is None:
+            continue
+        alias_schema = _b.GetSchema(alias_name)
+        module_path = alias_schema.ModulePath()
+        class_name = alias_schema.OperatorName()
+        class_module = _find_or_create_module(parent if op_class._is_reader else _ops, module_path)
+        setattr(class_module, class_name, op_class)
+        fn = fn_map.get(op_class)
+        if fn is not None:
+            fn_module = _internal.get_submodule(parent, module_path)
+            setattr(fn_module, _to_snake_case(class_name), fn)

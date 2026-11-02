@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'dcgm-exporter'
+    static_configs:
+      - targets: ['dcgm-exporter:9400']
+
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # OTel-sourced alert metrics, commented out deliberately.
+  #
+  # Every job above has a service in the profile lists that ship this file;
+  # otel-collector does not. warehouse-operations is the only profile family
+  # that deploys prometheus, and none of its lists contain the collector - so
+  # an active job here would give every warehouse deployment a permanently DOWN
+  # target and a red tile in Grafana, for a feature it never asked for.
+  #
+  # Uncomment if you deploy both. The alert service's own alert_bridge_* series
+  # are scraped from the service directly; these are the additive OTel ones,
+  # which have to come through the collector because an in-process OTel reader
+  # cannot register into the multiprocess registry :9081 serves.
+  #
+  # - job_name: 'otel-collector'
+  #   static_configs:
+  #     - targets: ['otel-collector:8889']

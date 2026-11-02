@@ -1,0 +1,149 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <memory>
+#include "HttpServerRequestHandler.h"
+#include "adaptor_loader.h"
+#include "media_adaptor_loader.h"
+#include "vms_media_interface.h"
+
+
+class IVstModule;
+
+typedef IVstModule* (*createObject_t) (void);
+typedef void (*deleteObject_t) (IVstModule*);
+
+class IVstModule
+{
+    public:
+        createObject_t m_createObject = nullptr;
+        deleteObject_t m_deleteObject = nullptr;
+        IVstModule* m_module = nullptr;
+        std::map<std::string,HttpServerRequestHandler::httpFunction, std::less<>>  m_func;
+        nv_vms::IMediaInterface* m_mediaInterface = nullptr;
+
+        virtual const std::map<std::string,HttpServerRequestHandler::httpFunction, std::less<>> getHttpApi() { return m_func; };
+        virtual void postInit() { /* Optional hook: modules that need no post-initialization work keep this no-op. */ }
+        virtual ~IVstModule() = default;
+};
+
+class ModuleLoader
+{
+    public:
+        static ModuleLoader* getInstance()
+        {
+            static ModuleLoader instance;
+            return &instance;
+        }
+        ModuleLoader();
+        ~ModuleLoader();
+
+        ModuleLoader(const ModuleLoader&) = delete;
+        ModuleLoader& operator=(const ModuleLoader&) = delete;
+        ModuleLoader(ModuleLoader&&) = delete;
+        ModuleLoader& operator=(ModuleLoader&&) = delete;
+
+        int initialize(nv_vms::ModuleId module_id = nv_vms::ModuleAll);
+        void deInitialize();
+        std::string getDeviceId();
+        std::string getDeviceType();
+        std::shared_ptr<nv_vms::DeviceManager> getDeviceManagerObject();
+#ifdef UNIT_TEST
+        /** For unit tests only: set DeviceManager so StreamMonitor/QosRtspClient get a valid instance. */
+        void setDeviceManagerForTest(std::shared_ptr<nv_vms::DeviceManager> dm);
+#endif
+        nv_vms::ModuleId getModuleId(const std::string& moduleName);
+        std::string getModuleIdAsString(nv_vms::ModuleId module_id);
+
+        IVstModule* getRtspServerMgmtInstance()
+        {
+            return m_rtspServer;
+        }
+        IVstModule *getRecorderInstance()
+        {
+            return m_streamRecorder;
+        }
+        IVstModule *getStorageMngtInstance()
+        {
+            return m_storageManagement;
+        }
+        IVstModule *getSensorMngtInstance()
+        {
+            return m_sensorManagement;
+        }
+        IVstModule *getPeerConnectionManager()
+        {
+            return m_peerConnectionManager;
+        }
+        IVstModule *getPeerConnectionLiveInstance()
+        {
+            return m_peerConnectionLiveManager;
+        }
+        IVstModule *getPeerConnectionReplayInstance()
+        {
+            return m_peerConnectionReplayManager;
+        }
+        IVstModule *getStreamBridgeInstance()
+        {
+            return m_streamBridge;
+        }
+
+        nv_vms::IMediaInterface* getMediaInterface()
+        {
+            return m_mediaAdaptorHandle.instance;
+        }
+
+        void setMediaAdaptorLibPath(const std::string& path)
+        {
+            m_mediaAdaptorLibPath = path;
+        }
+
+        IVstModule* m_rtspServer = nullptr;
+        IVstModule* m_streamRecorder = nullptr;
+        IVstModule* m_storageManagement = nullptr;
+        IVstModule* m_sensorManagement = nullptr;
+        IVstModule* m_peerConnectionManager = nullptr;
+        IVstModule* m_peerConnectionLiveManager = nullptr;
+        IVstModule* m_peerConnectionReplayManager = nullptr;
+        IVstModule* m_streamBridge = nullptr;
+    private:
+        int loadRtspServerLib();
+        int loadStreamRecorderLib();
+        int loadStorageManagementLib();
+        int loadSensorManagementLib();
+        int loadPeerConnectionManagerLib();
+        int loadPeerConnectionLiveLib();
+        int loadPeerConnectionReplayLib();
+        int loadStreamBridgeLib();
+        int loadMediaAdaptor();
+        void unloadMediaAdaptor();
+
+        nv_vms::SharedLibrary* m_handleRtspServer = nullptr;
+        nv_vms::SharedLibrary* m_handleStreamRecorder = nullptr;
+        nv_vms::SharedLibrary* m_handleStorageManagement = nullptr;
+        nv_vms::SharedLibrary* m_handleSensorManagement = nullptr;
+        nv_vms::SharedLibrary* m_handlePeerConnectionManager = nullptr;
+        nv_vms::SharedLibrary* m_handlePeerConnectionLiveManager = nullptr;
+        nv_vms::SharedLibrary* m_handlePeerConnectionReplayManager = nullptr;
+        nv_vms::SharedLibrary* m_handleStreamBridge = nullptr;
+        nv_vms::AdaptorLoader m_loader;
+        std::shared_ptr<nv_vms::DeviceManager> m_deviceManager;
+        nv_vms::MediaAdaptorLoader::MediaAdaptorHandle m_mediaAdaptorHandle{};
+        std::string m_mediaAdaptorLibPath;
+};

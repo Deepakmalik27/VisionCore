@@ -1,0 +1,96 @@
+.vscode/
+.venv
+.eggs/
+env/
+*.DS_Store
+.coverage
+htmlcov/
+# interpreter bytecode
+__pycache__/
+__MACOSX/
+repo-to-text_*.txt
+
+# experiment results
+runs/
+videos/
+# Derived replay caches beside user-supplied datasets
+**/.boxmot/replay_cache/
+
+# experiment files
+*.pkl
+
+# partial downlaods
+*.part
+
+# Downloaded weights
+/models/
+weights/*.pt
+weights/*.torchscript
+weights/*.onnx
+weights/*_openvino_model
+weights/*.engine
+weights/*.tflite
+
+# runtime evaluation downloads
+/data/
+/datasets/
+
+# zip files
+*.zip
+
+# exports
+*_openvino_model
+*_coreml_model/
+*.torchscript
+*.pt
+*.pth
+*.pth
+*.onnx
+*.engine
+*.data
+
+# interactive plots
+*.html
+*.gif
+*.pdf
+
+# tf models
+*saved_model/
+tf_models/
+
+# distribution / packaging
+build/
+dist/
+*.egg-info/
+site/
+
+# cmc debug images
+boxmot/trackers/common/motion/cmc/*.jpg
+
+# json outputs
+*_output.json
+
+# In-place compiled native (C++) tracker artifacts (scikit-build-core editable install)
+boxmot/native/cpp/trackers/**/*.so
+boxmot/native/cpp/trackers/**/*.dylib
+boxmot/native/cpp/trackers/**/*.dll
+boxmot/native/cpp/trackers/**/*.pyd
+boxmot/native/cpp/trackers/**/*.a
+boxmot/native/cpp/trackers/*/*_replay
+boxmot/native/cpp/trackers/*/*_replay.exe
+
+# CMake caches that may end up beside the C++ sources in inplace builds
+boxmot/native/cpp/trackers/**/CMakeCache.txt
+boxmot/native/cpp/trackers/**/CMakeFiles/
+boxmot/native/cpp/trackers/**/cmake_install.cmake
+
+# scikit-build-core inplace editable build artifacts at the repo root
+.skbuild-info.json
+.cmake/
+.ninja_deps
+.ninja_log
+build.ninja
+CMakeCache.txt
+CMakeFiles/
+CMakeInit.txt
+cmake_install.cmake

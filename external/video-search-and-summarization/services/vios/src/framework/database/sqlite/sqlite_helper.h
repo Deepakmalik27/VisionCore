@@ -1,0 +1,182 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <stdio.h>
+#include <sqlite3.h>
+#include <iostream>
+#include <string>
+#include <assert.h>
+
+#include "logger.h"
+#include "database_schema.h"
+#include "database_manager.h"
+#include "device_manager.h"
+#include "query_builder.h"
+#include <optional>
+
+
+#define GET_SQLITE_INSTANCE nv_vms::Sqlite::getInstance
+
+namespace nv_vms
+{
+    class Sqlite : public IDatabaseInterface
+    {
+    public:
+        static Sqlite *getInstance()
+        {
+            static Sqlite instance;
+            static bool initialized = false;
+            if (!initialized)
+            {
+                assert(instance.connect() == 0);
+                initialized = true;
+            }
+            return &instance;
+        }
+
+        // IDatabaseInterface mandatory
+        bool connect() override;
+        bool executeQuery(const std::string &query, queryResult &result) override;
+        bool executeQuery(const std::string &query) override;
+        bool isConnected() override;
+
+        // Database type identification
+        DatabaseType getDatabaseType() const override { return DatabaseType::SQLite; }
+        const char* getDatabaseName() const override { return "SQLite"; }
+        
+        // Parameterized query methods to prevent SQL injection
+        bool executeQuery(const std::string &queryTemplate, const std::vector<std::string> &params, queryResult &result) override;
+        bool executeQuery(const std::string &queryTemplate, const std::vector<std::string> &params) override;
+
+        // IDatabaseInterface optionals
+        int insertRowEvent(EventDBColumns &row) override;
+        int insertRowSensorDetails(SensorDetailsDBColumns &row) override;
+        SensorDetailsDBColumns readSensorDetails(std::string deviceId, std::string sensorId) override;
+        std::vector<SensorDetailsDBColumns> readSensorDetails(std::string deviceId) override;
+        SensorDetailsDBColumns readSensorDetailsByLocation(std::string location) override;
+        int deleteSensorDetails(std::string sensorId) override;
+        int insertRowVideoRecord(VideoRecordDBColumns &row) override;
+        std::vector<VideoRecordDBColumns> readVideoRecordStreamIdBased(std::string streamId, int64_t startTime, int64_t endTime) override;
+        std::vector<VideoRecordDBColumns> readVideoRecordSensorIdBased(std::string sensorId, int64_t startTime, int64_t endTime) override;
+        std::vector<VideoRecordDBColumns> readVideoRecord(std::string sensorId, int64_t startTime, int64_t endTime, const std::vector<std::string>& streamIds = std::vector<std::string>()) override;
+        std::vector<VideoRecordDBColumns> readVideoRecordUniqueIdBased(std::string id) override;
+        std::vector<VideoRecordDBColumns> readVideoRecordSensorIdUniqueIdBased(std::string sensorId, std::string id) override;
+        VideoRecordDBColumns readInProgressVideoRecord(std::string streamId, int64_t startTime) override;
+        VideoRecordDBColumns readVideoRecordExactMatch(std::string streamId, int64_t startTime) override;
+        VideoRecordDBColumns readVideoRecordExactMatchFilePath(std::string sensorId, std::string filePath, int64_t startTime) override;
+        int updateVideoRecordInDb(VideoRecordDBColumns &row) override;
+        int updateVideoRecordDurationBatch(const std::vector<VideoRecordDBColumns> &rows) override;
+        int insertRowVideoRecordSchedule(VideoRecordScheduleDBColumns &row) override;
+        std::vector<VideoRecordScheduleDBColumns> readVideoRecordSchedules(std::string streamId = "") override;
+        bool deleteVideoRecordSchedule(std::string sensorId, std::string startTime, std::string endTime) override;
+        int deleteVideoRecordings(std::vector<std::string> &filePaths) override;
+        std::vector<VideoRecordDBColumns> readRecordsInBatch(uint32_t &batchSize, bool excludeCloudScanned = false) override;
+        std::vector<VideoRecordDBColumns> getVideoRecordFilePaths(std::string sensorId, int64_t startTime, int64_t endTime) override;
+        std::vector<VideoRecordDBColumns> getVideoRecordFilePathsSensorIdBased(std::string sensorId, int64_t startTime, int64_t endTime) override;
+        std::vector<VideoRecordDBColumns> getVideoRecordFilePathsIdBased(std::string id) override;
+        int deleteStreamDetailsUsingSensorId(std::string sensorId) override;
+        int deleteRecordingStatusUsingSensorId(std::string sensorId) override;
+        int deleteRowStream(std::string streamId) override;
+        SensorStreamsDBColumns readSensorStreams(std::string streamId) override;
+        int insertRowStream(SensorStreamsDBColumns &row) override;
+        std::vector<SensorStreamsDBColumns> readAllStreamsForGivenSensorID(std::string sensorId) override;
+        std::vector<SensorInfoDBColumns> readSensorInfo(std::string sensorId) override;
+        std::string readStreamProperty(std::string streamId, std::string property) override;
+        std::vector<VideoRecordDBColumns> getRecordedVideoSize() override;
+        bool checkVideoRecordExists(std::string sensorId) override;
+        std::vector<VideoRecordDBColumns> getAllDisconnectedSensorId() override;
+        UserDetailsDBColumns getUserDetail(const std::string username) override;
+        int setUserDetail(UserDetailsDBColumns &row) override;
+        std::vector<UserSessionsDBColumns> getUserSessions(const std::string username) override;
+        int deleteUserSession(const std::string username, const std::string sessionId) override;
+        int setUserSession(UserSessionsDBColumns &row) override;
+        void deleteExpiredUserSessions() override;
+        std::vector<UserSessionsDBColumns> getAllSessions() override;
+        int deleteUserDetails(const std::string username) override;
+        void extendSession(const std::string username, const std::string sessionId) override;
+        std::string getLocalDeviceId() override;
+        std::string getLocalDeviceName() override;
+        int setLocalDeviceId(const std::string deviceId) override;
+        int setLocalDeviceName(const std::string &deviceName, const std::string &deviceId) override;
+        std::string getLocalDeviceLocation() override;
+        int setLocalDeviceLocation(const std::string &deviceLocation, const std::string &deviceId) override;
+        std::vector<VideoFileInfo> getFileList(std::string sensorId, int64_t t1, int64_t t2,
+                                               size_t maxFiles = 0, bool accurate = false) override;
+        std::vector<VideoFileInfo> getFileListStreamIdBased(std::string streamId, int64_t t1, int64_t t2) override;
+        std::vector<VideoFileInfo> getFileListUniqueIdSensorIdBased(std::string uniqueId, std::string sensorId, int64_t t1, int64_t t2) override;
+        std::vector<VideoFileInfo> getNextFileList(std::string streamId, int64_t t1) override;
+        VideoFileInfo getInProgressRecordFile(std::string streamId, int64_t startTime) override;
+        VideoFileInfo getRecordFileInfo(std::string streamId, int64_t startTime) override;
+        int getAllStreams(std::vector<std::shared_ptr<StreamInfo>> &streamInfo, const std::string &deviceId) override;
+        int getAllSensors(std::vector<std::shared_ptr<SensorInfo>> &sensorInfo, const std::string &deviceId) override;
+        bool isSensorExists(const std::shared_ptr<SensorInfo> &in_device, const std::string &deviceId) override;
+        std::shared_ptr<SensorInfo> findExistingSensor(const std::shared_ptr<SensorInfo> &in_device, const std::string &deviceId) override;
+        std::shared_ptr<SensorInfo> searchSensorAndGetSensorInfo(const std::string &searchSensorId, const std::string &deviceId) override;
+        std::vector<VideoRecordDBColumns> getAllVideoRecordFilePaths() override;
+        int setDbVersion(DbDetailsColumns &row) override;
+        DbDetailsColumns getDbVersion() override;
+        int updateFileProtectionInDb(bool fileProtection, std::string filePath) override;
+        int updateFilesProtectionInDb(bool fileProtection, const std::vector<std::string>& filePaths) override;
+        int updateObjectIdInDb(const std::string& objectId, const std::string& filePath) override;
+        int updateFileProtectionAndObjectIdInDb(bool fileProtection, const std::string& objectId, const std::string& filePath) override;
+        int resetProtectedFlagsInDb() override;
+        std::vector<VideoRecordDBColumns> getProtectedFilesFromDB() override;
+        VmsErrorCode getMainStreamFromDB(std::shared_ptr<StreamInfo> &mainStream, const SensorDetailsDBColumns &sensorDetails) override;
+        VmsErrorCode getSubStreamFromDB(std::shared_ptr<StreamInfo> &subStream, const SensorStreamsDBColumns &streamDetails, const std::string device_name) override;
+        VmsErrorCode getSensorInfoFromDB(std::shared_ptr<SensorInfo> &sensorInfo, const SensorDetailsDBColumns &sensorDetails) override;
+        uint64_t getTotalCurrentRecordSize() override;
+        int setRecordingStatus(const std::string &streamId, RecordState new_status, const std::optional<std::string> &sensorId) override;
+        VmsErrorCode getRecordingStatus(std::map<std::string, RecordingStatusDBColumns, std::less<>> &allStatus, const std::optional<std::string> &streamId) override;
+        std::vector<SensorDetailsDBColumns> readAllSensorSatus(std::string deviceId) override;
+        VmsErrorCode getSensorIdsWithRecordingTimelines(std::unordered_set<std::string> &sensorIds) override;
+        int updateStreamInfo(std::string streamId, std::string proxyUrl, std::string replayUrl, std::pair<StreamStatus, std::string> status) override;
+        std::vector<SensorStreamsDBColumns> readAllStreams() override;
+        std::string searchSensorFileIdBased(const std::string &id) override;
+        
+        // Temp Files operations
+        int insertTempFileRecord(TempFilesDBColumns &row) override;
+        int deleteTempFileRecord(const std::string& filePath) override;
+        std::vector<TempFilesDBColumns> getAllTempFiles() override;
+        int cleanupTempFileRecords(int64_t olderThanTimestamp) override;
+        TempFilesDBColumns findTempFileByStreamAndTime(
+            const std::string& deviceId, const std::string& streamId,
+            int64_t startTimeMs, int64_t endTimeMs,
+            const std::string& fileType = "",
+            const std::string& containerFormat = "",
+            const std::string& configHash = "") override;
+        int updateTempFileExpiry(
+            const std::string& filePath, int64_t newExpiryTimestamp) override;
+
+        int queryCrashedRecordings(std::vector<VideoRecordDBColumns> &rows) override;
+
+#ifdef UNIT_TEST
+        std::vector<VideoRecordDBColumns> getLastRecordVideoRecord(std::string streamId) override;
+#endif
+    private:
+        Sqlite();
+        ~Sqlite();
+        Sqlite(const Sqlite &) = delete;
+        Sqlite &operator=(const Sqlite &) = delete;
+
+    private:
+        sqlite3 *m_db;
+        bool m_connected;
+    };
+
+} // nv_vms

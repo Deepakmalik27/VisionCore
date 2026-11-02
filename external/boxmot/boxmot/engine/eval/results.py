@@ -1,0 +1,651 @@
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from boxmot.engine.eval.motmetrics import (
+    _benchmark_config,
+    _resolve_eval_box_type,
+    _resolve_obb_eval_class_pairs,
+)
+
+if TYPE_CHECKING:
+    from rich.console import RenderableType
+else:
+    RenderableType = Any
+
+SUMMARY_COLUMNS = ("HOTA", "MOTA", "IDF1", "AssA", "AssRe", "IDSW", "IDs")
+CORE_SUMMARY_COLUMNS = ("HOTA", "MOTA", "IDF1")
+SUMMARY_INT_COLUMNS = {"IDSW", "IDs"}
+MOT_REPORT_INTEGER_FIELDS = {
+    "CLR_TP",
+    "CLR_FN",
+    "CLR_FP",
+    "IDSW",
+    "IDt",
+    "IDa",
+    "IDm",
+    "MT",
+    "PT",
+    "ML",
+    "Frag",
+    "IDTP",
+    "IDFN",
+    "IDFP",
+    "Dets",
+    "GT_Dets",
+    "IDs",
+    "GT_IDs",
+}
+SUMMARY_AGGREGATE_LABELS = {
+    "cls_comb_det_av": "Class Avg (Det)",
+    "cls_comb_cls_av": "Class Avg (Cls)",
+    "HUMAN": "Human (Super)",
+    "VEHICLE": "Vehicle (Super)",
+    "BIKE": "Bike (Super)",
+    "all": "All Classes",
+}
+
+
+@dataclass(slots=True)
+class ValidationResult:
+    """Structured result returned by the tracking evaluation workflow."""
+
+    benchmark: str
+    raw: dict[str, Any]
+    summary_label: str
+    summary: dict[str, Any]
+    exp_dir: Path | None = None
+    timings: dict[str, Any] = field(default_factory=dict)
+    args: Any = None
+    workflow_rendered: bool = False
+    reference_raw: dict[str, Any] | None = None
+    reference_name: str | None = None
+    detection_metrics: dict[str, dict[str, dict[str, float | None]]] | None = None
+    tracking_2d_metrics: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        if self.workflow_rendered:
+            return ""
+        return self.render()
+
+    def __repr__(self) -> str:
+        return f"ValidationResult(benchmark={self.benchmark!r}, summary={self.summary!r}, exp_dir={self.exp_dir!r})"
+
+    def render(
+        self,
+        *,
+        title: str | None = None,
+        include_sequences: bool = True,
+        include_timings: bool = False,
+    ) -> str:
+        from boxmot.engine.ui.reporters import validation as reporting
+
+        report_title = title
+        if report_title is None:
+            report_title = (
+                f"📊 BOXMOT vs {self.reference_name.upper()}"
+                if self.reference_raw is not None and self.reference_name
+                else reporting.CLI_RESULTS_SUMMARY_TITLE
+            )
+        return reporting.render_validation_cli_report(
+            self.raw,
+            args=self.args,
+            detection_metrics=self.detection_metrics,
+            tracking_2d_metrics=self.tracking_2d_metrics,
+            timings=self.timings,
+            title=report_title,
+            include_sequences=include_sequences,
+            include_timings=include_timings,
+            compare_raw=self.reference_raw,
+            compare_args=self.args,
+            compare_label=f"Δ vs {self.reference_name}" if self.reference_name else None,
+        )
+
+    def renderable(
+        self,
+        *,
+        title: str | None = None,
+        include_sequences: bool = True,
+        include_timings: bool = False,
+        compare_raw: dict[str, Any] | None = None,
+        compare_args: Any = None,
+    ) -> RenderableType:
+        from boxmot.engine.ui.reporters import validation as reporting
+
+        resolved_compare_raw = self.reference_raw if compare_raw is None else compare_raw
+        resolved_compare_args = self.args if compare_args is None else compare_args
+        resolved_title = title
+        if resolved_title is None and self.reference_raw is not None and self.reference_name:
+            resolved_title = f"📊 BOXMOT vs {self.reference_name.upper()}"
+        return reporting.build_validation_cli_renderable(
+            self.raw,
+            args=self.args,
+            detection_metrics=self.detection_metrics,
+            tracking_2d_metrics=self.tracking_2d_metrics,
+            timings=self.timings,
+            title=resolved_title,
+            include_sequences=include_sequences,
+            include_timings=include_timings,
+            compare_raw=resolved_compare_raw,
+            compare_args=resolved_compare_args,
+            compare_label=f"Δ vs {self.reference_name}" if self.reference_name else None,
+        )
+
+    def format_report(self, *, title: str | None = None, include_sequences: bool = True) -> str:
+        from boxmot.engine.ui.reporters import validation as reporting
+
+        report_title = reporting.DEFAULT_VALIDATION_REPORT_TITLE if title is None else title
+        return reporting.format_validation_report(
+            self.raw,
+            args=self.args,
+            detection_metrics=self.detection_metrics,
+            tracking_2d_metrics=self.tracking_2d_metrics,
+            title=report_title,
+            include_sequences=include_sequences,
+        )
+
+    def print_report(
+        self,
+        *,
+        title: str | None = None,
+        include_sequences: bool = True,
+        include_timings: bool = False,
+    ) -> None:
+        from boxmot.engine.ui.reporters import validation as reporting
+
+        report_title = title
+        if report_title is None:
+            report_title = (
+                f"📊 BOXMOT vs {self.reference_name.upper()}"
+                if self.reference_raw is not None and self.reference_name
+                else reporting.CLI_RESULTS_SUMMARY_TITLE
+            )
+        reporting.print_validation_cli_report(
+            self.raw,
+            args=self.args,
+            detection_metrics=self.detection_metrics,
+            tracking_2d_metrics=self.tracking_2d_metrics,
+            timings=self.timings,
+            title=report_title,
+            include_sequences=include_sequences,
+            include_timings=include_timings,
+            compare_raw=self.reference_raw,
+            compare_args=self.args,
+            compare_label=f"Δ vs {self.reference_name}" if self.reference_name else None,
+        )
+
+    def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
+        payload = {
+            "benchmark": self.benchmark,
+            "summary_label": self.summary_label,
+            "summary": dict(self.summary),
+            "timings": dict(self.timings),
+            "exp_dir": None if self.exp_dir is None else str(self.exp_dir),
+        }
+        if self.detection_metrics is not None:
+            payload["detection_metrics"] = self.detection_metrics
+        if self.tracking_2d_metrics is not None:
+            payload["tracking_2d_metrics"] = self.tracking_2d_metrics
+        if include_raw:
+            payload["raw"] = self.raw
+            if self.reference_raw is not None:
+                payload["reference_raw"] = self.reference_raw
+                payload["reference_name"] = self.reference_name
+        return payload
+
+
+def _extract_numeric_metrics(metrics: dict) -> dict:
+    numeric_metrics: dict = {}
+    for key, value in metrics.items():
+        if key == "per_sequence" or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            numeric_metrics[key] = int(value) if key in MOT_REPORT_INTEGER_FIELDS else float(value)
+    return numeric_metrics
+
+
+def build_mot_feedback(results: dict) -> dict:
+    """Normalize MOT metric output into a stable payload for research/reflection."""
+    summary_label, summary_metrics = _select_plot_metrics_data(results)
+    summary = _extract_numeric_metrics(summary_metrics)
+
+    if summary_label == "single_class" and isinstance(results, dict):
+        selected_view = results
+    elif isinstance(results, dict):
+        selected_view = results.get(summary_label, {}) or {}
+    else:
+        selected_view = {}
+
+    per_sequence_metrics = {}
+    for seq_name, seq_metrics in selected_view.get("per_sequence", {}).items():
+        if isinstance(seq_metrics, dict):
+            per_sequence_metrics[seq_name] = _extract_numeric_metrics(seq_metrics)
+
+    per_class_metrics = {}
+    if isinstance(results, dict) and summary_label != "single_class":
+        for class_name, class_metrics in results.items():
+            if not isinstance(class_metrics, dict):
+                continue
+            numeric_metrics = _extract_numeric_metrics(class_metrics)
+            if numeric_metrics:
+                per_class_metrics[class_name] = numeric_metrics
+
+    return {
+        "summary_label": summary_label,
+        "summary": summary,
+        "per_sequence_metrics": per_sequence_metrics,
+        "per_class_metrics": per_class_metrics,
+    }
+
+
+def filter_obb_mot_results(
+    parsed_results: dict,
+    args: argparse.Namespace,
+    bench_cfg: dict,
+) -> tuple[dict, bool]:
+    """Keep selected OBB classes and append aggregate MMOT rows when relevant."""
+    if not parsed_results:
+        return parsed_results, False
+
+    selected_classes = [name for name, _ in _resolve_obb_eval_class_pairs(args, bench_cfg)]
+    ordered: dict = {}
+    for class_name in selected_classes:
+        actual_key = (
+            class_name
+            if class_name in parsed_results
+            else next(
+                (key for key in parsed_results if key.lower() == class_name.lower()),
+                None,
+            )
+        )
+        if actual_key is not None:
+            ordered[actual_key] = parsed_results[actual_key]
+
+    if len(ordered) > 1:
+        for name in ["cls_comb_det_av", "cls_comb_cls_av", "HUMAN", "VEHICLE", "BIKE", "all"]:
+            if name in parsed_results and name not in ordered:
+                ordered[name] = parsed_results[name]
+
+    if ordered:
+        return ordered, len(selected_classes) == 1 and len(ordered) == 1
+
+    preferred_order = ["cls_comb_det_av", "cls_comb_cls_av", "HUMAN", "VEHICLE", "BIKE", "all"]
+    fallback = {name: parsed_results[name] for name in preferred_order if name in parsed_results}
+    if fallback:
+        return fallback, "cls_comb_det_av" in fallback and len(fallback) == 1
+    return parsed_results, len(parsed_results) == 1
+
+
+def _display_summary_name(name: str) -> str:
+    return SUMMARY_AGGREGATE_LABELS.get(name, name)
+
+
+def _is_numeric_metric(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _combined_summary_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        column: metrics[column]
+        for column in SUMMARY_COLUMNS
+        if column in metrics and _is_numeric_metric(metrics[column])
+    }
+
+
+def _load_report_cfg_from_args(args: Any) -> dict[str, Any]:
+    if args is None:
+        return {}
+    config = getattr(args, "evaluation_config", None)
+    return dict(config) if isinstance(config, Mapping) else {}
+
+
+def _infer_single_class_report_name(args: Any, cfg: dict[str, Any] | None = None) -> str:
+    if args is not None:
+        remapped = getattr(args, "remapped_class_names", None)
+        if remapped:
+            return str(remapped[0])
+
+        translated = getattr(args, "translated_benchmark_class_names", None)
+        if translated:
+            return str(translated[0])
+
+        cfg = cfg or _load_report_cfg_from_args(args)
+        bench_cfg = cfg.get("benchmark", {}) if isinstance(cfg, dict) else {}
+        eval_classes = bench_cfg.get("eval_classes")
+        if isinstance(eval_classes, dict) and len(eval_classes) == 1:
+            return str(next(iter(eval_classes.values())))
+        if isinstance(eval_classes, (list, tuple)) and len(eval_classes) == 1:
+            return str(eval_classes[0])
+
+        class_indices = getattr(args, "classes", None)
+        if class_indices is not None:
+            indices = class_indices if isinstance(class_indices, list) else [class_indices]
+            if len(indices) == 1:
+                return f"class_{int(indices[0])}"
+    return "results"
+
+
+def normalize_report_results(
+    raw: dict[str, Any],
+    args: Any = None,
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    if _combined_summary_metrics(raw):
+        return {_infer_single_class_report_name(args, cfg): raw}
+    return {str(name): metrics for name, metrics in raw.items() if isinstance(metrics, dict)}
+
+
+def _select_plot_metrics_data(results: dict) -> tuple[str, dict]:
+    if not results:
+        return "", {}
+
+    flat_summary = _combined_summary_metrics(results)
+    if flat_summary:
+        return "single_class", flat_summary
+
+    first_value = next(iter(results.values()))
+    if isinstance(first_value, (int, float)):
+        return "single_class", results
+
+    for name in ("cls_comb_det_av", "cls_comb_cls_av", "all"):
+        metrics = results.get(name)
+        if isinstance(metrics, dict):
+            return name, metrics
+
+    if len(results) == 1:
+        name, metrics = next(iter(results.items()))
+        if isinstance(metrics, dict):
+            return name, metrics
+    return "", {}
+
+
+def _format_summary_values(metrics: dict) -> list[str]:
+    return [_format_summary_cell(key, metrics.get(key, 0)) for key in SUMMARY_COLUMNS]
+
+
+def _format_summary_cell(column: str, value: Any) -> str:
+    if column in SUMMARY_INT_COLUMNS:
+        return f"{int(value or 0):>10}"
+    return f"{float(value or 0):>10.2f}"
+
+
+def _ansi_wrap(text: str, *codes: str, colorize: bool) -> str:
+    if not colorize or not text:
+        return text
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+
+def _colorize_delta(text: str, column: str, delta: float, *, colorize: bool) -> str:
+    if not colorize or delta == 0:
+        return text
+    positive_is_better = column not in SUMMARY_INT_COLUMNS
+    is_improvement = delta > 0 if positive_is_better else delta < 0
+    color_code = "32" if is_improvement else "31"
+    return f"\033[{color_code}m{text}\033[0m"
+
+
+def _format_summary_delta_only_cell(
+    column: str,
+    value: Any,
+    baseline_value: Any | None = None,
+    *,
+    width: int,
+    colorize: bool,
+) -> str:
+    if baseline_value is None:
+        return " " * width
+    if column in SUMMARY_INT_COLUMNS:
+        current = int(value or 0)
+        baseline = int(baseline_value or 0)
+        delta = current - baseline
+        delta_text = f"({delta:+d})"
+        padded = f"{delta_text:>{width}}"
+        return padded.replace(delta_text, _colorize_delta(delta_text, column, float(delta), colorize=colorize), 1)
+
+    current = float(value or 0.0)
+    baseline = float(baseline_value or 0.0)
+    delta = current - baseline
+    delta_text = f"({delta:+.2f})"
+    padded = f"{delta_text:>{width}}"
+    return padded.replace(delta_text, _colorize_delta(delta_text, column, delta, colorize=colorize), 1)
+
+
+def _summary_sort_keys(parsed_results: dict, args: argparse.Namespace, cfg: dict) -> tuple[list[str], list[str]]:
+    if not parsed_results:
+        return [], []
+    eval_box_type = _resolve_eval_box_type(args, cfg)
+    if eval_box_type != "obb":
+        return list(parsed_results.keys()), []
+
+    bench_cfg = _benchmark_config(cfg)
+    primary_keys: list[str] = []
+    seen: set[str] = set()
+    for class_name, _ in _resolve_obb_eval_class_pairs(args, bench_cfg):
+        actual_key = (
+            class_name
+            if class_name in parsed_results
+            else next(
+                (key for key in parsed_results if key.lower() == class_name.lower()),
+                None,
+            )
+        )
+        if actual_key is not None and actual_key not in seen:
+            primary_keys.append(actual_key)
+            seen.add(actual_key)
+
+    aggregate_keys = [key for key in parsed_results if key not in seen]
+    if not primary_keys:
+        return aggregate_keys, []
+    return primary_keys, aggregate_keys
+
+
+def _render_summary_table(
+    title: str,
+    name_header: str,
+    rows: list[tuple[str, dict[str, Any], dict[str, Any] | None]],
+    *,
+    total_width: int,
+    name_width: int,
+    colorize: bool,
+    compare_label: str | None = None,
+) -> str:
+    if not rows:
+        return ""
+
+    header_values = [name_header, *SUMMARY_COLUMNS]
+    header_fmt = f"{{:<{name_width}}} " + " ".join(["{:>10}"] * len(SUMMARY_COLUMNS))
+    compare_enabled = any(compare_metrics is not None for _, _, compare_metrics in rows)
+    lines = [
+        _ansi_wrap("=" * total_width, "36", colorize=colorize),
+        _ansi_wrap(f"{title:^{total_width}}", "1", "36", colorize=colorize),
+        _ansi_wrap("=" * total_width, "36", colorize=colorize),
+        _ansi_wrap(header_fmt.format(*header_values), "1", "34", colorize=colorize),
+        _ansi_wrap("-" * total_width, "36", colorize=colorize),
+    ]
+    for row_name, metrics, compare_metrics in rows:
+        row_line = f"{row_name:<{name_width}} " + " ".join(_format_summary_values(metrics))
+        if row_name.startswith("COMBINED"):
+            row_line = _ansi_wrap(row_line, "1", "33", colorize=colorize)
+        lines.append(row_line)
+        if compare_enabled and compare_metrics is not None:
+            delta_vals = " ".join(
+                _format_summary_delta_only_cell(
+                    column,
+                    metrics.get(column, 0),
+                    compare_metrics.get(column),
+                    width=10,
+                    colorize=colorize,
+                )
+                for column in SUMMARY_COLUMNS
+            )
+            lines.append(f"{(compare_label or ''):<{name_width}} {delta_vals}")
+    lines.append(_ansi_wrap("=" * total_width, "36", colorize=colorize))
+    return "\n".join(lines)
+
+
+def render_mot_report(
+    parsed_results: dict[str, dict[str, Any]],
+    args: Any = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    title: str = "📊 RESULTS SUMMARY",
+    include_sequences: bool = True,
+    always_include_combined: bool = False,
+    compare_results: dict[str, dict[str, Any]] | None = None,
+    compare_label: str | None = None,
+    colorize: bool = False,
+) -> str:
+    if not parsed_results:
+        return ""
+
+    cfg = cfg or _load_report_cfg_from_args(args)
+    compare_results = compare_results or {}
+    primary_keys, aggregate_keys = _summary_sort_keys(parsed_results, args or object(), cfg)
+    if not primary_keys and not aggregate_keys:
+        primary_keys = list(parsed_results.keys())
+
+    single_sequence = all(
+        len(metrics.get("per_sequence", {})) <= 1 for metrics in parsed_results.values() if isinstance(metrics, dict)
+    )
+    all_names = [_display_summary_name(name) for name in [*primary_keys, *aggregate_keys]]
+    for class_metrics in parsed_results.values():
+        all_names.extend(class_metrics.get("per_sequence", {}).keys())
+    all_names.extend([f"COMBINED ({_display_summary_name(name)})" for name in primary_keys])
+    name_width = max(18, max((len(name) for name in all_names), default=18) + 2)
+    total_width = name_width + 1 + (10 * len(SUMMARY_COLUMNS)) + (len(SUMMARY_COLUMNS) - 1)
+
+    blocks = [
+        "\n".join(
+            [
+                _ansi_wrap("=" * total_width, "36", colorize=colorize),
+                _ansi_wrap(f"{title:^{total_width}}", "1", "36", colorize=colorize),
+                _ansi_wrap("=" * total_width, "36", colorize=colorize),
+            ]
+        )
+    ]
+    if len(primary_keys) > 1:
+        class_rows = [
+            (_display_summary_name(name), parsed_results[name], compare_results.get(name)) for name in primary_keys
+        ]
+        blocks.append(
+            _render_summary_table(
+                "Per-Class Combined Metrics",
+                "Class",
+                class_rows,
+                total_width=total_width,
+                name_width=name_width,
+                colorize=colorize,
+                compare_label=compare_label,
+            )
+        )
+        if aggregate_keys:
+            aggregate_rows = [
+                (_display_summary_name(name), parsed_results[name], compare_results.get(name))
+                for name in aggregate_keys
+            ]
+            blocks.append(
+                _render_summary_table(
+                    "Aggregate Groups",
+                    "Group",
+                    aggregate_rows,
+                    total_width=total_width,
+                    name_width=name_width,
+                    colorize=colorize,
+                    compare_label=compare_label,
+                )
+            )
+        if include_sequences and (always_include_combined or not single_sequence):
+            for class_name in primary_keys:
+                compare_class_metrics = compare_results.get(class_name)
+                per_sequence_rows = [
+                    (
+                        seq_name,
+                        seq_metrics,
+                        compare_class_metrics.get("per_sequence", {}).get(seq_name)
+                        if isinstance(compare_class_metrics, dict)
+                        else None,
+                    )
+                    for seq_name, seq_metrics in sorted(parsed_results[class_name].get("per_sequence", {}).items())
+                ]
+                per_sequence_rows.append(
+                    (
+                        f"COMBINED ({_display_summary_name(class_name)})",
+                        parsed_results[class_name],
+                        compare_class_metrics
+                        if isinstance(compare_class_metrics, dict) and compare_class_metrics
+                        else None,
+                    )
+                )
+                blocks.append(
+                    _render_summary_table(
+                        f"Per-Sequence Details: {_display_summary_name(class_name)}",
+                        "Sequence",
+                        per_sequence_rows,
+                        total_width=total_width,
+                        name_width=name_width,
+                        colorize=colorize,
+                        compare_label=compare_label,
+                    )
+                )
+    else:
+        detail_keys = primary_keys or aggregate_keys or list(parsed_results.keys())
+        for class_name in detail_keys:
+            compare_class_metrics = compare_results.get(class_name)
+            per_sequence_rows = [
+                (
+                    seq_name,
+                    seq_metrics,
+                    compare_class_metrics.get("per_sequence", {}).get(seq_name)
+                    if isinstance(compare_class_metrics, dict)
+                    else None,
+                )
+                for seq_name, seq_metrics in sorted(parsed_results[class_name].get("per_sequence", {}).items())
+            ]
+            if not include_sequences:
+                per_sequence_rows = []
+            if always_include_combined or not single_sequence or not per_sequence_rows:
+                per_sequence_rows.append(
+                    (
+                        f"COMBINED ({_display_summary_name(class_name)})",
+                        parsed_results[class_name],
+                        compare_class_metrics
+                        if isinstance(compare_class_metrics, dict) and compare_class_metrics
+                        else None,
+                    )
+                )
+            blocks.append(
+                _render_summary_table(
+                    _display_summary_name(class_name),
+                    "Sequence",
+                    per_sequence_rows,
+                    total_width=total_width,
+                    name_width=name_width,
+                    colorize=colorize,
+                    compare_label=compare_label,
+                )
+            )
+    return "\n".join(block for block in blocks if block)
+
+
+__all__ = [
+    "CORE_SUMMARY_COLUMNS",
+    "MOT_REPORT_INTEGER_FIELDS",
+    "SUMMARY_COLUMNS",
+    "SUMMARY_INT_COLUMNS",
+    "ValidationResult",
+    "_combined_summary_metrics",
+    "_display_summary_name",
+    "_load_report_cfg_from_args",
+    "_select_plot_metrics_data",
+    "_summary_sort_keys",
+    "build_mot_feedback",
+    "filter_obb_mot_results",
+    "normalize_report_results",
+    "render_mot_report",
+]

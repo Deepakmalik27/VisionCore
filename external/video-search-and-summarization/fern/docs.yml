@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=https://schema.buildwithfern.dev/docs-yml.json
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+instances:
+  - url: nvidia-vss.docs.buildwithfern.com/vss
+    custom-domain: docs.nvidia.com/vss
+    multi-source: true
+
+title: NVIDIA Blueprint for Video Search and Summarization
+
+global-theme: nvidia
+
+layout:
+  api-reference-expand-properties: true
+
+# Fern must never interpret ${...}: the docs are full of shell and Compose
+# variables. The ${VSS_DOCS_*:-default} markers are filled in per version by
+# .github/scripts/build_fern_site.py before every Fern build.
+settings:
+  substitute-env-vars: false
+
+logo:
+  href: /vss
+  right-text: VSS
+
+navbar-links:
+  - type: github
+    value: https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization
+
+# Published versions, in dropdown order; the first is the default and serves
+# the unversioned /vss/... URLs. Add each release on develop as a `ref:` entry
+# naming its release tag (newest first), at any time before the tag is pushed;
+# entries whose tag does not exist yet are skipped with a warning. Each
+# release's pages are read from its tag, so publishing does not require merging
+# the release branch into develop. A docs refresh replaces a release's `ref:`
+# with its docs tag, docs-vX.Y.Z-N (docs/README.md). Dev is the `path:` entry
+# for the checkout being built (../docs/index.yml). Any other `path:` entry is a
+# static version in fern/versions/, built as-is from develop: Archives lists the
+# documentation of earlier releases.
+versions:
+  - display-name: "3.3.0"
+    slug: "3.3.0"
+    ref: docs-v3.3.0-1
+  - display-name: Dev
+    slug: dev
+    path: ../docs/index.yml
+  - display-name: Archives
+    slug: archives
+    path: ./versions/archives.yml
+
+# Rules live in redirects.yml; see docs/README.md, "Redirects".
+redirects: ./redirects.yml

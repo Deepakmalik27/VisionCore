@@ -1,0 +1,36 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Server-Side Rendering Support for Alerts Module
+ *
+ * This file provides server-side rendering (SSR) support and server-side utilities
+ * for the alerts management module. It includes functions for data pre-fetching,
+ * server-side state initialization, and SSR-compatible data processing to ensure
+ * optimal performance and SEO compatibility in server-rendered applications.
+ *
+ * **Key Features:**
+ * - Server-side data fetching with proper error handling and timeout management
+ * - SSR-compatible state initialization for seamless client-side hydration
+ * - Performance optimization through data pre-loading and caching strategies
+ * - Security considerations for server-side API calls and data sanitization
+ * - Compatibility with popular SSR frameworks (Next.js, Nuxt.js, SvelteKit)
+ * - Proper handling of environment variables and configuration in server context
+ *
+ */
+export declare function fetchAlertsData(): Promise<{
+    systemStatus: string;
+    apiUrl: string | undefined;
+    vstApiUrl: string | undefined;
+    defaultTimeWindow: number;
+    defaultAutoRefreshInterval: number;
+    defaultVlmVerified: boolean;
+    maxResults: number;
+    pageSize: number;
+    alertReportPromptTemplate: string;
+    vlmVerifiedAlertReportPromptTemplate: string;
+    maxSearchTimeLimit: string;
+    mediaWithObjectsBbox: boolean;
+    enableRealtimeAlerts: boolean;
+    enableCvAlertsVerification: boolean;
+}>;
+//# sourceMappingURL=server.d.ts.map

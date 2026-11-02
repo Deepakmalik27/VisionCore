@@ -1,0 +1,285 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+
+import numpy as np
+
+from boxmot.trackers.common.tracking.collections import (
+    LIVE_STATE_GROUPS,
+    TRACK_COLLECTION_ATTRS,
+    empty_track_collection_like,
+    track_collection_attrs,
+    tracks_from_mapping,
+    validate_track_group,
+)
+from boxmot.utils import logger as LOGGER
+
+
+class _PrecomputedCMC:
+    """Frame-local CMC adapter used by class-separated updates."""
+
+    requires_frame_pixels = False
+
+    def __init__(self, warp: np.ndarray | None) -> None:
+        self.warp = warp
+
+    def apply(self, img: np.ndarray | None, dets: np.ndarray | None = None) -> np.ndarray | None:
+        return self.warp
+
+
+@dataclass
+class ClassTrackState:
+    """Class-local tracker collections grouped by lifecycle role."""
+
+    attrs: dict[str, object] = field(default_factory=dict)
+
+    def tracks(self, group: str) -> list:
+        return tracks_from_mapping(self.attrs, group)
+
+    def has_live_tracks(self) -> bool:
+        return any(self.tracks(group) for group in LIVE_STATE_GROUPS)
+
+
+class PerClassUpdateMixin:
+    """Class-separated update pipeline for trackers that share one public instance."""
+
+    class_track_collection_attrs = TRACK_COLLECTION_ATTRS
+
+    def _track_per_class(
+        self,
+        dets: np.ndarray,
+        img: np.ndarray | None,
+        embs: np.ndarray = None,
+        masks: np.ndarray = None,
+    ):
+        """Run one frame with class-local tracker collections."""
+        self._ensure_class_track_states()
+        per_class_tracks = []
+        per_class_masks = []
+        frame_count = self.frame_count
+        classes_to_update = self._class_update_ids(dets)
+        pooled_config = self.kalman_config
+        pooled_noise = pooled_config.noise
+        pooled_filter = getattr(self, "kalman_filter", None)
+        original_cmc = getattr(self, "cmc", None)
+        precomputed_cmc = self._precompute_per_frame_cmc(original_cmc, dets, img, len(classes_to_update))
+
+        if precomputed_cmc is not None:
+            self.cmc = precomputed_cmc
+
+        try:
+            for cls_id in classes_to_update:
+                class_indices = self._class_detection_indices(dets, cls_id)
+                class_dets, class_embs = self.get_class_dets_n_embs(dets, embs, cls_id)
+                class_masks = self._get_class_masks(dets, masks, cls_id)
+                # Carry the original frame row through the class-local tracker
+                # itself.  This keeps both public outputs and saved track
+                # objects aligned with frame-level detections; remapping only
+                # the returned ndarray left ``active_tracks`` and histories
+                # with ambiguous class-local indices.
+                class_dets = np.column_stack((class_dets, class_indices)).astype(
+                    class_dets.dtype,
+                    copy=False,
+                )
+
+                LOGGER.debug(
+                    f"Processing class {int(cls_id)}: {class_dets.shape} with embeddings"
+                    f" {class_embs.shape if class_embs is not None else None}"
+                )
+
+                self._load_class_track_state(cls_id)
+                if pooled_noise.by_class:
+                    canonical_id = self._decode_kernel_class_id(int(cls_id))
+                    self.kalman_config = replace(pooled_config, noise=pooled_noise.for_class(canonical_id))
+                    if pooled_filter is not None:
+                        # ByteTrack and BotSort own stateless filter helpers at
+                        # tracker level. Keep distinct helpers per class so new
+                        # tracks retain the correct owner during batch updates.
+                        state = self._ensure_class_track_state(cls_id)
+                        if "kalman_filter" not in state.attrs:
+                            state.attrs["kalman_filter"] = self.motion_model.create_filter(
+                                noise_config=self.kalman_noise_config,
+                            )
+                        self.kalman_filter = state.attrs["kalman_filter"]
+                self.frame_count = frame_count
+
+                result = self._track_detections(dets=class_dets, img=img, embs=class_embs, masks=class_masks)
+                if isinstance(result, tuple):
+                    tracks, track_masks = result
+                else:
+                    tracks, track_masks = result, None
+
+                self._save_class_track_state(cls_id)
+
+                if tracks.size > 0:
+                    per_class_tracks.append(tracks)
+                    per_class_masks.append(track_masks)
+        finally:
+            self.kalman_config = pooled_config
+            if pooled_filter is not None:
+                self.kalman_filter = pooled_filter
+            if precomputed_cmc is not None:
+                self.cmc = original_cmc
+
+        self.frame_count = frame_count + 1
+        self._restore_class_track_collections()
+        if per_class_tracks:
+            combined_tracks = np.vstack(per_class_tracks)
+            available_masks = [np.asarray(value) for value in per_class_masks if value is not None]
+            if available_masks:
+                mask_shape = available_masks[0].shape[1:]
+                mask_dtype = available_masks[0].dtype
+                aligned_masks = []
+                for tracks, track_masks in zip(per_class_tracks, per_class_masks):
+                    if track_masks is None:
+                        aligned_masks.append(np.zeros((len(tracks), *mask_shape), dtype=mask_dtype))
+                        continue
+                    track_masks = np.asarray(track_masks)
+                    if len(track_masks) != len(tracks) or track_masks.shape[1:] != mask_shape:
+                        raise ValueError(
+                            "Per-class tracker masks must stay row-aligned and share one spatial shape"
+                        )
+                    aligned_masks.append(track_masks)
+                return combined_tracks, np.vstack(aligned_masks)
+            return combined_tracks
+
+        return self._empty_output()
+
+    def _class_detection_indices(self, dets: np.ndarray, cls_id: int) -> np.ndarray:
+        """Return frame-global row indices for one detector class."""
+        if dets.size == 0:
+            return np.empty((0,), dtype=np.int32)
+        return np.flatnonzero(dets[:, self.detection_layout.cls_idx] == cls_id).astype(np.int32)
+
+    def _initialize_class_track_states(self) -> None:
+        self.class_track_states = {}
+
+    def _ensure_class_track_states(self) -> None:
+        if self.class_track_states is None:
+            self._initialize_class_track_states()
+
+    def _reset_class_track_states(self) -> None:
+        if self.class_track_states is None:
+            return
+        self.class_track_states = {}
+
+    def _ensure_class_track_state(self, cls_id: int) -> ClassTrackState:
+        self._ensure_class_track_states()
+        cls_id = int(cls_id)
+        kernel_validator = getattr(self, "_validate_kernel_class_ids", None)
+        if kernel_validator is None:
+            self.class_catalog.validate_ids([cls_id])
+        else:
+            kernel_validator([cls_id])
+        state = self.class_track_states.setdefault(cls_id, ClassTrackState())
+        for attr_name in self._class_state_attr_names():
+            state.attrs.setdefault(attr_name, self._empty_state_like(getattr(self, attr_name)))
+        return state
+
+    def _class_state_attr_names(self) -> tuple[str, ...]:
+        return tuple(attr_name for attr_name in self.class_track_collection_attrs if hasattr(self, attr_name))
+
+    @staticmethod
+    def _empty_state_like(value):
+        return empty_track_collection_like(value)
+
+    def _class_update_ids(self, dets: np.ndarray) -> list[int]:
+        detected_classes = {int(value) for value in self.detection_layout.classes(dets)}
+        kernel_validator = getattr(self, "_validate_kernel_class_ids", None)
+        if kernel_validator is None:
+            self.class_catalog.validate_ids(detected_classes)
+        else:
+            kernel_validator(detected_classes)
+
+        active_classes = {
+            cls_id
+            for cls_id, state in self.class_track_states.items()
+            if state.has_live_tracks()
+        }
+        return sorted(detected_classes | active_classes)
+
+    def _load_class_track_state(self, cls_id: int) -> None:
+        state = self._ensure_class_track_state(cls_id)
+        for attr_name in self._class_state_attr_names():
+            setattr(self, attr_name, state.attrs[attr_name])
+
+    def _save_class_track_state(self, cls_id: int) -> None:
+        state = self._ensure_class_track_state(cls_id)
+        for attr_name in self._class_state_attr_names():
+            state.attrs[attr_name] = getattr(self, attr_name)
+
+    def _restore_class_track_collections(self) -> None:
+        self.active_tracks = self.all_class_tracks("active")
+        for group in ("pool", "lost", "removed"):
+            for attr_name in track_collection_attrs(group):
+                if hasattr(self, attr_name):
+                    setattr(self, attr_name, self._flatten_class_state_attr(attr_name))
+
+    def _flatten_class_state_attr(self, attr_name: str) -> list:
+        if self.class_track_states is None:
+            return []
+        values = []
+        for state in self.class_track_states.values():
+            attr_value = state.attrs.get(attr_name)
+            if attr_value:
+                values.extend(list(attr_value))
+        return values
+
+    def get_class_track_state(self, cls_id: int) -> ClassTrackState:
+        resolver = getattr(self, "_kernel_class_id_for_lookup", None)
+        kernel_id = int(cls_id) if resolver is None else resolver(int(cls_id))
+        return self._ensure_class_track_state(kernel_id)
+
+    def get_class_tracks(self, cls_id: int, group: str = "active") -> list:
+        """Return class-local tracks by lifecycle group."""
+        validate_track_group(group)
+        return self.get_class_track_state(cls_id).tracks(group)
+
+    def all_class_tracks(self, group: str = "active") -> list:
+        """Return tracks from all classes for one lifecycle group."""
+        if self.class_track_states is None:
+            return []
+        tracks = []
+        for state in self.class_track_states.values():
+            tracks.extend(state.tracks(group))
+        return tracks
+
+    def _precompute_per_frame_cmc(self, cmc, dets: np.ndarray, img: np.ndarray | None, class_count: int):
+        # Keep camera history current through empty frames before a class appears.
+        if cmc is None or class_count == 1 or not callable(getattr(cmc, "apply", None)):
+            return None
+        if img is None and getattr(cmc, "requires_frame_pixels", True):
+            raise ValueError("img is required when camera-motion compensation is enabled")
+        warp = cmc.apply(img, self.cmc_detection_boxes(dets))
+        return _PrecomputedCMC(warp)
+
+    def _get_class_masks(self, dets: np.ndarray, masks: np.ndarray, cls_id: int):
+        """Slice masks by class, matching ``get_class_dets_n_embs``."""
+        if masks is None:
+            return None
+        if dets.size == 0:
+            return masks[:0]
+        class_indices = np.where(dets[:, self.detection_layout.cls_idx] == cls_id)[0]
+        return masks[class_indices]
+
+    def get_class_dets_n_embs(self, dets, embs, cls_id):
+        class_dets = self.detection_layout.empty_dets(dtype=np.float32)
+        class_embs = np.empty((0, self.last_emb_size)) if self.last_emb_size is not None else None
+
+        if dets.size == 0:
+            return class_dets, class_embs
+
+        class_indices = np.where(dets[:, self.detection_layout.cls_idx] == cls_id)[0]
+        class_dets = dets[class_indices]
+
+        if embs is None:
+            return class_dets, class_embs
+
+        assert dets.shape[0] == embs.shape[0], (
+            "Detections and embeddings must have the same number of elements when both are provided"
+        )
+        class_embs = None
+        if embs.size > 0:
+            class_embs = embs[class_indices]
+            self.last_emb_size = class_embs.shape[1]
+        return class_dets, class_embs

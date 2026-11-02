@@ -1,0 +1,597 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import shutil
+import time
+from collections.abc import Callable, Coroutine
+from copy import deepcopy
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, overload
+
+import aiohttp
+import av
+import orjson
+from PIL import Image
+
+from ..anonymize import (
+    anonymize_data,
+    anonymize_prefixed_event_id,
+)
+from ..data import EventType, WSJSONPacketFrame, WSPacket
+from ..utils import from_js_time, is_online, run_async, write_json
+
+if TYPE_CHECKING:
+    from ..api import ProtectApiClient
+
+
+def generate_blank_video(output_path: Path, length: int) -> None:
+    """
+    Generate a blank video with silent audio using PyAV.
+
+    Args:
+        output_path: Path to output MP4 file.
+        length: Duration in seconds.
+
+    """
+    width, height = 1280, 720
+    fps = 25
+    sample_rate = 44100
+    samples_per_frame = 1024
+
+    with av.open(str(output_path), "w") as container:
+        video_stream = container.add_stream("h264", rate=fps)
+        video_stream.width = width
+        video_stream.height = height
+        video_stream.pix_fmt = "yuv420p"
+
+        audio_stream = container.add_stream("aac", rate=sample_rate)
+        audio_stream.layout = "stereo"  # type: ignore[assignment]
+
+        # Create black frame (YUV420p: Y=16 is black, U=V=128 is neutral)
+        black_frame = av.VideoFrame(width, height, "yuv420p")
+        # Y plane (full resolution)
+        y_size = width * height
+        black_frame.planes[0].update(bytes([16] * y_size))
+        # U and V planes (half resolution each direction)
+        uv_size = (width // 2) * (height // 2)
+        black_frame.planes[1].update(bytes([128] * uv_size))
+        black_frame.planes[2].update(bytes([128] * uv_size))
+
+        # Create silent audio frame
+        silent_samples = bytes(
+            samples_per_frame * 2 * 2
+        )  # 2 channels, 2 bytes per sample
+
+        total_frames = fps * length
+        total_audio_frames = (sample_rate * length) // samples_per_frame
+
+        for i in range(total_frames):
+            black_frame.pts = i
+            for packet in video_stream.encode(black_frame):
+                container.mux(packet)
+
+        for i in range(total_audio_frames):
+            audio_frame = av.AudioFrame(
+                format="s16", layout="stereo", samples=samples_per_frame
+            )
+            audio_frame.planes[0].update(silent_samples)
+            audio_frame.rate = sample_rate
+            audio_frame.pts = i * samples_per_frame
+            for packet in audio_stream.encode(audio_frame):
+                container.mux(packet)
+
+        # Flush encoders
+        for packet in video_stream.encode(None):
+            container.mux(packet)
+        for packet in audio_stream.encode(None):
+            container.mux(packet)
+
+
+def placeholder_image(
+    output_path: Path,
+    width: int,
+    height: int | None = None,
+) -> None:
+    if height is None:
+        height = width
+
+    image = Image.new("RGB", (width, height), (128, 128, 128))
+    image.save(output_path, "PNG")
+
+
+_LOGGER = logging.getLogger(__name__)
+LOG_CALLABLE = Callable[[str], None]
+PROGRESS_CALLABLE = Callable[[int, str], Coroutine[Any, Any, None]]
+
+
+class SampleDataGenerator:
+    """Generate sample data for debugging and testing purposes"""
+
+    _record_num_ws: int = 0
+    _record_ws_start_time: float = time.monotonic()
+    _record_listen_for_events: bool = False
+    _record_ws_messages: dict[str, dict[str, Any]] = {}
+    _record_events_ws_messages: dict[str, Any] = {}
+    _record_devices_ws_messages: dict[str, Any] = {}
+    _log: LOG_CALLABLE | None = None
+    _log_warning: LOG_CALLABLE | None = None
+    _ws_progress: PROGRESS_CALLABLE | None = None
+
+    constants: dict[str, Any] = {}
+    client: ProtectApiClient
+    output_folder: Path
+    do_zip: bool
+    anonymize: bool
+    wait_time: int
+
+    def __init__(
+        self,
+        client: ProtectApiClient,
+        output: Path,
+        anonymize: bool,
+        wait_time: int,
+        log: LOG_CALLABLE | None = None,
+        log_warning: LOG_CALLABLE | None = None,
+        ws_progress: PROGRESS_CALLABLE | None = None,
+        do_zip: bool = False,
+    ) -> None:
+        self.client = client
+        self.output_folder = output
+        self.do_zip = do_zip
+        self.anonymize = anonymize
+        self.wait_time = wait_time
+        self._log = log
+        self._log_warning = log_warning
+        self._ws_progress = ws_progress
+
+        if self._log_warning is None and self._log is not None:
+            self._log_warning = self._log
+
+    def log(self, msg: str) -> None:
+        if self._log is not None:
+            self._log(msg)
+        else:
+            _LOGGER.debug(msg)
+
+    def log_warning(self, msg: str) -> None:
+        if self._log_warning is not None:
+            self._log_warning(msg)
+        else:
+            _LOGGER.warning(msg)
+
+    def generate(self) -> None:
+        run_async(self.async_generate())
+
+    async def async_generate(self, close_session: bool = True) -> None:
+        self.log(f"Output folder: {self.output_folder}")
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+        websocket = self.client._get_websocket()
+        websocket.start()
+        self.log("Websocket started...")
+        websocket._subscription = self._handle_ws_message
+
+        self.log("Updating devices...")
+        await self.client.update()
+
+        bootstrap: dict[str, Any] = await self.client.api_request_obj("bootstrap")
+        bootstrap = await self.write_json_file("sample_bootstrap", bootstrap)
+        self.constants["server_name"] = bootstrap["nvr"]["name"]
+        self.constants["server_id"] = bootstrap["nvr"]["mac"]
+        self.constants["server_version"] = bootstrap["nvr"]["version"]
+        self.constants["server_ip"] = bootstrap["nvr"]["host"]
+        self.constants["server_model"] = bootstrap["nvr"]["type"]
+        self.constants["last_update_id"] = bootstrap["lastUpdateId"]
+        self.constants["user_id"] = bootstrap["authUserId"]
+        self.constants["counts"] = {
+            "camera": len(bootstrap["cameras"]),
+            "user": len(bootstrap["users"]),
+            "liveview": len(bootstrap["liveviews"]),
+            "viewer": len(bootstrap["viewers"]),
+            "light": len(bootstrap.get("lights", [])),
+            "sensor": len(bootstrap.get("sensors", [])),
+            "chime": len(bootstrap.get("chimes", [])),
+        }
+
+        self.log("Generating event data...")
+        motion_event = await self.generate_event_data()
+        await self.generate_device_data(motion_event)
+        self.log("Recording websocket events...")
+        await self.record_ws_events()
+
+        if close_session:
+            await self.client.close_session()
+            await self.client.close_public_api_session()
+
+        await self.write_json_file("sample_constants", self.constants, anonymize=False)
+
+        if self.do_zip:
+            self.log("Zipping files...")
+
+            def zip_files() -> None:
+                shutil.make_archive(str(self.output_folder), "zip", self.output_folder)
+                shutil.rmtree(self.output_folder)
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, zip_files)
+
+    async def record_ws_events(self) -> None:
+        if self.wait_time <= 0:
+            self.log("Skipping recording Websocket messages...")
+            return
+
+        self._record_num_ws = 0
+        self._record_ws_start_time = time.monotonic()
+        self._record_listen_for_events = True
+        self._record_ws_messages = {}
+        self._record_events_ws_messages = {}
+        self._record_devices_ws_messages = {}
+
+        # Start public API websockets if API key is available
+        has_public_api = self.client.is_api_key_set()
+        if has_public_api:
+            self.log("Starting public API websockets...")
+            events_ws = self.client._get_events_websocket()
+            events_ws._subscription = self._handle_events_ws_message
+            events_ws.start()
+            devices_ws = self.client._get_devices_websocket()
+            devices_ws._subscription = self._handle_devices_ws_message
+            devices_ws.start()
+        else:
+            self.log("No API key set, skipping public API websocket recording...")
+
+        self.log(f"Waiting {self.wait_time} seconds for WS messages...")
+        if self._ws_progress is not None:
+            await self._ws_progress(self.wait_time, "Waiting for WS messages")
+        else:
+            await asyncio.sleep(self.wait_time)
+
+        self._record_listen_for_events = False
+        await self.client.async_disconnect_ws()
+
+        if has_public_api:
+            events_ws.stop()
+            devices_ws.stop()
+
+        await self.write_json_file(
+            "sample_ws_messages",
+            self._record_ws_messages,
+            anonymize=False,
+        )
+
+        if has_public_api:
+            await self.write_json_file(
+                "sample_ws_events_public",
+                self._record_events_ws_messages,
+                anonymize=False,
+            )
+            await self.write_json_file(
+                "sample_ws_devices_public",
+                self._record_devices_ws_messages,
+                anonymize=False,
+            )
+
+    @overload
+    async def write_json_file(
+        self,
+        name: str,
+        data: list[Any],
+        anonymize: bool | None = None,
+    ) -> list[Any]: ...
+
+    @overload
+    async def write_json_file(
+        self,
+        name: str,
+        data: dict[str, Any],
+        anonymize: bool | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def write_json_file(
+        self,
+        name: str,
+        data: list[Any] | dict[str, Any],
+        anonymize: bool | None = None,
+    ) -> list[Any] | dict[str, Any]:
+        if anonymize is None:
+            anonymize = self.anonymize
+
+        if anonymize:
+            data = anonymize_data(data)
+
+        self.log(f"Writing {name}...")
+        await write_json(self.output_folder / f"{name}.json", data)
+
+        return data
+
+    async def write_binary_file(
+        self,
+        name: str,
+        ext: str,
+        raw: bytes | None,
+    ) -> None:
+        def write() -> None:
+            if raw is None:
+                self.log(f"No image data, skipping {name}...")
+                return
+
+            self.log(f"Writing {name}...")
+            Path(self.output_folder / f"{name}.{ext}").write_bytes(raw)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, write)
+
+    async def write_image_file(self, name: str, raw: bytes | None) -> None:
+        await self.write_binary_file(name, "png", raw)
+
+    async def generate_event_data(self) -> dict[str, Any] | None:
+        data = await self.client.get_events_raw()
+
+        self.constants["time"] = datetime.now(tz=UTC).isoformat()
+        self.constants["event_count"] = len(data)
+
+        motion_event: dict[str, Any] | None = None
+        for event_dict in reversed(data):
+            if (
+                motion_event is None
+                and event_dict["type"] == EventType.MOTION.value
+                and event_dict["camera"] is not None
+                and event_dict["thumbnail"] is not None
+                and event_dict["end"] is not None
+            ):
+                motion_event = deepcopy(event_dict)
+                self.log(f"Using motion event: {motion_event['id']}...")
+                break
+
+        # anonymize data after pulling events
+        data = await self.write_json_file("sample_raw_events", data)
+
+        return motion_event
+
+    async def generate_device_data(self, motion_event: dict[str, Any] | None) -> None:
+        await asyncio.gather(
+            self.generate_camera_data(),
+            self.generate_motion_data(motion_event),
+            self.generate_light_data(),
+            self.generate_viewport_data(),
+            self.generate_sensor_data(),
+            self.generate_chime_data(),
+            self.generate_liveview_data(),
+        )
+
+    async def generate_camera_data(self) -> None:
+        objs = await self.client.api_request_list("cameras")
+        device_id: str | None = None
+        camera_is_online = False
+        for obj_dict in objs:
+            device_id = obj_dict["id"]
+            if is_online(obj_dict):
+                camera_is_online = True
+                break
+
+        if device_id is None:
+            self.log("No camera found. Skipping camera endpoints...")
+            return
+
+        # json data
+        obj = await self.client.api_request_obj(f"cameras/{device_id}")
+        await self.write_json_file("sample_camera", deepcopy(obj))
+        self.constants["camera_online"] = camera_is_online
+
+        # Check if camera has channels
+        if not obj.get("channels") or len(obj["channels"]) == 0:
+            self.log(
+                "Camera has no channels, skipping snapshot and thumbnail generation",
+            )
+            return
+
+        if not camera_is_online:
+            self.log(
+                "Camera is not online, skipping snapshot and thumbnail generation",
+            )
+            return
+
+        # snapshot
+        width = obj["channels"][0]["width"]
+        height = obj["channels"][0]["height"]
+        filename = "sample_camera_snapshot"
+        if self.anonymize:
+            self.log(f"Writing {filename}...")
+            placeholder_image(self.output_folder / f"{filename}.png", width, height)
+        else:
+            snapshot = await self.client.get_camera_snapshot(obj["id"], width, height)
+            await self.write_image_file(filename, snapshot)
+
+        # public api snapshot
+        pub_filename = "sample_camera_public_api_snapshot"
+        if self.anonymize:
+            self.log(f"Writing {pub_filename}...")
+            placeholder_image(self.output_folder / f"{pub_filename}.png", width, height)
+        else:
+            pub_snapshot = await self.client.get_public_api_camera_snapshot(obj["id"])
+            await self.write_image_file(pub_filename, pub_snapshot)
+
+    async def generate_motion_data(
+        self,
+        motion_event: dict[str, Any] | None,
+    ) -> None:
+        if motion_event is None:
+            self.log("No motion event, skipping thumbnail generation...")
+            return
+
+        # event thumbnail
+        filename = "sample_camera_thumbnail"
+        thumbnail_id = motion_event["thumbnail"]
+        if self.anonymize:
+            self.log(f"Writing {filename}...")
+            placeholder_image(self.output_folder / f"{filename}.png", 640, 360)
+            thumbnail_id = anonymize_prefixed_event_id(thumbnail_id)
+        else:
+            img = await self.client.get_event_thumbnail(thumbnail_id)
+            await self.write_image_file(filename, img)
+        self.constants["camera_thumbnail"] = thumbnail_id
+
+        # event video
+        filename = "sample_camera_video"
+        length = int((motion_event["end"] - motion_event["start"]) / 1000)
+        if self.anonymize:
+            generate_blank_video(
+                self.output_folder / f"{filename}.mp4",
+                length,
+            )
+        else:
+            video = await self.client.get_camera_video(
+                motion_event["camera"],
+                from_js_time(motion_event["start"]),
+                from_js_time(motion_event["end"]),
+                2,
+            )
+            await self.write_binary_file(filename, "mp4", video)
+        self.constants["camera_video_length"] = length
+
+    async def generate_light_data(self) -> None:
+        objs = await self.client.api_request_list("lights")
+        device_id: str | None = None
+        for obj_dict in objs:
+            device_id = obj_dict["id"]
+            if is_online(obj_dict):
+                break
+
+        if device_id is None:
+            self.log("No light found. Skipping light endpoints...")
+            return
+
+        obj = await self.client.api_request_obj(f"lights/{device_id}")
+        await self.write_json_file("sample_light", obj)
+
+    async def generate_viewport_data(self) -> None:
+        objs = await self.client.api_request_list("viewers")
+        device_id: str | None = None
+        for obj_dict in objs:
+            device_id = obj_dict["id"]
+            if is_online(obj_dict):
+                break
+
+        if device_id is None:
+            self.log("No viewer found. Skipping viewer endpoints...")
+            return
+
+        obj = await self.client.api_request_obj(f"viewers/{device_id}")
+        await self.write_json_file("sample_viewport", obj)
+
+    async def generate_sensor_data(self) -> None:
+        objs = await self.client.api_request_list("sensors")
+        device_id: str | None = None
+        for obj_dict in objs:
+            device_id = obj_dict["id"]
+            if is_online(obj_dict):
+                break
+
+        if device_id is None:
+            self.log("No sensor found. Skipping sensor endpoints...")
+            return
+
+        obj = await self.client.api_request_obj(f"sensors/{device_id}")
+        await self.write_json_file("sample_sensor", obj)
+
+    async def generate_chime_data(self) -> None:
+        objs = await self.client.api_request_list("chimes")
+        device_id: str | None = None
+        for obj_dict in objs:
+            device_id = obj_dict["id"]
+            if is_online(obj_dict):
+                break
+
+        if device_id is None:
+            self.log("No chime found. Skipping doorlock endpoints...")
+            return
+
+        obj = await self.client.api_request_obj(f"chimes/{device_id}")
+        await self.write_json_file("sample_chime", obj)
+
+    async def generate_liveview_data(self) -> None:
+        objs = await self.client.api_request_list("liveviews")
+        device_id: str | None = None
+        for obj_dict in objs:
+            device_id = obj_dict["id"]
+            break
+
+        if device_id is None:
+            self.log("No liveview found. Skipping liveview endpoints...")
+            return
+
+        obj = await self.client.api_request_obj(f"liveviews/{device_id}")
+        await self.write_json_file("sample_liveview", obj)
+
+    def _handle_ws_message(self, msg: aiohttp.WSMessage) -> None:
+        if not self._record_listen_for_events:
+            return
+
+        now = time.monotonic()
+        self._record_num_ws += 1
+        time_offset = now - self._record_ws_start_time
+
+        if msg.type == aiohttp.WSMsgType.BINARY:
+            packet = WSPacket(msg.data)
+
+            if not isinstance(packet.action_frame, WSJSONPacketFrame):
+                self.log_warning(
+                    f"Got non-JSON action frame: {packet.action_frame.payload_format}",
+                )
+                return
+
+            if not isinstance(packet.data_frame, WSJSONPacketFrame):
+                self.log_warning(
+                    f"Got non-JSON data frame: {packet.data_frame.payload_format}",
+                )
+                return
+
+            if self.anonymize:
+                packet.action_frame.data = anonymize_data(packet.action_frame.data)
+                packet.data_frame.data = anonymize_data(packet.data_frame.data)
+                packet.pack_frames()
+
+            self._record_ws_messages[str(time_offset)] = {
+                "raw": packet.raw_base64,
+                "action": packet.action_frame.data,
+                "data": packet.data_frame.data,
+            }
+        else:
+            self.log_warning(f"Got non-binary message: {msg.type}")
+
+    def _handle_public_api_ws_message(
+        self,
+        msg: aiohttp.WSMessage,
+        store: dict[str, Any],
+    ) -> None:
+        if not self._record_listen_for_events:
+            return
+
+        now = time.monotonic()
+        time_offset = now - self._record_ws_start_time
+
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            try:
+                data = orjson.loads(msg.data)
+            except (orjson.JSONDecodeError, TypeError) as exc:
+                preview = str(msg.data)[:200]
+                self.log_warning(
+                    f"Failed to parse public API WS message: {preview} ({exc})"
+                )
+                return
+
+            if self.anonymize:
+                data = anonymize_data(data)
+
+            store[str(time_offset)] = data
+        else:
+            self.log_warning(
+                f"Got non-text public API WS message: {msg.type}",
+            )
+
+    def _handle_events_ws_message(self, msg: aiohttp.WSMessage) -> None:
+        self._handle_public_api_ws_message(msg, self._record_events_ws_messages)
+
+    def _handle_devices_ws_message(self, msg: aiohttp.WSMessage) -> None:
+        self._handle_public_api_ws_message(msg, self._record_devices_ws_messages)

@@ -1,0 +1,230 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if and .Values.enabled (.Values.useStatefulSet | default true) }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "vss-vios-streamprocessing.fullname" . }}
+  labels:
+    app.kubernetes.io/name: vss-vios-streamprocessing
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  serviceName: {{ include "vss-vios-streamprocessing.headlessServiceName" . }}
+  replicas: {{ .Values.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vss-vios-streamprocessing
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vss-vios-streamprocessing
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- $notifCm := include "vss-vios-streamprocessing.notificationConfigMapName" . }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if $notifCm }}
+        checksum/vios-notification: {{ .Release.Revision | quote }}
+        {{- end }}
+    spec:
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* ConfigMap mounts are read-only; seed into emptyDir when overlay HTTP
+           endpoints are set so VIOS can write calibration.json / Top.png. */}}
+      {{- $writableConfigs := or .Values.calibrationFileEndpoint .Values.floormapImageEndpoint }}
+      {{- $waitRedis := (.Values.waitForRedis | default dict).enabled }}
+      {{- if or $writableConfigs $waitRedis }}
+      initContainers:
+        {{- if $waitRedis }}
+        {{- $pfx := default false (coalesce .Values.useReleaseNamePrefix (index (.Values.global | default dict) "useReleaseNamePrefix")) }}
+        {{- $redisH := ternary (printf "%s-redis" .Release.Name) "redis" $pfx }}
+        # Compose parity with the wait-for-redis service. VST builds its
+        # notification manager at startup and does not retry.
+        - name: wait-for-redis
+          image: "{{ (.Values.waitForRedis.image | default dict).repository | default "busybox" }}:{{ (.Values.waitForRedis.image | default dict).tag | default "1.38.0" }}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              host={{ .Values.waitForRedis.host | default $redisH | quote }}
+              port={{ .Values.waitForRedis.port | default 6379 | quote }}
+              timeout={{ .Values.waitForRedis.timeoutSeconds | default 120 }}
+              i=0
+              until nc -z "${host}" "${port}"; do
+                i=$((i + 2))
+                if [ "${i}" -ge "${timeout}" ]; then
+                  echo "timed out waiting for redis at ${host}:${port}" >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+              echo "redis ${host}:${port} is up"
+        {{- end }}
+        {{- if $writableConfigs }}
+        - name: seed-vst-configs
+          image: {{ .Values.configSeed.image.repository | default "docker.io/library/busybox" }}:{{ .Values.configSeed.image.tag | default "1.38.0" }}
+          imagePullPolicy: {{ .Values.configSeed.image.pullPolicy | default "IfNotPresent" }}
+          command: ["sh", "-c", "cp -a /configmap-configs/. /home/vst/vst_release/configs/{{- if $notifCm }} && cp /notification-config/notification_config.json /home/vst/vst_release/configs/notification_config.json{{- end }}"]
+          volumeMounts:
+            - name: configs-cm
+              mountPath: /configmap-configs
+              readOnly: true
+            {{- if $notifCm }}
+            - name: notification-config
+              mountPath: /notification-config
+              readOnly: true
+            {{- end }}
+            - name: configs
+              mountPath: /home/vst/vst_release/configs
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: vss-vios-streamprocessing
+          image: {{ include "vss-vios-streamprocessing.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          env:
+            {{- toYaml .Values.env | nindent 12 }}
+            - name: CENTRALIZE_DB_HOSTADDR
+              value: {{ (.Values.centralizedDbHost | default (include "vss-vios-streamprocessing.postgresFullname" .)) | quote }}
+            - name: CENTRALIZE_DB_PORT
+              value: {{ (.Values.centralizedDbPort | default "5432") | quote }}
+            {{- if .Values.centralizedDbPassword }}
+            - name: CENTRALIZE_DB_PASSWORD
+              value: {{ .Values.centralizedDbPassword | quote }}
+            {{- else }}
+            - name: CENTRALIZE_DB_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "vss-vios-streamprocessing.postgresCmName" . }}
+                  key: CENTRALIZE_DB_PASSWORD
+            {{- end }}
+            - name: SENSOR_MODULE_ENDPOINT
+              value: {{ .Values.sensorModuleEndpoint | default (printf "http://%s:30000" (include "vss-vios-streamprocessing.peerHost" (dict "root" . "short" "vss-vios-sensor"))) | quote }}
+            - name: VST_INGRESS_ENDPOINT
+              value: {{ include "vss-vios-streamprocessing.vstIngressEndpoint" . | quote }}
+            {{- /* VIOS-only SDRC toggle (global.vios.useSdrc, default false). See
+                   the vios-sensor deployment for the full rationale.
+                   VST_ENABLE_NOTIFICATION is independent (global.vios.enableNotification,
+                   defaults to useSdrc) — matches docker. */}}
+            {{- $g := .Values.global | default dict }}
+            {{- $useSdrc := dig "vios" "useSdrc" false $g }}
+            {{- $enableNotif := dig "vios" "enableNotification" $useSdrc $g }}
+            - name: VST_USE_SDRC
+              value: {{ $useSdrc | quote }}
+            - name: VST_ENABLE_NOTIFICATION
+              value: {{ $enableNotif | quote }}
+          volumeMounts:
+            - name: configs
+              mountPath: /home/vst/vst_release/configs
+              {{- if not $writableConfigs }}
+              readOnly: true
+              {{- end }}
+            - name: vst-data
+              mountPath: /home/vst/vst_release/vst_data
+            - name: vst-video
+              mountPath: /home/vst/vst_release/vst_video
+            - name: streamer-videos
+              mountPath: /home/vst/vst_release/streamer_videos
+            - name: temp-files
+              mountPath: /home/vst/vst_release/webroot/temp_files
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- if $writableConfigs }}
+        - name: configs-cm
+          configMap:
+            name: {{ include "vss-vios-streamprocessing.fullname" . }}-configs
+        - name: configs
+          emptyDir: {}
+        {{- else if $notifCm }}
+        - name: configs
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "vss-vios-streamprocessing.fullname" . }}-configs
+              - configMap:
+                  name: {{ $notifCm }}
+        {{- else }}
+        - name: configs
+          configMap:
+            name: {{ include "vss-vios-streamprocessing.fullname" . }}-configs
+        {{- end }}
+        {{- if and $writableConfigs $notifCm }}
+        - name: notification-config
+          configMap:
+            name: {{ $notifCm }}
+        {{- end }}
+        - name: vst-data
+          {{- if and (index .Values "persistence") .Values.persistence.vstData.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.vstData.existingClaim | default (include "vss-vios-streamprocessing.sharedVstClaimVstData" .) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: vst-video
+          {{- if and (index .Values "persistence") .Values.persistence.vstVideo.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.vstVideo.existingClaim | default (include "vss-vios-streamprocessing.sharedVstClaimVstVideo" .) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: streamer-videos
+          {{- if and (index .Values "persistence") (index .Values.persistence "streamerVideos") .Values.persistence.streamerVideos.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.streamerVideos.existingClaim | default (include "vss-vios-streamprocessing.sharedVstClaimStreamerVideos" .) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: temp-files
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

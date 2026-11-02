@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LVS profile — sample install overrides.
+# nims.gpuType below is RTXPRO6000BW. Chart values.yaml defaults to H100.
+# Set nims.gpuType to the GPU you are installing on before helm install.
+# Install: helm upgrade --install vss . -f values-lvs.yaml -n vss --create-namespace
+#
+# Set ngc.apiKey, global.storageClass, global.externalHost (+ optional scheme/port), global.kibanaPublicUrl, and vssIngress as needed.
+# Stack + NIM defaults live in chart values.yaml.
+
+profile: lvs
+mode: ""
+llmNameSlug: "" # Reserved compatibility value; model selection uses nims.* and service settings.
+vlmNameSlug: none # LVS uses the integrated RT-VLM checkpoint, not a VLM NIM subchart.
+vlmName: "nim_nvidia_cosmos3-nano-reasoner_bf16-final"
+
+ngc:
+  createSecrets: true
+  apiKey: ""
+
+global:
+  storageClass: "" # e.g. oci-bv-high, gp3, standard, local-path
+  externalScheme: "http" # http or https
+  externalHost: "EXTERNAL_HOST" # e.g. vss.140.238.75.84.nip.io
+  externalPort: "" # Default 80 (http) / 443 (https): use "" — chart omits :port in URLs. Non-default port only: e.g. "8080", "8443".
+  # Must be a real browser URL; Helm does not substitute EXTERNAL_HOST here from global.externalHost. Match your ingress host (often http://kibana.<same-as-externalHost>).
+  kibanaPublicUrl: ""
+  # Remote NIM: one place for vss-agent + vss-summarization. Use the same base URL for both (e.g. http://host:31081); vss-summarization adds /v1 internally when absent.
+  llmBaseUrl: ""
+  vlmBaseUrl: ""
+  llmName: "nvidia/nemotron-3.5-lightning-30b-a3b"
+  vlmName: "nim_nvidia_cosmos3-nano-reasoner_bf16-final"
+
+
+# Shared umbrella helm/services/nims — override gpuType here (see dev-profile-lvs/values.yaml for full nims.* defaults).
+# LVS deploys the LLM NIM and lets vss-rtvi-vlm load the integrated VLM checkpoint.
+nims:
+  enabled: true
+  gpuType: RTXPRO6000BW
+
+# VIOS umbrella (../../services/vios): parent Chart.yaml uses condition: vios.enabled — keep true here or in values.yaml or the whole VST stack is skipped.
+vios:
+  enabled: true
+
+# vss-agent / vss-summarization model ids: set global.llmName / global.vlmName above (override with agent.vss-agent.llmName or vss-summarization.llmName if needed).
+
+# In-cluster LVS → LLM/RT-VLM: optional llmService / vlmService slugs under vss-summarization.
+# Remote endpoints: use global.llmBaseUrl / global.vlmBaseUrl.
+# LVS backend routes VLM calls through vss-rtvi-vlm by default (RTVI_VLM_URL set in values.yaml extraEnv). Override only to bypass RTVI.
+vss-summarization:
+  vlmService: "vss-rtvi-vlm"
+
+# LVS always enables vss-rtvi-vlm (integrated checkpoint, Kafka enabled in values.yaml). Override here only when
+# you need a different image tag, a shared/remote VLM endpoint (useSharedNim: true), or edge VLM_INPUT_* defaults.
+# See values.yaml for the full env list.
+rtvi:
+  enabled: true
+  vss-rtvi-vlm:
+    enabled: true
+    useSharedNim: false
+
+# Monitoring is opt-in because clusters using the NVIDIA GPU Operator commonly
+# already run dcgm-exporter. To deploy this chart's exporter, set both
+# monitoring.enabled=true and monitoring.dcgmExporter.enabled=true.
+monitoring:
+  enabled: false
+  prometheus:
+    enabled: false
+  grafana:
+    enabled: false
+  nodeExporter:
+    enabled: false
+  dcgmExporter:
+    enabled: false
+
+# Helm-managed Ingress (uses existing IngressClass). Set ingressClassName to match your controller (default haproxy).
+vssIngress:
+  enabled: true
+  ingressClassName: haproxy
+  host: ""
+  vssUiPort: 3000
+  vssAgentPort: 8000
+  vstIngressPort: 30888
+  # LVS is at /lvs and RT-VLM at /rtvi-vlm — the canonical mounts, the same on
+  # every profile and on the Docker edge. Neither owns the origin root.
+  lvsBackendPort: 38111
+  rtviVlmPort: 8000
+  vaMcpPort: 9901
+  elasticsearchPort: 9200
+  kibanaHost: ""
+  phoenixHost: ""
+  kibanaPort: 5601
+  phoenixPort: 6006
+  # Optional; default streamer.<global.externalHost or vssIngress.host>.
+  streamerHost: ""
+  # HAProxy ingress request timeouts. Default controller value is 50s, which is
+  # too short for /v1/summarize (long-running LVS pipeline) and causes 504s. Ten
+  # minutes is still short of what a long video takes, and a 504 arrives at the
+  # CLI as a failed job while LVS keeps working, so match the client the ingress
+  # is fronting: `vss summarize run` waits 3600s, as does the Docker edge.
+  timeoutClient: "3600s"
+  timeoutServer: "3600s"

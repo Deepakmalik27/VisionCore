@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- /* Renders the SDRC workload config for the alerts profile.
+       KEEP THIS TEMPLATE. The docker compose alerts profile removed SDRC and
+       provisions vss-rtvi-cv from VIOS webhooks instead; Helm keeps SDRC
+       because it is what distributes streams across streamprocessing /
+       vss-rtvi-cv replicas and recovers them on pod loss. Webhooks target one
+       fixed Service address and cannot do that. See infra.sdrc in
+       values.yaml for the full rationale before changing this for compose
+       parity. */}}
+{{- $infra := index .Values "infra" | default dict }}
+{{- $sdrc := index $infra "sdrc" | default dict }}
+{{- $config := index $sdrc "config" | default dict }}
+{{- $infraEnabled := index $infra "enabled" | default false }}
+{{- $sdrcEnabled := index $sdrc "enabled" | default false }}
+{{- if and $infraEnabled $sdrcEnabled }}
+{{- $configPath := get $sdrc "configFilePath" | default "configs/sdrc/config.yml" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  {{- /* The name the sdrc chart mounts, so the two cannot drift. */}}
+  {{- $cmName := "" }}
+  {{- with index .Subcharts "infra" }}{{ with index .Subcharts "sdrc" }}{{ $cmName = include "sdrc.configMapName" . }}{{ end }}{{ end }}
+  name: {{ required "infra.sdrc.config.configMapName is required" $cmName }}
+  labels:
+    app.kubernetes.io/name: sdrc
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  {{ get $config "key" | default "config.yml" }}: |
+{{ required (printf "%s is required when infra.sdrc.enabled=true" $configPath) (tpl (.Files.Get $configPath) .) | nindent 4 }}
+{{- end }}

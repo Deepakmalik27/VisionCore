@@ -1,0 +1,26 @@
+{
+    "name": "@nvidia-mdx/web-api-core",
+    "version": "3.3.0",
+    "description": "Core functionalities of video analytics apis",
+    "main": "index.js",
+    "dependencies": {
+        "@elastic/elasticsearch": "9.4.3",
+        "@grpc/grpc-js": "1.14.5",
+        "ajv": "8.20.0",
+        "ajv-errors": "3.0.0",
+        "cron": "2.4.4",
+        "deepcopy": "1.0.1",
+        "kafkajs": "2.2.4",
+        "moment": "2.30.1",
+        "multer": "2.3.0",
+        "node-cache": "5.1.2",
+        "proto3-json-serializer": "2.0.2",
+        "protobufjs": "7.6.5",
+        "winston": "3.13.0"
+    },
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "author": "NVIDIA CORPORATION",
+    "license": "Apache-2.0"
+}

@@ -1,0 +1,14 @@
+dataset:
+  ref: dancetrack
+  split: val
+
+detector:
+  ref: yolox-x-dancetrack
+  checkpoint: default
+
+reid:
+  ref: lmbn-n-duke
+
+evaluation:
+  class_map:
+    pedestrian: person

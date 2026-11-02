@@ -1,0 +1,4570 @@
+"""Tests for uiprotect.unifi_protect_server."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import time
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
+from io import BytesIO
+from ipaddress import IPv4Address, IPv6Address
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, Mock, patch
+
+import aiohttp
+import orjson
+import pytest
+from aiofiles import os as aos
+
+# Pillow ships with the optional `cli` extra; skip the whole module rather than
+# fail at collection when it's absent (a minimal install without --all-extras).
+pytest.importorskip("PIL")
+
+from PIL import Image
+
+from tests.conftest import (
+    TEST_CAMERA_EXISTS,
+    TEST_PUBLIC_API_SNAPSHOT_EXISTS,
+    TEST_SNAPSHOT_EXISTS,
+    TEST_THUMBNAIL_EXISTS,
+    TEST_VIDEO_EXISTS,
+    MockDatetime,
+    async_read_bytes,
+    async_write_bytes,
+    async_write_text,
+    compare_objs,
+    get_time,
+    validate_video_file,
+)
+from tests.sample_data.constants import CONSTANTS
+from uiprotect.api import ProtectApiClient, RTSPSStreams, get_user_hash
+from uiprotect.data import (
+    Camera,
+    ChannelQuality,
+    EventType,
+    Light,
+    ModelType,
+    PTZPatrol,
+    PTZPreset,
+    PublicBootstrap,
+    PublicCamera,
+    PublicSirenStatus,
+    Siren,
+    create_from_unifi_dict,
+)
+from uiprotect.data.devices import LEDSettings
+from uiprotect.data.types import DeviceState, Version, VideoMode
+from uiprotect.data.websocket import WSAction, WSSubscriptionMessage
+from uiprotect.exceptions import (
+    ArmedModeError,
+    BadRequest,
+    GlobalAlarmManagerError,
+    NotAuthorized,
+    NvrError,
+)
+from uiprotect.stream import TalkbackSession
+from uiprotect.utils import decode_token_cookie, to_js_time
+from uiprotect.websocket import WebsocketState
+
+from .common import assert_equal_dump
+
+OLD_VERSION = Version("1.2.3")
+NFC_FINGERPRINT_SUPPORT_VERSION = Version("5.1.57")
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from uiprotect.data.base import ProtectAdoptableDeviceModel
+    from uiprotect.data.bootstrap import Bootstrap
+
+
+async def check_camera(camera: Camera):
+    assert camera.last_nfc_card_scanned is None
+    assert camera.last_fingerprint_identified is None
+
+    for channel in camera.channels:
+        assert channel._api is not None
+
+    data = await camera.get_snapshot()
+    assert data is not None
+    img = Image.open(BytesIO(data))
+    assert img.format in {"PNG", "JPEG"}
+
+    camera.last_ring_event  # noqa: B018
+
+    check_device(camera)
+
+    if VideoMode.HIGH_FPS in camera.feature_flags.video_modes:
+        assert camera.feature_flags.has_highfps
+    else:
+        assert not camera.feature_flags.has_highfps
+
+    if camera.feature_flags.has_hdr:
+        assert not camera.feature_flags.has_wdr
+    else:
+        assert camera.feature_flags.has_wdr
+
+
+def check_device(device: ProtectAdoptableDeviceModel):
+    assert device.protect_url == f"https://127.0.0.1:0/protect/devices/{device.id}"
+
+
+async def check_bootstrap(bootstrap: Bootstrap):
+    bootstrap.api._api_key = "test_api_key"
+    assert bootstrap.auth_user
+    assert (
+        bootstrap.nvr.protect_url
+        == f"https://127.0.0.1:0/protect/devices/{bootstrap.nvr.id}"
+    )
+
+    for light in bootstrap.lights.values():
+        if light.camera is not None:
+            await check_camera(light.camera)
+        check_device(light)
+
+    for camera in bootstrap.cameras.values():
+        await check_camera(camera)
+
+    for viewer in bootstrap.viewers.values():
+        assert viewer.liveview
+        check_device(viewer)
+
+    for sensor in bootstrap.sensors.values():
+        check_device(sensor)
+
+
+def test_base_url(protect_client: ProtectApiClient):
+    arg = f"{protect_client.private_ws_path}?lastUpdateId={protect_client.bootstrap.last_update_id}"
+
+    assert protect_client.base_url == "https://127.0.0.1:0"
+    assert str(protect_client._ws_url_object) == f"wss://127.0.0.1:0{arg}"
+
+    protect_client._port = 443
+    protect_client._update_url()
+
+    assert protect_client.base_url == "https://127.0.0.1"
+    assert str(protect_client._ws_url_object) == f"wss://127.0.0.1{arg}"
+
+
+def test_api_client_creation():
+    """Test we can create the object."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "username",
+        "password",
+        debug=True,
+        store_sessions=False,
+    )
+    assert client
+
+
+def test_early_bootstrap():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "username",
+        "password",
+        debug=True,
+        store_sessions=False,
+    )
+
+    with pytest.raises(BadRequest):
+        client.bootstrap  # noqa: B018
+
+
+@pytest.mark.asyncio()
+@pytest.mark.skipif(not TEST_CAMERA_EXISTS, reason="Missing testdata")
+async def test_bootstrap_get_device_from_mac(bootstrap):
+    orig_bootstrap = deepcopy(bootstrap)
+    mac = bootstrap["cameras"][0]["mac"]
+
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "username",
+        "password",
+        debug=True,
+        store_sessions=False,
+    )
+    client.api_request_obj = AsyncMock(side_effect=[bootstrap, orig_bootstrap])
+    client.update_device = AsyncMock()
+
+    bootstrap_obj = await client.get_bootstrap()
+    camera = bootstrap_obj.get_device_from_mac(mac)
+
+    assert camera is not None
+    assert camera.mac == mac
+
+
+@pytest.mark.asyncio()
+@pytest.mark.skipif(not TEST_CAMERA_EXISTS, reason="Missing testdata")
+async def test_bootstrap_get_device_from_mac_bad_mac(bootstrap):
+    orig_bootstrap = deepcopy(bootstrap)
+
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "username",
+        "password",
+        debug=True,
+        store_sessions=False,
+    )
+    client.api_request_obj = AsyncMock(side_effect=[bootstrap, orig_bootstrap])
+    client.update_device = AsyncMock()
+
+    bootstrap_obj = await client.get_bootstrap()
+    camera = bootstrap_obj.get_device_from_mac("not_a_mac")
+
+    assert camera is None
+
+
+def test_connection_host(protect_client: ProtectApiClient):
+    protect_client.bootstrap.nvr.hosts = [
+        IPv4Address("192.168.1.1"),
+        IPv4Address("192.168.2.1"),
+        IPv4Address("192.168.3.1"),
+        "se-gw.local",
+    ]
+
+    # mismatch between client IP and IP that NVR returns
+    protect_client._connection_host = None
+    protect_client._host = "192.168.10.1"
+    assert protect_client.connection_host == IPv4Address("192.168.1.1")
+
+    # same IP from client and NVR (first match)
+    protect_client._connection_host = None
+    protect_client._host = "192.168.1.1"
+    assert protect_client.connection_host == IPv4Address("192.168.1.1")
+
+    # same IP from client and NVR (not first match)
+    protect_client._connection_host = None
+    protect_client._host = "192.168.3.1"
+    assert protect_client.connection_host == IPv4Address("192.168.3.1")
+
+    # same IP from client and NVR (not first match, DNS host)
+    protect_client._connection_host = None
+    protect_client._host = "se-gw.local"
+    assert protect_client.connection_host == "se-gw.local"
+
+
+def test_connection_host_with_hostname_fallback(protect_client: ProtectApiClient):
+    """Test connection_host property when host is a hostname (not IP)."""
+    protect_client.bootstrap.nvr.hosts = [
+        IPv4Address("192.168.1.1"),
+        IPv4Address("192.168.2.1"),
+        "hostname.local",
+    ]
+
+    # Hostname triggers ValueError, falls back to first host
+    protect_client._connection_host = None
+    protect_client._host = "unifi.local"
+    assert protect_client.connection_host == IPv4Address("192.168.1.1")
+
+
+@pytest.mark.parametrize(
+    ("host",),
+    [
+        ("127.0.0.1",),
+        ("2001:db8::1",),
+        ("192.168.1.100",),
+        ("fe80::1",),
+        ("unifi.local",),
+    ],
+)
+def test_connection_host_override(host: str):
+    """Test override_connection_host stores host as-is (string)."""
+    protect = ProtectApiClient(
+        host,
+        443,
+        "test",
+        "test",
+        override_connection_host=True,
+        store_sessions=False,
+    )
+
+    # Host is always stored as string, format_host_for_url handles formatting
+    assert protect._connection_host == host
+    assert isinstance(protect._connection_host, str)
+
+
+@pytest.mark.asyncio()
+async def test_connection_host_update_with_dns_resolution(
+    protect_client: ProtectApiClient,
+):
+    """Test that update() resolves hostnames via ip_from_host."""
+    # Setup: host is a hostname that will be resolved
+    protect_client._connection_host = None
+    protect_client._host = "unifi.local"
+
+    # Create a new bootstrap object with specific hosts
+    bootstrap = protect_client.bootstrap.model_copy()
+    bootstrap.nvr.hosts = [
+        IPv4Address("192.168.1.1"),
+        IPv4Address("192.168.1.100"),
+    ]
+
+    # Mock get_bootstrap to return our custom bootstrap
+    # Mock ip_from_host to return an IP that exists in nvr.hosts
+    with (
+        patch.object(
+            protect_client, "get_bootstrap", new=AsyncMock(return_value=bootstrap)
+        ),
+        patch(
+            "uiprotect.api.ip_from_host",
+            new=AsyncMock(return_value=IPv4Address("192.168.1.100")),
+        ),
+    ):
+        await protect_client.update()
+
+    # Should have selected the resolved IP from nvr.hosts
+    assert protect_client._connection_host == IPv4Address("192.168.1.100")
+
+
+@pytest.mark.asyncio()
+async def test_connection_host_update_fallback_to_first(
+    protect_client: ProtectApiClient,
+):
+    """Test that update() falls back to first host if no match found."""
+    # Setup: host won't match anything
+    protect_client._connection_host = None
+    protect_client._host = "unknown.local"
+
+    # Create a new bootstrap object with specific hosts
+    bootstrap = protect_client.bootstrap.model_copy()
+    bootstrap.nvr.hosts = [
+        IPv4Address("192.168.1.1"),
+        IPv4Address("192.168.1.2"),
+    ]
+
+    # Mock get_bootstrap to return our custom bootstrap
+    # Mock ip_from_host to return an IP that's NOT in nvr.hosts
+    with (
+        patch.object(
+            protect_client, "get_bootstrap", new=AsyncMock(return_value=bootstrap)
+        ),
+        patch(
+            "uiprotect.api.ip_from_host",
+            new=AsyncMock(return_value=IPv4Address("10.0.0.1")),
+        ),
+    ):
+        await protect_client.update()
+
+    # Should fall back to first host
+    assert protect_client._connection_host == IPv4Address("192.168.1.1")
+
+
+def test_connection_host_ipv6(protect_client: ProtectApiClient):
+    """Test that IPv6 addresses work correctly for connection_host."""
+    protect_client.bootstrap.nvr.hosts = [
+        IPv6Address("fe80::1ff:fe23:4567:890a"),
+        IPv6Address("2001:db8::1"),
+        IPv4Address("192.168.1.1"),
+    ]
+
+    # Test IPv6 address selection
+    protect_client._connection_host = None
+    protect_client._host = "192.168.10.1"
+    assert protect_client.connection_host == IPv6Address("fe80::1ff:fe23:4567:890a")
+
+    # Test matching IPv6 address
+    protect_client._connection_host = None
+    protect_client._host = "2001:db8::1"
+    assert protect_client.connection_host == IPv6Address("2001:db8::1")
+
+
+def test_api_client_with_ipv6():
+    """Test that ProtectApiClient handles IPv6 addresses correctly in URLs."""
+    # Test with IPv6 address
+    protect = ProtectApiClient(
+        "fe80::1",
+        443,
+        "test",
+        "test",
+        store_sessions=False,
+    )
+
+    # Check that URLs are formatted with brackets for IPv6
+    assert "[fe80::1]" in str(protect._url)
+    assert "[fe80::1]" in str(protect._ws_url)
+
+    # Test with IPv6 and custom port
+    protect_port = ProtectApiClient(
+        "2001:db8::1",
+        7443,
+        "test",
+        "test",
+        store_sessions=False,
+    )
+
+    assert "[2001:db8::1]:7443" in str(protect_port._url)
+    assert "[2001:db8::1]:7443" in str(protect_port._ws_url)
+
+
+@pytest.mark.asyncio()
+async def test_force_update_with_old_version(protect_client: ProtectApiClient):
+    protect_client._bootstrap = None
+
+    await protect_client.update()
+
+    assert protect_client.bootstrap
+    original_bootstrap = protect_client.bootstrap
+    protect_client._bootstrap = None
+    with patch(
+        "uiprotect.api.ProtectApiClient.get_bootstrap",
+        AsyncMock(return_value=AsyncMock(nvr=AsyncMock(version=OLD_VERSION))),
+    ) as mock:
+        await protect_client.update()
+        assert mock.called
+
+    assert protect_client.bootstrap
+    assert original_bootstrap != protect_client.bootstrap
+
+
+@pytest.mark.asyncio()
+async def test_force_update_with_nfc_fingerprint_version(
+    protect_client: ProtectApiClient,
+):
+    protect_client._bootstrap = None
+
+    await protect_client.update()
+
+    assert protect_client.bootstrap
+    original_bootstrap = protect_client.bootstrap
+    protect_client._bootstrap = None
+    with (
+        patch(
+            "uiprotect.api.ProtectApiClient.get_bootstrap",
+            return_value=AsyncMock(
+                nvr=AsyncMock(version=NFC_FINGERPRINT_SUPPORT_VERSION)
+            ),
+        ) as get_bootstrap_mock,
+        patch(
+            "uiprotect.api.ProtectApiClient.api_request_list",
+            side_effect=lambda endpoint: {
+                "keyrings": [
+                    {
+                        "deviceType": "camera",
+                        "deviceId": "new_device_id_1",
+                        "registryType": "fingerprint",
+                        "registryId": "new_registry_id_1",
+                        "lastActivity": 1733432893331,
+                        "metadata": {},
+                        "ulpUser": "new_ulp_user_id_1",
+                        "id": "new_keyring_id_1",
+                        "modelKey": "keyring",
+                    }
+                ],
+                "ulp-users": [
+                    {
+                        "ulpId": "new_ulp_id_1",
+                        "firstName": "localadmin",
+                        "lastName": "",
+                        "fullName": "localadmin",
+                        "avatar": "",
+                        "status": "ACTIVE",
+                        "id": "new_ulp_user_id_1",
+                        "modelKey": "ulpUser",
+                    }
+                ],
+            }.get(endpoint, []),
+        ) as api_request_list_mock,
+    ):
+        await protect_client.update()
+        assert get_bootstrap_mock.called
+        assert api_request_list_mock.called
+        api_request_list_mock.assert_any_call("keyrings")
+        api_request_list_mock.assert_any_call("ulp-users")
+        assert api_request_list_mock.call_count == 2
+
+    assert protect_client.bootstrap
+    assert original_bootstrap != protect_client.bootstrap
+    assert len(protect_client.bootstrap.keyrings)
+    assert len(protect_client.bootstrap.ulp_users)
+
+
+@pytest.mark.asyncio()
+async def test_force_update_no_user_keyring_access(protect_client: ProtectApiClient):
+    protect_client._bootstrap = None
+
+    await protect_client.update()
+
+    assert protect_client.bootstrap
+    original_bootstrap = protect_client.bootstrap
+    protect_client._bootstrap = None
+    with (
+        patch(
+            "uiprotect.api.ProtectApiClient.get_bootstrap",
+            return_value=AsyncMock(
+                nvr=AsyncMock(version=NFC_FINGERPRINT_SUPPORT_VERSION)
+            ),
+        ) as get_bootstrap_mock,
+        patch(
+            "uiprotect.api.ProtectApiClient.api_request_list",
+            side_effect=NotAuthorized,
+        ) as api_request_list_mock,
+    ):
+        await protect_client.update()
+        assert get_bootstrap_mock.called
+        assert api_request_list_mock.called
+        api_request_list_mock.assert_any_call("keyrings")
+        api_request_list_mock.assert_any_call("ulp-users")
+        assert api_request_list_mock.call_count == 2
+
+    assert protect_client.bootstrap
+    assert original_bootstrap != protect_client.bootstrap
+    assert not len(protect_client.bootstrap.keyrings)
+    assert not len(protect_client.bootstrap.ulp_users)
+
+
+@pytest.mark.asyncio()
+async def test_force_update_user_keyring_internal_error(
+    protect_client: ProtectApiClient,
+):
+    protect_client._bootstrap = None
+
+    await protect_client.update()
+
+    assert protect_client.bootstrap
+    protect_client._bootstrap = None
+    with (
+        pytest.raises(BadRequest),
+        patch(
+            "uiprotect.api.ProtectApiClient.get_bootstrap",
+            return_value=AsyncMock(
+                nvr=AsyncMock(version=NFC_FINGERPRINT_SUPPORT_VERSION)
+            ),
+        ),
+        patch(
+            "uiprotect.api.ProtectApiClient.api_request_list",
+            side_effect=BadRequest,
+        ),
+    ):
+        await protect_client.update()
+
+
+@pytest.mark.asyncio()
+async def test_get_nvr(protect_client: ProtectApiClient, nvr):
+    """Verifies the `get_nvr` method"""
+    nvr_obj = await protect_client.get_nvr()
+    nvr_dict = nvr_obj.unifi_dict()
+
+    compare_objs(ModelType.NVR.value, nvr, nvr_dict)
+
+
+@pytest.mark.asyncio()
+async def test_bootstrap(protect_client: ProtectApiClient):
+    """Verifies lookup of all object via ID"""
+    await check_bootstrap(protect_client.bootstrap)
+
+
+@pytest.mark.asyncio()
+async def test_bootstrap_cached_property(protect_client: ProtectApiClient):
+    """Test cached property works with bootstrap."""
+    bootstrap = protect_client.bootstrap
+
+    assert bootstrap.has_doorbell is True
+    bootstrap.cameras = {}
+    assert bootstrap.has_doorbell is True
+    bootstrap._has_doorbell = None
+    assert bootstrap.has_doorbell is False
+
+
+@pytest.mark.asyncio()
+async def test_bootstrap_construct(protect_client_no_debug: ProtectApiClient):
+    """Verifies lookup of all object via ID"""
+    await check_bootstrap(protect_client_no_debug.bootstrap)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.utils.datetime", MockDatetime)
+async def test_get_events_raw_default(protect_client: ProtectApiClient, now: datetime):
+    events = await protect_client.get_events_raw(_allow_manual_paginate=False)
+
+    end = now + timedelta(seconds=10)
+
+    protect_client.api_request.assert_called_with(  # type: ignore[attr-defined]
+        url="events",
+        method="get",
+        require_auth=True,
+        raise_exception=True,
+        public_api=False,
+        params={
+            "orderDirection": "ASC",
+            "withoutDescriptions": "false",
+            "start": to_js_time(end - timedelta(hours=1)),
+            "end": to_js_time(end),
+        },
+    )
+    assert len(events) == CONSTANTS["event_count"]
+    for event in events:
+        assert event["type"] in EventType.values()
+        assert event["modelKey"] in ModelType.values()
+
+
+@pytest.mark.asyncio()
+async def test_get_events_raw_limit(protect_client: ProtectApiClient):
+    await protect_client.get_events_raw(limit=10)
+
+    protect_client.api_request.assert_called_with(  # type: ignore[attr-defined]
+        url="events",
+        method="get",
+        require_auth=True,
+        raise_exception=True,
+        public_api=False,
+        params={"orderDirection": "ASC", "withoutDescriptions": "false", "limit": 10},
+    )
+
+
+@pytest.mark.asyncio()
+async def test_get_events_raw_types(protect_client: ProtectApiClient):
+    await protect_client.get_events_raw(
+        limit=10,
+        types=[EventType.MOTION, EventType.SMART_DETECT],
+    )
+
+    protect_client.api_request.assert_called_with(  # type: ignore[attr-defined]
+        url="events",
+        method="get",
+        require_auth=True,
+        raise_exception=True,
+        public_api=False,
+        params={
+            "orderDirection": "ASC",
+            "withoutDescriptions": "false",
+            "limit": 10,
+            "types": ["motion", "smartDetectZone"],
+        },
+    )
+
+
+@pytest.mark.skipif(not TEST_CAMERA_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_device_mismatch(protect_client: ProtectApiClient, camera):
+    protect_client.api_request_obj = AsyncMock(return_value=camera)  # type: ignore[method-assign]
+
+    with pytest.raises(NvrError):
+        await protect_client.get_device(ModelType.LIGHT, "test_id", Light)
+
+
+@pytest.mark.skipif(not TEST_CAMERA_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_device_not_adopted(protect_client: ProtectApiClient, camera):
+    camera["isAdopted"] = False
+    protect_client.api_request_obj = AsyncMock(return_value=camera)  # type: ignore[method-assign]
+
+    with pytest.raises(NvrError):
+        await protect_client.get_device(ModelType.CAMERA, "test_id")
+
+
+@pytest.mark.skipif(not TEST_CAMERA_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_device_not_adopted_enabled(protect_client: ProtectApiClient, camera):
+    camera["isAdopted"] = False
+    protect_client.ignore_unadopted = False
+    protect_client.api_request_obj = AsyncMock(return_value=camera)  # type: ignore[method-assign]
+
+    obj = create_from_unifi_dict(camera)
+    assert_equal_dump(
+        obj, await protect_client.get_device(ModelType.CAMERA, "test_id", Camera)
+    )
+
+
+@pytest.mark.skipif(not TEST_SNAPSHOT_EXISTS, reason="Missing testdata")
+@patch("uiprotect.utils.datetime", MockDatetime)
+@patch("uiprotect.api.time.time", get_time)
+@pytest.mark.asyncio()
+async def test_get_camera_snapshot(protect_client: ProtectApiClient, now):
+    data = await protect_client.get_camera_snapshot("test_id")
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        "cameras/test_id/snapshot",
+        params={
+            "ts": to_js_time(now),
+            "force": "true",
+        },
+        raise_exception=False,
+    )
+
+    img = Image.open(BytesIO(data))
+    assert img.format in {"PNG", "JPEG"}
+
+
+@pytest.mark.skipif(not TEST_PUBLIC_API_SNAPSHOT_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_public_api_camera_snapshot(protect_client: ProtectApiClient, now):
+    data = await protect_client.get_public_api_camera_snapshot("test_id")
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        public_api=True,
+        raise_exception=False,
+        url="/v1/cameras/test_id/snapshot",
+        params={
+            "highQuality": "false",
+        },
+    )
+
+    img = Image.open(BytesIO(data))
+    assert img.format in {"PNG", "JPEG"}
+
+
+@pytest.mark.skipif(not TEST_PUBLIC_API_SNAPSHOT_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_public_api_camera_snapshot_hq_true(
+    protect_client: ProtectApiClient, now
+):
+    data = await protect_client.get_public_api_camera_snapshot(
+        "test_id", high_quality=True
+    )
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        public_api=True,
+        raise_exception=False,
+        url="/v1/cameras/test_id/snapshot",
+        params={
+            "highQuality": "true",
+        },
+    )
+
+    img = Image.open(BytesIO(data))
+    assert img.format in {"PNG", "JPEG"}
+
+
+@pytest.mark.skipif(not TEST_SNAPSHOT_EXISTS, reason="Missing testdata")
+@patch("uiprotect.utils.datetime", MockDatetime)
+@patch("uiprotect.api.time.time", get_time)
+@pytest.mark.asyncio()
+async def test_get_camera_snapshot_args(protect_client: ProtectApiClient, now):
+    data = await protect_client.get_camera_snapshot("test_id", 1920, 1080)
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        "cameras/test_id/snapshot",
+        params={
+            "ts": to_js_time(now),
+            "force": "true",
+            "w": 1920,
+            "h": 1080,
+        },
+        raise_exception=False,
+    )
+
+    img = Image.open(BytesIO(data))
+    assert img.format in {"PNG", "JPEG"}
+
+
+@pytest.mark.skipif(not TEST_VIDEO_EXISTS, reason="Missing testdata")
+@patch("uiprotect.api.datetime", MockDatetime)
+@patch("uiprotect.api.time.time", get_time)
+@pytest.mark.asyncio()
+async def test_get_camera_video(protect_client: ProtectApiClient, now, tmp_path: Path):
+    camera = next(iter(protect_client.bootstrap.cameras.values()))
+    start = now - timedelta(seconds=CONSTANTS["camera_video_length"])
+
+    data = await protect_client.get_camera_video(camera.id, start, now)
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        "video/export",
+        params={
+            "camera": camera.id,
+            "channel": 0,
+            "start": to_js_time(start),
+            "end": to_js_time(now),
+        },
+        raise_exception=False,
+    )
+
+    out_path = tmp_path / "video.mp4"
+    await async_write_bytes(out_path, data)
+    await asyncio.to_thread(
+        validate_video_file, out_path, CONSTANTS["camera_video_length"]
+    )
+
+
+@pytest.mark.asyncio()
+async def test_get_camera_video_http_error(
+    protect_client: ProtectApiClient, now: datetime
+) -> None:
+    """Test get_camera_video with HTTP error response."""
+    camera = next(iter(protect_client.bootstrap.cameras.values()))
+    start = now - timedelta(seconds=CONSTANTS["camera_video_length"])
+
+    # Test the simple path (no output_file) which uses api_request_raw
+    protect_client.api_request_raw = AsyncMock(
+        side_effect=NotAuthorized("Access denied")
+    )
+
+    with pytest.raises(NotAuthorized):
+        await protect_client.get_camera_video(camera.id, start, now)
+
+
+@pytest.mark.asyncio()
+async def test_get_camera_video_logging(
+    protect_client: ProtectApiClient, now: datetime, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test get_camera_video debug logging."""
+    caplog.set_level(logging.DEBUG, logger="uiprotect.api")
+
+    camera = next(iter(protect_client.bootstrap.cameras.values()))
+    start = now - timedelta(seconds=CONSTANTS["camera_video_length"])
+
+    # Create a simple async context manager class for the file mock
+    class MockAsyncFile:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def write(self, data):
+            pass
+
+    # Mock the response
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.close = Mock()
+
+    # Create a mock content with iter_chunked method
+    class MockContent:
+        def iter_chunked(self, chunk_size):
+            return MockAsyncIterator()
+
+    class MockAsyncIterator:
+        def __init__(self):
+            self.items = [b"test_chunk"]
+            self.index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.index >= len(self.items):
+                raise StopAsyncIteration
+            item = self.items[self.index]
+            self.index += 1
+            return item
+
+    mock_response.content = MockContent()
+
+    # Mock aiofiles.open to return our mock file
+    with patch("aiofiles.open", return_value=MockAsyncFile()):
+        protect_client.request = AsyncMock(return_value=mock_response)
+
+        await protect_client.get_camera_video(
+            camera.id,
+            start,
+            now,
+            output_file="/tmp/test.mp4",  # noqa: S108
+        )
+
+    # Check that debug log was written
+    assert any(
+        "Requesting camera video:" in record.message for record in caplog.records
+    )
+
+
+@pytest.mark.skipif(not TEST_THUMBNAIL_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_event_thumbnail(protect_client: ProtectApiClient):
+    data = await protect_client.get_event_thumbnail("e-test_id")
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        "events/test_id/thumbnail",
+        params={},
+        raise_exception=False,
+    )
+
+    img = Image.open(BytesIO(data))
+    assert img.format in {"PNG", "JPEG"}
+
+
+@pytest.mark.skipif(not TEST_THUMBNAIL_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_event_thumbnail_args(protect_client: ProtectApiClient):
+    data = await protect_client.get_event_thumbnail("test_id", 1920, 1080)
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        "events/test_id/thumbnail",
+        params={
+            "w": 1920,
+            "h": 1080,
+        },
+        raise_exception=False,
+    )
+
+    img = Image.open(BytesIO(data))
+    assert img.format in {"PNG", "JPEG"}
+
+
+@pytest.mark.skipif(not TEST_THUMBNAIL_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_event_thumbnail_uuid_with_e_dash(protect_client: ProtectApiClient):
+    """Regression test for #810: event IDs containing 'e-' must not be corrupted."""
+    event_id = "4028adde-42c6-4873-a49e-94da9bd22190"
+    data = await protect_client.get_event_thumbnail(event_id)
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        f"events/{event_id}/thumbnail",
+        params={},
+        raise_exception=False,
+    )
+
+
+@pytest.mark.skipif(not TEST_THUMBNAIL_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_get_event_thumbnail_strips_legacy_prefix(
+    protect_client: ProtectApiClient,
+):
+    """Legacy thumbnail IDs of the form 'e-<event_id>' should have the prefix stripped."""
+    data = await protect_client.get_event_thumbnail(
+        "e-4028adde-42c6-4873-a49e-94da9bd22190"
+    )
+    assert data is not None
+
+    protect_client.api_request_raw.assert_called_with(  # type: ignore[attr-defined]
+        "events/4028adde-42c6-4873-a49e-94da9bd22190/thumbnail",
+        params={},
+        raise_exception=False,
+    )
+
+
+@pytest.mark.asyncio()
+async def test_play_speaker(protect_client: ProtectApiClient):
+    """Test play_speaker with default parameters."""
+    device_id = "cf1a330397c08f919d02bd7c"
+    protect_client.api_request = AsyncMock()
+
+    await protect_client.play_speaker(device_id)
+
+    protect_client.api_request.assert_called_with(
+        f"chimes/{device_id}/play-speaker",
+        method="post",
+        json=None,
+    )
+
+
+@pytest.mark.asyncio()
+async def test_play_speaker_with_volume(protect_client: ProtectApiClient):
+    """Test play_speaker with volume parameter."""
+    device_id = "cf1a330397c08f919d02bd7c"
+    volume = 5
+    chime = protect_client.bootstrap.chimes[device_id]
+    protect_client.api_request = AsyncMock()
+
+    await protect_client.play_speaker(device_id, volume=volume)
+
+    protect_client.api_request.assert_called_with(
+        f"chimes/{device_id}/play-speaker",
+        method="post",
+        json={
+            "volume": volume,
+            "repeatTimes": chime.repeat_times,
+        },
+    )
+
+
+@pytest.mark.asyncio()
+async def test_play_speaker_with_ringtone_id(protect_client: ProtectApiClient):
+    """Test play_speaker with ringtone_id parameter."""
+    device_id = "cf1a330397c08f919d02bd7c"
+    ringtone_id = "ringtone_1"
+    chime = protect_client.bootstrap.chimes[device_id]
+    protect_client.api_request = AsyncMock()
+
+    await protect_client.play_speaker(device_id, ringtone_id=ringtone_id)
+
+    protect_client.api_request.assert_called_with(
+        f"chimes/{device_id}/play-speaker",
+        method="post",
+        json={
+            "volume": chime.volume,
+            "repeatTimes": chime.repeat_times,
+            "ringtoneId": ringtone_id,
+        },
+    )
+
+
+@pytest.mark.asyncio()
+async def test_play_speaker_invalid_chime_id(protect_client: ProtectApiClient):
+    """Test play_speaker with invalid chime ID."""
+    device_id = "invalid_id"
+    protect_client.api_request = AsyncMock()
+
+    with pytest.raises(BadRequest):
+        await protect_client.play_speaker(device_id, volume=5)
+
+
+@pytest.mark.asyncio()
+async def test_play_speaker_with_all_parameters(protect_client: ProtectApiClient):
+    """Test play_speaker with all parameters."""
+    device_id = "cf1a330397c08f919d02bd7c"
+    volume = 5
+    repeat_times = 3
+    ringtone_id = "ringtone_1"
+    track_no = 2
+    protect_client.api_request = AsyncMock()
+
+    await protect_client.play_speaker(
+        device_id,
+        volume=volume,
+        repeat_times=repeat_times,
+        ringtone_id=ringtone_id,
+        track_no=track_no,
+    )
+
+    protect_client.api_request.assert_called_with(
+        f"chimes/{device_id}/play-speaker",
+        method="post",
+        json={
+            "volume": volume,
+            "repeatTimes": repeat_times,
+            "ringtoneId": ringtone_id,
+        },
+    )
+
+
+@pytest.mark.asyncio()
+async def test_create_api_key_success(protect_client: ProtectApiClient):
+    protect_client.api_request = AsyncMock(
+        return_value={"data": {"full_api_key": "test_api_key"}}
+    )
+    result = await protect_client.create_api_key("test")
+    assert result == "test_api_key"
+    protect_client.api_request.assert_called_with(
+        api_path="/proxy/users/api/v2",
+        url="/user/self/keys",
+        method="post",
+        json={"name": "test"},
+    )
+
+
+@pytest.mark.asyncio()
+async def test_create_api_key_empty_name(protect_client: ProtectApiClient):
+    protect_client._last_token_cookie_decode = {"userId": "test_user_id"}
+    with pytest.raises(BadRequest, match="API key name cannot be empty"):
+        await protect_client.create_api_key("")
+
+
+@pytest.mark.asyncio()
+async def test_create_api_key_failure(protect_client: ProtectApiClient):
+    protect_client.api_request = AsyncMock(return_value={})
+    protect_client._last_token_cookie_decode = {"userId": "test_user_id"}
+    with pytest.raises(BadRequest, match="Failed to create API key"):
+        await protect_client.create_api_key("test")
+
+
+@pytest.mark.asyncio()
+async def test_api_request_raw_with_custom_api_path() -> None:
+    """Test api_request_raw uses custom api_path when provided"""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test",
+        "test",
+        verify_ssl=False,
+    )
+
+    # Mock the request method to verify the path
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.read = AsyncMock(return_value=b"test_response")
+    mock_response.close = Mock()
+    mock_response.release = Mock()
+
+    client.request = AsyncMock(return_value=mock_response)
+
+    result = await client.api_request_raw("/test/endpoint", api_path="/custom/api/path")
+
+    assert result == b"test_response"
+    client.request.assert_called_with(
+        "get",
+        "/custom/api/path/test/endpoint",
+        require_auth=True,
+        auto_close=False,
+        public_api=False,
+    )
+
+
+@pytest.mark.asyncio()
+async def test_api_request_raw_with_default_api_path() -> None:
+    """Test api_request_raw uses default api_path when not provided"""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test",
+        "test",
+        verify_ssl=False,
+    )
+
+    # Mock the request method to verify the path
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.read = AsyncMock(return_value=b"test_response")
+    mock_response.close = Mock()
+    mock_response.release = Mock()
+
+    client.request = AsyncMock(return_value=mock_response)
+
+    result = await client.api_request_raw("/test/endpoint")
+
+    assert result == b"test_response"
+    client.request.assert_called_with(
+        "get",
+        f"{client.private_api_path}/test/endpoint",
+        require_auth=True,
+        auto_close=False,
+        public_api=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_auth_config_file_not_found():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test",
+        "test",
+        verify_ssl=False,
+    )
+    with patch("aiofiles.open", side_effect=FileNotFoundError):
+        result = await client._read_auth_config()
+        assert result is None
+
+
+class AsyncMockOpen:
+    def __init__(self, read_data: bytes):
+        self._read_data = read_data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        pass
+
+    async def read(self):
+        return self._read_data
+
+
+@pytest.mark.asyncio
+async def test_read_auth_config_empty_file():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test",
+        "test",
+        verify_ssl=False,
+    )
+    with patch("aiofiles.open", return_value=AsyncMockOpen(b"")):
+        result = await client._read_auth_config()
+        assert result is None
+
+
+@pytest.mark.asyncio
+async def test_read_auth_config_invalid_json():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test",
+        "test",
+        verify_ssl=False,
+    )
+    with patch("aiofiles.open", return_value=AsyncMockOpen(b"{invalid json")):
+        result = await client._read_auth_config()
+        assert result is None
+
+
+@pytest.mark.asyncio
+async def test_read_auth_config_no_session():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test",
+        "test",
+        verify_ssl=False,
+    )
+    with patch("aiofiles.open", return_value=AsyncMockOpen(b"{}")):
+        result = await client._read_auth_config()
+        assert result is None
+
+
+def test_api_key_init():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+    assert hasattr(client, "_api_key")
+    assert client._api_key == "my_key"
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ProtectApiClient.request")
+async def test_authenticate_sets_csrf_token(mock_request: AsyncMock) -> None:
+    """Test that authenticate() extracts and sets the x-csrf-token header."""
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.headers = {
+        "set-cookie": "TOKEN=test_token_value; path=/",
+        "x-csrf-token": "test-csrf-token-12345",
+    }
+    mock_response.cookies = {}
+    mock_request.return_value = mock_response
+
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=False,
+    )
+
+    await client.authenticate()
+
+    assert client.headers is not None
+    assert client.headers.get("x-csrf-token") == "test-csrf-token-12345"
+    assert client._is_authenticated is True
+
+    mock_request.assert_called_once_with(
+        "post",
+        url="/api/auth/login",
+        json={
+            "username": "test_user",
+            "password": "test_pass",
+            "rememberMe": False,
+        },
+    )
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ProtectApiClient.request")
+async def test_authenticate_without_csrf_token(mock_request: AsyncMock) -> None:
+    """Test that authenticate() works even if no x-csrf-token is returned."""
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.headers = {
+        "set-cookie": "TOKEN=test_token_value; path=/",
+    }
+    mock_response.cookies = {}
+    mock_request.return_value = mock_response
+
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=False,
+    )
+
+    await client.authenticate()
+
+    assert client.headers is None or client.headers.get("x-csrf-token") is None
+    assert client._is_authenticated is True
+
+
+@pytest.mark.asyncio()
+async def test_load_session_rejects_missing_csrf_token(tmp_path: Path) -> None:
+    """Test that _read_auth_config rejects sessions without CSRF token."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+
+    # Create a config file with a session but no CSRF token (simulating old session)
+    session_hash = get_user_hash(str(client._url), "test_user")
+    config = {
+        "sessions": {
+            session_hash: {
+                "metadata": {"path": "/", "expires": "Sun, 21 Dec 2025 13:44:52 GMT"},
+                "cookiename": "TOKEN",
+                "value": "old_token_without_csrf",
+                "csrf": None,  # Old session without CSRF token
+            }
+        }
+    }
+
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_bytes(config_file, orjson.dumps(config))
+
+    # Try to load the session
+    cookie = await client._read_auth_config()
+
+    # Should return None because CSRF token is missing
+    assert cookie is None
+    assert client._is_authenticated is False
+
+
+@pytest.mark.asyncio()
+async def test_load_session_accepts_valid_csrf_token(tmp_path: Path) -> None:
+    """Test that _read_auth_config accepts sessions with valid CSRF token."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+
+    # Create a config file with a session including CSRF token
+    session_hash = get_user_hash(str(client._url), "test_user")
+    config = {
+        "sessions": {
+            session_hash: {
+                "metadata": {"path": "/", "expires": "Sun, 21 Dec 2025 13:44:52 GMT"},
+                "cookiename": "TOKEN",
+                "value": "valid_token_with_csrf",
+                "csrf": "valid-csrf-token-12345",
+            }
+        }
+    }
+
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_bytes(config_file, orjson.dumps(config))
+
+    # Try to load the session
+    cookie = await client._read_auth_config()
+
+    # Should successfully load the session
+    assert cookie is not None
+    assert client._is_authenticated is True
+    assert client.headers is not None
+    assert client.headers.get("x-csrf-token") == "valid-csrf-token-12345"
+
+
+@pytest.mark.asyncio()
+async def test_load_session_with_invalid_token(tmp_path: Path) -> None:
+    """Test that loading a session with an invalid token (not enough segments) handles gracefully."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+
+    # Create a config file with a session containing an invalid token
+    # (not a valid JWT format - should have 3 segments separated by dots)
+    session_hash = get_user_hash(str(client._url), "test_user")
+    config = {
+        "sessions": {
+            session_hash: {
+                "metadata": {"path": "/", "expires": "Sun, 21 Dec 2025 13:44:52 GMT"},
+                "cookiename": "TOKEN",
+                "value": "invalid_token_not_jwt",  # Invalid: only 1 segment, not 3
+                "csrf": "valid-csrf-token-12345",
+            }
+        }
+    }
+
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_bytes(config_file, orjson.dumps(config))
+
+    # Load the session
+    cookie = await client._read_auth_config()
+
+    # Should successfully load the cookie even if token is invalid
+    assert cookie is not None
+    assert client._is_authenticated is True
+    assert client._last_token_cookie is not None
+
+    # The decode should fail gracefully and return None
+    # This simulates the "Authentication token decode error: Not enough segments" from the issue
+    decoded = decode_token_cookie(client._last_token_cookie)
+    assert decoded is None
+
+    # Verify is_authenticated returns False for invalid token
+    assert client.is_authenticated() is False
+
+
+@pytest.mark.asyncio()
+async def test_load_session_with_token_two_segments(tmp_path: Path) -> None:
+    """Test that loading a session with a token having only 2 segments handles gracefully."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+
+    # Create a config file with a token that has 2 segments instead of 3
+    session_hash = get_user_hash(str(client._url), "test_user")
+    config = {
+        "sessions": {
+            session_hash: {
+                "metadata": {"path": "/", "expires": "Sun, 21 Dec 2025 13:44:52 GMT"},
+                "cookiename": "TOKEN",
+                "value": "segment1.segment2",  # Invalid: only 2 segments instead of 3
+                "csrf": "valid-csrf-token-12345",
+            }
+        }
+    }
+
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_bytes(config_file, orjson.dumps(config))
+
+    # Load the session
+    cookie = await client._read_auth_config()
+
+    # Should successfully load the cookie even if token is invalid
+    assert cookie is not None
+    assert client._is_authenticated is True
+    assert client._last_token_cookie is not None
+
+    # The decode should fail gracefully and return None
+    decoded = decode_token_cookie(client._last_token_cookie)
+    assert decoded is None
+
+    # Verify is_authenticated returns False for invalid token
+    assert client.is_authenticated() is False
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ProtectApiClient.request")
+async def test_invalid_token_triggers_reauthentication(
+    mock_request: AsyncMock, tmp_path: Path
+) -> None:
+    """Test that an invalid token in session triggers re-authentication and updates the session file."""
+    # Create a config file with an invalid token (like from the GitHub issue)
+    session_hash = get_user_hash("https://127.0.0.1:0", "test_user")
+    invalid_config = {
+        "sessions": {
+            session_hash: {
+                "metadata": {"path": "/", "expires": "Sun, 21 Dec 2025 13:44:52 GMT"},
+                "cookiename": "TOKEN",
+                "value": "invalid_token",  # Not a valid JWT
+                "csrf": "old-csrf-token",
+            }
+        }
+    }
+
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_bytes(config_file, orjson.dumps(invalid_config))
+
+    # Setup mock for authentication
+    mock_auth_response = AsyncMock()
+    mock_auth_response.status = 200
+    mock_auth_response.headers = {
+        "set-cookie": "TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0IiwiZXhwIjoxNzMzMDAwMDAwfQ.test; path=/",
+        "x-csrf-token": "new-csrf-token-12345",
+    }
+    mock_auth_response.cookies = {}
+    mock_request.return_value = mock_auth_response
+
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+
+    try:
+        # Ensure authentication is triggered (which loads the session first)
+        await client.ensure_authenticated()
+
+        # Should have called authenticate() due to invalid token
+        assert mock_request.called
+        assert client._is_authenticated is True
+
+        # Verify the session file was updated with the new valid token
+        updated_config = orjson.loads(await async_read_bytes(config_file))
+        session_data = updated_config["sessions"][session_hash]
+        assert session_data["csrf"] == "new-csrf-token-12345"
+        # The new token should be a valid JWT format (3 segments)
+        assert session_data["value"].count(".") == 2
+    finally:
+        await client.close_session()
+
+
+@pytest.mark.asyncio()
+async def test_clear_session_removes_specific_session(tmp_path: Path) -> None:
+    """Test that clear_session removes only the specific user/host session."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+
+    session_hash = get_user_hash(str(client._url), "test_user")
+    config = {
+        "sessions": {
+            session_hash: {
+                "metadata": {"path": "/", "expires": "Sun, 21 Dec 2025 13:44:52 GMT"},
+                "cookiename": "TOKEN",
+                "value": "some_token_value",
+                "csrf": "some-csrf-token",
+            },
+            "other_session_hash": {
+                "metadata": {"path": "/"},
+                "cookiename": "TOKEN",
+                "value": "other_token",
+                "csrf": "other-csrf",
+            },
+        }
+    }
+
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_bytes(config_file, orjson.dumps(config))
+
+    await client.clear_session()
+
+    # File should still exist with the other session intact
+    updated_config = orjson.loads(await async_read_bytes(config_file))
+    assert session_hash not in updated_config["sessions"]
+    assert "other_session_hash" in updated_config["sessions"]
+    assert client._is_authenticated is False
+
+
+@pytest.mark.asyncio()
+async def test_clear_session_does_nothing_when_sessions_disabled(
+    tmp_path: Path,
+) -> None:
+    """Test that clear_session does nothing when store_sessions=False."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=False,
+        config_dir=tmp_path,
+    )
+
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_bytes(config_file, orjson.dumps({"sessions": {}}))
+
+    await client.clear_session()
+
+    # File should still exist since sessions are disabled
+    assert await aos.path.exists(config_file)
+    config = orjson.loads(await async_read_bytes(config_file))
+    assert config == {"sessions": {}}
+
+
+@pytest.mark.asyncio()
+async def test_clear_session_with_invalid_config_file(tmp_path: Path) -> None:
+    """Test that clear_session handles invalid config file gracefully."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+
+    # Create a config file with invalid JSON
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_text(config_file, "invalid json content {{{")
+
+    # Call clear_session - should handle the exception gracefully
+    await client.clear_session()
+
+    # File should still exist
+    assert await aos.path.exists(config_file)
+
+
+@pytest.mark.asyncio()
+async def test_clear_session_handles_missing_file(tmp_path: Path) -> None:
+    """Test that clear_session handles a missing config file gracefully."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+    # Set auth state to simulate authenticated client
+    client._is_authenticated = True
+    client._last_token_cookie = "some_token"  # noqa: S105
+
+    # Don't create the config file
+    await client.clear_session()
+
+    # No file should exist and no error should be raised
+    config_file = tmp_path / "unifi_protect.json"
+    assert not await aos.path.exists(config_file)
+    # Client state should NOT be reset since no file was found
+    assert client._is_authenticated is True
+    assert client._last_token_cookie == "some_token"  # noqa: S105
+
+
+@pytest.mark.asyncio()
+async def test_clear_session_when_session_not_in_config(tmp_path: Path) -> None:
+    """Test that clear_session handles missing session hash gracefully."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+        config_dir=tmp_path,
+    )
+    # Set auth state to simulate authenticated client
+    client._is_authenticated = True
+    client._last_token_cookie = "some_token"  # noqa: S105
+
+    config = {
+        "sessions": {
+            "different_hash": {
+                "metadata": {"path": "/"},
+                "cookiename": "TOKEN",
+                "value": "token1",
+                "csrf": "csrf1",
+            }
+        }
+    }
+
+    config_file = tmp_path / "unifi_protect.json"
+    await async_write_bytes(config_file, orjson.dumps(config))
+
+    await client.clear_session()
+
+    # File should still have the original session
+    updated_config = orjson.loads(await async_read_bytes(config_file))
+    assert "different_hash" in updated_config["sessions"]
+    # Client state should NOT be reset since no session was actually removed
+    assert client._is_authenticated is True
+    assert client._last_token_cookie == "some_token"  # noqa: S105
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ProtectApiClient.request")
+async def test_authenticate_with_session_storage(
+    mock_request: AsyncMock, tmp_path: Path
+) -> None:
+    """Test that authenticate() stores session with CSRF token when store_sessions=True."""
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.headers = {
+        "set-cookie": "TOKEN=stored_token_value; path=/; Secure; HttpOnly",
+        "x-csrf-token": "stored-csrf-token-67890",
+    }
+    mock_response.cookies = {}
+    mock_request.return_value = mock_response
+
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=True,
+    )
+    client.config_dir = tmp_path
+
+    await client.authenticate()
+
+    # Verify authentication succeeded
+    assert client._is_authenticated is True
+    assert client.headers is not None
+    assert client.headers.get("x-csrf-token") == "stored-csrf-token-67890"
+
+    # Verify session was saved to file
+    config_file = tmp_path / "unifi_protect.json"
+    assert await aos.path.exists(config_file)
+
+    config = orjson.loads(await async_read_bytes(config_file))
+    assert "sessions" in config
+    sessions = config["sessions"]
+    assert len(sessions) == 1
+
+    # Get the session (there's only one)
+    session = next(iter(sessions.values()))
+    assert session["csrf"] == "stored-csrf-token-67890"
+    assert "TOKEN" in session["cookiename"]
+
+
+@pytest.mark.asyncio()
+async def test_csrf_token_rotation() -> None:
+    """Test that _update_last_token_cookie updates CSRF token when server sends new one."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "test_user",
+        "test_pass",
+        verify_ssl=False,
+        store_sessions=False,
+    )
+
+    # Set initial CSRF token
+    client.set_header("x-csrf-token", "initial-csrf-token")
+
+    # Simulate API response with new CSRF token
+    mock_response = AsyncMock()
+    mock_response.headers = {
+        "x-csrf-token": "rotated-csrf-token",
+    }
+    mock_response.cookies = {}
+
+    # Call the method that updates CSRF token
+    await client._update_last_token_cookie(mock_response)
+
+    # Verify CSRF token was updated
+    assert client.headers is not None
+    assert client.headers.get("x-csrf-token") == "rotated-csrf-token"
+
+
+@pytest.mark.asyncio()
+async def test_get_meta_info_calls_public_api():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+    client.api_request_obj = AsyncMock(return_value={"applicationVersion": "1.0.0"})
+    result = await client.get_meta_info()
+    assert result.application_version == "1.0.0"
+    client.api_request_obj.assert_called_with(url="/v1/meta/info", public_api=True)
+
+
+@pytest.mark.asyncio()
+async def test_api_request_raw_public_api_sets_path_and_header():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.read = AsyncMock(return_value=b"public_response")
+    mock_response.close = Mock()
+    mock_response.release = Mock()
+    client.request = AsyncMock(return_value=mock_response)
+
+    result = await client.api_request_raw(
+        "/v1/meta/info",
+        public_api=True,
+    )
+    assert result == b"public_response"
+    client.request.assert_called_with(
+        "get",
+        f"{client.public_api_path}/v1/meta/info",
+        require_auth=True,
+        auto_close=False,
+        public_api=True,
+    )
+
+
+@pytest.mark.asyncio()
+async def test_api_request_raw_public_api_requires_api_key():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key=None,
+        verify_ssl=False,
+    )
+    # Patch get_session to avoid aiohttp session creation
+    client.get_session = AsyncMock()
+    with pytest.raises(
+        NotAuthorized, match="API key is required for public API requests"
+    ):
+        await client.api_request_raw(
+            "/v1/meta/info",
+            public_api=True,
+        )
+
+
+@pytest.mark.asyncio()
+async def test_get_meta_info_invalid_response_type():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+    # Mock api_request to return a non-dict value; api_request_obj raises NvrError
+    client.api_request = AsyncMock(return_value=None)
+    with pytest.raises(NvrError, match="Could not decode object from /v1/meta/info"):
+        await client.get_meta_info()
+
+
+@pytest.mark.asyncio()
+async def test_public_api_sets_x_api_key_header() -> None:
+    """Test that X-API-KEY header is set when using public API."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_api_key_123",
+        verify_ssl=False,
+        store_sessions=False,  # Disable session storage to avoid auth cookie updates
+    )
+
+    # Create a mock session and response
+    mock_session = AsyncMock()
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.content_type = "application/json"
+    mock_response.read = AsyncMock(return_value=b'{"test": "data"}')
+    mock_response.release = Mock()
+    mock_response.close = Mock()
+    mock_response.url = "https://127.0.0.1:0/proxy/protect/integration/v1/test"
+    mock_response.headers = {}  # Real mapping so x-csrf-token lookup stays sync
+    mock_response.cookies = {}  # Empty cookies to avoid cookie processing
+
+    # Track headers passed to session.request
+    actual_headers: dict[str, str] | None = None
+
+    # Create async context manager for the request
+    class MockRequestContext:
+        async def __aenter__(self) -> AsyncMock:
+            return mock_response
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_val: BaseException | None,
+            exc_tb: object,
+        ) -> None:
+            return None
+
+    def mock_session_request(
+        method: str, url: str, headers: dict[str, str] | None = None, **kwargs: Any
+    ) -> MockRequestContext:
+        nonlocal actual_headers
+        actual_headers = headers
+        return MockRequestContext()
+
+    mock_session.request = mock_session_request
+    client.get_public_api_session = AsyncMock(return_value=mock_session)
+
+    # Make a public API request
+    await client.api_request_raw("/v1/test", public_api=True)
+
+    # Verify the X-API-KEY header was set
+    assert actual_headers == {"X-API-KEY": "test_api_key_123"}
+
+
+@pytest.mark.asyncio
+async def test_get_public_api_session_creates_and_reuses_session():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        verify_ssl=False,
+    )
+    session1 = await client.get_public_api_session()
+    assert isinstance(session1, aiohttp.ClientSession)
+    session2 = await client.get_public_api_session()
+    assert session1 is session2
+    await session1.close()
+    session3 = await client.get_public_api_session()
+    assert session3 is not session1
+    assert isinstance(session3, aiohttp.ClientSession)
+    await session3.close()
+
+
+@pytest.mark.asyncio
+async def test_public_api_session_constructor_assignment():
+    async with aiohttp.ClientSession() as session:
+        client = ProtectApiClient(
+            "127.0.0.1",
+            0,
+            "user",
+            "pass",
+            public_api_session=session,
+            verify_ssl=False,
+        )
+        assert client._public_api_session is session
+
+
+@pytest.mark.asyncio()
+async def test_request_uses_get_session_for_private_api():
+    """Test that request uses get_session (not get_public_api_session) for private API calls."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        verify_ssl=False,
+    )
+    # Patch get_session to return a mock session
+    mock_session = AsyncMock()
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.content_type = "application/json"
+    mock_response.read = AsyncMock(return_value=b"{}")
+    mock_response.release = Mock()
+    mock_response.close = Mock()
+    mock_response.headers = {}
+    mock_response.cookies = {}
+
+    # __aenter__ returns the response
+    class MockRequestContext:
+        async def __aenter__(self):
+            return mock_response
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_session.request = lambda *args, **kwargs: MockRequestContext()
+    client.get_session = AsyncMock(return_value=mock_session)
+    client.ensure_authenticated = AsyncMock()
+    # Should use get_session, not get_public_api_session
+    client.get_public_api_session = AsyncMock()
+    # Call request with public_api=False
+    result = await client.request("get", "/test/endpoint", public_api=False)
+    assert result is mock_response
+    client.get_session.assert_awaited()
+    client.get_public_api_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_public_api_session():
+    async with aiohttp.ClientSession() as session:
+        client = ProtectApiClient(
+            "127.0.0.1",
+            0,
+            "user",
+            "pass",
+            public_api_session=session,
+            verify_ssl=False,
+        )
+        # Should be the same session
+        assert client._public_api_session is session
+        # Close the session
+        await client.close_public_api_session()
+        # Should be None after closing
+        assert client._public_api_session is None
+        # Should be idempotent (no error if called again)
+        await client.close_public_api_session()
+
+
+@pytest.mark.asyncio
+async def test_close_session_closes_public_api_session():
+    """Test that close_session also closes the public API session."""
+    mock_session = AsyncMock()
+    mock_public_session = AsyncMock()
+
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        verify_ssl=False,
+    )
+    client._session = mock_session
+    client._loaded_session = True
+    client._public_api_session = mock_public_session
+
+    await client.close_session()
+
+    # Both sessions should be closed
+    mock_session.close.assert_called_once()
+    mock_public_session.close.assert_called_once()
+    assert client._session is None
+    assert client._public_api_session is None
+    assert client._loaded_session is False
+
+
+def test_set_api_key_sets_value():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key=None,
+        verify_ssl=False,
+    )
+    client.set_api_key("test_key")
+    assert client._api_key == "test_key"
+
+
+def test_set_api_key_empty_raises():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key=None,
+        verify_ssl=False,
+    )
+
+    with pytest.raises(BadRequest, match="API key cannot be empty"):
+        client.set_api_key("")
+
+
+def test_set_api_key_rearms_public_websockets():
+    """set_api_key() clears auth-failure backoff on both public websockets."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key=None,
+        verify_ssl=False,
+    )
+    events_ws = Mock()
+    devices_ws = Mock()
+    client._events_websocket = events_ws
+    client._devices_websocket = devices_ws
+
+    client.set_api_key("fresh-key")
+
+    assert client._api_key == "fresh-key"
+    events_ws.reset_auth_failure.assert_called_once_with()
+    devices_ws.reset_auth_failure.assert_called_once_with()
+
+
+def test_is_api_key_set_true():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+    assert client.is_api_key_set() is True
+
+
+def test_is_api_key_set_false():
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key=None,
+        verify_ssl=False,
+    )
+    assert client.is_api_key_set() is False
+
+
+@pytest.mark.asyncio
+async def test_create_camera_rtsps_streams_with_list_qualities():
+    """Test creating RTSPS streams with a list of qualities."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    mock_response = (
+        b'{"high": "rtsps://example.com/high", "medium": "rtsps://example.com/medium"}'
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=mock_response)
+    ) as mock_request:
+        result = await client.create_camera_rtsps_streams(
+            "camera123", ["high", "medium"]
+        )
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="POST",
+            json={"qualities": ["high", "medium"]},
+        )
+
+        assert result is not None
+        assert result.get_stream_url("high") == "rtsps://example.com/high"
+        assert result.get_stream_url("medium") == "rtsps://example.com/medium"
+
+
+@pytest.mark.asyncio
+async def test_create_camera_rtsps_streams_with_string_quality():
+    """Test creating RTSPS streams with a single quality string."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    mock_response = b'{"high": "rtsps://example.com/high"}'
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=mock_response)
+    ) as mock_request:
+        result = await client.create_camera_rtsps_streams("camera123", "high")
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="POST",
+            json={"qualities": ["high"]},
+        )
+
+        assert result is not None
+        assert result.get_stream_url("high") == "rtsps://example.com/high"
+
+
+@pytest.mark.asyncio
+async def test_create_camera_rtsps_streams_none_response():
+    """Test creating RTSPS streams with None response."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=None)
+    ) as mock_request:
+        result = await client.create_camera_rtsps_streams("camera123", ["high"])
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="POST",
+            json={"qualities": ["high"]},
+        )
+
+        assert result is None
+
+
+@pytest.mark.asyncio
+async def test_create_camera_rtsps_streams_invalid_json():
+    """Test creating RTSPS streams with invalid JSON response."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=b"invalid json")
+    ) as mock_request:
+        result = await client.create_camera_rtsps_streams("camera123", ["high"])
+
+        mock_request.assert_called_once()
+        assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_camera_rtsps_streams():
+    """Test getting existing RTSPS streams."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    mock_response = (
+        b'{"high": "rtsps://example.com/high", "medium": "rtsps://example.com/medium"}'
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=mock_response)
+    ) as mock_request:
+        result = await client.get_camera_rtsps_streams("camera123")
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="GET",
+        )
+
+        assert result is not None
+        assert result.get_stream_url("high") == "rtsps://example.com/high"
+        assert result.get_stream_url("medium") == "rtsps://example.com/medium"
+        assert set(result.get_available_stream_qualities()) == {"high", "medium"}
+
+
+@pytest.mark.asyncio
+async def test_get_camera_rtsps_streams_none_response():
+    """Test getting RTSPS streams with None response."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=None)
+    ) as mock_request:
+        result = await client.get_camera_rtsps_streams("camera123")
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="GET",
+        )
+
+        assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_camera_rtsps_streams_invalid_json():
+    """Test getting RTSPS streams with invalid JSON response."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=b"invalid json")
+    ) as mock_request:
+        result = await client.get_camera_rtsps_streams("camera123")
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="GET",
+        )
+
+        assert result is None
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_success():
+    """Test deleting RTSPS streams successfully."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=b"")
+    ) as mock_request:
+        result = await client.delete_camera_rtsps_streams(
+            "camera123", ["high", "medium"]
+        )
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="DELETE",
+            params=[("qualities", "high"), ("qualities", "medium")],
+        )
+
+        assert result is True
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_single_quality():
+    """Test deleting RTSPS streams with single quality."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=b"")
+    ) as mock_request:
+        result = await client.delete_camera_rtsps_streams("camera123", "high")
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="DELETE",
+            params=[("qualities", "high")],
+        )
+
+        assert result is True
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_failure():
+    """Test deleting RTSPS streams with failure."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=None)
+    ) as mock_request:
+        result = await client.delete_camera_rtsps_streams("camera123", ["high"])
+
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="DELETE",
+            params=[("qualities", "high")],
+        )
+
+        assert result is False
+
+
+@pytest.mark.asyncio
+async def test_camera_rtsps_streams_channel_quality_enum_serialization():
+    """ChannelQuality members serialise to their wire values on both create + delete."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+    with patch.object(
+        client,
+        "api_request_raw",
+        new=AsyncMock(return_value=b'{"high": "rtsps://example.com/high"}'),
+    ) as mock_request:
+        await client.create_camera_rtsps_streams("camera123", ChannelQuality.HIGH)
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="POST",
+            json={"qualities": ["high"]},
+        )
+
+    with patch.object(
+        client,
+        "api_request_raw",
+        new=AsyncMock(return_value=b'{"package": "rtsps://example.com/package"}'),
+    ) as mock_request:
+        await client.create_camera_rtsps_streams("camera123", [ChannelQuality.PACKAGE])
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="POST",
+            json={"qualities": ["package"]},
+        )
+
+    with patch.object(
+        client, "api_request_raw", new=AsyncMock(return_value=b"")
+    ) as mock_request:
+        await client.delete_camera_rtsps_streams(
+            "camera123", [ChannelQuality.HIGH, ChannelQuality.PACKAGE]
+        )
+        mock_request.assert_called_once_with(
+            public_api=True,
+            url="/v1/cameras/camera123/rtsps-stream",
+            method="DELETE",
+            params=[("qualities", "high"), ("qualities", "package")],
+        )
+
+
+def _rtsps_client() -> ProtectApiClient:
+    return ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="test_key",
+        verify_ssl=False,
+    )
+
+
+def _seed_rtsps_camera(
+    client: ProtectApiClient,
+    camera_id: str,
+    streams: RTSPSStreams | None = None,
+    state: DeviceState = DeviceState.CONNECTED,
+) -> PublicCamera:
+    """Place a public camera (optionally carrying RTSPS streams) into the cache."""
+    camera = PublicCamera.model_construct(
+        id=camera_id, state=state, rtsps_streams=streams
+    )
+    client._public_bootstrap.cameras[camera_id] = camera
+    return camera
+
+
+@pytest.mark.asyncio
+async def test_get_camera_rtsps_streams_is_flag_free_fetch():
+    """The fetch primitive always issues an HTTP GET and never touches the cache."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(
+        client, "camera123", RTSPSStreams(high="rtsps://example.com/stale")
+    )
+
+    with patch.object(
+        client,
+        "api_request_raw",
+        new=AsyncMock(return_value=b'{"high": "rtsps://example.com/fresh"}'),
+    ) as mock_request:
+        result = await client.get_camera_rtsps_streams("camera123")
+
+    mock_request.assert_called_once()
+    assert result is not None
+    assert result.get_stream_url("high") == "rtsps://example.com/fresh"
+    # The cached camera field is left untouched by the bare fetch primitive.
+    assert camera.rtsps_streams.get_stream_url("high") == "rtsps://example.com/stale"
+
+
+@pytest.mark.asyncio
+async def test_create_camera_rtsps_streams_write_through():
+    """A successful create writes the new streams onto the cached camera field."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(client, "camera123")
+
+    with patch.object(
+        client,
+        "api_request_raw",
+        new=AsyncMock(return_value=b'{"high": "rtsps://example.com/high"}'),
+    ):
+        result = await client.create_camera_rtsps_streams("camera123", "high")
+
+    assert result is not None
+    assert camera.rtsps_streams is result
+
+
+@pytest.mark.asyncio
+async def test_create_camera_rtsps_streams_no_camera_skips_write_through():
+    """Create returns the streams but writes nothing when the camera is not cached."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+
+    with patch.object(
+        client,
+        "api_request_raw",
+        new=AsyncMock(return_value=b'{"high": "rtsps://example.com/high"}'),
+    ):
+        result = await client.create_camera_rtsps_streams("camera123", "high")
+
+    assert result is not None
+    assert "camera123" not in client._public_bootstrap.cameras
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_drops_quality_from_field():
+    """Deleting one quality removes only that key from the cached camera streams."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(
+        client,
+        "camera123",
+        RTSPSStreams(
+            high="rtsps://example.com/high",
+            low="rtsps://example.com/low",
+        ),
+    )
+
+    with patch.object(client, "api_request_raw", new=AsyncMock(return_value=b"")):
+        result = await client.delete_camera_rtsps_streams("camera123", "high")
+
+    assert result is True
+    assert camera.rtsps_streams.get_stream_url("high") is None
+    assert camera.rtsps_streams.get_stream_url("low") == "rtsps://example.com/low"
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_clears_field_when_empty():
+    """Deleting the last quality clears the camera's streams field to None."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(
+        client, "camera123", RTSPSStreams(high="rtsps://example.com/high")
+    )
+
+    with patch.object(client, "api_request_raw", new=AsyncMock(return_value=b"")):
+        result = await client.delete_camera_rtsps_streams("camera123", "high")
+
+    assert result is True
+    assert camera.rtsps_streams is None
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_failure_keeps_field():
+    """A failed delete leaves the cached camera streams untouched."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    streams = RTSPSStreams(high="rtsps://example.com/high")
+    camera = _seed_rtsps_camera(client, "camera123", streams)
+
+    with patch.object(client, "api_request_raw", new=AsyncMock(return_value=None)):
+        result = await client.delete_camera_rtsps_streams("camera123", "high")
+
+    assert result is False
+    assert camera.rtsps_streams is streams
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_no_camera_is_noop():
+    """A delete for an uncached camera succeeds without touching the cache."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+
+    with patch.object(client, "api_request_raw", new=AsyncMock(return_value=b"")):
+        result = await client.delete_camera_rtsps_streams("camera123", "high")
+
+    assert result is True
+    assert "camera123" not in client._public_bootstrap.cameras
+
+
+@pytest.mark.asyncio
+async def test_schedule_rtsps_refresh_overwrites_in_place():
+    """A scheduled refresh re-fetches in place and clears its own task entry."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(
+        client, "cam1", RTSPSStreams(high="rtsps://example.com/stale")
+    )
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+
+    async def _fake_get(camera_id: str) -> RTSPSStreams:
+        return fresh
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("cam1")
+    await client._rtsps_refresh_tasks["cam1"]
+
+    assert camera.rtsps_streams is fresh
+    assert "cam1" not in client._rtsps_refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_schedule_rtsps_refresh_primes_streamless_camera():
+    """A streamless cached camera is primed (fetched + filled), not skipped."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(client, "cam1")
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+    client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=fresh
+    )
+
+    client._schedule_rtsps_refresh("cam1")
+    await client._rtsps_refresh_tasks["cam1"]
+
+    assert camera.rtsps_streams is fresh
+    client.get_camera_rtsps_streams.assert_awaited_once_with("cam1")
+
+
+@pytest.mark.asyncio
+async def test_schedule_rtsps_refresh_skips_unknown_camera():
+    """Refresh is not scheduled for a camera that is not cached."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    client.get_camera_rtsps_streams = AsyncMock()  # type: ignore[method-assign]
+
+    client._schedule_rtsps_refresh("cam1")
+
+    assert client._rtsps_refresh_tasks == {}
+    client.get_camera_rtsps_streams.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_schedule_rtsps_refresh_noop_without_bootstrap():
+    """No public bootstrap means no refresh task is created."""
+    client = _rtsps_client()
+
+    client._schedule_rtsps_refresh("cam1")
+
+    assert client._rtsps_refresh_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_schedule_rtsps_refresh_coalesces_in_flight():
+    """A refresh already in flight for a camera is not duplicated."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/high"))
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def _fake_get(camera_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("cam1")
+    await started.wait()
+    first = client._rtsps_refresh_tasks["cam1"]
+
+    client._schedule_rtsps_refresh("cam1")
+    assert client._rtsps_refresh_tasks["cam1"] is first
+
+    release.set()
+    await first
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_swallows_errors(caplog):
+    """A failed background refresh is logged and the task entry is cleared."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/high"))
+    client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("boom")
+    )
+
+    with caplog.at_level("ERROR"):
+        await client._refresh_camera_rtsps("cam1")
+
+    assert "Failed to refresh RTSPS streams for camera cam1" in caplog.text
+    assert "cam1" not in client._rtsps_refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_does_not_resurrect_evicted_camera():
+    """A refresh that completes after the camera is removed must not re-add it."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/stale"))
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_get(camera_id: str) -> RTSPSStreams:
+        started.set()
+        await release.wait()
+        return fresh
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("cam1")
+    task = client._rtsps_refresh_tasks["cam1"]
+    await started.wait()
+    # Evict mid-flight, as a remove frame would (camera gone from the store).
+    client._public_bootstrap.cameras.pop("cam1", None)
+
+    release.set()
+    await task
+
+    assert "cam1" not in client._public_bootstrap.cameras
+    assert "cam1" not in client._rtsps_refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_does_not_resurrect_cleared_field():
+    """A refresh completing after the field is cleared must not repopulate it."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(
+        client, "cam1", RTSPSStreams(high="rtsps://example.com/stale")
+    )
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_get(camera_id: str) -> RTSPSStreams:
+        started.set()
+        await release.wait()
+        return fresh
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("cam1")
+    task = client._rtsps_refresh_tasks["cam1"]
+    await started.wait()
+    # Clear the field mid-flight, as a delete of the last quality would.
+    camera.rtsps_streams = None
+
+    release.set()
+    await task
+
+    assert camera.rtsps_streams is None
+    assert "cam1" not in client._rtsps_refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_prime_does_not_clobber_concurrent_create():
+    """A prime completing after a create write-through must not overwrite it."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(client, "cam1")
+    created = RTSPSStreams(high="rtsps://example.com/created")
+    primed = RTSPSStreams(high="rtsps://example.com/primed")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_get(camera_id: str) -> RTSPSStreams:
+        started.set()
+        await release.wait()
+        return primed
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("cam1")
+    task = client._rtsps_refresh_tasks["cam1"]
+    await started.wait()
+    # A create write-through lands while the prime fetch is in flight.
+    camera.rtsps_streams = created
+
+    release.set()
+    await task
+
+    assert camera.rtsps_streams is created
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_prime_ignores_missing_camera():
+    """A prime scheduled for a camera gone before the task body runs is a no-op."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=RTSPSStreams(high="rtsps://example.com/fresh")
+    )
+
+    await client._refresh_camera_rtsps("cam1")
+
+    assert "cam1" not in client._public_bootstrap.cameras
+    assert "cam1" not in client._rtsps_refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_partial_does_not_resurrect_during_refresh():
+    """A partial delete during an in-flight refresh must not resurrect the deleted quality."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(
+        client,
+        "camera123",
+        RTSPSStreams(
+            high="rtsps://example.com/high",
+            low="rtsps://example.com/low",
+        ),
+    )
+    # The in-flight fetch returns the full set, including the to-be-deleted quality.
+    refetched = RTSPSStreams(
+        high="rtsps://example.com/high",
+        low="rtsps://example.com/low",
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_get(camera_id: str) -> RTSPSStreams:
+        started.set()
+        await release.wait()
+        return refetched
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("camera123")
+    await started.wait()
+    task = client._rtsps_refresh_tasks["camera123"]
+
+    with patch.object(client, "api_request_raw", new=AsyncMock(return_value=b"")):
+        result = await client.delete_camera_rtsps_streams("camera123", "high")
+
+    assert result is True
+    after_delete = camera.rtsps_streams
+    assert after_delete is not None
+    assert after_delete.get_stream_url("high") is None
+    assert after_delete.get_stream_url("low") == "rtsps://example.com/low"
+
+    release.set()
+    await task
+
+    # The refresh saw the replaced object (identity changed) and backed off,
+    # so the deleted 'high' quality is not resurrected.
+    assert camera.rtsps_streams is after_delete
+    assert camera.rtsps_streams.get_stream_url("high") is None
+    assert "camera123" not in client._rtsps_refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_refresh_all_cached_rtsps_noop_without_bootstrap():
+    """Refreshing all cached entries is a no-op when nothing is primed."""
+    client = _rtsps_client()
+    assert client._public_bootstrap is None
+
+    await client._refresh_all_cached_rtsps()
+
+
+@pytest.mark.asyncio
+async def test_refresh_all_cached_rtsps_refreshes_each_populated_camera():
+    """Refreshing all cached entries re-fetches every camera that has streams once."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/a"))
+    _seed_rtsps_camera(client, "cam2", RTSPSStreams(high="rtsps://example.com/b"))
+    # A camera with no streams yet is left to the prime step, not refreshed.
+    _seed_rtsps_camera(client, "cam3")
+    client.get_camera_rtsps_streams = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    await client._refresh_all_cached_rtsps()
+
+    assert client.get_camera_rtsps_streams.await_count == 2
+    fetched = {call.args[0] for call in client.get_camera_rtsps_streams.await_args_list}
+    assert fetched == {"cam1", "cam2"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_all_cached_rtsps_coalesces_with_in_flight_refresh():
+    """A per-camera refresh already in flight is awaited, not duplicated."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/high"))
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def _fake_get(camera_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("cam1")
+    await started.wait()
+
+    refresh_all = asyncio.create_task(client._refresh_all_cached_rtsps())
+    await asyncio.sleep(0)
+    release.set()
+    await refresh_all
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_rtsps_refresh_cancels_in_flight_for_camera():
+    """A camera-targeted cancel stops its pending refresh and clears the entry."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/high"))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_get(camera_id: str) -> None:
+        started.set()
+        await release.wait()
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("cam1")
+    await started.wait()
+    task = client._rtsps_refresh_tasks["cam1"]
+
+    client._cancel_rtsps_refresh("cam1")
+
+    assert "cam1" not in client._rtsps_refresh_tasks
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancel_rtsps_refresh_no_pending_task_is_noop():
+    """Cancelling a camera with no pending refresh does nothing."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+
+    client._cancel_rtsps_refresh("cam1")
+
+    assert client._rtsps_refresh_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_cancel_rtsps_refresh_tasks_cancels_pending():
+    """Cancelling pending refresh tasks stops them and clears the registry."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/high"))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_get(camera_id: str) -> None:
+        started.set()
+        await release.wait()
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    client._schedule_rtsps_refresh("cam1")
+    await started.wait()
+    task = client._rtsps_refresh_tasks["cam1"]
+
+    await client._cancel_rtsps_refresh_tasks()
+
+    assert task.cancelled()
+    assert client._rtsps_refresh_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_cancel_rtsps_refresh_tasks_empty_noop():
+    """Cancelling with no pending refresh tasks returns early."""
+    client = _rtsps_client()
+
+    await client._cancel_rtsps_refresh_tasks()
+
+    assert client._rtsps_refresh_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_notifies_subscribers_on_prime():
+    """Priming a streamless camera emits a devices-WS update carrying the camera."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(client, "cam1")
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+    client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=fresh
+    )
+    messages = []
+    client.subscribe_devices_websocket(messages.append)
+
+    await client._refresh_camera_rtsps("cam1")
+
+    assert camera.rtsps_streams is fresh
+    assert len(messages) == 1
+    msg = messages[0]
+    assert msg.action is WSAction.UPDATE
+    assert msg.new_obj is camera
+    assert msg.changed_data["modelKey"] == "camera"
+    assert msg.changed_data["id"] == "cam1"
+    assert "rtsps_streams" in msg.changed_data
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_notifies_subscribers_on_change():
+    """A refresh that changes the streams emits one devices-WS update."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(
+        client, "cam1", RTSPSStreams(high="rtsps://example.com/stale")
+    )
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+    client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=fresh
+    )
+    messages = []
+    client.subscribe_devices_websocket(messages.append)
+
+    await client._refresh_camera_rtsps("cam1")
+
+    assert camera.rtsps_streams is fresh
+    assert len(messages) == 1
+    assert messages[0].new_obj is camera
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_reaches_typed_device_subscribers():
+    """A background prime is observable through the typed ``subscribe_devices`` channel."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(client, "cam1")
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+    client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=fresh
+    )
+    changes = []
+    client.subscribe_devices(changes.append)
+
+    await client._refresh_camera_rtsps("cam1")
+
+    assert len(changes) == 1
+    change = changes[0]
+    assert change.model is camera
+    assert change.model_type is ModelType.CAMERA
+    assert change.device_id == "cam1"
+    assert "rtsps_streams" in change.changed_fields
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_no_notify_on_unchanged():
+    """A refresh whose fetched streams equal the cached ones emits nothing."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/same"))
+    client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=RTSPSStreams(high="rtsps://example.com/same")
+    )
+    messages = []
+    client.subscribe_devices_websocket(messages.append)
+
+    await client._refresh_camera_rtsps("cam1")
+
+    assert messages == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_no_notify_on_failure():
+    """A failed refresh writes nothing and emits no devices-WS update."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/high"))
+    client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("boom")
+    )
+    messages = []
+    client.subscribe_devices_websocket(messages.append)
+
+    await client._refresh_camera_rtsps("cam1")
+
+    assert messages == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_camera_rtsps_no_notify_on_backoff():
+    """An identity-guard backoff (camera evicted mid-flight) emits nothing."""
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    _seed_rtsps_camera(client, "cam1", RTSPSStreams(high="rtsps://example.com/stale"))
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_get(camera_id: str) -> RTSPSStreams:
+        started.set()
+        await release.wait()
+        return fresh
+
+    client.get_camera_rtsps_streams = _fake_get  # type: ignore[method-assign]
+    messages = []
+    client.subscribe_devices_websocket(messages.append)
+    client._schedule_rtsps_refresh("cam1")
+    task = client._rtsps_refresh_tasks["cam1"]
+    await started.wait()
+    client._public_bootstrap.cameras.pop("cam1", None)
+
+    release.set()
+    await task
+
+    assert messages == []
+
+
+def test_rtsps_streams_class():
+    """Test RTSPSStreams class functionality."""
+    # Test with multiple qualities
+    streams = RTSPSStreams(
+        high="rtsps://example.com/high",
+        medium="rtsps://example.com/medium",
+        low="rtsps://example.com/low",
+    )
+
+    assert streams.get_stream_url("high") == "rtsps://example.com/high"
+    assert streams.get_stream_url("medium") == "rtsps://example.com/medium"
+    assert streams.get_stream_url("low") == "rtsps://example.com/low"
+    assert streams.get_stream_url("nonexistent") is None
+
+    available_qualities = streams.get_available_stream_qualities()
+    assert set(available_qualities) == {"high", "medium", "low"}
+
+    # Test with single quality
+    single_stream = RTSPSStreams(ultra="rtsps://example.com/ultra")
+    assert single_stream.get_stream_url("ultra") == "rtsps://example.com/ultra"
+    assert set(single_stream.get_available_stream_qualities()) == {"ultra"}
+
+    # Test with empty streams
+    empty_stream = RTSPSStreams()
+    assert empty_stream.get_stream_url("any") is None
+    assert empty_stream.get_available_stream_qualities() == []
+
+
+def test_rtsps_streams_get_stream_url_srtp():
+    """Test get_stream_url srtp flag strips the ?enableSrtp query for go2rtc."""
+    streams = RTSPSStreams(high="rtsps://example.com:7441/abc?enableSrtp")
+
+    assert streams.get_stream_url("high") == "rtsps://example.com:7441/abc?enableSrtp"
+    assert (
+        streams.get_stream_url("high", srtp=True)
+        == "rtsps://example.com:7441/abc?enableSrtp"
+    )
+    assert streams.get_stream_url("high", srtp=False) == "rtsps://example.com:7441/abc"
+    # Missing quality returns None regardless of srtp.
+    assert streams.get_stream_url("nonexistent", srtp=False) is None
+
+    # srtp=False is a no-op when there is no ?enableSrtp suffix, and only that
+    # exact suffix is stripped — any other query stays intact.
+    plain = RTSPSStreams(high="rtsps://example.com:7441/abc")
+    assert plain.get_stream_url("high", srtp=False) == "rtsps://example.com:7441/abc"
+    other = RTSPSStreams(high="rtsps://example.com:7441/abc?foo=bar")
+    assert (
+        other.get_stream_url("high", srtp=False)
+        == "rtsps://example.com:7441/abc?foo=bar"
+    )
+
+
+def _override_client(host: str) -> ProtectApiClient:
+    return ProtectApiClient(
+        host,
+        443,
+        "user",
+        "pass",
+        override_connection_host=True,
+        store_sessions=False,
+        verify_ssl=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("host", "url", "expected"),
+    [
+        (
+            "10.0.0.5",
+            "rtsps://192.168.1.1:7441/abc?enableSrtp",
+            "rtsps://10.0.0.5:7441/abc?enableSrtp",
+        ),
+        (
+            "2001:db8::1",
+            "rtsps://192.168.1.1:7441/abc?enableSrtp",
+            "rtsps://[2001:db8::1]:7441/abc?enableSrtp",
+        ),
+        (
+            "unifi.local",
+            "rtsps://192.168.1.1/abc",
+            "rtsps://unifi.local/abc",
+        ),
+        (
+            "10.0.0.5",
+            "rtsps://[2001:db8::2]:7441/abc",
+            "rtsps://10.0.0.5:7441/abc",
+        ),
+    ],
+)
+def test_rtsps_streams_get_stream_url_override_host(
+    host: str, url: str, expected: str
+) -> None:
+    """override_connection_host replaces the host, keeping port, path and query."""
+    streams = RTSPSStreams(api=_override_client(host), high=url)
+
+    assert streams.get_stream_url("high") == expected
+
+
+def test_rtsps_streams_get_stream_url_override_host_srtp_stripped() -> None:
+    """The host rewrite composes with srtp=False."""
+    streams = RTSPSStreams(
+        api=_override_client("10.0.0.5"),
+        high="rtsps://192.168.1.1:7441/abc?enableSrtp",
+    )
+
+    assert streams.get_stream_url("high", srtp=False) == "rtsps://10.0.0.5:7441/abc"
+
+
+def test_rtsps_streams_get_stream_url_override_host_missing_quality() -> None:
+    """A missing quality stays None under the override."""
+    streams = RTSPSStreams(api=_override_client("10.0.0.5"), high=None)
+
+    assert streams.get_stream_url("high") is None
+    assert streams.get_stream_url("nonexistent") is None
+
+
+def test_rtsps_streams_get_stream_url_override_host_malformed_port() -> None:
+    """An unparsable port leaves the server URL untouched."""
+    streams = RTSPSStreams(
+        api=_override_client("10.0.0.5"), high="rtsps://192.168.1.1:noport/abc"
+    )
+
+    assert streams.get_stream_url("high") == "rtsps://192.168.1.1:noport/abc"
+
+
+def test_rtsps_streams_get_stream_url_without_override_is_verbatim() -> None:
+    """Without the override the server URL is returned as-is."""
+    client = ProtectApiClient(
+        "10.0.0.5", 443, "user", "pass", store_sessions=False, verify_ssl=False
+    )
+    streams = RTSPSStreams(api=client, high="rtsps://192.168.1.1:7441/abc")
+
+    assert streams.get_stream_url("high") == "rtsps://192.168.1.1:7441/abc"
+
+
+def test_rtsps_streams_get_stream_url_without_api_is_verbatim() -> None:
+    """Streams built without a client reference cannot rewrite the host."""
+    streams = RTSPSStreams(high="rtsps://192.168.1.1:7441/abc")
+
+    assert streams.get_stream_url("high") == "rtsps://192.168.1.1:7441/abc"
+
+
+@pytest.mark.asyncio
+async def test_get_camera_rtsps_streams_applies_override_host() -> None:
+    """Streams fetched from the public API honour override_connection_host."""
+    client = _override_client("10.0.0.5")
+    client._api_key = "test_key"
+
+    with patch.object(
+        client,
+        "api_request_raw",
+        new=AsyncMock(return_value=b'{"high": "rtsps://192.168.1.1:7441/abc"}'),
+    ):
+        result = await client.get_camera_rtsps_streams("camera123")
+
+    assert result is not None
+    assert result.get_stream_url("high") == "rtsps://10.0.0.5:7441/abc"
+
+
+@pytest.mark.asyncio
+async def test_public_only_client_applies_override_host() -> None:
+    """A public-only client can rewrite the RTSPS host without a private bootstrap."""
+    client = ProtectApiClient.public_only(
+        "10.0.0.5", 443, "test_key", override_connection_host=True, verify_ssl=False
+    )
+
+    with patch.object(
+        client,
+        "api_request_raw",
+        new=AsyncMock(return_value=b'{"high": "rtsps://192.168.1.1:7441/abc"}'),
+    ):
+        result = await client.get_camera_rtsps_streams("camera123")
+
+    assert client.is_public_only is True
+    assert result is not None
+    assert result.get_stream_url("high") == "rtsps://10.0.0.5:7441/abc"
+
+
+@pytest.mark.asyncio
+async def test_delete_camera_rtsps_streams_survivors_apply_override_host() -> None:
+    """Surviving qualities after a delete still honour override_connection_host."""
+    client = _override_client("10.0.0.5")
+    client._api_key = "test_key"
+    client._public_bootstrap = PublicBootstrap()
+    camera = _seed_rtsps_camera(
+        client,
+        "camera123",
+        RTSPSStreams(
+            api=client,
+            high="rtsps://192.168.1.1:7441/high",
+            low="rtsps://192.168.1.1:7441/low",
+        ),
+    )
+
+    with patch.object(client, "api_request_raw", new=AsyncMock(return_value=b"")):
+        assert await client.delete_camera_rtsps_streams("camera123", "high") is True
+
+    assert camera.rtsps_streams is not None
+    assert camera.rtsps_streams.get_stream_url("low") == "rtsps://10.0.0.5:7441/low"
+
+
+@pytest.mark.asyncio
+async def test_create_camera_rtsps_streams_applies_override_host() -> None:
+    """Streams created through the public API honour override_connection_host."""
+    client = _override_client("10.0.0.5")
+    client._api_key = "test_key"
+
+    with patch.object(
+        client,
+        "api_request_raw",
+        new=AsyncMock(return_value=b'{"high": "rtsps://192.168.1.1:7441/abc"}'),
+    ):
+        result = await client.create_camera_rtsps_streams("camera123", "high")
+
+    assert result is not None
+    assert result.get_stream_url("high") == "rtsps://10.0.0.5:7441/abc"
+
+
+def test_rtsps_streams_active_inactive():
+    """Test RTSPSStreams active/inactive stream quality detection."""
+    # Test with mixed active and inactive streams
+    streams = RTSPSStreams(
+        high="rtsps://example.com/high",
+        medium=None,  # inactive
+        low="rtsps://example.com/low",
+        ultra=None,  # inactive
+    )
+
+    # All available qualities (active + inactive)
+    available = streams.get_available_stream_qualities()
+    assert set(available) == {"high", "medium", "low", "ultra"}
+
+    # Only active streams (with URLs)
+    active = streams.get_active_stream_qualities()
+    assert set(active) == {"high", "low"}
+
+    # Only inactive streams (without URLs)
+    inactive = streams.get_inactive_stream_qualities()
+    assert set(inactive) == {"medium", "ultra"}
+
+
+def test_rtsps_streams_all_active():
+    """Test RTSPSStreams when all streams are active."""
+    streams = RTSPSStreams(
+        high="rtsps://example.com/high",
+        medium="rtsps://example.com/medium",
+    )
+
+    assert set(streams.get_available_stream_qualities()) == {"high", "medium"}
+    assert set(streams.get_active_stream_qualities()) == {"high", "medium"}
+    assert streams.get_inactive_stream_qualities() == []
+
+
+def test_rtsps_streams_all_inactive():
+    """Test RTSPSStreams when all streams are inactive."""
+    streams = RTSPSStreams(
+        high=None,
+        medium=None,
+    )
+
+    assert set(streams.get_available_stream_qualities()) == {"high", "medium"}
+    assert streams.get_active_stream_qualities() == []
+    assert set(streams.get_inactive_stream_qualities()) == {"high", "medium"}
+
+
+def test_rtsps_streams_active_inactive_qualities():
+    """Test RTSPSStreams active and inactive quality methods."""
+    # Test with mixed active (URLs) and inactive (None) streams
+    streams = RTSPSStreams(
+        high="rtsps://example.com/high",
+        medium=None,  # inactive stream
+        low="rtsps://example.com/low",
+        ultra=None,  # inactive stream
+    )
+
+    # Test active streams (those with valid RTSPS URLs)
+    active_qualities = streams.get_active_stream_qualities()
+    assert set(active_qualities) == {"high", "low"}
+
+    # Test inactive streams (those with None values)
+    inactive_qualities = streams.get_inactive_stream_qualities()
+    assert set(inactive_qualities) == {"medium", "ultra"}
+
+    # Test all available streams (both active and inactive)
+    available_qualities = streams.get_available_stream_qualities()
+    assert set(available_qualities) == {"high", "medium", "low", "ultra"}
+
+    # Test that active + inactive equals available
+    assert set(active_qualities + inactive_qualities) == set(available_qualities)
+
+
+def test_rtsps_streams_only_active():
+    """Test RTSPSStreams with only active streams."""
+    streams = RTSPSStreams(
+        high="rtsps://example.com/high",
+        medium="rtsps://example.com/medium",
+    )
+
+    active_qualities = streams.get_active_stream_qualities()
+    assert set(active_qualities) == {"high", "medium"}
+
+    inactive_qualities = streams.get_inactive_stream_qualities()
+    assert inactive_qualities == []
+
+    available_qualities = streams.get_available_stream_qualities()
+    assert set(available_qualities) == {"high", "medium"}
+
+
+def test_rtsps_streams_only_inactive():
+    """Test RTSPSStreams with only inactive streams."""
+    streams = RTSPSStreams(
+        high=None,
+        medium=None,
+        low=None,
+    )
+
+    active_qualities = streams.get_active_stream_qualities()
+    assert active_qualities == []
+
+    inactive_qualities = streams.get_inactive_stream_qualities()
+    assert set(inactive_qualities) == {"high", "medium", "low"}
+
+    available_qualities = streams.get_available_stream_qualities()
+    assert set(available_qualities) == {"high", "medium", "low"}
+
+
+def test_rtsps_streams_empty():
+    """Test RTSPSStreams with no streams."""
+    streams = RTSPSStreams()
+
+    assert streams.get_active_stream_qualities() == []
+    assert streams.get_inactive_stream_qualities() == []
+    assert streams.get_available_stream_qualities() == []
+
+
+def test_rtsps_streams_edge_cases():
+    """Test RTSPSStreams edge cases and string validation."""
+    # Test with empty strings and various URL formats
+    streams = RTSPSStreams(
+        high="rtsps://valid.com/stream",
+        medium="",  # empty string - still a string, so active
+        low="http://invalid.com/stream",  # still a string, so active
+        ultra="invalid_url",  # still a string, so active
+    )
+
+    # All string values are considered active (including empty strings)
+    active_qualities = streams.get_active_stream_qualities()
+    assert set(active_qualities) == {"high", "medium", "low", "ultra"}
+
+    # Test with None values (should be inactive)
+    streams_with_none = RTSPSStreams(
+        high="rtsps://valid.com/stream",
+        medium=None,  # None value - inactive
+    )
+
+    active_qualities = streams_with_none.get_active_stream_qualities()
+    assert active_qualities == ["high"]
+
+    inactive_qualities = streams_with_none.get_inactive_stream_qualities()
+    assert inactive_qualities == ["medium"]
+
+    available_qualities = streams.get_available_stream_qualities()
+    assert set(available_qualities) == {"high", "medium", "low", "ultra"}
+
+
+def test_rtsps_streams_none_pydantic_extra():
+    """Test RTSPSStreams when __pydantic_extra__ is None."""
+    # Create an RTSPSStreams instance and manually set __pydantic_extra__ to None
+    # This simulates edge cases where pydantic might not initialize extra fields
+    streams = RTSPSStreams()
+
+    # Manually set __pydantic_extra__ to None to test the None check
+    streams.__pydantic_extra__ = None
+
+    # All methods should return empty lists when __pydantic_extra__ is None
+    assert streams.get_available_stream_qualities() == []
+    assert streams.get_active_stream_qualities() == []
+    assert streams.get_inactive_stream_qualities() == []
+
+    # get_stream_url should still work (uses getattr, not __pydantic_extra__)
+    assert streams.get_stream_url("any") is None
+
+
+@pytest.mark.asyncio
+async def test_raise_for_status_status_codes():
+    """Test _raise_for_status with different HTTP status codes."""
+    # Create API client
+    api = ProtectApiClient("test.com", 443, "username", "password")
+
+    # Test success codes (2xx) - should not raise
+    success_tests = [
+        (199, True, NvrError),  # Just below 2xx range
+        (200, False, None),  # Start of 2xx range
+        (201, False, None),  # Common success code
+        (299, False, None),  # End of 2xx range
+        (300, True, NvrError),  # Just above 2xx range
+    ]
+
+    for status_code, should_raise, expected_exception in success_tests:
+        response = Mock()
+        response.status = status_code
+        response.url = "https://test.com/api/test"
+
+        with patch("uiprotect.api.get_response_reason", return_value="Test"):
+            if should_raise:
+                with pytest.raises(expected_exception):
+                    await api._raise_for_status(response, raise_exception=True)
+            else:
+                # Should not raise any exception
+                await api._raise_for_status(response, raise_exception=True)
+                await api._raise_for_status(response, raise_exception=False)
+
+    # Test specific error codes
+    error_tests = [
+        (400, BadRequest),
+        (401, NotAuthorized),
+        (403, NotAuthorized),
+        (404, BadRequest),
+        (429, NvrError),
+        (500, NvrError),
+    ]
+
+    for status_code, expected_exception in error_tests:
+        response = Mock()
+        response.status = status_code
+        response.url = "https://test.com/api/test"
+
+        with patch("uiprotect.api.get_response_reason", return_value="Error"):
+            # Should raise with raise_exception=True
+            with pytest.raises(expected_exception):
+                await api._raise_for_status(response, raise_exception=True)
+
+            # Should not raise with raise_exception=False
+            await api._raise_for_status(response, raise_exception=False)
+
+
+@pytest.mark.asyncio
+async def test_raise_for_status_global_alarm_manager_error() -> None:
+    """400 with global alarm manager reason raises GlobalAlarmManagerError."""
+    api = ProtectApiClient("test.com", 443, "username", "password")
+    response = Mock()
+    response.status = 400
+    response.url = "https://test.com/api/test"
+
+    with (
+        patch(
+            "uiprotect.api.get_response_reason",
+            return_value="Global alarm manager is configured",
+        ),
+        pytest.raises(GlobalAlarmManagerError),
+    ):
+        await api._raise_for_status(response, raise_exception=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Arm alarm is armed",
+        "arm alarm is armed",
+        "ARM ALARM IS ARMED",
+        "Arm Alarm Is Armed",
+    ],
+)
+async def test_raise_for_status_armed_mode_error(reason: str) -> None:
+    """400 with arm alarm armed reason raises ArmedModeError (case-insensitive)."""
+    api = ProtectApiClient("test.com", 443, "username", "password")
+    response = Mock()
+    response.status = 400
+    response.url = "https://test.com/api/test"
+
+    with (
+        patch(
+            "uiprotect.api.get_response_reason",
+            return_value=reason,
+        ),
+        pytest.raises(ArmedModeError),
+    ):
+        await api._raise_for_status(response, raise_exception=True)
+
+
+@pytest.mark.asyncio
+async def test_raise_for_status_generic_bad_request() -> None:
+    """400 with an unrelated reason raises a plain BadRequest."""
+    api = ProtectApiClient("test.com", 443, "username", "password")
+    response = Mock()
+    response.status = 400
+    response.url = "https://test.com/api/test"
+
+    with (
+        patch(
+            "uiprotect.api.get_response_reason",
+            return_value="Some other validation failure",
+        ),
+        pytest.raises(BadRequest) as exc_info,
+    ):
+        await api._raise_for_status(response, raise_exception=True)
+
+    assert not isinstance(exc_info.value, (GlobalAlarmManagerError, ArmedModeError))
+
+
+@pytest.mark.asyncio
+async def test_api_request_raw_error_handling():
+    """Test api_request_raw error handling with raise_exception parameter."""
+    # Create API client
+    api = ProtectApiClient("test.com", 443, "username", "password")
+
+    # Mock the request method to return a response with error status
+    mock_response = AsyncMock()
+    mock_response.status = 404
+    mock_response.url = "https://test.com/api/test"
+    mock_response.read = AsyncMock(return_value=b'{"error": "not found"}')
+    mock_response.release = Mock()
+
+    api.request = AsyncMock(return_value=mock_response)
+
+    # Mock get_response_reason
+    with patch("uiprotect.api.get_response_reason", return_value="Not Found"):
+        # Test with raise_exception=False - should return None
+        result = await api.api_request_raw("/test", raise_exception=False)
+        assert result is None
+
+        # Verify that response.read() was NOT called since we return early
+        mock_response.read.assert_not_called()
+
+        # Reset mock for next test
+        mock_response.reset_mock()
+        api.request.reset_mock()
+
+        # Test with raise_exception=True - should raise exception
+        with pytest.raises(BadRequest):
+            await api.api_request_raw("/test", raise_exception=True)
+
+        # Verify that response.release() was called in the exception handler
+        mock_response.release.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_api_request_raw_success():
+    """Test api_request_raw with successful response."""
+    # Create API client
+    api = ProtectApiClient("test.com", 443, "username", "password")
+
+    # Mock the request method to return a response with success status
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.url = "https://test.com/api/test"
+    mock_response.read = AsyncMock(return_value=b'{"success": true}')
+    mock_response.release = Mock()
+
+    api.request = AsyncMock(return_value=mock_response)
+
+    # Test with success status - should return data
+    result = await api.api_request_raw("/test", raise_exception=True)
+    assert result == b'{"success": true}'
+
+    # Verify that response.read() was called
+    mock_response.read.assert_called_once()
+    # Verify that response.release() was called
+    mock_response.release.assert_called_once()
+
+
+# Public API Tests
+
+
+@pytest.mark.asyncio()
+async def test_get_nvr_public_success():
+    """Test successful NVR retrieval from public API."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    client.api_request_obj = AsyncMock(
+        return_value={
+            "id": "663d0a9d001d8803e40003ea",
+            "modelKey": "nvr",
+            "name": "Test NVR",
+            "doorbellSettings": {
+                "defaultMessageText": "WELCOME",
+                "defaultMessageResetTimeoutMs": 60000,
+                "customMessages": [],
+                "customImages": [],
+            },
+        }
+    )
+
+    result = await client.get_nvr_public()
+
+    assert result is not None
+    assert result.id == "663d0a9d001d8803e40003ea"
+    assert result.name == "Test NVR"
+    client.api_request_obj.assert_called_with(url="/v1/nvrs", public_api=True)
+
+
+@pytest.mark.asyncio()
+async def test_get_nvr_public_error():
+    """Test NVR retrieval error handling."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    client.api_request_obj = AsyncMock(side_effect=Exception("API Error"))
+
+    with pytest.raises(Exception, match="API Error"):
+        await client.get_nvr_public()
+
+    client.api_request_obj.assert_called_with(url="/v1/nvrs", public_api=True)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicCamera.from_unifi_dict")
+async def test_get_cameras_public_success(mock_create):
+    """Test successful cameras retrieval from public API."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    mock_cameras_data = [
+        {
+            "id": "663d0aa400918803e4000445",
+            "name": "Camera 1",
+            "type": "UVC G4 Doorbell Pro PoE",
+            "mac": "E438830EDA97",
+            "modelKey": "camera",
+            "firmwareVersion": "4.74.78",
+        },
+        {
+            "id": "663d0aa400918803e4000446",
+            "name": "Camera 2",
+            "type": "UVC G4 Doorbell Pro PoE",
+            "mac": "E438830EDA98",
+            "modelKey": "camera",
+            "firmwareVersion": "4.74.78",
+        },
+    ]
+
+    # Mock the API request
+    client.api_request_list = AsyncMock(return_value=mock_cameras_data)
+
+    # Mock the Camera.from_unifi_dict method
+    mock_camera = Mock()
+    mock_create.return_value = mock_camera
+
+    result = await client.get_cameras_public()
+
+    assert result is not None
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert all(camera == mock_camera for camera in result)
+    client.api_request_list.assert_called_with(url="/v1/cameras", public_api=True)
+    assert mock_create.call_count == 2
+
+
+@pytest.mark.asyncio()
+async def test_get_cameras_public_error():
+    """Test cameras retrieval error handling."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    client.api_request_list = AsyncMock(side_effect=Exception("API Error"))
+
+    with pytest.raises(Exception, match="API Error"):
+        await client.get_cameras_public()
+
+    client.api_request_list.assert_called_with(url="/v1/cameras", public_api=True)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicCamera.from_unifi_dict")
+async def test_get_camera_public_success(mock_create):
+    """Test successful single camera retrieval from public API."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    mock_camera_data = {
+        "id": "663d0aa400918803e4000445",
+        "name": "Camera 1",
+        "type": "UVC G4 Doorbell Pro PoE",
+        "mac": "E438830EDA97",
+        "modelKey": "camera",
+        "firmwareVersion": "4.74.78",
+    }
+
+    # Mock the API request
+    client.api_request_obj = AsyncMock(return_value=mock_camera_data)
+
+    # Mock the Camera.from_unifi_dict method
+    mock_camera = Mock()
+    mock_camera.id = "663d0aa400918803e4000445"
+    mock_camera.name = "Camera 1"
+    mock_create.return_value = mock_camera
+
+    result = await client.get_camera_public("663d0aa400918803e4000445")
+
+    assert result is not None
+    assert result.id == "663d0aa400918803e4000445"
+    assert result.name == "Camera 1"
+    client.api_request_obj.assert_called_with(
+        url="/v1/cameras/663d0aa400918803e4000445", public_api=True
+    )
+    mock_create.assert_called_once_with(**mock_camera_data, api=client)
+
+
+@pytest.mark.asyncio()
+async def test_get_camera_public_error():
+    """Test single camera retrieval error handling."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    client.api_request_obj = AsyncMock(side_effect=Exception("API Error"))
+
+    with pytest.raises(Exception, match="API Error"):
+        await client.get_camera_public("663d0aa400918803e4000445")
+
+    client.api_request_obj.assert_called_with(
+        url="/v1/cameras/663d0aa400918803e4000445", public_api=True
+    )
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicChime.from_unifi_dict")
+async def test_get_chimes_public_success(mock_create):
+    """Test successful chimes retrieval from public API."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    mock_chimes_data = [
+        {
+            "id": "663d0aa401108803e4000447",
+            "name": "Chime 1",
+            "type": "UP Chime PoE",
+            "mac": "E438830ABC01",
+            "modelKey": "chime",
+            "firmwareVersion": "1.5.4",
+        }
+    ]
+
+    # Mock the API request
+    client.api_request_list = AsyncMock(return_value=mock_chimes_data)
+
+    # Mock the Chime.from_unifi_dict method
+    mock_chime = Mock()
+    mock_chime.id = "663d0aa401108803e4000447"
+    mock_chime.name = "Chime 1"
+    mock_create.return_value = mock_chime
+
+    result = await client.get_chimes_public()
+
+    assert result is not None
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0].id == "663d0aa401108803e4000447"
+    assert result[0].name == "Chime 1"
+    client.api_request_list.assert_called_with(url="/v1/chimes", public_api=True)
+    mock_create.assert_called_once_with(**mock_chimes_data[0], api=client)
+
+
+@pytest.mark.asyncio()
+async def test_get_chimes_public_error():
+    """Test chimes retrieval error handling."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    client.api_request_list = AsyncMock(side_effect=Exception("API Error"))
+
+    with pytest.raises(Exception, match="API Error"):
+        await client.get_chimes_public()
+
+    client.api_request_list.assert_called_with(url="/v1/chimes", public_api=True)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicChime.from_unifi_dict")
+async def test_get_chime_public_success(mock_create):
+    """Test successful single chime retrieval from public API."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    mock_chime_data = {
+        "id": "663d0aa401108803e4000447",
+        "name": "Chime 1",
+        "type": "UP Chime PoE",
+        "mac": "E438830ABC01",
+        "modelKey": "chime",
+        "firmwareVersion": "1.5.4",
+    }
+
+    # Mock the API request
+    client.api_request_obj = AsyncMock(return_value=mock_chime_data)
+
+    # Mock the Chime.from_unifi_dict method
+    mock_chime = Mock()
+    mock_chime.id = "663d0aa401108803e4000447"
+    mock_chime.name = "Chime 1"
+    mock_create.return_value = mock_chime
+
+    result = await client.get_chime_public("663d0aa401108803e4000447")
+
+    assert result is not None
+    assert result.id == "663d0aa401108803e4000447"
+    assert result.name == "Chime 1"
+    client.api_request_obj.assert_called_with(
+        url="/v1/chimes/663d0aa401108803e4000447", public_api=True
+    )
+    mock_create.assert_called_once_with(**mock_chime_data, api=client)
+
+
+@pytest.mark.asyncio()
+async def test_get_chime_public_error():
+    """Test single chime retrieval error handling."""
+    client = ProtectApiClient(
+        "127.0.0.1",
+        0,
+        "user",
+        "pass",
+        api_key="my_key",
+        verify_ssl=False,
+    )
+
+    client.api_request_obj = AsyncMock(side_effect=Exception("API Error"))
+
+    with pytest.raises(Exception, match="API Error"):
+        await client.get_chime_public("663d0aa401108803e4000447")
+
+    client.api_request_obj.assert_called_with(
+        url="/v1/chimes/663d0aa401108803e4000447", public_api=True
+    )
+
+
+def test_led_settings_ignores_unmodelled_keys():
+    """LEDSettings parses and serialises without the keys it does not model."""
+    led_settings = LEDSettings.from_unifi_dict(
+        isEnabled=True, blinkRate=100, welcomeLed=True, floodLed=False
+    )
+
+    assert led_settings.unifi_dict() == {"isEnabled": True}
+
+
+@pytest.mark.asyncio()
+async def test_update_bootstrap_soon_creates_task_when_none_exists(
+    protect_client: ProtectApiClient,
+):
+    """Test _update_bootstrap_soon creates a new task when none exists."""
+    protect_client._update_task = None
+    protect_client.update = AsyncMock()
+
+    protect_client._update_bootstrap_soon()
+
+    assert protect_client._update_task is not None
+    await protect_client._update_task
+    protect_client.update.assert_called_once()
+
+
+@pytest.mark.asyncio()
+async def test_update_bootstrap_soon_creates_task_when_previous_done(
+    protect_client: ProtectApiClient,
+):
+    """Test _update_bootstrap_soon creates a new task when previous task is done."""
+    completed_task = asyncio.create_task(asyncio.sleep(0))
+    await completed_task
+    protect_client._update_task = completed_task
+    protect_client.update = AsyncMock()
+
+    protect_client._update_bootstrap_soon()
+
+    assert protect_client._update_task is not None
+    await protect_client._update_task
+    protect_client.update.assert_called_once()
+
+
+@pytest.mark.asyncio()
+async def test_update_bootstrap_soon_skips_when_task_running(
+    protect_client: ProtectApiClient,
+):
+    """Test _update_bootstrap_soon does not create a new task when one is running."""
+    task_event = asyncio.Event()
+    running_task = asyncio.create_task(task_event.wait())
+    protect_client._update_task = running_task
+    protect_client.update = AsyncMock()
+
+    protect_client._update_bootstrap_soon()
+
+    assert protect_client._update_task is running_task
+    protect_client.update.assert_not_called()
+
+    task_event.set()
+    await running_task
+
+
+# Tests for JSON deserialization in api_request, api_request_obj, api_request_list
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_data,expected,expected_type",
+    [
+        (b'{"key": "value", "number": 42}', {"key": "value", "number": 42}, dict),
+        (b'[{"id": 1}, {"id": 2}]', [{"id": 1}, {"id": 2}], list),
+        (None, None, type(None)),
+    ],
+    ids=["dict_response", "list_response", "empty_response"],
+)
+async def test_api_request_success(
+    simple_api_client, response_data, expected, expected_type
+):
+    """Test api_request successfully deserializes various JSON responses."""
+    simple_api_client.api_request_raw = AsyncMock(return_value=response_data)
+
+    result = await simple_api_client.api_request("/test")
+
+    assert result == expected
+    assert isinstance(result, expected_type)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_data",
+    [
+        pytest.param(b"invalid json {{{", id="invalid_syntax"),
+        pytest.param(b'{"key": "value"', id="truncated"),
+        pytest.param(b"\x00\x01\x02\x03\x04", id="binary_data"),
+    ],
+)
+async def test_api_request_json_decode_error(simple_api_client, invalid_data):
+    """Test api_request raises NvrError on JSONDecodeError."""
+    simple_api_client.api_request_raw = AsyncMock(return_value=invalid_data)
+
+    with pytest.raises(NvrError, match="Could not decode JSON from /test"):
+        await simple_api_client.api_request("/test")
+
+
+@pytest.mark.asyncio
+async def test_api_request_complex_nested_json(simple_api_client):
+    """Test api_request handles complex nested JSON structures."""
+    complex_json = b'{"devices": [{"id": "cam1"}], "meta": {"nested": {"deep": true}}}'
+    simple_api_client.api_request_raw = AsyncMock(return_value=complex_json)
+
+    result = await simple_api_client.api_request("/test")
+
+    assert result["devices"][0]["id"] == "cam1"
+    assert result["meta"]["nested"]["deep"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_request_unicode(simple_api_client):
+    """Test api_request handles JSON with unicode characters."""
+    simple_api_client.api_request_raw = AsyncMock(
+        return_value='{"name": "Kamera Außen", "emoji": "📷"}'.encode()
+    )
+
+    result = await simple_api_client.api_request("/test")
+
+    assert result["name"] == "Kamera Außen"
+    assert result["emoji"] == "📷"
+
+
+@pytest.mark.asyncio
+async def test_api_request_obj_success(simple_api_client):
+    """Test api_request_obj successfully returns dict."""
+    simple_api_client.api_request_raw = AsyncMock(return_value=b'{"id": "test-id"}')
+
+    result = await simple_api_client.api_request_obj("/test")
+
+    assert result == {"id": "test-id"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_data",
+    [pytest.param(b'[{"id": 1}]', id="list"), pytest.param(b"null", id="null")],
+)
+async def test_api_request_obj_invalid_type(simple_api_client, response_data):
+    """Test api_request_obj raises NvrError when response is not a dict."""
+    simple_api_client.api_request_raw = AsyncMock(return_value=response_data)
+
+    with pytest.raises(NvrError, match="Could not decode object from /test"):
+        await simple_api_client.api_request_obj("/test")
+
+
+@pytest.mark.asyncio
+async def test_api_request_list_success(simple_api_client):
+    """Test api_request_list successfully returns list."""
+    simple_api_client.api_request_raw = AsyncMock(
+        return_value=b'[{"id": 1}, {"id": 2}]'
+    )
+
+    result = await simple_api_client.api_request_list("/test")
+
+    assert result == [{"id": 1}, {"id": 2}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_data",
+    [pytest.param(b'{"id": "test"}', id="dict"), pytest.param(b"null", id="null")],
+)
+async def test_api_request_list_invalid_type(simple_api_client, response_data):
+    """Test api_request_list raises NvrError when response is not a list."""
+    simple_api_client.api_request_raw = AsyncMock(return_value=response_data)
+
+    with pytest.raises(NvrError, match="Could not decode list from /test"):
+        await simple_api_client.api_request_list("/test")
+
+
+# PTZ Private API Tests
+
+
+@pytest.mark.asyncio
+async def test_get_presets_ptz_camera(protect_client: ProtectApiClient):
+    """Test get_presets_ptz_camera API method."""
+    mock_response: list[dict[str, Any]] = [
+        {
+            "id": "preset1",
+            "name": "Home",
+            "slot": -1,
+            "ptz": {"pan": 0.0, "tilt": 0.0, "zoom": 1.0},
+        },
+        {
+            "id": "preset2",
+            "name": "Front Door",
+            "slot": 0,
+            "ptz": {"pan": 45.0, "tilt": 10.0, "zoom": 2.0},
+        },
+    ]
+    protect_client.api_request = AsyncMock(return_value=mock_response)
+
+    presets = await protect_client.get_presets_ptz_camera("camera123")
+
+    assert len(presets) == 2
+    assert all(isinstance(p, PTZPreset) for p in presets)
+    assert presets[0].name == "Home"
+    assert presets[0].slot == -1
+    assert presets[0].id == "preset1"
+    assert presets[1].name == "Front Door"
+    assert presets[1].slot == 0
+    assert presets[1].id == "preset2"
+
+    protect_client.api_request.assert_called_with("cameras/camera123/ptz/preset")
+
+
+@pytest.mark.asyncio
+async def test_get_patrols_ptz_camera(protect_client: ProtectApiClient):
+    """Test get_patrols_ptz_camera API method."""
+    mock_response: list[dict[str, Any]] = [
+        {
+            "name": "Patrol",
+            "slot": 0,
+            "presets": [0],
+            "presetMovementSpeed": None,
+            "presetDurationSeconds": 20,
+            "camera": "camera123",
+            "id": "patrol1",
+            "modelKey": "ptzPatrol",
+        },
+        {
+            "name": "Patrol 2",
+            "slot": 1,
+            "presets": [0, 2, 3],
+            "presetMovementSpeed": 50,
+            "presetDurationSeconds": 23,
+            "camera": "camera123",
+            "id": "patrol2",
+            "modelKey": "ptzPatrol",
+        },
+    ]
+    protect_client.api_request = AsyncMock(return_value=mock_response)
+
+    patrols = await protect_client.get_patrols_ptz_camera("camera123")
+
+    assert len(patrols) == 2
+    assert all(isinstance(p, PTZPatrol) for p in patrols)
+    assert patrols[0].name == "Patrol"
+    assert patrols[0].slot == 0
+    assert patrols[0].presets == [0]
+    assert patrols[0].preset_movement_speed is None
+    assert patrols[0].preset_duration_seconds == 20
+    assert patrols[1].name == "Patrol 2"
+    assert patrols[1].preset_movement_speed == 50
+    assert patrols[1].presets == [0, 2, 3]
+
+    protect_client.api_request.assert_called_with("cameras/camera123/ptz/patrol")
+
+
+@pytest.mark.parametrize(
+    ("method", "api_path"),
+    [
+        ("get_presets_ptz_camera", "cameras/camera123/ptz/preset"),
+        ("get_patrols_ptz_camera", "cameras/camera123/ptz/patrol"),
+    ],
+)
+@pytest.mark.parametrize("return_value", [[], None])
+@pytest.mark.asyncio
+async def test_ptz_get_methods_empty(
+    protect_client: ProtectApiClient,
+    method: str,
+    api_path: str,
+    return_value: list[Any] | None,
+):
+    """Test PTZ get methods return empty list when no data or None."""
+    protect_client.api_request = AsyncMock(return_value=return_value)
+
+    result = await getattr(protect_client, method)("camera123")
+
+    assert result == []
+    protect_client.api_request.assert_called_with(api_path)
+
+
+# PTZ Public API Tests
+
+
+@pytest.mark.parametrize(
+    ("method", "args", "expected_path"),
+    [
+        ("ptz_goto_preset_public", {"slot": 2}, "/ptz/goto/2"),
+        ("ptz_patrol_start_public", {"slot": 1}, "/ptz/patrol/start/1"),
+        ("ptz_patrol_stop_public", {}, "/ptz/patrol/stop"),
+    ],
+)
+@pytest.mark.asyncio()
+async def test_ptz_public_api(
+    protect_client: ProtectApiClient, method: str, args: dict, expected_path: str
+):
+    """Test PTZ public API methods."""
+    protect_client.api_request_raw = AsyncMock(return_value=b"")
+
+    await getattr(protect_client, method)("camera123", **args)
+
+    protect_client.api_request_raw.assert_called_with(
+        url=f"/v1/cameras/camera123{expected_path}",
+        method="post",
+        public_api=True,
+    )
+
+
+# Talkback Public API Tests
+
+
+@pytest.mark.asyncio
+async def test_create_talkback_session_public(protect_client: ProtectApiClient):
+    """Test create_talkback_session_public API method."""
+    mock_response: dict[str, Any] = {
+        "url": "rtp://192.168.1.100:7004",
+        "codec": "opus",
+        "samplingRate": 24000,
+    }
+    protect_client.api_request_obj = AsyncMock(return_value=mock_response)  # type: ignore[method-assign]
+
+    session = await protect_client.create_talkback_session_public("camera123")
+
+    assert isinstance(session, TalkbackSession)
+    assert session.url == "rtp://192.168.1.100:7004"
+    assert session.codec == "opus"
+    assert session.sampling_rate == 24000
+    protect_client.api_request_obj.assert_called_once_with(  # type: ignore[attr-defined]
+        url="/v1/cameras/camera123/talkback-session",
+        method="post",
+        public_api=True,
+    )
+
+
+def _siren_client() -> ProtectApiClient:
+    client = _rtsps_client()
+    client._public_bootstrap = PublicBootstrap()
+    return client
+
+
+def _seed_siren(
+    client: ProtectApiClient,
+    siren_id: str = "siren1",
+    *,
+    seconds_left: float | None = 0.0,
+) -> Siren:
+    """Cache a siren whose timed run ends ``seconds_left`` from now."""
+    if seconds_left is None:
+        status = PublicSirenStatus(is_active=False)
+    else:
+        activated_at = datetime.now(UTC) + timedelta(seconds=seconds_left - 5)
+        status = PublicSirenStatus(
+            is_active=True, activated_at=to_js_time(activated_at), duration=5000
+        )
+    siren = Siren.model_construct(id=siren_id, siren_status=status)
+    client._public_bootstrap.sirens[siren_id] = siren
+    return siren
+
+
+def _capture_devices_messages(client: ProtectApiClient) -> list[WSSubscriptionMessage]:
+    messages: list[WSSubscriptionMessage] = []
+    client._devices_ws_subscriptions.append(messages.append)
+    return messages
+
+
+@pytest.mark.asyncio
+async def test_siren_expiry_emits_synthetic_devices_update():
+    """An expiring timed run announces itself as a devices-WS update."""
+    client = _siren_client()
+    siren = _seed_siren(client, seconds_left=0.01)
+    messages = _capture_devices_messages(client)
+
+    client._schedule_siren_off("siren1")
+    await client._siren_off_tasks["siren1"]
+
+    assert siren.is_active is False
+    assert siren.siren_status.is_active is False
+    assert len(messages) == 1
+    msg = messages[0]
+    assert msg.action is WSAction.UPDATE
+    assert msg.new_update_id == "siren1"
+    assert msg.new_obj is siren
+    assert msg.changed_data == {
+        "modelKey": "siren",
+        "id": "siren1",
+        "sirenStatus": siren.siren_status.unifi_dict(),
+    }
+    assert msg.changed_data["sirenStatus"]["isActive"] is False
+    assert "siren1" not in client._siren_off_tasks
+
+
+@pytest.mark.asyncio
+async def test_siren_expiry_announces_run_that_already_ended():
+    """A deadline already in the past still produces exactly one announcement."""
+    client = _siren_client()
+    siren = _seed_siren(client, seconds_left=-30)
+    messages = _capture_devices_messages(client)
+
+    client._schedule_siren_off("siren1")
+    await client._siren_off_tasks["siren1"]
+
+    assert len(messages) == 1
+    assert siren.is_active is False
+
+    # The cleared flag makes ``turn_off_at`` ``None``, so re-deriving from the
+    # same cached status neither re-arms nor re-announces.
+    client._schedule_siren_off("siren1")
+    assert client._siren_off_tasks == {}
+    assert len(messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_siren_schedule_disarms_idle_siren():
+    """An idle siren drops any armed timer without announcing."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=60)
+    messages = _capture_devices_messages(client)
+    client._schedule_siren_off("siren1")
+    armed = client._siren_off_tasks["siren1"]
+
+    client._public_bootstrap.sirens["siren1"].siren_status.is_active = False
+    client._schedule_siren_off("siren1")
+
+    assert armed.cancelled() or armed.cancelling()
+    assert client._siren_off_tasks == {}
+    assert messages == []
+
+
+@pytest.mark.asyncio
+async def test_siren_schedule_for_uncached_siren_disarms():
+    """A siren gone from the cache leaves no timer behind."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=60)
+    client._schedule_siren_off("siren1")
+    armed = client._siren_off_tasks["siren1"]
+
+    del client._public_bootstrap.sirens["siren1"]
+    client._schedule_siren_off("siren1")
+
+    assert armed.cancelled() or armed.cancelling()
+    assert client._siren_off_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_siren_schedule_without_public_bootstrap_is_noop():
+    """Without the public cache there is no status to derive a deadline from."""
+    client = _rtsps_client()
+    client._schedule_siren_off("siren1")
+    assert client._siren_off_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_siren_schedule_rearms_on_a_newer_run():
+    """A restarted run replaces the timer armed for the previous one."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=60)
+    client._schedule_siren_off("siren1")
+    first = client._siren_off_tasks["siren1"]
+
+    client._schedule_siren_off("siren1")
+    second = client._siren_off_tasks["siren1"]
+
+    assert second is not first
+    assert first.cancelled() or first.cancelling()
+
+
+@pytest.mark.asyncio
+async def test_siren_expiry_skips_a_siren_removed_mid_run():
+    """A siren removed while its timer is pending announces nothing."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=0.01)
+    messages = _capture_devices_messages(client)
+
+    client._schedule_siren_off("siren1")
+    del client._public_bootstrap.sirens["siren1"]
+    await client._siren_off_tasks["siren1"]
+
+    assert messages == []
+    assert client._siren_off_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_siren_expiry_honours_the_devices_ws_model_filter():
+    """A filtered-out model updates the cache without emitting a frame."""
+    client = _siren_client()
+    siren = _seed_siren(client, seconds_left=0.01)
+    client._devices_ws_subscribed_models = {ModelType.CAMERA}
+    messages = _capture_devices_messages(client)
+
+    client._schedule_siren_off("siren1")
+    await client._siren_off_tasks["siren1"]
+
+    assert messages == []
+    assert siren.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_close_session_cancels_pending_siren_expiry():
+    """Shutdown drains the siren timers like every other background task."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=60)
+    client._schedule_siren_off("siren1")
+    task = client._siren_off_tasks["siren1"]
+
+    await client.close_session()
+
+    assert task.cancelled()
+    assert client._siren_off_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_devices_ws_disconnect_cancels_pending_siren_expiry():
+    """A dropped devices websocket disarms timers derived from now-stale status."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=60)
+    client._devices_ws_has_been_connected = True
+    client._schedule_siren_off("siren1")
+    task = client._siren_off_tasks["siren1"]
+
+    client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+
+    assert task.cancelled() or task.cancelling()
+    assert client._siren_off_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_reschedule_siren_offs_rearms_snapshot_and_drops_departed():
+    """A refreshed snapshot re-arms its own sirens and forgets the ones it lost."""
+    client = _siren_client()
+    _seed_siren(client, "gone", seconds_left=60)
+    client._schedule_siren_off("gone")
+    departed = client._siren_off_tasks["gone"]
+    del client._public_bootstrap.sirens["gone"]
+    _seed_siren(client, "siren1", seconds_left=60)
+
+    client._reschedule_siren_offs(client._public_bootstrap)
+
+    assert departed.cancelled() or departed.cancelling()
+    assert set(client._siren_off_tasks) == {"siren1"}
+    await client._cancel_siren_off_tasks()
+
+
+@pytest.mark.asyncio
+async def test_siren_rearm_keeps_tracking_the_live_timer():
+    """A re-armed timer stays tracked once the cancelled one finishes cleaning up."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=60)
+    client._schedule_siren_off("siren1")
+    cancelled = client._siren_off_tasks["siren1"]
+    # Let the timer reach its sleep, so cancelling it runs the cleanup that
+    # would otherwise evict the replacement armed below.
+    await asyncio.sleep(0)
+
+    client._schedule_siren_off("siren1")
+    live = client._siren_off_tasks["siren1"]
+    with contextlib.suppress(asyncio.CancelledError):
+        await cancelled
+
+    assert client._siren_off_tasks == {"siren1": live}
+    await client.close_session()
+    assert live.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_siren_rearm_announces_the_run_only_once():
+    """Frames arriving mid-run re-arm the timer without duplicating the announcement."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=0.02)
+    messages = _capture_devices_messages(client)
+
+    for _ in range(3):
+        client._schedule_siren_off("siren1")
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
+
+    assert len(messages) == 1
+    assert client._siren_off_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_devices_ws_reconnect_rearms_siren_expiry():
+    """A reconnect re-arms from the cached status without waiting on the resync."""
+    client = _siren_client()
+    _seed_siren(client, seconds_left=60)
+    client._schedule_siren_off("siren1")
+    client._devices_ws_has_been_connected = True
+    client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    assert client._siren_off_tasks == {}
+
+    # Debounced: the reconnect resync that would otherwise re-arm is deferred.
+    client._last_public_resync = time.monotonic()
+    client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+
+    assert set(client._siren_off_tasks) == {"siren1"}
+    await client._cancel_siren_off_tasks()
+
+
+@pytest.mark.asyncio
+async def test_siren_expiry_skips_a_run_superseded_mid_sleep():
+    """A timer armed for a finished run stays silent once a later run replaces it."""
+    client = _siren_client()
+    siren = _seed_siren(client, seconds_left=0.01)
+    messages = _capture_devices_messages(client)
+
+    client._schedule_siren_off("siren1")
+    task = client._siren_off_tasks["siren1"]
+    siren.siren_status.activated_at = to_js_time(datetime.now(UTC) + timedelta(hours=1))
+    await task
+
+    assert messages == []
+    assert siren.siren_status.is_active is True

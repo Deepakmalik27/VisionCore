@@ -1,0 +1,279 @@
+name: Build and Smoke-Test Release Wheel
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: 'Published base revision; defaults to the triggering commit'
+        required: false
+        type: string
+        default: ''
+      candidate_sha:
+        description: 'Exact unpublished candidate commit in source_bundle'
+        required: false
+        type: string
+        default: ''
+      source_bundle:
+        description: 'Same-run artifact containing release-source.bundle'
+        required: false
+        type: string
+        default: ''
+      upload_artifacts:
+        description: 'Upload the gated distributions for the calling workflow'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      version:
+        description: 'Validated in-tree package version'
+        value: ${{ jobs.release_artifacts.outputs.version }}
+  workflow_dispatch:
+    inputs:
+      upload_artifacts:
+        description: 'Upload gated distributions as artifacts'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  source_gates:
+    name: Source tests, docs, and native parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Match regular CI's numerical thread limits in workers and child processes.
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      # Load release setup actions from this workflow's revision before selecting source.
+      - name: Bootstrap release checkout action
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+
+      - name: Install native build dependencies
+        uses: ./.github/actions/install-ubuntu-packages
+        with:
+          packages: cmake g++ libopencv-dev libeigen3-dev
+
+      - name: Check out release source
+        uses: ./.github/actions/checkout-release-source
+        with:
+          source_sha: ${{ inputs.source_sha || github.sha }}
+          candidate_sha: ${{ inputs.candidate_sha }}
+          source_bundle: ${{ inputs.source_bundle }}
+
+      - name: Set up Python and uv
+        uses: ./.github/actions/setup-ci-python
+        with:
+          python-version: '3.11'
+
+      - name: Install release-gate dependencies
+        run: |
+          uv sync --locked \
+            --extra cpu \
+            --extra yolo \
+            --extra evolve \
+            --extra service \
+            --extra mots \
+            --group dev \
+            --group test \
+            --group docs
+
+      - name: Run Python tests in parallel
+        run: |
+          uv run --no-sync pytest \
+            -n logical --maxprocesses=4 --dist worksteal \
+            -q -ra --durations=30 \
+            --ignore=tests/unit/native \
+            tests
+
+      - name: Run native tests
+        # Native fixtures configure and build targets in shared directories.
+        run: uv run --no-sync pytest -q -ra --durations=30 tests/unit/native
+
+      - name: Build strict documentation
+        env:
+          # MkDocs is constrained to <2; hide Material's general 2.0 notice.
+          NO_MKDOCS_2_WARNING: '1'
+        run: uv run --no-sync mkdocs build --strict
+
+  build:
+    name: Build release distributions once
+    needs: source_gates
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
+    steps:
+      - name: Bootstrap release checkout action
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+
+      - name: Check out release source
+        uses: ./.github/actions/checkout-release-source
+        with:
+          source_sha: ${{ inputs.source_sha || github.sha }}
+          candidate_sha: ${{ inputs.candidate_sha }}
+          source_bundle: ${{ inputs.source_bundle }}
+
+      - name: Set up Python and uv
+        uses: ./.github/actions/setup-ci-python
+        with:
+          python-version: '3.11'
+
+      - name: Build the in-tree version
+        run: uv build --no-sources
+
+      - name: Validate wheel metadata and contents
+        id: release-version
+        run: |
+          python - <<'PY'
+          import ast
+          import email
+          import os
+          import pathlib
+          import tomllib
+          import zipfile
+
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          wheels = list(pathlib.Path("dist").glob("*.whl"))
+          sdists = list(pathlib.Path("dist").glob("*.tar.gz"))
+          assert len(wheels) == 1, f"expected one wheel, found {wheels}"
+          assert len(sdists) == 1, f"expected one source distribution, found {sdists}"
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = archive.namelist()
+              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
+              metadata = email.message_from_bytes(archive.read(metadata_name))
+              module = ast.parse(archive.read("boxmot/__init__.py"))
+          assert metadata["Version"] == version
+          module_version = next(
+              ast.literal_eval(node.value)
+              for node in module.body
+              if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
+          )
+          assert module_version == version
+          forbidden = [
+              name
+              for name in names
+              if name.startswith(("datasets/", "boxmot/datasets/mot/", "boxmot/datasets/reid/"))
+              or "/.staging/" in name
+              or "/builds/" in name
+              or name.endswith((".npy", ".npz", ".parquet"))
+          ]
+          assert not forbidden, f"wheel contains dataset/build artifacts: {forbidden[:20]}"
+
+          output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as stream:
+              stream.write(f"version={version}\n")
+          PY
+
+      - name: Upload immutable candidate distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: boxmot-release-candidate
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  clean_wheel_smoke:
+    name: Clean wheel smoke (Python ${{ matrix.python-version }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - name: Bootstrap release checkout action
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+
+      - name: Checkout release checks
+        uses: ./.github/actions/checkout-release-source
+        with:
+          source_sha: ${{ inputs.source_sha || github.sha }}
+          candidate_sha: ${{ inputs.candidate_sha }}
+          source_bundle: ${{ inputs.source_bundle }}
+          path: source
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: boxmot-release-candidate
+          path: candidate
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the candidate wheel into a clean interpreter
+        run: |
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu candidate/*.whl
+          python -m pip check
+
+      - name: Smoke-test release imports and CLI
+        working-directory: ${{ runner.temp }}
+        env:
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python -I "$GITHUB_WORKSPACE/source/tests/ci/release_contract.py" \
+            --expected-version "$RELEASE_VERSION" --check-cli-help --check-trackers
+
+      - name: Smoke-test lazy imports and auxiliary entrypoints
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -I - <<'PY'
+          import sys
+
+          import boxmot.engine.materialization.workflow
+          import boxmot.engine.tracking.sinks
+          import boxmot.engine.tracking.sources
+
+          assert "ultralytics" not in sys.modules
+          assert not any(name.startswith("boxmot.native.trackers") for name in sys.modules)
+          PY
+          boxmot --help > boxmot-help.txt
+          grep -q materialize boxmot-help.txt
+          if grep -q generate boxmot-help.txt; then
+            echo "Removed generate command is still present" >&2
+            exit 1
+          fi
+          for module in \
+            boxmot.engine.commands.reid.ablation \
+            boxmot.engine.commands.reid.human_pretrain \
+            boxmot.engine.commands.reid.privileged_cache \
+            boxmot.engine.commands.reid.teacher_extract; do
+            python -m "$module" --help > /dev/null
+          done
+          python - <<'PY'
+          from boxmot.engine.service.__main__ import main
+
+          assert callable(main)
+          PY
+
+  release_artifacts:
+    name: Expose distributions only after every gate passes
+    needs: [build, clean_wheel_smoke]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: boxmot-release-candidate
+          path: dist
+
+      - name: Record gated artifact checksums
+        run: (cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS)
+
+      - name: Upload gated release distributions
+        if: ${{ inputs.upload_artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: boxmot-release-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

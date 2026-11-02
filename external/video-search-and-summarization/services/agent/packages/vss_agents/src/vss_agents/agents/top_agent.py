@@ -1,0 +1,2149 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import asyncio
+from collections.abc import AsyncGenerator
+from collections.abc import Hashable
+import copy
+from datetime import UTC
+from datetime import datetime
+from html import escape
+import json
+import logging
+import re
+import time
+from typing import Any
+from typing import Literal
+from typing import cast
+from uuid import uuid4
+
+from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.messages import BaseMessage
+from langchain_core.messages import HumanMessage
+from langchain_core.messages import SystemMessage
+from langchain_core.messages import ToolMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import MessagesPlaceholder
+from langchain_core.runnables import Runnable
+from langchain_core.runnables.config import RunnableConfig
+from langchain_core.tools import BaseTool
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.config import get_stream_writer
+from langgraph.graph import StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from nat.builder.builder import Builder
+from nat.builder.context import Context
+from nat.builder.context import ContextState
+from nat.builder.framework_enum import LLMFrameworkEnum
+from nat.builder.function_info import FunctionInfo
+from nat.cli.register_workflow import register_function
+from nat.data_models.api_server import ChatRequest
+from nat.data_models.api_server import ChatRequestOrMessage
+from nat.data_models.api_server import Message
+from nat.data_models.component_ref import FunctionRef
+from nat.data_models.component_ref import LLMRef
+from nat.data_models.function import FunctionBaseConfig
+from nat.data_models.intermediate_step import IntermediateStepPayload
+from nat.data_models.intermediate_step import IntermediateStepType
+from nat.data_models.intermediate_step import StreamEventData
+from nat.data_models.intermediate_step import TokenUsageBaseModel
+from nat.data_models.intermediate_step import TraceMetadata
+from nat.data_models.intermediate_step import UsageInfo
+from nat.utils.type_converter import GlobalTypeConverter
+from pydantic import BaseModel
+from pydantic import Field
+from typing_extensions import override  # noqa: UP035  # mypy targets 3.11
+
+from vss_agents.agents.data_models import AgentDecision
+from vss_agents.agents.data_models import AgentMessageChunk
+from vss_agents.agents.data_models import AgentMessageChunkType
+from vss_agents.agents.data_models import AgentOutput
+from vss_agents.agents.data_models import AgentRequestOptions
+from vss_agents.agents.postprocessing import POSTPROCESSING_FEEDBACK_MARKER
+from vss_agents.agents.postprocessing import PostprocessingConfig
+from vss_agents.agents.postprocessing import PostprocessingNode
+from vss_agents.tools.lvs_config_media import LVS_CONFIG_MEDIA_BLOCKED_MESSAGE
+from vss_agents.tools.lvs_config_media import LVS_CONFIG_MEDIA_TOOL_NAME
+from vss_agents.tools.lvs_config_media import user_requested_caption_generation
+from vss_agents.tools.vst.timeline import get_timeline
+from vss_agents.tools.vst.utils import get_name_to_stream_id_map
+from vss_agents.utils.asyncmixin import AsyncMixin
+from vss_agents.utils.reasoning_parsing import parse_reasoning_content
+from vss_agents.utils.reasoning_utils import get_llm_reasoning_bind_kwargs
+from vss_agents.utils.reasoning_utils import get_thinking_tag
+from vss_agents.utils.time_convert import iso8601_to_datetime
+
+logger = logging.getLogger(__name__)
+
+PLAN_CLARIFY_PREFIX = "[USER]"
+TOOL_NOT_FOUND_ERROR_MESSAGE = "There is no tool named {tool_name}. Tool must be one of {tools}."
+NO_INPUT_ERROR_MESSAGE = "No human input received to the agent, Please ask a valid question."
+EMPTY_MESSAGES_ERROR = 'No input received in state: "current_message"'
+EMPTY_SCRATCHPAD_ERROR = 'No tool input received in state: "agent_scratchpad"'
+_TOOL_RESULTS_DELIMITER = "\n\n---\n### Latest Tool Results\n"
+_TOOL_FAILURE_PREFIX = "Tool call failed:"
+_TOOL_FAILURE_STATUSES = {"aborted", "error", "failed", "failure"}
+_REQUEST_OPTIONS_CONTEXT_MARKERS = ("current_request_options", "previous_request_options")
+_CONTEXT_BLOCK_PREFIX = "[Context:"
+_NULL_ARG_SENTINELS = {"none", "null"}
+# Original invocation plus this many retries, only while identical calls keep failing.
+# A recorded success is reused; further exact duplicates are skipped.
+MAX_IDENTICAL_TOOL_CALL_RETRIES = 2
+MAX_IDENTICAL_TOOL_CALL_ATTEMPTS = 1 + MAX_IDENTICAL_TOOL_CALL_RETRIES
+DUPLICATE_TOOL_CALL_SKIP_PREFIX = "Identical tool call skipped:"
+DUPLICATE_TOOL_CALL_SKIP_MESSAGE = (
+    DUPLICATE_TOOL_CALL_SKIP_PREFIX + " `{name}` was already executed {attempts} time(s) with the same "
+    "arguments. Do not call it again with these arguments. Use the previous result and continue."
+)
+DUPLICATE_TOOL_CALL_SKIP_NO_RESULT_MESSAGE = (
+    DUPLICATE_TOOL_CALL_SKIP_PREFIX + " `{name}` already reached the retry limit ({attempts} attempts) "
+    "with the same arguments. Do not call it again with these arguments."
+)
+DUPLICATE_TOOL_CALL_FAILED_SKIP_MESSAGE = (
+    "This tool failed {attempts} times: {last_error}. Retry limit reached; no successful result is available."
+)
+_TRACE_TOOL_NAME = re.compile(r"^(?:Tool|Calling sub-agent):\s*([^\r\n]+)", re.IGNORECASE)
+_PLAN_CHECKBOX_RE = re.compile(r"(?m)^\s*(?:\d+[\.\)]\s+|[-*]\s+)?\[[x ]\]")
+_NUMBERED_PLAN_RE = re.compile(r"(?m)^\s*\d+[\.\)]\s+\S")
+
+
+def trace_step_title(step_number: int, step_type: str, content: str) -> str:
+    """Build a trace heading that exposes the called tool when one is present."""
+    tool_name = _TRACE_TOOL_NAME.match(content.strip())
+    if not tool_name:
+        return f"{step_number} - {step_type}"
+    # This becomes an HTML attribute in the legacy chat response.
+    return f"{step_number} - {step_type}: {escape(tool_name.group(1).strip(), quote=True)}"
+
+
+class TopAgentRequest(ChatRequestOrMessage):
+    """Extended ChatRequestOrMessage with reasoning parameters."""
+
+    llm_reasoning: bool | None = Field(default=None, description="Enable LLM reasoning mode")
+    vlm_reasoning: bool | None = Field(default=None, description="Enable VLM reasoning mode")
+    search_source_type: Literal["video_file", "rtsp"] | None = Field(
+        default="video_file", description="Video source type for search: 'video_file' or 'rtsp'"
+    )
+    use_critic: bool | None = Field(default=None, description="Whether to verify search results with VLM critic agent")
+
+
+def _extract_text_content(message: "Message") -> dict:
+    """
+    Extract text content from a NAT Message for LangChain compatibility.
+
+    NAT Message.content can be:
+    - str: use directly
+    - list[UserContent]: extract text from TextContent items (ignore ImageContent, AudioContent)
+
+    Args:
+        message: NAT Message object
+
+    Returns:
+        Dict with 'role' and 'content' (text string) suitable for message processing
+    """
+    content = message.content
+    if isinstance(content, str):
+        text_content = content
+    elif isinstance(content, list):
+        # Extract text from TextContent items only (skip ImageContent, AudioContent)
+        text_parts = []
+        for item in content:
+            # TextContent has type="text" and a text attribute
+            if getattr(item, "type", None) == "text" and hasattr(item, "text"):
+                text_parts.append(item.text)
+        text_content = "\n".join(text_parts)
+    else:
+        text_content = str(content)
+
+    return {"role": message.role.value if hasattr(message.role, "value") else message.role, "content": text_content}
+
+
+# Helper function to extract text from message content (handles both string and list formats)
+def _get_content_text(msg: BaseMessage) -> str:
+    content = msg.content
+    if isinstance(content, str):
+        return content
+    # content is list[str | dict[str, Any]]
+    # Extract text from list of dicts (e.g., [{'type': 'text', 'text': '...'}])
+    texts: list[str] = []
+    for item in content:
+        if isinstance(item, dict) and "text" in item:
+            texts.append(str(item["text"]))
+        elif isinstance(item, str):
+            texts.append(item)
+    return " ".join(texts)
+
+
+def _tool_response_failed(response: Any) -> bool:
+    """Return whether a tool response explicitly reports failure."""
+    if isinstance(response, dict):
+        success = response.get("success")
+        status = response.get("status")
+    else:
+        success = getattr(response, "success", None)
+        status = getattr(response, "status", None)
+
+    if success is False:
+        return True
+
+    status_value = getattr(status, "value", status)
+    return isinstance(status_value, str) and status_value.lower() in _TOOL_FAILURE_STATUSES
+
+
+def strip_frontend_tags(content: str) -> str:
+    """
+    Strip frontend display tags from message content.
+
+    Args:
+        content: The message content that may contain frontend tags
+
+    Returns:
+        The content with frontend tags replaced by descriptive text
+    """
+    if not content or not isinstance(content, str):
+        return content or ""
+
+    # Replace <incidents>...</incidents> with placeholder
+    cleaned = re.sub(r"<incidents>.*?</incidents>", "[Incident data]", content, flags=re.DOTALL)
+
+    return cleaned
+
+
+async def _augment_context_clip_offsets(message_text: str) -> str:
+    """Add offset seconds alongside the ISO timestamps in a +Chat "[Context: [...]]" block.
+
+    dev-profile-search runs video_understanding in offset mode (seconds since stream
+    start), while the +Chat button emits ISO startTime/endTime. For each sensor-clip entry
+    this adds startOffset/endOffset (seconds) next to the original ISO fields, so the agent
+    can pass offsets to video_understanding while any other consumer still sees the ISO
+    values.
+
+    Additive and non-destructive: the original startTime/endTime are preserved and only
+    sensor-clip entries are touched. It reuses VST helpers read-only and returns the
+    message unchanged (byte-for-byte) when there is no block, parsing fails, or no clip was
+    augmented. The critic path is unaffected — it converts independently from search
+    results, not from this message.
+    """
+    if not message_text:
+        return message_text
+    prefix_idx = message_text.find(_CONTEXT_BLOCK_PREFIX)
+    if prefix_idx == -1:
+        return message_text
+    array_start = message_text.find("[", prefix_idx + len(_CONTEXT_BLOCK_PREFIX))
+    if array_start == -1:
+        return message_text
+    try:
+        clips, array_end = json.JSONDecoder().raw_decode(message_text, array_start)
+    except json.JSONDecodeError:
+        logger.warning("Could not parse +Chat [Context] block; leaving message unchanged")
+        return message_text
+    if not isinstance(clips, list):
+        return message_text
+
+    # Resolve sensor names to stream IDs with a single VST lookup, and memoize each stream's
+    # start time so multiple clips (even from the same sensor) don't trigger redundant VST
+    # round-trips. This turns the previous 2*N calls into 1 + (unique streams).
+    try:
+        name_to_stream_id = await get_name_to_stream_id_map()
+    except Exception as exc:  # keep the message intact on failure; never break the turn
+        logger.warning("Could not fetch VST stream map for [Context] offsets: %s", exc)
+        return message_text
+
+    stream_start_cache: dict[str, datetime] = {}
+
+    changed = False
+    for clip in clips:
+        if not isinstance(clip, dict):
+            continue
+        if clip.get("mediaType") != "sensor-clip":
+            continue
+        sensor_name = clip.get("sensorName")
+        start_iso = clip.get("startTime")
+        end_iso = clip.get("endTime")
+        if not (sensor_name and start_iso and end_iso):
+            continue
+
+        stream_id = name_to_stream_id.get(sensor_name)
+        if stream_id is None and sensor_name in name_to_stream_id.values():
+            # sensorName is already a stream ID.
+            stream_id = sensor_name
+        if stream_id is None:
+            logger.warning("Unknown sensor in [Context] clip, skipping: %s", sensor_name)
+            continue
+
+        try:
+            if stream_id not in stream_start_cache:
+                stream_start_iso, _ = await get_timeline(stream_id)
+                stream_start_cache[stream_id] = iso8601_to_datetime(stream_start_iso)
+            stream_start = stream_start_cache[stream_id]
+            # Add offsets alongside the original ISO fields (non-destructive).
+            clip["startOffset"] = (iso8601_to_datetime(start_iso) - stream_start).total_seconds()
+            clip["endOffset"] = (iso8601_to_datetime(end_iso) - stream_start).total_seconds()
+            changed = True
+        except Exception as exc:  # keep the message intact on failure; never break the turn
+            logger.warning("Failed to add offsets for [Context] clip %s: %s", sensor_name, exc)
+
+    if not changed:
+        return message_text
+    wrapper_close = message_text.find("]", array_end)
+    if wrapper_close == -1:
+        return message_text
+    augmented_block = f"{_CONTEXT_BLOCK_PREFIX} {json.dumps(clips)}]"
+    return message_text[:prefix_idx] + augmented_block + message_text[wrapper_close + 1 :]
+
+
+def _llm_tool_args(args: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop nulls and LLM-rendered null sentinels from a tool-call argument dict."""
+    if not args:
+        return {}
+    return {
+        key: value
+        for key, value in args.items()
+        if value is not None and not (isinstance(value, str) and value.strip().lower() in _NULL_ARG_SENTINELS)
+    }
+
+
+def identical_tool_call_key(name: str, args: dict[str, Any] | None) -> str:
+    """Stable fingerprint for an exact tool name + argument duplicate."""
+    return json.dumps({"name": name, "args": _llm_tool_args(args)}, sort_keys=True, default=str)
+
+
+def reserve_identical_tool_call(state: "TopAgentState", name: str, args: dict[str, Any] | None) -> bool:
+    """Allow the original call, then retries only after recorded failures, up to the cap.
+
+    A recorded success is reused and not executed again. Parallel extras in the same
+    turn are skipped until a failure is stored, so a success cannot consume the retry budget.
+    """
+    key = identical_tool_call_key(name, args)
+    outcome = state.identical_tool_call_last_outcome.get(key, {})
+    if outcome.get("status") == "success":
+        return False
+    attempts = state.identical_tool_call_attempts.get(key, 0)
+    if attempts >= MAX_IDENTICAL_TOOL_CALL_ATTEMPTS:
+        return False
+    if attempts > 0 and outcome.get("status") != "error":
+        return False
+    state.identical_tool_call_attempts[key] = attempts + 1
+    return True
+
+
+def _is_duplicate_tool_call_skip(response: Any) -> bool:
+    """Return whether a ToolMessage is a retry-cap skip, not a fresh execution."""
+    text = _get_content_text(response)
+    return text.startswith(DUPLICATE_TOOL_CALL_SKIP_PREFIX) or text.startswith("This tool failed ")
+
+
+def _looks_like_plan(text: str) -> bool:
+    """Return True when LLM output still looks like an execution plan.
+
+    A non-empty rewrite is not enough: a one-line VLM summary such as
+    "VLM analysis output: 3." would replace the structured plan, after which
+    the agent retries the last successful tool until the recursion limit.
+    """
+    if not text or not text.strip():
+        return False
+    return bool(_PLAN_CHECKBOX_RE.search(text) or _NUMBERED_PLAN_RE.search(text))
+
+
+def _has_unrecovered_tool_failure(call_results: list[tuple[str, bool, int]]) -> bool:
+    """Return True when a failed call has no later successful retry of the same tool.
+
+    Parallel mixed batches (same origin index) stay unrecovered so a successful
+    sibling cannot mark a failed call complete. A later AIMessage that retries
+    the same tool and succeeds is treated as recovery.
+    """
+    for name, failed, origin in call_results:
+        if not failed:
+            continue
+        recovered = any(
+            later_name == name and not later_failed and later_origin > origin
+            for later_name, later_failed, later_origin in call_results
+        )
+        if not recovered:
+            return True
+    return False
+
+
+def _plan_completion_note(completed_tools: list[str]) -> str:
+    """Tell the next turn that a preserved plan already has successful results."""
+    if not completed_tools:
+        return ""
+    names = ", ".join(f"`{name}`" for name in dict.fromkeys(completed_tools))
+    return (
+        f"\n\nNOTE: the plan above could not be refreshed this cycle. "
+        f"{names} already completed successfully and the result appears below. "
+        f"Treat those steps as done and continue with the next pending step; "
+        f"do not repeat a call whose result is already present."
+    )
+
+
+def _record_pending_tool_calls(
+    msg: AIMessage,
+    pending_calls: dict[str, dict[str, Any]],
+    origin: int,
+) -> None:
+    """Index tool calls from an AI message by id for later result matching."""
+    for tc in msg.tool_calls:
+        tc_id = tc["id"] or ""
+        pending_calls[tc_id] = {
+            "name": tc["name"],
+            "args": tc["args"],
+            "origin": origin,
+        }
+
+
+def _record_tool_result(
+    msg: ToolMessage,
+    pending_calls: dict[str, dict[str, Any]],
+    fallback_origin: int,
+    scratchpad_lines: list[str],
+    tool_results_lines: list[str],
+    completed_tools: list[str],
+    call_results: list[tuple[str, bool, int]],
+) -> None:
+    """Record a tool result for the plan-update prompt and the results appendix."""
+    call_info = pending_calls.pop(msg.tool_call_id, None)
+    tool_name = (call_info["name"] if call_info else None) or getattr(msg, "name", None) or "tool"
+    result_text = _get_content_text(msg)
+    tool_failed = _tool_response_failed(msg) or result_text.lstrip().startswith(_TOOL_FAILURE_PREFIX)
+    skipped_duplicate = _is_duplicate_tool_call_skip(msg)
+    origin = call_info["origin"] if call_info else fallback_origin
+    call_results.append((tool_name, tool_failed, origin))
+    # Full result for programmatic appendix
+    tool_results_lines.append(f"`{tool_name}` result:\n{result_text}")
+    if tool_failed or skipped_duplicate:
+        return
+    completed_tools.append(tool_name)
+    if call_info:
+        scratchpad_lines.append(f"Called tool `{tool_name}` with args: {call_info['args']}")
+    # Failed results are deliberately excluded from the plan-tracking
+    # prompt so they cannot be mistaken for successful evidence.
+    truncated = result_text[:500] + "…" if len(result_text) > 500 else result_text
+    scratchpad_lines.append(f"Result from `{tool_name}`: {truncated}")
+
+
+def _summarize_scratchpad_for_plan(
+    scratchpad: list[BaseMessage],
+) -> tuple[str, list[str], list[str], bool]:
+    """Return scratchpad summary, exact results, completed tools, and unrecovered failure."""
+    scratchpad_lines: list[str] = []
+    tool_results_lines: list[str] = []
+    completed_tools: list[str] = []
+    pending_calls: dict[str, dict[str, Any]] = {}  # tool_call_id -> {name, args, origin}
+    call_results: list[tuple[str, bool, int]] = []
+    ai_message_index = 0
+    for msg in scratchpad:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            _record_pending_tool_calls(msg, pending_calls, ai_message_index)
+            ai_message_index += 1
+            continue
+        if isinstance(msg, ToolMessage):
+            _record_tool_result(
+                msg,
+                pending_calls,
+                ai_message_index,
+                scratchpad_lines,
+                tool_results_lines,
+                completed_tools,
+                call_results,
+            )
+            continue
+        text = _get_content_text(msg)
+        if text.strip():
+            scratchpad_lines.append(text)
+    return (
+        "\n".join(scratchpad_lines),
+        tool_results_lines,
+        completed_tools,
+        _has_unrecovered_tool_failure(call_results),
+    )
+
+
+def _split_plan_sections(plan: str) -> tuple[str, str]:
+    """Split the structured plan from the appended latest-tool-results section."""
+    plan_parts = plan.split(_TOOL_RESULTS_DELIMITER, 1)
+    previous_tool_results = plan_parts[1] if len(plan_parts) > 1 else ""
+    return plan_parts[0].rstrip(), previous_tool_results
+
+
+def _plan_update_user_question(state: "TopAgentState") -> str:
+    """Return the current user question text for the plan-update prompt."""
+    if not state.current_message or not hasattr(state.current_message, "content"):
+        return ""
+    if not state.current_message.content:
+        return ""
+    return str(state.current_message.content)
+
+
+def _plan_update_system_content(llm: BaseChatModel, llm_reasoning: bool | None) -> str:
+    """Build the plan-tracking system prompt, including an optional thinking tag."""
+    system_content = (
+        "You are a plan-tracking assistant. You will be given the user's question, an execution plan and "
+        "a scratchpad of previous tool calls and their results.\n\n"
+        "Your job:\n"
+        "- Mark completed steps with [x] and append a concise result summary.\n"
+        "- Keep pending steps with [ ].\n"
+        "- Adjust, add, or remove remaining steps based on what was learned from the results.\n"
+        "- If `vst_video_list` identifies the target as `media_type='video'`, use `video_understanding` for a specific content question; use `lvs_video_understanding` only for whole-video summarization.\n"
+        "- Return ONLY the updated plan — no commentary, no preamble.\n"
+    )
+    thinking_tag = get_thinking_tag(llm, llm_reasoning)
+    if thinking_tag:
+        system_content += f"\n{thinking_tag}"
+    return system_content
+
+
+async def _rewrite_or_preserve_plan(
+    llm: BaseChatModel,
+    callbacks: list[BaseCallbackHandler],
+    llm_reasoning: bool | None,
+    clean_plan: str,
+    scratchpad_summary: str,
+    user_question: str,
+    completed_tools: list[str],
+    has_tool_failure: bool,
+) -> str:
+    """Rewrite the plan with the LLM, or keep it when a tool failure must not be marked done."""
+    if has_tool_failure:
+        # A plan-updating LLM can mistake an exception message for evidence
+        # that the requested work completed. Keep the existing plan pending
+        # whenever any call in a batch fails, including mixed batches, and
+        # expose every exact result to the next turn. Successful results are
+        # therefore preserved without letting failed work be completed or
+        # discarded by an LLM rewrite.
+        logger.warning("Tool failure detected; preserving the current plan without marking steps complete")
+        return clean_plan
+
+    system_content = _plan_update_system_content(llm, llm_reasoning)
+    messages: list[BaseMessage] = [
+        SystemMessage(content=system_content),
+        HumanMessage(
+            content=(
+                f"User question:\n{user_question}\n\n"
+                f"Current plan:\n{clean_plan}\n\nScratchpad (recent tool calls and results):\n{scratchpad_summary}"
+            )
+        ),
+    ]
+    llm_kwargs = get_llm_reasoning_bind_kwargs(llm, llm_reasoning)
+    llm_to_use = llm.bind(**llm_kwargs) if llm_kwargs else llm
+    result = await llm_to_use.ainvoke(messages, config=RunnableConfig(callbacks=callbacks))
+    _, parsed_plan = parse_reasoning_content(result)
+    # parse_reasoning_content already returns plain content as `parsed_plan`,
+    # so it is empty only when the model produced reasoning and nothing else.
+    # Falling back to the raw `result.content` there is actively harmful: it is
+    # either "" (wiping the plan) or the unparsed "<think>...</think>" blob (making
+    # the reasoning *become* the plan). Both strand the agent, which then re-derives
+    # the same tool call every cycle until it exhausts the recursion limit. Keep the
+    # previous plan instead, matching the has_tool_failure branch above.
+    updated_plan = (parsed_plan or "").strip()
+    if _looks_like_plan(updated_plan):
+        return updated_plan
+    logger.warning("Plan update produced no usable plan; preserving the current plan")
+    return clean_plan + _plan_completion_note(completed_tools)
+
+
+def _append_tool_results(plan: str, previous_tool_results: str, tool_results_lines: list[str]) -> str:
+    """Append exact tool results so the next turn still has the raw evidence."""
+    sections: list[str] = []
+    if previous_tool_results:
+        sections.append(previous_tool_results)
+    if tool_results_lines:
+        sections.append("\n\n".join(tool_results_lines))
+    if not sections:
+        return plan
+    return plan + _TOOL_RESULTS_DELIMITER + "\n\n".join(sections)
+
+
+def duplicate_tool_call_skip_payload(state: "TopAgentState", name: str, args: dict[str, Any] | None) -> tuple[str, str]:
+    """Return (content, status) for a skipped identical call from the recorded outcome."""
+    key = identical_tool_call_key(name, args)
+    outcome = state.identical_tool_call_last_outcome.get(key, {})
+    attempts = state.identical_tool_call_attempts.get(key, 0) or MAX_IDENTICAL_TOOL_CALL_ATTEMPTS
+    last_status = str(outcome.get("status", ""))
+    last_content = str(outcome.get("content", "")).strip()
+    if last_status == "success":
+        return (
+            DUPLICATE_TOOL_CALL_SKIP_MESSAGE.format(name=name, attempts=attempts),
+            "success",
+        )
+    if last_status == "error" or last_content.startswith(_TOOL_FAILURE_PREFIX):
+        last_error = last_content or "unknown error"
+        return (
+            DUPLICATE_TOOL_CALL_FAILED_SKIP_MESSAGE.format(
+                attempts=attempts,
+                last_error=last_error,
+            ),
+            "error",
+        )
+    return (
+        DUPLICATE_TOOL_CALL_SKIP_NO_RESULT_MESSAGE.format(name=name, attempts=attempts),
+        "success",
+    )
+
+
+def _store_identical_tool_call_outcome(
+    state: "TopAgentState",
+    name: str,
+    args: dict[str, Any] | None,
+    status: str,
+    content: Any,
+) -> None:
+    """Keep any executed success. A later failure must not hide it."""
+    key = identical_tool_call_key(name, args)
+    previous = state.identical_tool_call_last_outcome.get(key, {})
+    if previous.get("status") == "success" and status != "success":
+        return
+    state.identical_tool_call_last_outcome[key] = {
+        "status": status,
+        "content": str(content),
+    }
+
+
+class TopAgentState(BaseModel):
+    """State for the Top Agent conversation tracking"""
+
+    current_message: BaseMessage | None = Field(default=None, description="Current user query")
+    agent_scratchpad: list[BaseMessage] = Field(default_factory=list, description="Agent thoughts / intermediate steps")
+    conversation_history: list[BaseMessage] = Field(
+        default_factory=list,
+        description="Recent conversation messages as HumanMessage/AIMessage (agent-think stripped)",
+    )
+    iteration_count: int = Field(default=0, description="Current iteration count")
+    final_answer: str = Field(default="", description="Final answer from the agent")
+    tool_failure: str = Field(
+        default="",
+        description="Last unrecovered tool exception, surfaced instead of an answer the agent wrote without it",
+    )
+    plan: str = Field(default="", description="Execution plan drafted by the plan node")
+    previous_conversation: str = Field(default="", description="Previous conversation summary")
+    options: AgentRequestOptions = Field(default_factory=AgentRequestOptions, description="Per-request options")
+    subagent_side_effects: list[str] = Field(
+        default_factory=list,
+        description="Accumulated sub-agent side effects (download links, media URLs)",
+    )
+    previous_options: AgentRequestOptions | None = Field(
+        default=None,
+        description="Per-request options from the previous conversation turn.",
+    )
+    identical_tool_call_attempts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Per-request counts of exact tool name + argument invocations.",
+    )
+    identical_tool_call_last_outcome: dict[str, dict[str, str]] = Field(
+        default_factory=dict,
+        description="Last status and content for each exact tool name + argument fingerprint.",
+    )
+
+
+class TopAgentConfig(FunctionBaseConfig, name="top_agent"):
+    """Config for the Top Agent."""
+
+    workflow_alias: str | None = Field(
+        default=None,
+        description="Alias used by the NAT MCP server to register this workflow.",
+    )
+    tool_names: list[FunctionRef] = Field(
+        default_factory=list,
+        description="The list of regular tools to provide to the top agent (e.g., get_fov_counts_with_chart).",
+    )
+    subagent_names: list[str] = Field(
+        default_factory=list,
+        description="Names of sub-agents that support native streaming (e.g., ['report_agent', 'multi_report_agent']). "
+        "These will be called with their native streaming interface to show internal reasoning steps.",
+    )
+    llm_name: LLMRef = Field(description="The LLM model to use with the top agent.")
+    log_level: str = Field(default="INFO", description="Logging level for the agent (DEBUG, INFO, WARNING, ERROR).")
+    max_iterations: int = Field(default=10, description="Maximum number of iterations for the agent.")
+    max_history: int = Field(
+        default=10,
+        ge=0,
+        description="Maximum number of messages to keep in the conversation history. Set to 0 to disable.",
+    )
+    prompt: str = Field(..., description="The prompt to use for the top agent.")
+    llm_reasoning: bool = Field(default=False, description="Enable LLM reasoning mode.")
+    planning_enabled: bool = Field(default=False, description="Enable plan-then-execute mode.")
+    plan_prompt: str | None = Field(
+        default=None,
+        description="Prompt for the plan node. If None, a default planning instruction is used.",
+    )
+    tool_call_prompt: str | None = Field(
+        default=None,
+        description="Tool call rules prompt. If None and planning is enabled, extracted from the main prompt via LLM.",
+    )
+    response_format_prompt: str | None = Field(
+        default=None,
+        description="Response format rules prompt. If None and planning is enabled, extracted from the main prompt via LLM.",
+    )
+
+    # Postprocessing configuration
+    postprocessing: PostprocessingConfig | None = Field(
+        default=None,
+        description="Postprocessing configuration.",
+    )
+
+
+class TopAgent(AsyncMixin):
+    """Top-level routing agent with native tool calling"""
+
+    llm: BaseChatModel
+    llm_with_tools: Runnable[Any, BaseMessage]
+    subagent_functions: dict[str, Any]
+    subagent_names: set[str]
+    callbacks: list[BaseCallbackHandler]
+    max_iterations: int
+    prompt: ChatPromptTemplate
+    plan_exec_prompt: ChatPromptTemplate | None
+    tools_dict: dict[str, BaseTool]
+    graph: CompiledStateGraph
+    checkpointer: InMemorySaver
+    planning_enabled: bool
+    plan_prompt: str | None
+    plan_system_prompt: str
+    tool_call_prompt: str
+    response_format_prompt: str
+    request_options_context_enabled: bool
+
+    @override
+    async def __ainit__(
+        self,
+        llm: BaseChatModel,
+        prompt: ChatPromptTemplate,
+        tools: list[BaseTool] | None = None,
+        subagents: list[BaseTool] | None = None,
+        subagent_functions: dict[str, Any] | None = None,
+        callbacks: list[BaseCallbackHandler] | None = None,
+        max_iterations: int = 10,
+        max_history: int = 3,
+        postprocessing_config: PostprocessingConfig | None = None,
+        postprocessing_llm: BaseChatModel | None = None,
+        planning_enabled: bool = False,
+        plan_prompt: str | None = None,
+        plan_exec_prompt: ChatPromptTemplate | None = None,
+        plan_system_prompt: str = "",
+        tool_call_prompt: str = "",
+        response_format_prompt: str = "",
+    ) -> None:
+        logger.info("Initializing Top Agent")
+        await super().__ainit__()
+
+        self.llm = llm
+        self.max_history = max_history
+        tools_list = tools or []
+        subagents_list = subagents or []
+
+        # Merge tools and subagents for LLM binding
+        subagents_plus_tools = tools_list + subagents_list
+        self.llm_with_tools = llm.bind_tools(subagents_plus_tools) if subagents_plus_tools else llm
+
+        # Track which tools are subagents and store their native functions
+        self.subagent_functions = subagent_functions or {}
+        self.subagent_names = set(self.subagent_functions.keys())
+
+        self.callbacks = callbacks or []
+        self.max_iterations = max_iterations
+
+        # Initialize postprocessing if config is present
+        self.postprocessing = (
+            PostprocessingNode(postprocessing_config, llm=postprocessing_llm) if postprocessing_config else None
+        )
+
+        logger.info(
+            "Setting up top agent with %d regular tools, %d sub-agents",
+            len(tools_list),
+            len(subagents_list),
+        )
+        if self.subagent_names:
+            logger.info("Sub-agents with native streaming: %s", list(self.subagent_names))
+
+        # Store prompt for dynamic agent creation with model parameters
+        self.prompt = prompt
+        self.plan_exec_prompt = plan_exec_prompt
+        self.planning_enabled = planning_enabled
+        self.plan_prompt = plan_prompt
+        self.plan_system_prompt = plan_system_prompt
+        self.tool_call_prompt = tool_call_prompt
+        self.response_format_prompt = response_format_prompt
+        self.request_options_context_enabled = self._prompt_requests_request_options_context(
+            str(prompt),
+            plan_prompt,
+            plan_system_prompt,
+            tool_call_prompt,
+            response_format_prompt,
+        )
+        self.tools_dict = {tool.name: tool for tool in subagents_plus_tools}
+        self.graph = await self._build_graph()
+        logger.info("Successfully initialized Top Agent with %d total tools", len(self.tools_dict))
+
+    @staticmethod
+    def _prompt_requests_request_options_context(*prompt_parts: str | None) -> bool:
+        """Return True when config prompts explicitly request request-option context."""
+        return any(
+            marker in prompt_part
+            for prompt_part in prompt_parts
+            if prompt_part
+            for marker in _REQUEST_OPTIONS_CONTEXT_MARKERS
+        )
+
+    def _get_tool(self, tool_name: str) -> BaseTool | None:
+        """Get a tool by name from the tools dict."""
+        tool = self.tools_dict.get(tool_name)
+        if tool is None:
+            logger.error("Tool not found: %s. Available tools: %s", tool_name, list(self.tools_dict.keys()))
+        return tool
+
+    async def _plan_update_node(self, state: TopAgentState) -> TopAgentState:
+        """
+        Plan-update node: uses the LLM to dynamically update the execution plan
+        based on tool results in the scratchpad, then clears the scratchpad.
+
+        The LLM handles structural updates (marking [x], adjusting steps).
+        Exact tool results are appended programmatically so nothing is lost.
+        """
+        if not state.agent_scratchpad:
+            return state
+
+        writer = get_stream_writer()
+        logger.debug("Starting Plan Update Node")
+
+        scratchpad_summary, tool_results_lines, completed_tools, has_tool_failure = _summarize_scratchpad_for_plan(
+            state.agent_scratchpad
+        )
+        clean_plan, previous_tool_results = _split_plan_sections(state.plan)
+        updated_plan = await _rewrite_or_preserve_plan(
+            self.llm,
+            self.callbacks,
+            state.options.llm_reasoning,
+            clean_plan,
+            scratchpad_summary,
+            _plan_update_user_question(state),
+            completed_tools,
+            has_tool_failure,
+        )
+        updated_plan = _append_tool_results(updated_plan, previous_tool_results, tool_results_lines)
+
+        logger.info("Plan update node produced updated plan:\n%s", updated_plan)
+        writer(AgentMessageChunk(type=AgentMessageChunkType.THOUGHT, content="Updated Plan:\n\n" + updated_plan))
+
+        state.plan = updated_plan
+        state.agent_scratchpad = []
+        return state
+
+    def _tool_accepts_param(self, tool_name: str, param_name: str) -> bool:
+        """Check if a tool accepts a specific parameter by inspecting its schema."""
+        tool = self.tools_dict.get(tool_name)
+        if tool and hasattr(tool, "args_schema") and tool.args_schema is not None:
+            schema_fields = getattr(tool.args_schema, "model_fields", {})
+            return param_name in schema_fields
+        return False
+
+    def _request_options_context(self, state: TopAgentState) -> str:
+        """Return generic request option context for prompts that need it."""
+        if not getattr(self, "request_options_context_enabled", False) or state.previous_options is None:
+            return ""
+        options_context = json.dumps(
+            {
+                "current_request_options": state.options.model_dump(mode="json"),
+                "previous_request_options": state.previous_options.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        return (
+            "\n\nRequest options context for the current and previous user turns. "
+            "Use this only when it is relevant to the user's request.\n"
+            f"{options_context}"
+        )
+
+    async def astream(
+        self,
+        input_messages: list[BaseMessage],
+        options: AgentRequestOptions | None = None,
+    ) -> AsyncGenerator[AgentMessageChunk]:
+        """Stream the agent's response."""
+        if options is None:
+            options = AgentRequestOptions()
+
+        if not input_messages:
+            raise RuntimeError(EMPTY_MESSAGES_ERROR)
+
+        current_message = input_messages[-1]
+
+        logger.info(f"Current message: {current_message.content[:50] if current_message.content else '(empty)'}...")
+
+        # Get conversation_id from ContextVar
+        thread_id = ContextState.get().conversation_id.get()
+        previous_state = self.graph.get_state({"configurable": {"thread_id": thread_id}}).values
+
+        if previous_state and self.max_history > 0:
+            # Follow up question, add previous messages to the current messages
+            logger.info("Follow a previous conversation %s: %s", thread_id, previous_state)
+            # Retrieve conversation history from previous state
+            conversation_history = previous_state.get("conversation_history", [])
+            logger.info(f"Retrieved {len(conversation_history)} messages of conversation history from previous state")
+
+            # Only summarize when history has reached max_history.
+            # Summarize the older half into previous_conversation, keep the newer half.
+            previous_conversation = previous_state.get("previous_conversation", "")
+            half = self.max_history // 2
+
+            if len(conversation_history) >= self.max_history:
+                older_half = conversation_history[:half]
+                conversation_history = conversation_history[half:]
+                logger.info(
+                    "History reached max_history (%d), summarizing older %d messages, keeping newer %d",
+                    self.max_history,
+                    len(older_half),
+                    len(conversation_history),
+                )
+
+                older_text = "\n".join(_get_content_text(m) for m in older_half)
+
+                summary_thinking_tag = get_thinking_tag(self.llm, options.llm_reasoning)
+                summary_prompt = (
+                    "Briefly summarize the conversation history in 2-3 sentences:\n"
+                    "- What did the user ask?\n"
+                    "- What tools were called?\n"
+                    "- What was the high-level outcome?\n\n"
+                    "Keep it concise.\n\n"
+                    "Older conversation summary: {older_conversation_summary}\n"
+                    "Latest messages:\n{latest_messages}"
+                )
+
+                summary_messages: list[BaseMessage] = []
+                if summary_thinking_tag:
+                    summary_messages.append(SystemMessage(content=summary_thinking_tag))
+                summary_messages.append(
+                    HumanMessage(
+                        content=summary_prompt.format(
+                            older_conversation_summary=previous_conversation,
+                            latest_messages=older_text,
+                        )
+                    )
+                )
+
+                llm_kwargs = get_llm_reasoning_bind_kwargs(self.llm, options.llm_reasoning)
+                llm_to_use = self.llm.bind(**llm_kwargs) if llm_kwargs else self.llm
+                summary_result = await llm_to_use.ainvoke(
+                    summary_messages, config=RunnableConfig(callbacks=self.callbacks)
+                )
+                summary_reasoning, summary_content = parse_reasoning_content(summary_result)
+                if summary_reasoning:
+                    previous_conversation = summary_content
+                else:
+                    previous_conversation = summary_content or summary_result.content
+
+                logger.info(
+                    "Summarized older history into previous_conversation (%d chars)", len(previous_conversation)
+                )
+
+            input_state = TopAgentState(
+                current_message=copy.deepcopy(current_message),
+                previous_conversation=previous_conversation,
+                conversation_history=list(conversation_history),
+                agent_scratchpad=[],
+                final_answer="",
+                options=options,
+                previous_options=copy.deepcopy(previous_state.get("options")),
+            )
+        else:
+            input_state = TopAgentState(
+                current_message=copy.deepcopy(current_message),
+                previous_conversation="",
+                conversation_history=[],
+                agent_scratchpad=[],
+                options=options,
+            )
+
+        try:
+            config: RunnableConfig = RunnableConfig(
+                configurable={
+                    "thread_id": thread_id,
+                    "stream": True,
+                },
+                recursion_limit=self.max_iterations,
+            )
+            async for chunk in self.graph.astream(input=input_state, config=config, stream_mode="custom"):
+                if isinstance(chunk, AgentMessageChunk):
+                    yield chunk
+
+        except Exception as ex:
+            logger.exception("Failed to stream agent")
+            error_chunk = AgentMessageChunk(
+                type=AgentMessageChunkType.ERROR,
+                content=f"Error: {ex}",
+            )
+            yield error_chunk
+            user_message = "Sorry, I wasn't able to complete your request. Please try again. If the issue persists, please contact your administrator."
+            yield AgentMessageChunk(type=AgentMessageChunkType.FINAL, content=user_message)
+
+    async def _plan_node(self, state: TopAgentState) -> TopAgentState:
+        """
+        Planning node: drafts a step-by-step execution plan using tool names/descriptions only.
+
+        Invokes the LLM without tool bindings so it focuses on planning rather than executing.
+        The resulting plan is stored in state.plan and emitted as a THOUGHT chunk.
+        """
+        writer = get_stream_writer()
+        logger.debug("Starting Plan Node")
+
+        if state.current_message is None:
+            raise RuntimeError(EMPTY_MESSAGES_ERROR)
+
+        question = state.current_message.content
+        if not isinstance(question, str):
+            question = str(question)
+
+        # TODO: Hack for UI to show the uploaded video, use commands "/show" to by pass plan in next release.
+        lowered_question = question.lower()
+        show_video_prefix = "let's show the videos just uploaded"
+        if lowered_question.startswith(show_video_prefix):
+            logger.info("Plan node: by pass plan for showing uploaded video")
+            names_raw = question[len(show_video_prefix) :].removesuffix("?").strip()
+            state.plan = (
+                f"1. You MUST call the vst_video_clip tool in parallel, once for each name in: {names_raw}. "
+                "Pass the name as the sensor_id argument. "
+                "Do NOT invent, guess, or template the video URL - it MUST come from the tool result.\n"
+                "2. For each tool result, format an HTML video tag using the EXACT video_url "
+                'returned by the tool: <video src="<VIDEO_URL_FROM_TOOL_RESULT>" '
+                'alt="<NAME>"><NAME></video>. '
+                "<VIDEO_URL_FROM_TOOL_RESULT> is a substitution placeholder - replace it with the "
+                "exact url string the tool returned, not with the literal text "
+                '"<VIDEO_URL_FROM_TOOL_RESULT>" and not with any example domain like '
+                "vst.example.com.\n"
+                "3. If a vst_video_clip call fails or returns no url, say so for that name "
+                "instead of inventing a URL."
+            )
+            return state
+
+        # Build one-line description per tool
+        tool_descriptions = "\n".join(f"- {t.name}: {t.description}" for t in self.tools_dict.values())
+        tool_descriptions_block = f"\n\nAvailable tools:\n{tool_descriptions}"
+        previous_exec_feedback = ""
+        if state.agent_scratchpad:
+            previous_exec_feedback = "\n\nPrevious execution feedback:\n" + "\n".join(
+                _get_content_text(m) for m in state.agent_scratchpad
+            )
+
+        planning_instruction = self.plan_prompt or (
+            "Review the available tools, the conversation history, and the user's question, "
+            "then produce a concise numbered execution plan. Start each step with a tool name and a brief description of the step.\n"
+            "Put relevant context (e.g. sensor IDs or time ranges) from the conversation history directly in the plan steps "
+            "so the execution agent does not need to re-read the history.\n"
+            "Never answer with sensor names, incidents, counts, media URLs, or other deployment data from memory. "
+            "When an available tool can retrieve the answer, the plan MUST call that tool.\n"
+            "If the user's request is too ambiguous to build a reliable plan, respond with EXACTLY:\n"
+            "[USER] <your clarifying question>\n"
+            "If user's question can be answered directly without any tools, respond with EXACTLY:\n"
+            "[USER] <your answer>\n"
+            "This will be sent back to the user directly — do NOT produce a plan in that case.\n\n"
+            "Example plan:\n"
+            "1. Call `get_sensor_ids` — resolve the camera the user mentioned (camera 3 from prior turn).\n"
+            "2. Call `get_event_clips` with sensor_id from step 1 and time range 08:00-09:00 from the query.\n"
+            "3. Summarize the clips and return them to the user.\n\n"
+            "Examples that require a clarifying question:\n"
+            "- Can you generate a report? (And the previous conversation did not mention any video name.)\n"
+            "- Can you show me the video? (And the previous conversation did not mention any video name.)\n"
+            "Example clarifying question:\n"
+            "[USER] Which video or camera are you referring to? "
+            "Please provide a sensor name or video ID so I can look it up.\n\n"
+            "Example direct answer:\n"
+            "what tools are available?\n"
+            "[USER] The available tools are: ... (list of tools)\n"
+        )
+
+        # Include previous conversation summary in the system message so the plan can reference prior context
+        logger.debug("Planning instruction: " + planning_instruction)
+        logger.debug("Tool descriptions: " + tool_descriptions_block)
+        summary_block = ""
+        if state.previous_conversation:
+            summary_block = f"\n\nPrevious conversation summary:\n{state.previous_conversation}\n\n"
+            logger.debug("Summary: " + summary_block)
+        request_options_context = self._request_options_context(state)
+        system_content = (
+            self.plan_system_prompt
+            + planning_instruction
+            + tool_descriptions_block
+            + summary_block
+            + request_options_context
+            + previous_exec_feedback
+        )
+
+        thinking_tag = get_thinking_tag(self.llm, state.options.llm_reasoning)
+        if thinking_tag:
+            system_content += f"\n{thinking_tag}"
+
+        # Include recent conversation history so the plan can reference prior turns
+        messages: list[BaseMessage] = [SystemMessage(content=system_content)]
+
+        if state.conversation_history and self.max_history > 0:
+            messages.extend(state.conversation_history)
+        messages.append(HumanMessage(content="User question: " + question))
+
+        llm_kwargs = get_llm_reasoning_bind_kwargs(self.llm, state.options.llm_reasoning)
+        # Plan without tool bindings. A tool-bound model answers a planning prompt with the single
+        # next action and no text at all, so a multi-step plan (e.g. `vst_video_list` to resolve the
+        # media type, then `report_agent` to build the report) collapses to its first step and every
+        # later step — including the one that produces the artifacts — is silently dropped.
+        llm_to_use = self.llm.bind(**llm_kwargs) if llm_kwargs else self.llm
+
+        result = await llm_to_use.ainvoke(messages, config=RunnableConfig(callbacks=self.callbacks))
+
+        plan_reasoning, plan_text = parse_reasoning_content(result)
+        if not plan_text:
+            # Same hazard as plan_update: the raw content here is the unparsed reasoning
+            # blob. An empty initial plan is recoverable (plan_update builds one from the
+            # first tool result); a plan that is really a think-blob poisons every later turn.
+            plan_text = ""
+            logger.warning("Plan node produced no usable plan; continuing with an empty plan")
+
+        # Nemotron can return reasoning without a final plan when thinking is enabled. An empty
+        # plan falls back to the general routing prompt, which may treat "video summarization" as
+        # a request for lvs_video_understanding and return prose before report_agent can create
+        # artifacts. Limit this recovery to report tools whose schema accepts sensor_id, so it
+        # does not rewrite incident-report plans on profiles with a different report contract.
+        report_tool = self.tools_dict.get("report_agent")
+        report_fields = getattr(getattr(report_tool, "args_schema", None), "model_fields", {})
+        if not plan_text and "report" in lowered_question and "sensor_id" in report_fields:
+            plan_text = (
+                "1. Call `report_agent` with every media name from the user's request (as a single list when the "
+                "request names more than one) and the original request as `user_query`, then present the "
+                "generated report."
+            )
+            logger.warning("Recovered an empty uploaded-video report plan with a direct report_agent step")
+
+        logger.debug("Plan node produced plan:\n%s", plan_text)
+        if plan_reasoning:
+            logger.debug("Plan node reasoning:\n%s", plan_reasoning)
+
+        # Check if the planner wants to ask the user for clarification
+        if plan_text.strip().startswith(PLAN_CLARIFY_PREFIX):
+            clarification = plan_text.strip()[len(PLAN_CLARIFY_PREFIX) :].strip()
+            if "report" in question.lower() and "incident_id" in report_fields and "sensor_id" not in report_fields:
+                state.plan = (
+                    "1. Call `report_agent` without a sensor filter to retrieve the most recent incident "
+                    "and generate its detailed report."
+                )
+                logger.warning("Rejected unnecessary camera clarification for incident report: %s", clarification)
+                writer(AgentMessageChunk(type=AgentMessageChunkType.THOUGHT, content="Plan: \n\n" + state.plan))
+                return state
+            if "vst_sensor_list" in self.tools_dict and any(
+                term in question.lower() for term in ("available sensor", "available camera", "sensor id", "camera id")
+            ):
+                state.plan = "1. Call `vst_sensor_list` to retrieve the available sensor names from VST."
+                logger.warning("Rejected ungrounded planner answer for sensor-list query: %s", clarification)
+                writer(AgentMessageChunk(type=AgentMessageChunkType.THOUGHT, content="Plan: \n\n" + state.plan))
+                return state
+            logger.info("Plan node requesting clarification: %s", clarification)
+            state.final_answer = clarification
+            return state
+
+        writer(AgentMessageChunk(type=AgentMessageChunkType.THOUGHT, content="Plan: \n\n" + plan_text))
+        state.plan = plan_text
+        logger.info(f"Plan node produced plan: {plan_text}")
+        return state
+
+    async def agent_node(self, state: TopAgentState) -> TopAgentState:
+        """
+        Main reasoning node for the top agent.
+
+        This node calls the LLM to decide what action to take next.
+        Returns the updated state with the agent's response.
+        """
+        writer = get_stream_writer()
+        logger.debug("Starting Agent Node")
+
+        if state.current_message is None:
+            raise RuntimeError(EMPTY_MESSAGES_ERROR)
+        if (
+            len(state.agent_scratchpad) == 0
+            and isinstance(state.current_message.content, str)
+            and state.current_message.content.strip() == ""
+        ):
+            logger.error("No human input passed to the agent.")
+            writer(AgentMessageChunk(type=AgentMessageChunkType.FINAL, content=NO_INPUT_ERROR_MESSAGE))
+            state.final_answer = NO_INPUT_ERROR_MESSAGE
+            return state
+
+        question = state.current_message.content
+
+        try:
+            # Get the thinking tag based on the LLM model and llm_reasoning state
+            thinking_tag = get_thinking_tag(self.llm, state.options.llm_reasoning)
+            thinking_tag_formatted = f"\n{thinking_tag}" if thinking_tag else ""
+
+            if thinking_tag:
+                logger.info(f"Applying thinking tag: '{thinking_tag}'")
+
+            llm_kwargs = get_llm_reasoning_bind_kwargs(self.llm, state.options.llm_reasoning)
+            llm_to_use = self.llm_with_tools.bind(**llm_kwargs) if llm_kwargs else self.llm_with_tools
+            request_options_context = self._request_options_context(state)
+
+            if state.plan and self.plan_exec_prompt is not None:
+                prompt_to_use = self.plan_exec_prompt
+                logger.info("Using plan (updated by plan_update node):\n%s", state.plan)
+                invoke_kwargs: dict[str, Any] = {
+                    "question": question,
+                    "plan_section": state.plan,  # Already updated by plan_update node
+                    "request_options_context": request_options_context,
+                    "current_time": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    "thinking_tag": thinking_tag_formatted,
+                }
+            else:
+                prompt_to_use = self.prompt
+                invoke_kwargs = {
+                    "question": question,
+                    "conversation_summary": state.previous_conversation,
+                    "agent_scratchpad": state.agent_scratchpad,
+                    "conversation_history": state.conversation_history,
+                    "request_options_context": request_options_context,
+                    "current_time": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    "thinking_tag": thinking_tag_formatted,
+                }
+
+            agent_to_use = prompt_to_use | llm_to_use
+            output_message = await agent_to_use.ainvoke(
+                invoke_kwargs,
+                config=RunnableConfig(callbacks=self.callbacks),
+            )
+
+            reasoning, final_result = parse_reasoning_content(output_message)
+            logger.debug("The user's question was: %s", question)
+            logger.debug("The agent's thoughts are:\n%s", reasoning)
+            logger.debug("The agent's final result is:\n%s", final_result)
+            if reasoning:
+                writer(AgentMessageChunk(type=AgentMessageChunkType.THOUGHT, content=reasoning))
+
+            # Get tool_calls if output_message is AIMessage
+            tool_calls: list[Any] = []
+            if isinstance(output_message, AIMessage) and output_message.tool_calls:
+                tool_calls = output_message.tool_calls
+
+            # Check if we have a final answer
+            if final_result and not tool_calls:
+                if state.tool_failure:
+                    # The agent stopped calling tools after one raised, so this answer is written from
+                    # memory rather than from the tool. Relay the failure instead of the invention.
+                    state.final_answer = state.tool_failure
+                    logger.warning("Relayed the unrecovered tool failure instead of an ungrounded answer")
+                else:
+                    state.final_answer = final_result
+                    logger.debug("Agent provided final answer (pending postprocessing validation)")
+                # Still add the final answer to the scratchpad for the conversation history summary and postprocessing retries
+
+            # Add agent response to scratchpad
+            # Combine reasoning and content to preserve full context
+            # Format the summary response without think tags to avoid confusion with the think tag in the system message
+            if reasoning:
+                full_content = f"The model's reasoning is: {reasoning}\nThe model's answer is: {final_result or ''}"
+            else:
+                full_content = final_result or ""
+
+            # Local Nemotron Nano 9b v2 NIM requires content to be non-empty
+            # Use a single space as a minimal valid placeholder instead of empty string
+            model_name = getattr(self.llm, "model_name", "") or getattr(self.llm, "model", "")
+            model_name = str(model_name).lower() if model_name else ""
+            if full_content.strip() == "":
+                logging.info("Full content is empty, setting to 'Agent wants to call tools.")
+                full_content = "Agent wants to call tools."
+
+            if tool_calls:
+                state.agent_scratchpad.append(AIMessage(content=full_content, tool_calls=tool_calls))
+            else:
+                state.agent_scratchpad.append(AIMessage(content=full_content))
+
+            return state
+
+        except Exception as e:
+            logger.exception("Failed to call agent_node")
+            raise e
+
+    async def tool_or_subagent_node(self, state: TopAgentState) -> TopAgentState:
+        """
+        Execute tools or sub-agents requested by the agent.
+
+        This node can handle both:
+        - Regular tools (like video_analytics_mcp.video_analytics.get_sensor_ids)
+        - Sub-agents (like report_agent) that may return structured output with thinking traces
+        """
+        writer = get_stream_writer()
+        try:
+            logger.debug("Starting tool/sub-agent execution")
+            if not state.agent_scratchpad or len(state.agent_scratchpad) == 0:
+                raise RuntimeError(EMPTY_SCRATCHPAD_ERROR)
+            last_message = state.agent_scratchpad[-1]
+            if not isinstance(last_message, AIMessage):
+                raise RuntimeError("Expected AIMessage in agent_scratchpad for tool execution")
+            agent_output: AIMessage = last_message
+            tool_calls: list[Any] = agent_output.tool_calls if hasattr(agent_output, "tool_calls") else []
+            if not tool_calls:
+                logger.warning("No tool calls found in agent output")
+                return state
+            requested_tool_names = [tool_call["name"] for tool_call in tool_calls]
+            requested_tools = [self._get_tool(tool_name) for tool_name in requested_tool_names]
+            if not requested_tools:
+                configured_tool_names = list(self.tools_dict.keys())
+                logger.warning(
+                    "Some requested tools not found: %s. Available: %s",
+                    requested_tool_names,
+                    configured_tool_names,
+                )
+                error_message = HumanMessage(
+                    content=TOOL_NOT_FOUND_ERROR_MESSAGE.format(
+                        tool_name=requested_tool_names,
+                        tools=configured_tool_names,
+                    ),
+                )
+                state.agent_scratchpad.append(error_message)
+                return state
+
+            # Reserve identical (name, args) slots sequentially so parallel calls cannot exceed the cap.
+            skipped_tool_call_ids: set[str] = set()
+            for tool, tool_call in zip(requested_tools, tool_calls, strict=False):
+                if tool is None:
+                    continue
+                if not reserve_identical_tool_call(state, tool_call["name"], tool_call.get("args")):
+                    skipped_tool_call_ids.add(tool_call["id"])
+
+            # Run the tool/sub-agent
+            async def run_tool(tool: BaseTool | None, tool_call: dict[str, Any]) -> ToolMessage:
+                try:
+                    if tool is None:
+                        return ToolMessage(
+                            name=tool_call["name"],
+                            tool_call_id=tool_call["id"],
+                            content=f"Tool '{tool_call['name']}' not found",
+                        )
+
+                    tool_response: Any = None
+
+                    # Check if this is a sub-agent that we should call natively for streaming
+                    tool_name = tool_call["name"]
+                    is_subagent = tool_name in self.subagent_names
+                    if tool_call["id"] in skipped_tool_call_ids:
+                        skip_content, skip_status = duplicate_tool_call_skip_payload(
+                            state, tool_name, tool_call.get("args")
+                        )
+                        logger.warning(
+                            "Skipping duplicate %s after %d identical attempts",
+                            tool_name,
+                            state.identical_tool_call_attempts.get(
+                                identical_tool_call_key(tool_name, tool_call.get("args")), 0
+                            ),
+                        )
+                        writer(
+                            AgentMessageChunk(
+                                type=AgentMessageChunkType.TOOL_CALL,
+                                content=(
+                                    f"Tool: {tool_name}\n"
+                                    f"Args: {_llm_tool_args(tool_call.get('args'))}\n"
+                                    f"Result: {skip_content}"
+                                ),
+                            )
+                        )
+                        return ToolMessage(
+                            name=tool_name,
+                            tool_call_id=tool_call["id"],
+                            content=skip_content,
+                            status=skip_status,
+                        )
+
+                    # Caption HITL (lvs_config_media) is allowed only on an explicit user
+                    # request. Summarize/report not_configured must stop in chat instead.
+                    if tool_name == LVS_CONFIG_MEDIA_TOOL_NAME:
+                        user_text = (
+                            _get_content_text(state.current_message) if state.current_message is not None else ""
+                        )
+                        if not user_requested_caption_generation(user_text):
+                            logger.warning(
+                                "Blocked %s: current user message is not an explicit caption-generation request",
+                                tool_name,
+                            )
+                            if not state.final_answer:
+                                state.final_answer = LVS_CONFIG_MEDIA_BLOCKED_MESSAGE
+                            return ToolMessage(
+                                name=tool_name,
+                                tool_call_id=tool_call["id"],
+                                content=LVS_CONFIG_MEDIA_BLOCKED_MESSAGE,
+                            )
+
+                    logger.info(f"Executing tool/sub-agent: {tool_name}")
+
+                    # Build tool args once, filtering actual nulls and common LLM-rendered null sentinels.
+                    tool_args = _llm_tool_args(tool_call.get("args"))
+                    if self._tool_accepts_param(tool_name, "request_options"):
+                        tool_args["request_options"] = state.options.model_dump(mode="json")
+                        logger.info("Passing request_options to %s", tool_name)
+                    if self._tool_accepts_param(tool_name, "llm_reasoning"):
+                        tool_args["llm_reasoning"] = state.options.llm_reasoning
+                        logger.info(f"Passing llm_reasoning={state.options.llm_reasoning} to {tool_name}")
+                    if self._tool_accepts_param(tool_name, "vlm_reasoning"):
+                        tool_args["vlm_reasoning"] = state.options.vlm_reasoning
+                        logger.info(f"Passing vlm_reasoning={state.options.vlm_reasoning} to {tool_name}")
+                    if self._tool_accepts_param(tool_name, "use_critic"):
+                        tool_args["use_critic"] = state.options.use_critic
+                        logger.info(f"Passing use_critic={state.options.use_critic} to {tool_name}")
+
+                    # Use native streaming for configured sub-agents
+                    final_chunks = []
+                    if is_subagent:
+                        # Yield sub-agent call message before processing
+                        subagent_msg = f"Calling sub-agent: {tool_name}\nArgs: {tool_args}"
+                        writer(AgentMessageChunk(type=AgentMessageChunkType.SUBAGENT_CALL, content=subagent_msg))
+
+                        # Emit TOOL_START telemetry for subagent
+                        subagent_run_id = str(uuid4())
+                        subagent_start_time = time.time()
+                        saved_context = None
+                        try:
+                            step_manager = Context.get().intermediate_step_manager
+                            # Save the current context state before emitting TOOL_START
+                            context_state = step_manager._context_state
+                            saved_context = context_state.active_span_id_stack.get().copy()
+
+                            tool_start_payload = IntermediateStepPayload(
+                                event_type=IntermediateStepType.TOOL_START,
+                                framework=LLMFrameworkEnum.LANGCHAIN,
+                                name=tool_name,
+                                UUID=subagent_run_id,
+                                data=StreamEventData(input=json.dumps(tool_args)),
+                                metadata=TraceMetadata(tool_inputs=tool_args),
+                                usage_info=UsageInfo(token_usage=TokenUsageBaseModel()),
+                            )
+                            step_manager.push_intermediate_step(tool_start_payload)
+                            logger.info(f"TOOL_START telemetry emitted for {tool_name} with UUID {subagent_run_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to emit TOOL_START telemetry for {tool_name}: {e}", exc_info=True)
+
+                        nat_function = self.subagent_functions[tool_name]
+                        async for chunk in nat_function.astream(tool_args):
+                            if isinstance(chunk, AgentMessageChunk):
+                                logger.debug(f"Received AgentMessageChunk from {tool_name}: type={chunk.type}")
+                                if chunk.type == AgentMessageChunkType.FINAL:
+                                    # Try to parse as AgentOutput JSON for sub-agents
+                                    try:
+                                        agent_output = AgentOutput.model_validate_json(chunk.content)
+                                        logger.debug(f"Received AgentOutput from {tool_name} via FINAL chunk")
+                                        final_content_parts = []
+                                        if agent_output.messages:
+                                            final_content_parts.extend(agent_output.messages)
+                                        if agent_output.side_effects:
+                                            for value in agent_output.side_effects.values():
+                                                final_content_parts.append(f"{value}")
+
+                                        final_content = "\n".join(final_content_parts)
+                                        final_chunks.append(final_content)
+
+                                        # Don't set final_answer from sub-agents so the planning is not blocked
+                                        # Accumulate side_effects (download links, media URLs)
+                                        # so they can be appended in finalize_node.
+                                        side_effects_parts = []
+                                        if agent_output.side_effects:
+                                            # Keep artifact_note in scratchpad context only
+                                            side_effects_parts = [
+                                                f"{value}"
+                                                for key, value in agent_output.side_effects.items()
+                                                if key != "artifact_note"
+                                            ]
+                                            if side_effects_parts:
+                                                state.subagent_side_effects.append("\n".join(side_effects_parts))
+                                        logger.info(
+                                            f"Accumulated side_effects from {tool_name}: {len(side_effects_parts)} items"
+                                        )
+
+                                        if agent_output.messages:
+                                            messages_text = " ".join(agent_output.messages)
+                                        else:
+                                            messages_text = final_content
+                                        artifact_note = (
+                                            str(agent_output.side_effects.get("artifact_note", ""))
+                                            if agent_output.side_effects
+                                            else ""
+                                        )
+                                        if artifact_note:
+                                            messages_text = (
+                                                f"{messages_text}\n\n{artifact_note}"
+                                                if messages_text
+                                                else artifact_note
+                                            )
+                                        normalized_messages = messages_text.strip().lower()
+                                        if agent_output.status == "error" or normalized_messages.startswith(
+                                            "no incidents found"
+                                        ):
+                                            state.final_answer = agent_output.error_message or messages_text
+                                        tool_response = f"tool: {tool_name} completed. Result: {messages_text}"
+                                    except (json.JSONDecodeError, Exception):
+                                        # Not AgentOutput JSON, treat as plain text
+                                        final_chunks.append(chunk.content)
+                                        logger.info(f"Raw output from {tool_name}")
+                                        tool_response = chunk.content
+                                else:
+                                    # For non-FINAL chunks, yield directly
+                                    writer(chunk)
+                            else:
+                                # Store non-AgentMessageChunk results
+                                final_chunks.append(str(chunk))
+                                tool_response = chunk
+
+                        # Emit TOOL_END telemetry for subagent
+                        try:
+                            step_manager = Context.get().intermediate_step_manager
+                            subagent_output = (
+                                tool_response or "\n".join(final_chunks) or f"Subagent {tool_name} completed"
+                            )
+                            logger.info(
+                                f"Emitting TOOL_END for {tool_name} with UUID {subagent_run_id}, output length: {len(str(subagent_output))}"
+                            )
+
+                            # Manually ensure the step is in outstanding_start_steps
+                            # This is needed because the async subagent execution may have lost the context
+                            if (
+                                subagent_run_id not in step_manager._outstanding_start_steps
+                                and saved_context is not None
+                            ):
+                                from nat.builder.intermediate_step_manager import OpenStep
+
+                                logger.info(f"Manually registering outstanding step for {tool_name}")
+                                parent_step_id = saved_context[-1] if saved_context else None
+                                step_manager._outstanding_start_steps[subagent_run_id] = OpenStep(
+                                    step_id=subagent_run_id,
+                                    step_name=tool_name,
+                                    step_type=IntermediateStepType.TOOL_START,
+                                    step_parent_id=parent_step_id,
+                                    prev_stack=saved_context,
+                                    active_stack=[*saved_context, subagent_run_id],
+                                )
+
+                            tool_end_payload = IntermediateStepPayload(
+                                event_type=IntermediateStepType.TOOL_END,
+                                span_event_timestamp=subagent_start_time,
+                                framework=LLMFrameworkEnum.LANGCHAIN,
+                                name=tool_name,
+                                UUID=subagent_run_id,
+                                metadata=TraceMetadata(tool_outputs=subagent_output),
+                                usage_info=UsageInfo(token_usage=TokenUsageBaseModel()),
+                                data=StreamEventData(input=json.dumps(tool_args), output=subagent_output),
+                            )
+                            step_manager.push_intermediate_step(tool_end_payload)
+                            logger.info(f"TOOL_END telemetry emitted for {tool_name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to emit TOOL_END telemetry for {tool_name}: {e}", exc_info=True)
+                    else:
+                        # Use LangChain streaming for regular tools
+                        async for chunk in tool.astream(
+                            input=tool_args,
+                            config=RunnableConfig(callbacks=self.callbacks),
+                        ):
+                            if isinstance(chunk, AgentMessageChunk):
+                                logger.debug(f"Received AgentMessageChunk from {tool_call['name']}: type={chunk.type}")
+                                # Yield the chunk directly to the stream writer
+                                writer(chunk)
+                                if chunk.type == AgentMessageChunkType.FINAL:
+                                    final_chunks.append(chunk.content)
+                                    # Mark that we have a final answer
+                                    state.final_answer = chunk.content
+                                    logger.info(f"Set state.final_answer from {tool_call['name']}")
+                            else:
+                                tool_response = chunk
+
+                    # If no response was captured, use a default summary
+                    if tool_response is None:
+                        tool_response = f"tool: {tool_call['name']} completed"
+
+                    # Convert tool response to string for scratchpad and check for summary field
+                    tool_response_str = str(tool_response)
+
+                    if (
+                        not is_subagent
+                        and not state.final_answer
+                        and hasattr(tool_response, "summary")
+                        and tool_response.summary
+                    ):
+                        # Extract summary but defer FINAL chunk until postprocessing validates it
+                        final_content = tool_response.summary
+                        state.final_answer = final_content
+                        logger.info(f"Extracted summary from {tool_call['name']} (pending postprocessing validation)")
+                        # Use a shorter message for scratchpad and reasoning trace
+                        tool_response_str = f"Returned summary with {len(final_content)} characters"
+
+                    # Yield tool call in reasoning trace for regular tools (even if we extracted a summary)
+                    # Sub-agents already yielded their call message earlier
+                    if not is_subagent:
+                        # For regular tools, yield TOOL_CALL with call info and result
+                        result_msg = f"Tool: {tool_call['name']}\nArgs: {tool_args}\nResult: {tool_response_str}"
+                        writer(AgentMessageChunk(type=AgentMessageChunkType.TOOL_CALL, content=result_msg))
+
+                    logger.debug(
+                        f"Tool {tool_call['name']} completed, final_answer={'set' if state.final_answer else 'not set'}"
+                    )
+
+                    # Convert empty tool response to placeholder
+                    tool_content = tool_response
+                    if not tool_content or (isinstance(tool_content, str) and tool_content.strip() == ""):
+                        logger.warning(f"Tool {tool_call['name']} returned empty content, using placeholder")
+                        tool_content = "Tool returned empty content"
+
+                    status = "error" if _tool_response_failed(tool_response) else "success"
+                    _store_identical_tool_call_outcome(
+                        state, tool_call["name"], tool_call.get("args"), status, tool_content
+                    )
+                    return ToolMessage(
+                        name=tool_call["name"],
+                        tool_call_id=tool_call["id"],
+                        content=tool_content,
+                        status=status,
+                    )
+
+                except Exception as ex:
+                    logger.exception("Tool execution failed")
+                    error_response = f"Tool call failed: {ex!s}"
+                    # Record the failure rather than answering with it. Answering ends the graph, and
+                    # a plan whose early step fails (e.g. `lvs_video_understanding` on a media name it
+                    # cannot resolve) then never reaches the step that writes the report. The agent node
+                    # surfaces this instead of an answer it wrote without the tool.
+                    state.tool_failure = error_response
+                    _store_identical_tool_call_outcome(
+                        state, tool_call["name"], tool_call.get("args"), "error", error_response
+                    )
+                    return ToolMessage(
+                        name=tool_call["name"],
+                        tool_call_id=tool_call["id"],
+                        content=error_response,
+                        status="error",
+                    )
+
+            # Execute all tool calls
+            tasks = [run_tool(tool, tool_call) for tool, tool_call in zip(requested_tools, tool_calls, strict=False)]
+            any_tool_succeeded = False
+            for task in asyncio.as_completed(tasks):
+                tool_response = await task
+                executed_successfully = getattr(
+                    tool_response, "status", None
+                ) == "success" and not _is_duplicate_tool_call_skip(tool_response)
+                any_tool_succeeded = any_tool_succeeded or executed_successfully
+                state.agent_scratchpad.append(tool_response)
+
+            # A sibling tool that answered grounds this turn, so a failure beside it is not the answer.
+            if any_tool_succeeded:
+                state.tool_failure = ""
+
+            # Add final answer to scratchpad for conversation history summary and postprocessing retries
+            if state.final_answer:
+                state.agent_scratchpad.append(AIMessage(content=state.final_answer))
+
+        except Exception as ex:
+            logger.exception("Failed to call tool_or_subagent_node")
+            state.agent_scratchpad.append(HumanMessage(content=str(ex)))
+
+        return state
+
+    async def _postprocessing_node(self, state: TopAgentState) -> TopAgentState:
+        """Postprocess output: validate before finalizing the graph."""
+        if not self.postprocessing or not self.postprocessing.config.enabled or not state.final_answer:
+            return state
+
+        user_query = ""
+        if state.current_message and hasattr(state.current_message, "content"):
+            user_query = str(state.current_message.content) if state.current_message.content else ""
+
+        result = await self.postprocessing.process(
+            state.final_answer,
+            user_query=user_query,
+            scratchpad=state.agent_scratchpad,
+            llm_reasoning=state.options.llm_reasoning,
+        )
+
+        if result.passed:
+            logger.info("Postprocessing passed")
+        else:
+            logger.info(f"Postprocessing failed: {result.feedback}")
+            state.final_answer = ""
+            feedback_message = f"{POSTPROCESSING_FEEDBACK_MARKER}\n{result.feedback}\nPlease try again."
+            state.agent_scratchpad.append(HumanMessage(content=feedback_message))
+            logger.info("Appended postprocessing feedback to scratchpad")
+
+        return state
+
+    async def _conditional_edge(self, state: TopAgentState) -> str:
+        """Determine next action from agent node."""
+        try:
+            logger.debug("Starting Conditional Edge")
+
+            # Check if we have a final answer
+            if state.final_answer:
+                logger.info("Agent has final answer, ending: %s", state.final_answer)
+                return AgentDecision.END.value
+
+            # Check last message in scratchpad
+            if not state.agent_scratchpad:
+                logger.debug("No scratchpad, routing to agent")
+                return AgentDecision.AGENT.value
+
+            agent_output = state.agent_scratchpad[-1]
+            if isinstance(agent_output, AIMessage):
+                if agent_output.tool_calls:
+                    logger.info("Agent is calling %d tools", len(agent_output.tool_calls))
+                    return AgentDecision.TOOL.value
+                else:
+                    logger.info("Agent has no tool calls, ending")
+                    return AgentDecision.END.value
+            else:
+                # Tool message or human message, route back to agent
+                logger.debug("Last message is not AIMessage, routing to agent")
+                return AgentDecision.AGENT.value
+
+        except Exception:
+            logger.exception("Failed to determine next action")
+            logger.warning("Ending graph traversal due to error")
+            return AgentDecision.END.value
+
+    async def _conditional_edge_from_tool(self, state: TopAgentState) -> str:
+        """Conditional edge from tool node - check if we should end or continue to agent."""
+        try:
+            if state.final_answer:
+                logger.info("Tool node set final_answer, ending graph traversal")
+                return AgentDecision.END.value
+            else:
+                logger.debug("Tool finished, continuing to agent")
+                return AgentDecision.AGENT.value
+        except Exception:
+            logger.exception("Failed to determine next step from tool")
+            return AgentDecision.AGENT.value
+
+    async def finalize_node(self, state: TopAgentState) -> TopAgentState:
+        """Final node that emits FINAL chunk and updates conversation history."""
+        # Append accumulated sub-agent side effects
+        if state.subagent_side_effects:
+            subagent_content = "\n\n".join(state.subagent_side_effects)
+            if state.final_answer:
+                state.final_answer = state.final_answer + "\n\n" + subagent_content
+            else:
+                state.final_answer = subagent_content
+
+        if state.final_answer:
+            # Remove backslash-escaped quotes (LLM artifact from JSON context, e.g. src=\"url\" -> src="url")
+            state.final_answer = state.final_answer.replace('\\"', '"').replace("\\'", "'")
+            # strip inline code quotes e.g. `abc` -> abc, but leave code blocks unchanged
+            state.final_answer = re.sub(r"(?<!`)`(?!`)([^`]+)`(?!`)", r"\1", state.final_answer)
+
+            writer = get_stream_writer()
+            writer(AgentMessageChunk(type=AgentMessageChunkType.FINAL, content=state.final_answer))
+            # clean up the agent_scratchpad
+            state.agent_scratchpad = []
+
+            if state.current_message:
+                cleaned_response = strip_frontend_tags(state.final_answer)
+                if cleaned_response and self.max_history > 0:
+                    # Append new turn, keep last max_history messages
+
+                    state.conversation_history.append(HumanMessage(content=state.current_message.content))
+                    state.conversation_history.append(AIMessage(content=cleaned_response))
+                    logger.info(
+                        f"Updated conversation history in finalize_node: {len(state.conversation_history)} messages (max {self.max_history})"
+                    )
+        return state
+
+    async def _build_graph(self) -> CompiledStateGraph:
+        try:
+            self.checkpointer = InMemorySaver()
+            graph = StateGraph(TopAgentState)
+            graph.add_node("agent", self.agent_node)
+            graph.add_node("tool", self.tool_or_subagent_node)
+            graph.add_node("finalize", self.finalize_node)
+
+            if self.postprocessing:
+                # Validate before ending the graph
+                graph.add_node("postprocessing", self._postprocessing_node)
+                end_target = "postprocessing"
+            else:
+                end_target = "finalize"
+
+            if self.planning_enabled:
+                graph.add_node("plan", self._plan_node)
+                graph.add_node("plan_update", self._plan_update_node)
+                graph.set_entry_point("plan")
+                # If the plan node set final_answer (clarification), skip to finalize;
+                # otherwise proceed to agent for execution.
+                graph.add_conditional_edges(
+                    "plan",
+                    lambda s: AgentDecision.END.value if s.final_answer else AgentDecision.AGENT.value,
+                    {
+                        AgentDecision.END.value: end_target,
+                        AgentDecision.AGENT.value: "agent",
+                    },
+                )
+                # tool → plan_update (if no final_answer) or end_target (if final_answer set)
+                conditional_edge_from_tool_outputs: dict[Hashable, str] = {
+                    AgentDecision.END.value: end_target,
+                    AgentDecision.AGENT.value: "plan_update",
+                }
+                graph.add_conditional_edges(
+                    "tool", self._conditional_edge_from_tool, conditional_edge_from_tool_outputs
+                )
+                graph.add_edge("plan_update", "agent")
+            else:
+                graph.set_entry_point("agent")
+                # Make tool -> agent edge conditional to support tools that set final_answer
+                tool_edge_outputs: dict[Hashable, str] = {
+                    AgentDecision.END.value: end_target,
+                    AgentDecision.AGENT.value: "agent",
+                }
+                graph.add_conditional_edges("tool", self._conditional_edge_from_tool, tool_edge_outputs)
+            conditional_edge_possible_outputs: dict[Hashable, str] = {
+                AgentDecision.TOOL.value: "tool",
+                AgentDecision.END.value: end_target,
+                AgentDecision.AGENT.value: "agent",
+            }
+            graph.add_conditional_edges("agent", self._conditional_edge, conditional_edge_possible_outputs)
+
+            if self.postprocessing:
+                if self.planning_enabled:
+                    graph.add_conditional_edges("postprocessing", lambda s: "finalize" if s.final_answer else "plan")
+                else:
+                    graph.add_conditional_edges("postprocessing", lambda s: "finalize" if s.final_answer else "agent")
+
+            graph.add_edge("finalize", "__end__")
+            self.graph = graph.compile(checkpointer=self.checkpointer)
+            logger.info("Agent Graph built and compiled successfully")
+            return self.graph
+        except Exception:
+            logger.exception("Failed to build the Agent Graph")
+            raise
+
+
+async def _extract_prompt_sections(
+    llm: BaseChatModel,
+    prompt_text: str,
+    callbacks: list[BaseCallbackHandler] | None = None,
+) -> tuple[str, str]:
+    """Extract tool_call_prompt and response_format_prompt from the main prompt via LLM.
+
+    Called at factory init time when planning is enabled but the user hasn't
+    provided these prompts explicitly. The extracted prompts are used in the
+    plan_exec_prompt so the execution agent knows how to call tools and format
+    responses without re-reading the full system prompt.
+
+    Returns:
+        Tuple of (tool_call_prompt, response_format_prompt). Empty strings on failure.
+    """
+    extraction_system = (
+        "You are a prompt analysis assistant. Given a system prompt, extract two specific sections:\n"
+        "1. Tool Call Rules — any instructions about how to call tools, retry behavior, "
+        "parameter requirements, error handling for tool calls.\n"
+        "2. Response Format Rules — any instructions about response formatting, markdown, "
+        "URL handling, output structure, phrases to avoid.\n\n"
+        "Return ONLY the extracted text in the exact XML format below.\n"
+        "If a section is not found in the prompt, leave the tags empty.\n\n"
+        "<tool_call_prompt>\n</tool_call_prompt>\n"
+        "<response_format_prompt>\n</response_format_prompt>"
+    )
+    messages: list[BaseMessage] = [
+        SystemMessage(content=extraction_system),
+        HumanMessage(content=f"Extract sections from this system prompt:\n\n{prompt_text}"),
+    ]
+    try:
+        result = await llm.ainvoke(messages, config=RunnableConfig(callbacks=callbacks or []))
+        content = result.content if isinstance(result.content, str) else str(result.content)
+
+        tool_call_match = re.search(r"<tool_call_prompt>(.*?)</tool_call_prompt>", content, re.DOTALL)
+        response_format_match = re.search(r"<response_format_prompt>(.*?)</response_format_prompt>", content, re.DOTALL)
+
+        tool_call = tool_call_match.group(1).strip() if tool_call_match else ""
+        response_format = response_format_match.group(1).strip() if response_format_match else ""
+
+        logger.info(
+            "Extracted prompt sections: tool_call=%d chars, response_format=%d chars",
+            len(tool_call),
+            len(response_format),
+        )
+        return tool_call, response_format
+    except Exception:
+        logger.exception("Failed to extract prompt sections via LLM, using empty defaults")
+        return "", ""
+
+
+async def _get_subagents(subagent_names: list[str], builder: Builder) -> tuple[list[BaseTool], dict[str, Any]]:
+    """
+    Setup sub-agents by fetching them as both LangChain tools and native NAT functions.
+
+    Args:
+        subagent_names: List of sub-agent names to setup
+        builder: Builder instance for fetching tools and functions
+
+    Returns:
+        Tuple of (subagent_tools, subagent_functions) where:
+        - subagent_tools: List of BaseTool for LLM binding
+        - subagent_functions: Dict mapping subagent names to native NAT functions for streaming
+    """
+    subagent_functions: dict[str, Any] = {}
+    subagent_tools: list[BaseTool] = []
+
+    if not subagent_names:
+        return subagent_tools, subagent_functions
+
+    logger.info(f"Setting up sub-agents: {subagent_names}")
+    for subagent_name in subagent_names:
+        try:
+            # Get as LangChain tool for the LLM
+            subagent_tool = await builder.get_tool(subagent_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
+            subagent_tools.append(subagent_tool)
+
+            # Get as native NAT function for streaming
+            nat_function = await builder.get_function(subagent_name)
+            if nat_function and hasattr(nat_function, "astream"):
+                subagent_functions[subagent_name] = nat_function
+                logger.info(f"Registered {subagent_name} for native streaming")
+            else:
+                logger.warning(f"{subagent_name} does not support streaming (no astream method)")
+        except Exception as e:
+            logger.error(f"Failed to setup sub-agent {subagent_name}: {e}")
+
+    return subagent_tools, subagent_functions
+
+
+@register_function(config_type=TopAgentConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
+async def top_agent(config: TopAgentConfig, builder: Builder) -> AsyncGenerator[FunctionInfo]:
+    """Top-level routing agent with simple tool calling"""
+
+    # Configure agent logger level
+    vss_logger = logging.getLogger("agent")
+    log_level = getattr(logging, config.log_level.upper(), logging.INFO)
+    vss_logger.setLevel(log_level)
+    # Configure handler if not already present
+    if not vss_logger.handlers:
+        new_handler = logging.StreamHandler()
+        new_handler.setLevel(log_level)
+        new_handler.setFormatter(
+            logging.Formatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s")
+        )
+        vss_logger.addHandler(new_handler)
+        vss_logger.propagate = False
+    else:
+        for existing_handler in vss_logger.handlers:
+            existing_handler.setLevel(log_level)
+
+    logger.info(f"Logging configured at {config.log_level} level for all agent modules")
+
+    llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
+
+    # --- Resolve tool_call_prompt and response_format_prompt -----------------
+    tool_call_prompt = config.tool_call_prompt or ""
+    response_format_prompt = config.response_format_prompt or ""
+    prompts_explicitly_provided = bool(config.tool_call_prompt and config.response_format_prompt)
+
+    # If planning is enabled and prompts weren't provided, extract them from the
+    # main prompt via LLM so we can inject them into plan_exec_prompt.
+    if config.planning_enabled and not prompts_explicitly_provided:
+        tool_call_prompt, response_format_prompt = await _extract_prompt_sections(llm, config.prompt)
+
+    def _escape_template_literals(text: str) -> str:
+        """Treat config-authored prompt braces as literals in LangChain f-string templates."""
+        return text.replace("{", "{{").replace("}", "}}")
+
+    # --- Build the main agent system prompt ----------------------------------
+    # When the user provided tool_call / response_format separately they have
+    # removed those sections from config.prompt, so we need to append them.
+    # When extracted, the main prompt already contains them — appending again is
+    # harmless (slight repetition) but keeps both paths identical.
+    agent_prompt_text = _escape_template_literals(config.prompt)
+    if not config.planning_enabled:
+        if config.tool_call_prompt:
+            agent_prompt_text += "\n\n" + _escape_template_literals(config.tool_call_prompt)
+        if config.response_format_prompt:
+            agent_prompt_text += "\n\n" + _escape_template_literals(config.response_format_prompt)
+
+    prompt = ChatPromptTemplate(
+        [
+            (
+                "system",
+                agent_prompt_text
+                + "\n\n"
+                + "current time: {current_time}"
+                + "\n\nPrevious conversation summary: {conversation_summary}"
+                + "{request_options_context}"
+                + "{thinking_tag}",
+            ),
+            MessagesPlaceholder(variable_name="conversation_history", optional=True),
+            ("user", "{question}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad", optional=True),
+        ]
+    )
+
+    # --- Build plan_exec_prompt (only when planning is enabled) --------------
+    plan_exec_prompt: ChatPromptTemplate | None = None
+    if config.planning_enabled:
+        plan_exec_system = (
+            "Follow the execution plan precisely to answer the user's question.\n"
+            "All necessary context (sensor IDs, time ranges, etc.) should be already encoded in the plan.\n\n"
+            "If the plan lacks a required context or input parameter, ask the user for the missing information.\n\n"
+            "[x] means a step has been completed and the result is appended.\n\n"
+            "Summarize and return the final answer to the user after all steps are completed.\n"
+            "- Your final answer MUST answer ALL parts of the user's question (User's Question: {question}). "
+            "If the user asked multiple things, you MUST answer each one. "
+            "{request_options_context}"
+        )
+        if tool_call_prompt:
+            plan_exec_system += "\n\n## Tool call rules:\n " + _escape_template_literals(tool_call_prompt)
+        if response_format_prompt:
+            plan_exec_system += "\n\n## Response format rules:\n " + _escape_template_literals(response_format_prompt)
+        plan_exec_system += "\n\ncurrent time: {current_time}{thinking_tag}"
+
+        plan_exec_prompt = ChatPromptTemplate(
+            [
+                ("system", plan_exec_system),
+                ("user", "User Question: {question}\n\nExecution Plan:\n{plan_section}\n\n"),
+            ]
+        )
+
+    # Get regular tools
+    tools = await builder.get_tools(tool_names=config.tool_names, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
+
+    # Get sub-agents both as LangChain tools (for LLM) and as native NAT functions (for streaming)
+    subagent_tools, subagent_functions = await _get_subagents(config.subagent_names, builder)
+
+    logger.info(f"Total tools: {len(tools)} regular, {len(subagent_tools)} sub-agents")
+
+    # Use custom LLM for postprocessing if specified, otherwise use workflow LLM
+    postprocessing_llm = llm
+    if config.postprocessing and config.postprocessing.validators:
+        llm_rule_validator_cfg = config.postprocessing.validators.llm_based_rule_validator
+        if llm_rule_validator_cfg and llm_rule_validator_cfg.llm_name:
+            logger.info(f"Using custom LLM for postprocessing: {llm_rule_validator_cfg.llm_name}")
+            postprocessing_llm = await builder.get_llm(
+                llm_rule_validator_cfg.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN
+            )
+
+    agent = cast(
+        "TopAgent",
+        await TopAgent(
+            llm=llm,
+            tools=tools,
+            subagents=subagent_tools,
+            subagent_functions=subagent_functions,
+            max_iterations=config.max_iterations,
+            max_history=config.max_history,
+            prompt=prompt,
+            postprocessing_config=config.postprocessing,
+            postprocessing_llm=postprocessing_llm,
+            planning_enabled=config.planning_enabled,
+            plan_prompt=config.plan_prompt,
+            plan_exec_prompt=plan_exec_prompt,
+            plan_system_prompt=config.prompt,
+            tool_call_prompt=tool_call_prompt,
+            response_format_prompt=response_format_prompt,
+        ),
+    )
+
+    async def _response_fn(
+        request: ChatRequestOrMessage,
+    ) -> AsyncGenerator[str]:
+        """Streaming top agent response.
+
+        Args:
+            request: ChatRequestOrMessage with messages and optional reasoning parameters
+        """
+        # Validate as TopAgentRequest for typed access to per-request option fields
+        typed_request = TopAgentRequest.model_validate(request.model_dump())
+        options = AgentRequestOptions(
+            llm_reasoning=typed_request.llm_reasoning
+            if typed_request.llm_reasoning is not None
+            else config.llm_reasoning,
+            vlm_reasoning=typed_request.vlm_reasoning if typed_request.vlm_reasoning is not None else None,
+            search_source_type=typed_request.search_source_type or "video_file",
+            use_critic=typed_request.use_critic if typed_request.use_critic is not None else True,
+        )
+
+        # Override with WebSocket payload values if present (WebSocket requests don't pass params through request object)
+        context = Context.get()
+        if hasattr(context.metadata, "payload") and isinstance(context.metadata.payload, dict):
+            payload = context.metadata.payload
+            options_payload = options.model_dump(mode="json")
+            if "llm_reasoning" in payload:
+                options_payload["llm_reasoning"] = bool(payload["llm_reasoning"])
+            if "vlm_reasoning" in payload:
+                options_payload["vlm_reasoning"] = bool(payload["vlm_reasoning"])
+            if "search_source_type" in payload:
+                options_payload["search_source_type"] = payload["search_source_type"]
+            if "use_critic" in payload:
+                options_payload["use_critic"] = bool(payload["use_critic"])
+            options = AgentRequestOptions.model_validate(options_payload)
+            logger.info(f"Extracted from WebSocket payload - {options}")
+
+        logger.info("Creating Top Agent with options=%s", options)
+
+        try:
+            # Convert request to ChatRequest following NAT's agent pattern:
+            # https://github.com/NVIDIA/NeMo-Agent-Toolkit/blob/6184d2fb/src/nat/agent/tool_calling_agent/register.py#L86-L99
+            chat_request = GlobalTypeConverter.get().convert(request, to_type=ChatRequest)
+            # Extract only the latest message. Conversation history is managed by agent state.
+            # Rewrite +Chat [Context] clip ISO timestamps to offset seconds for video_understanding.
+            raw_text = _extract_text_content(chat_request.messages[-1]).get("content", "")
+            current_message = HumanMessage(content=await _augment_context_clip_offsets(raw_text))
+            # Collect all steps for unified trace
+            steps = []
+            final_content = []
+            step_num = 0
+
+            # Stream agent responses
+            async for chunk in agent.astream(
+                input_messages=[current_message],
+                options=options,
+            ):
+                if chunk.type == AgentMessageChunkType.THOUGHT:
+                    step_num += 1
+                    # Replace \n with spaces to clean up the display
+                    clean_content = chunk.content.replace("\\n", " ").replace("\n", " ")
+                    steps.append(f'<agent-think-step title="{step_num} - Thought">{clean_content}</agent-think-step>')
+                elif chunk.type == AgentMessageChunkType.TOOL_CALL:
+                    step_num += 1
+                    clean_content = chunk.content.replace("\\n", " ").replace("\n", " ")
+                    title = trace_step_title(step_num, "Tool Call", chunk.content)
+                    steps.append(f'<agent-think-step title="{title}">{clean_content}</agent-think-step>')
+                elif chunk.type == AgentMessageChunkType.SUBAGENT_CALL:
+                    step_num += 1
+                    clean_content = chunk.content.replace("\\n", " ").replace("\n", " ")
+                    title = trace_step_title(step_num, "Sub-Agent Call", chunk.content)
+                    steps.append(f'<agent-think-step title="{title}">{clean_content}</agent-think-step>')
+                elif chunk.type == AgentMessageChunkType.FINAL:
+                    final_content.append(chunk.content)
+                elif chunk.type == AgentMessageChunkType.ERROR:
+                    step_num += 1
+                    clean_content = chunk.content.replace("\\n", " ").replace("\n", " ")
+                    steps.append(f'<agent-think-step title="{step_num} - Error">{clean_content}</agent-think-step>')
+
+            # Yield all steps wrapped in unified agent-think
+            if steps:
+                steps_content = "\n".join(steps)
+                agent_think_block = f"\n\n<agent-think>{steps_content}</agent-think>\n\n"
+                logger.debug(f"Agent think block: {agent_think_block}")
+                yield agent_think_block
+
+            # Yield final content
+            if final_content:
+                final_output = "\n\n".join(final_content) + "\n\n"
+                logger.debug(f"Final output: {final_output}")
+                yield final_output
+
+        except Exception as ex:
+            logger.exception("Agent failed with exception")
+            yield f"I seem to be having a problem. {ex}"
+
+    async def _single_fn(request: ChatRequestOrMessage) -> str:
+        message = ""
+        async for chunk in _response_fn(request):
+            message += chunk
+        return message
+
+    yield FunctionInfo.create(stream_fn=_response_fn, single_fn=_single_fn, input_schema=ChatRequestOrMessage)

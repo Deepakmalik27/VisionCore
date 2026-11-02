@@ -1,0 +1,307 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import time
+
+from paho.mqtt.client import (Client, ConnectFlags, DisconnectFlags, MQTTMessageInfo,
+                              CONNACK_ACCEPTED, MQTT_ERR_SUCCESS)
+from paho.mqtt.enums import CallbackAPIVersion, MQTTProtocolVersion
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.properties import Properties
+from paho.mqtt.reasoncodes import ReasonCode
+from typing import Any
+from collections.abc import Callable, Mapping
+
+from mdx.analytics.core.schema.config import AppConfig
+from mdx.analytics.core.stream.sink.sink_base import Sink
+
+logger = logging.getLogger(__name__)
+
+# How long close() waits for queued publishes to reach the broker before giving up.
+#
+# Deliberately below MultiprocessingScheduler.SHUTDOWN_TIMEOUT_SECONDS (10s), which is how long a
+# worker gets after SIGTERM before the parent SIGKILLs it. Matching that number would leave no
+# margin: a worker that used its whole drain window would be killed at the instant the wait
+# returned, with the disconnect, the loop stop and its own teardown all still to do -- so the wait
+# meant to save those messages would be what got the process killed. The remainder is that margin.
+PUBLISH_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+class SinkMQTT(Sink):
+
+    def __init__(self, config: AppConfig) -> None:
+        """Initialize the MQTT sink with application configuration.
+        
+        :param AppConfig config: Application configuration containing MQTT settings
+        """
+
+        self._config = config.mqtt
+        self._producer_config = self._config.producer
+        self._get_topic = config.get_mqtt_topic
+
+        self._client: Client | None = None
+        # The most recent publish, kept so close() can confirm the queue drained. paho works a
+        # single ordered outgoing queue per client, so the last message reaching the broker means
+        # the ones before it did too -- which is why one handle is enough and a growing list of
+        # them is not needed.
+        self._last_publish: MQTTMessageInfo | None = None
+
+
+    def write(
+        self,
+        dest_key: str,
+        messages: list[Any],
+        value_serializer: Callable,
+        key_extractor: Callable | None = None,
+        key_serializer: Callable | None = None,
+        headers: Mapping[str, str | bytes] | None = None
+    ) -> None:
+        """Write multiple messages to an MQTT topic.
+        
+        :param str dest_key: Key used to determine the destination topic
+        :param list[Any] messages: List of messages to publish
+        :param Callable value_serializer: Function to serialize message values
+        :param Callable | None key_extractor: Optional function to extract keys from messages
+        :param Callable | None key_serializer: Optional function to serialize message keys
+        :param Mapping[str, str | bytes] | None headers: Optional headers to include with messages
+        :return: None. Returns without writing when no topic is configured for ``dest_key``;
+            an undefined destination is a disabled output, logged once by :meth:`Sink.resolve_destination`.
+        """
+
+        topic = self.resolve_destination(dest_key, self._get_topic)
+        if not topic:
+            return
+
+        if not self._client:
+            self._init_client()
+
+        for message in messages:
+
+            key = None
+
+            if key_extractor:
+                key = key_extractor(message)
+                if key_serializer:
+                    key = key_serializer(key)
+
+            if key and not isinstance(key, bytes):
+                raise ValueError(f"Message key must be of type `bytes`, incorrect type received - {type(key)}")
+
+            self._last_publish = self._client.publish( # type: ignore 
+                topic = topic,
+                payload = value_serializer(message),
+                properties = self._serialize_properties(headers, key),
+                qos = self._producer_config.qos,
+                retain = self._producer_config.retain
+            )
+
+
+    def write_msg(
+        self,
+        dest_key: str,
+        message: bytes,
+        key: bytes | None,
+        headers: Mapping[str, str | bytes] | None = None
+    ) -> None:
+        """Write a single serialized message to an MQTT topic.
+        
+        :param str dest_key: Key used to determine the destination topic
+        :param bytes message: Serialized message payload
+        :param bytes | None key: Optional message key
+        :param Mapping[str, str | bytes] | None headers: Optional headers to include with the message
+        :return: None. Returns without writing when no topic is configured for ``dest_key``;
+            an undefined destination is a disabled output, logged once by :meth:`Sink.resolve_destination`.
+        """
+
+        topic = self.resolve_destination(dest_key, self._get_topic)
+        if not topic:
+            return
+
+        if not self._client:
+            self._init_client()
+
+        self._last_publish = self._client.publish( # type: ignore
+            topic = topic,
+            payload = message,
+            properties = self._serialize_properties(headers, key),
+            qos = self._producer_config.qos,
+            retain = self._producer_config.retain
+        )
+
+
+    def _on_publish(
+        self,
+        client: Client,  # noqa: F841
+        userdata: Any,  # noqa: F841
+        mid: int,
+        rc: ReasonCode,
+        props: Properties | None  # noqa: F841
+    ) -> None:
+        """Callback function called when a message is published to the broker.
+        
+        :param Client client: The MQTT client instance
+        :param Any userdata: User data passed to the client
+        :param int mid: Message ID of the published message
+        :param ReasonCode rc: Reason code indicating publish result
+        :param Properties | None props: MQTT properties associated with the publish
+        """
+
+        if rc == MQTT_ERR_SUCCESS:
+            logger.debug(f'Published message with id {mid} successfully')
+        else:
+            if rc.value == 16:
+                logger.debug(f'Msg with id {mid} published to the broker but no matching subscribers are active.')
+            else:
+                logger.error(f'Failed to publish message with id {mid} - [code:{rc.value}] {rc!s}')
+
+
+    def _on_connect(
+        self,
+        client: Client,  # noqa: F841
+        userdata: Any,  # noqa: F841
+        conn_flags: ConnectFlags,  # noqa: F841
+        rc: ReasonCode,
+        props: Properties | None  # noqa: F841
+    ) -> None:
+        """Callback function called when the client connects to the broker.
+        
+        :param Client client: The MQTT client instance
+        :param Any userdata: User data passed to the client
+        :param ConnectFlags conn_flags: Connection flags returned by the broker
+        :param ReasonCode rc: Reason code indicating connection result
+        :param Properties | None props: MQTT properties associated with the connection
+        :raises Exception: If connection to MQTT broker fails
+        """
+
+        if rc == CONNACK_ACCEPTED:
+            logger.info('Producer connected to MQTT broker.')
+
+        else:
+            raise Exception(f'MQTT Connection Error in producer - [code:{rc.value}] {rc!s}')
+
+
+    def _on_disconnect(
+        self,
+        client: Client,  # noqa: F841
+        userdata: Any,  # noqa: F841
+        conn_flags: DisconnectFlags,  # noqa: F841
+        rc: ReasonCode,
+        props: Properties | None  # noqa: F841
+    ) -> None:
+        """Callback function called when the client disconnects from the broker.
+        
+        :param Client client: The MQTT client instance
+        :param Any userdata: User data passed to the client
+        :param DisconnectFlags conn_flags: Disconnect flags
+        :param ReasonCode rc: Reason code indicating disconnection result
+        :param Properties | None props: MQTT properties associated with the disconnection
+        :raises Exception: If disconnection from MQTT broker encounters an error
+        """
+
+        if self._client and self._client.is_connected():
+
+            if rc == MQTT_ERR_SUCCESS:
+                logger.info(f'Producer disconnected from MQTT broker.')
+
+            else:
+                raise Exception(f'MQTT Error while disconnecting producer - [code:{rc.value}] {rc!s}')
+
+
+    def _init_client(self):
+        """Initialize and configure the MQTT client with connection settings."""
+
+        self._client = Client(
+            callback_api_version = CallbackAPIVersion.VERSION2,
+            protocol = MQTTProtocolVersion.MQTTv5
+        )
+
+        self._client.on_connect = self._on_connect
+        self._client.on_publish = self._on_publish
+        self._client.on_disconnect = self._on_disconnect
+
+        self._client.connect(
+            host = self._config.host,
+            port = self._config.port,
+            keepalive = self._config.keepAliveSec,
+            clean_start = True
+        )
+
+        self._client.loop_start()
+
+
+    def _serialize_properties(self, headers: Mapping[str, str | bytes] | None = None, key: bytes | None = None) -> Properties:
+        """Serialize headers and optional key into MQTT properties.
+        
+        :param Mapping[str, str | bytes] | None headers: Optional headers to include as user properties
+        :param bytes | None key: Optional message key to include as user property
+        :return Properties: MQTT properties object with serialized headers and key
+        """
+
+        props = Properties(PacketTypes.PUBLISH)
+
+        # Add timestamp in milliseconds as a user property
+        timestamp = str(headers.get('timestamp', int(time.time() * 1000))) if headers else str(int(time.time() * 1000))
+        props.UserProperty = ('timestamp', timestamp)
+
+        if key:
+            props.UserProperty = ('key', key.decode('utf-8'))
+
+        if headers:
+            for k, v in headers.items():
+                # Skip timestamp since we already added it to the user property
+                if k == 'timestamp':
+                    continue
+                props.UserProperty = (k, v.decode('utf-8') if isinstance(v, bytes) else v)
+
+        return props
+
+
+    def close(self) -> None:
+        """Drain queued publishes, then close the MQTT client connection and stop the network loop.
+
+        publish() only queues; the network loop sends. loop_stop() does not promise the queue was
+        drained first, so disconnecting straight after a write can discard messages that were never
+        put on the wire. Under ``behaviorEmitOnce`` that is not a cosmetic loss: every track still
+        live at shutdown has its one and only behavior written by the close hook, immediately before
+        this runs, so anything dropped here is absent from the output entirely rather than merely
+        stale.
+
+        Waiting is best-effort and bounded. If the broker is already gone the wait cannot succeed,
+        and blocking shutdown on it would trade lost messages for a hung process, so it gives up and
+        says so.
+        """
+
+        if self._client:
+            # Every inspection sits inside the try, not just the wait: is_published() raises too --
+            # ValueError when the message never made it onto a full outgoing queue, RuntimeError
+            # when the publish itself failed. Those are the cases where the client most needs
+            # closing, so leaving the check outside would skip the disconnect precisely when a
+            # publish had already gone wrong, and leak the network loop thread with it.
+            try:
+                if self._last_publish is not None and not self._last_publish.is_published():
+                    self._last_publish.wait_for_publish(timeout=PUBLISH_DRAIN_TIMEOUT_SECONDS)
+
+                    if not self._last_publish.is_published():
+                        logger.error(
+                            f"Queued MQTT messages still undelivered after "
+                            f"{PUBLISH_DRAIN_TIMEOUT_SECONDS}s; disconnecting anyway")
+
+            except (RuntimeError, ValueError) as e:
+                logger.error(f"Queued MQTT messages were not delivered before shutdown: {e}")
+
+            finally:
+                self._client.disconnect()
+                self._client.loop_stop()

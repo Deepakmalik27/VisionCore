@@ -1,0 +1,76 @@
+# BoostTrack
+
+[Paper: BoostTrack++: Using Tracklet Information to Detect More Objects in Multiple Object Tracking](https://arxiv.org/abs/2408.13003)
+
+BoostTrack++ focuses on a neglected part of MOT pipelines: deciding which detections are worth trusting in the first place. The paper extends BoostTrack by using tracklet history to build a richer similarity score, then boosts low-confidence detections when past evidence suggests they are real objects. In practice, that improves recall and identity stability without giving up the online tracking-by-detection setup.
+
+Python AABB mode also supports optional [EdgeTAM mask guidance](../tasks/masks.md#use-temporal-masks-in-association)
+with `--tracker boosttrack --tracker-backend python --asso-func iou --edgetam --mask-guidance-weights edgetam.pt`.
+It requires IoU association and `per_class=False`, retains this tracker's
+existing association rules, and adds temporal model inference. Accuracy
+gains have not been established for this extension.
+
+## What BoxMOT Needs For BoostTrack
+
+- A detector plus appearance embeddings when `use_embeddings=True`, as in the
+  default full configuration. The Python implementation can generate missing
+  embeddings from a supplied `Frame` or consume embeddings already attached to
+  `Detections`.
+- Supports both AABB and OBB detections in BoxMOT.
+- Best when low-confidence true positives are a recurring problem and you want stronger association scoring than plain IoU or Mahalanobis distance.
+
+Direct construction accepts `reid=ReIDConfig(...)` or a prebuilt
+`AppearanceEncoder`, as described in the
+[Python API](../python/index.md#live-embeddings-in-reid-enabled-trackers).
+
+## Tuning notes
+
+### Adaptive Kalman Filter (`kalman.adaptive_kf`)
+
+The Python implementation supports experimental online process-noise estimation
+with `kalman.adaptive_kf=True` (default: `False`). It uses a window of up to 30 Kalman
+innovations per track, starts adapting after 15 measurement corrections, and
+blends the estimate with baseline noise (70% adaptive, 30% baseline).
+Initialization and prediction-only updates do not count toward warmup.
+Measurement noise is configured under `kalman.noise`.
+
+Consider adaptation for long tracks whose motion predictability changes, then
+compare against validated fixed noise settings. Short tracks may never leave
+warmup; detector, association, and camera-compensation errors can distort the
+estimate. `kalman.variable_dt=True` independently handles irregular capture intervals
+and can be combined with adaptation. See
+[choosing Kalman timing and adaptation](../modes/track.md#choose-kalman-timing-and-adaptation)
+for scenarios and CLI examples.
+
+Enable it with a typed Kalman configuration:
+
+```python
+from boxmot import KalmanConfig, create_tracker
+
+tracker = create_tracker(
+    "boosttrack",
+    kalman=KalmanConfig(adaptive_kf=True),
+)
+```
+
+Or set it in a custom tracker config YAML:
+
+```yaml
+kalman:
+  adaptive_kf: true
+```
+
+Use a calibrated tracker configuration to load covariance scales fitted against
+representative ground truth. Those scales live under `kalman.noise`; adaptation
+and timing remain separate settings within the same `kalman` group.
+
+## Python API
+
+Pass algorithm settings through `BoostTrackConfig`, for example
+`BoostTrack(config=BoostTrackConfig(det_thresh=0.5))`. Direct construction and
+`create_tracker("boosttrack")` use the same algorithm defaults. See the
+[tracker configuration guide](../config/trackers.md) for presets and component settings.
+
+::: boxmot.BoostTrackConfig
+
+::: boxmot.BoostTrack

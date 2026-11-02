@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Manual equivalent of what this chart's templates/vss-ingress.yaml renders, for a
+# cluster where you apply the Ingress yourself. Regenerate after changing routes:
+#
+#   helm template <RELEASE_NAME> ./dev-profile-base --set global.externalHost=<HOST> \
+#     --set global.useReleaseNamePrefix=true --show-only templates/vss-ingress.yaml
+#
+# Mounts come from the canonical route table in deploy/helm/services/common; keep
+# them in step with it and with the Docker edge (haproxy.cfg.template).
+#
+# Routes whose prefix is stripped before the backend sees it. The rest are in
+# vss-ingress-example.yaml — apply both.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: <RELEASE_NAME>-vss-ingress-rewrites
+  namespace: <NAMESPACE>
+  annotations:
+    haproxy.org/path-rewrite: |
+      ^/storage/(.*) /vst/storage/\1
+      ^/storage /vst/storage
+      /rtvi-vlm/(.*) /\1
+      /rtvi-vlm /
+      /phoenix/(.*) /\1
+      /phoenix /
+      /llm/(.*) /\1
+      /llm /
+spec:
+  ingressClassName: haproxy
+  rules:
+  - host: vss.<EXTERNAL_HOST>.nip.io
+    http:
+      paths:
+      - path: /storage
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-vios-ingress
+            port:
+              number: 30888
+      - path: /rtvi-vlm
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-rtvi-vlm
+            port:
+              number: 8000
+      - path: /phoenix
+        pathType: Prefix
+        backend:
+          service:
+            name: phoenix
+            port:
+              number: 6006
+      # Only present when this profile runs its own LLM NIM (nims.nemotron35).
+      # Point a hosted-LLM deployment at the provider directly and drop this
+      # route rather than mounting it at a Service that does not exist.
+      - path: /llm
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-nemotron-35-lightning-30b-a3b
+            port:
+              number: 8000

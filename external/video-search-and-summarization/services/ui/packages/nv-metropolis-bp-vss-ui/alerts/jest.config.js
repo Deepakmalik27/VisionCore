@@ -1,0 +1,34 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+module.exports = {
+  preset: 'ts-jest',
+  testEnvironment: 'jsdom',
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
+  moduleNameMapper: {
+    '^@nv-metropolis-bp-vss-ui/chat$': '<rootDir>/../__mocks__/@nv-metropolis-bp-vss-ui-chat.js',
+    '^common$': '<rootDir>/../../common/lib-src/index.ts',
+    '^@nvidia/foundations-react-core$': '<rootDir>/../__mocks__/@nvidia-foundations-react-core.js',
+    '\\.(css|less|scss|sass)$': 'identity-obj-proxy',
+  },
+  testMatch: [
+    '**/__tests__/**/*.(ts|tsx|js)',
+    '**/*.(test|spec).(ts|tsx|js)'
+  ],
+  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx'],
+  transform: {
+    '^.+\\.(ts|tsx)$': ['ts-jest', {
+      tsconfig: {
+        jsx: 'react',
+      }
+    }]
+  },
+  collectCoverageFrom: [
+    'lib-src/**/*.{ts,tsx}',
+    '!**/*.d.ts',
+    '!**/node_modules/**',
+    '!**/lib/**',
+  ],
+  clearMocks: true,
+  restoreMocks: true,
+};
+

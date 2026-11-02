@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from boxmot.trackers.common.detections.layout import DetectionLayout
+from boxmot.trackers.common.tracking.records import DetectionRecord
+
+
+def _validate_aligned_optional(name: str, values: np.ndarray | None, size: int) -> None:
+    if values is not None and len(values) != size:
+        raise ValueError(f"{name} must be aligned with detections")
+
+
+@dataclass(frozen=True)
+class _DetectionBatch:
+    """Immutable view of detections parsed through a detection layout."""
+
+    boxes: np.ndarray
+    confs: np.ndarray
+    clss: np.ndarray
+    det_inds: np.ndarray
+    embs: np.ndarray | None = None
+    masks: np.ndarray | None = None
+
+    @classmethod
+    def from_layout(
+        cls,
+        dets: np.ndarray,
+        layout: DetectionLayout,
+        embs: np.ndarray | None = None,
+        masks: np.ndarray | None = None,
+        copy: bool = True,
+    ) -> _DetectionBatch:
+        """Parse raw or indexed rows, optionally borrowing arrays until selection."""
+        dets = np.asarray(dets)
+        if dets.ndim != 2:
+            raise ValueError(f"Detections must be a 2D array, got shape {dets.shape}")
+        if dets.shape[1] not in (layout.det_cols, layout.det_cols + 1):
+            raise ValueError(
+                "Unsupported detection column count "
+                f"{dets.shape[1]}; expected {layout.det_cols} or {layout.det_cols + 1}"
+            )
+
+        size = len(dets)
+        _validate_aligned_optional("Embeddings", embs, size)
+        _validate_aligned_optional("Masks", masks, size)
+
+        boxes = layout.boxes(dets)
+        confs = layout.confidences(dets)
+        class_values = layout.classes(dets)
+        if class_values.size and not np.equal(class_values, np.floor(class_values)).all():
+            raise ValueError("Detection class IDs must be integers.")
+        clss = class_values.astype(np.int32, copy=copy)
+        if dets.shape[1] == layout.det_cols + 1:
+            det_ind_values = dets[:, layout.det_cols]
+            if det_ind_values.size and not np.equal(det_ind_values, np.floor(det_ind_values)).all():
+                raise ValueError("Detection indices must be integers.")
+            det_inds = det_ind_values.astype(np.int32, copy=copy)
+        else:
+            det_inds = np.arange(size, dtype=np.int32)
+
+        embs_arr = None if embs is None else np.asarray(embs)
+        masks_arr = None if masks is None else np.asarray(masks)
+        if copy:
+            boxes = boxes.copy()
+            confs = confs.copy()
+            if embs_arr is not None:
+                embs_arr = embs_arr.copy()
+            if masks_arr is not None:
+                masks_arr = masks_arr.copy()
+
+        return cls(
+            boxes=boxes,
+            confs=confs,
+            clss=clss,
+            det_inds=det_inds,
+            embs=embs_arr,
+            masks=masks_arr,
+        )
+
+    def __len__(self) -> int:
+        return int(self.boxes.shape[0])
+
+    def select(self, indices: np.ndarray | list[int] | list[bool]) -> _DetectionBatch:
+        """Return a detection batch filtered by integer indices or a boolean mask."""
+        return _DetectionBatch(
+            boxes=self.boxes[indices],
+            confs=self.confs[indices],
+            clss=self.clss[indices],
+            det_inds=self.det_inds[indices],
+            embs=None if self.embs is None else self.embs[indices],
+            masks=None if self.masks is None else self.masks[indices],
+        )
+
+    def split_by_confidence(
+        self,
+        high_thresh: float,
+        low_thresh: float | None = None,
+    ) -> tuple[_DetectionBatch, _DetectionBatch]:
+        """Return high-confidence and optional second-stage detections.
+
+        The split follows the tracker convention used by ByteTrack-like update
+        loops: high-confidence detections satisfy ``conf > high_thresh`` and
+        second-stage detections satisfy ``low_thresh < conf < high_thresh``.
+        """
+        high = self.select(self.confs > high_thresh)
+        if low_thresh is None:
+            low = self.select(np.zeros(len(self), dtype=bool))
+        else:
+            low = self.select((self.confs > low_thresh) & (self.confs < high_thresh))
+        return high, low
+
+    def with_confs(self, confs: np.ndarray) -> _DetectionBatch:
+        """Return a copy of this batch with updated confidence scores."""
+        confs = np.asarray(confs)
+        _validate_aligned_optional("Confidences", confs, len(self))
+        return _DetectionBatch(
+            boxes=self.boxes,
+            confs=confs.astype(self.confs.dtype, copy=True),
+            clss=self.clss,
+            det_inds=self.det_inds,
+            embs=self.embs,
+            masks=self.masks,
+        )
+
+    def with_embs(self, embs: np.ndarray | None) -> _DetectionBatch:
+        """Return a copy of this batch with updated aligned embeddings."""
+        if embs is None:
+            embs_arr = None
+        else:
+            embs_arr = np.asarray(embs)
+            _validate_aligned_optional("Embeddings", embs_arr, len(self))
+            embs_arr = embs_arr.copy()
+        return _DetectionBatch(
+            boxes=self.boxes,
+            confs=self.confs,
+            clss=self.clss,
+            det_inds=self.det_inds,
+            embs=embs_arr,
+            masks=self.masks,
+        )
+
+    def as_records(self) -> list[DetectionRecord]:
+        """Return one record per detection for code that prefers scalar records."""
+        return [
+            DetectionRecord(
+                box=self.boxes[i].copy(),
+                conf=float(self.confs[i]),
+                cls=int(self.clss[i]),
+                det_ind=int(self.det_inds[i]),
+                emb=None if self.embs is None else self.embs[i],
+                mask=None if self.masks is None else self.masks[i],
+            )
+            for i in range(len(self))
+        ]
+
+    def as_indexed_detections(self, dtype=np.float32) -> np.ndarray:
+        """Reconstruct ``[box..., conf, cls, det_ind]`` detections."""
+        if len(self) == 0:
+            return np.empty((0, self.boxes.shape[1] + 3), dtype=dtype)
+        output_dtype = np.dtype(dtype)
+        if (
+            self.boxes.dtype.kind != "f"
+            or self.confs.dtype != self.boxes.dtype
+            or self.clss.dtype != np.dtype(np.int32)
+            or self.det_inds.dtype != np.dtype(np.int32)
+            or output_dtype.kind not in "biufc"
+        ):
+            # Preserve NumPy promotion for custom batches, including object
+            # and string outputs. Standard floating kernel rows need no
+            # intermediate float64 matrix to hold their int32 metadata.
+            return np.column_stack((self.boxes, self.confs, self.clss, self.det_inds)).astype(dtype, copy=False)
+        box_cols = self.boxes.shape[1]
+        rows = np.empty((len(self), box_cols + 3), dtype=output_dtype)
+        rows[:, :box_cols] = self.boxes
+        rows[:, box_cols] = self.confs
+        rows[:, box_cols + 1] = self.clss
+        rows[:, box_cols + 2] = self.det_inds
+        return rows
+
+    def as_box_conf_detections(self, dtype=np.float32) -> np.ndarray:
+        """Reconstruct ``[box..., conf]`` detections for AABB-only association."""
+        if len(self) == 0:
+            return np.empty((0, self.boxes.shape[1] + 1), dtype=dtype)
+        if self.confs.dtype != self.boxes.dtype or np.dtype(dtype).kind not in "biufc":
+            return np.column_stack((self.boxes, self.confs)).astype(dtype, copy=False)
+        box_cols = self.boxes.shape[1]
+        rows = np.empty((len(self), box_cols + 1), dtype=dtype)
+        rows[:, :box_cols] = self.boxes
+        rows[:, box_cols] = self.confs
+        return rows
+
+
+__all__: tuple[str, ...] = ()

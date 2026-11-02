@@ -1,0 +1,195 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+include:
+
+services:
+
+  vss-behavior-analytics-3d:
+    extends:
+      file: ${VSS_APPS_DIR}/services/analytics/behavior-analytics/compose.yml
+      service: vss-behavior-analytics-base
+    profiles: ["vss-behavior-analytics-3d"]
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/resources/calibration.json
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json:/resources/vss-behavior-analytics-config.json
+    container_name: vss-behavior-analytics
+    networks:
+      default:
+        aliases:
+          - vss-behavior-analytics
+    command: python3 apps/analytics/main_analytics_3d_app.py --config /resources/vss-behavior-analytics-config.json --calibration /resources/calibration.json
+    depends_on:
+      broker-health-check:
+        condition: service_completed_successfully
+      bp-configurator-3d:
+        condition: service_healthy
+
+  vss-behavior-analytics-playback-3d:
+    extends:
+      file: ${VSS_APPS_DIR}/services/analytics/behavior-analytics/compose.yml
+      service: vss-behavior-analytics-base
+    profiles: ["vss-behavior-analytics-playback-3d"]
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json:/resources/vss-behavior-analytics-config.json
+      - $VSS_DATA_DIR/playback/warehouse_20x20_playback.txt:/opt/mdx/playback/warehouse_20x20_playback.txt
+    container_name: vss-behavior-analytics-playback
+    command: python3 apps/playback/playback_frames.py --config /resources/vss-behavior-analytics-config.json --playback-filepath /opt/mdx/playback/warehouse_20x20_playback.txt
+
+  bp-configurator-3d:
+    extends:
+      file: ${VSS_APPS_DIR}/services/configurators/vss-configurator/docker-compose.yaml
+      service: bp-configurator-base
+    container_name: vss-configurator
+    networks:
+      default:
+        aliases:
+          - vss-configurator
+    profiles: !override ["bp-configurator-3d"]
+    environment:
+      PROFILE_CONFIG_FILE: $VSS_APPS_DIR/industry-profiles/warehouse-operations/blueprint-configurator/blueprint_config.yml
+      DATASET_TYPE: ${DATASET_TYPE:-synthetic}
+      DS_CONFIG_DIR: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/deepstream/configs
+      NVSTREAMER_CONFIG_DIR: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/nvstreamer/configs
+      RECOMPUTE_BEV_CENTERS_ENABLED: true
+      SENSOR_FILE_PATH: ${SENSOR_FILE_PATH:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/camera_configs/camera_info.json}
+      CHECK_SENSOR_IN_CALIBRATION_FILE: true
+      ENABLE_SENSOR_CONFIGURATOR: true
+      CALL_SENSOR_ADD_API: true
+      SEND_CONFIG_TO_SDR: true
+      ENABLE_CALIBRATION_PROCESS: true
+      PORT: 5001
+    env_file:
+      - ${VSS_APPS_DIR}/containers.env
+      - ${BP_CONFIGURATOR_BASE_ENV_FILE:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/.env}
+      - ${BP_CONFIGURATOR_ENV_FILE:-$VSS_APPS_DIR/industry-profiles/warehouse-operations/overrides.env}
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations:$VSS_APPS_DIR/industry-profiles/warehouse-operations:rw
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET:/opt/data
+    depends_on:
+      broker-health-check:
+        condition: service_completed_successfully
+
+  ds-configurator-3d:
+    image: ${VSS_RT_CONFIG_ADAPTOR_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/vss-rt-config-adaptor}:${VSS_RT_CONFIG_ADAPTOR_TAG:-${VSS_CONTAINER_TAG:-develop-latest}}
+    profiles: ["ds-configurator-3d"]
+    container_name: vss-rtvi-cv-config-adaptor
+    user: "0:0"
+    network_mode: "service:perception-3d"
+    depends_on:
+      perception-3d:
+        condition: service_started
+    environment:
+      PORT: 9003
+      DS_CONFIG_PATH: /opt/data/ds-configurator/config.csv
+      EVENT_OBJECT_FIELD: event
+      METADATA_OBJECT_FIELD: metadata
+      DS_CONFIG_YAML_SOURCE_PATH: /opt/data/ds-configurator/config.yaml
+      DS_CONFIG_YAML_TARGET_PATH: /opt/data/ds-configurator/config.yaml
+      CALIB_FILE_PATH: /opt/data/ds-configurator/calibration.json
+    # depends_on:
+    #   sdr-3d:
+    #     condition: service_started
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/deepstream/configs:/opt/data/ds-configurator
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/opt/data/ds-configurator/calibration.json:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,socket; s=socket.create_connection(('127.0.0.1', int(os.environ.get('PORT', '9003'))), 3); s.close()"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  perception-3d:
+    extends:
+      file: $VSS_APPS_DIR/services/rtvi/rtvi-cv/compose.yaml
+      service: perception
+    profiles: ["perception-3d"]
+    container_name: vss-rtvi-cv
+    volumes:
+      # General mountings
+     - $VSS_DATA_DIR/models/:/opt/storage/
+     - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/models-download.json:/opt/config/models-download.json:ro
+     - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/opt/data/ds-configurator/calibration.json
+     - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/deepstream/label/labels-${DATASET_TYPE:-synthetic}.txt:/opt/nvidia/deepstream/deepstream/sources/sparse4d/label/labels-${DATASET_TYPE:-synthetic}.txt:ro
+     - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/deepstream/configs/config.yaml:/opt/data/ds-configurator/config.yaml
+
+      # Config mountings
+     - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/deepstream/configs/:/opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/configs/
+
+    environment:
+      DS_MODEL_FAMILY: sparse4d-warehouse
+      DS_MODE_FLAG: "5"
+      DS_MESSAGE_RATE: 1
+      DS_TRACKER_REID: "false"
+      DS_SHOW_SENSOR_ID: "false"
+      SPARSE4D_DEBUG_TS: "1"
+      SPARSE4D_CONFIG_PATH: "/opt/data/ds-configurator/"
+      SPARSE4D_ENGINE_PATH: "/opt/storage/sparse4d/"
+      CUDA_MPS_PIPE_DIRECTORY: "/tmp/nvidia-mps-via/"
+      CUSTOM_LIB_PATH: "/usr/local/lib/python3.10/dist-packages/torch/lib:/opt/nvidia/deepstream/deepstream/sources/sparse4d/"
+      CUSTOM_PRELOAD_LIB: "/opt/nvidia/deepstream/deepstream/sources/sparse4d/libmsda_fp16.so"
+      MSDA_PLUGIN_PATH: "/opt/nvidia/deepstream/deepstream/sources/sparse4d/libmsda_fp16.so"
+      NETWORK_WIDTH: 960
+      NETWORK_HEIGHT: 540
+      HARDWARE_PROFILE: $HARDWARE_PROFILE
+      NGC_CLI_API_KEY: ${NGC_CLI_API_KEY}
+      DS_MODEL_DOWNLOAD: auto
+    depends_on:
+      sdr-controller:
+        condition: service_started
+      sensor-ms-3d:
+        condition: service_started
+      broker-health-check:
+        condition: service_completed_successfully
+      bp-configurator-3d:
+        condition: service_healthy
+
+  kibana-init-container-3d:
+    build:
+      context: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app
+      dockerfile: Dockerfiles/kibana-dashboard.Dockerfile
+    profiles: ["kibana-init-container-3d"]
+    container_name: vss-kibana-init
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/kibana-dashboard/warehouse-3d-kibana-objects.ndjson:/opt/vss/kibana-objects.ndjson
+    command: bash /opt/vss/init-scripts/kibana-import-dashboard.sh
+    depends_on:
+      kibana:
+        condition: service_healthy
+
+  import-calibration-output-container-3d:
+    build:
+      context: $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app
+      dockerfile: Dockerfiles/import-calibration.Dockerfile
+    profiles: ["import-calibration-output-container-3d"]
+    container_name: vss-import-calibration-output
+    volumes:
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/opt/vss/calibration.json
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-3d-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/images:/opt/vss/images/
+    command: bash /opt/vss/init-scripts/calibration-import.sh
+    restart: on-failure:5
+    depends_on:
+      bp-configurator-3d:
+        condition: service_healthy
+
+volumes:
+  vss-behavior-analytics-3d:

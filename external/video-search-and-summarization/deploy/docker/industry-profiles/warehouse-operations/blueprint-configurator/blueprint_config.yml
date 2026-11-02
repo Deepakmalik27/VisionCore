@@ -1,0 +1,918 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ========================================================================================================
+#
+# This YAML file defines hardware-specific configurations for GPU profiles and deployment modes.
+# It controls how the Configurator generates configuration files based on provided profile
+
+# ========================================================================================================
+# COMMONS
+# ========================================================================================================
+# Common variables and file operations are defined here and can be reused across multiple hardware profiles.
+
+# ========================================================================================================
+
+commons:
+  # Prerequisites: Count video files and set NUM_STREAMS variable
+  # This runs before variables are processed, so NUM_STREAMS can be used in variable expressions
+  # To enable file count, set enabled: true on the operation below
+  prerequisites:
+    2d:
+      - operation_type: "file_management"
+        enabled: false
+        target_directories:
+          - "${VSS_DATA_DIR}/videos/${SAMPLE_VIDEO_DATASET}"
+        file_management:
+          action: "file_count"       # Count files matching pattern
+          parameters:
+            pattern: "*.mp4"          # File pattern to match
+          output_variable: NUM_STREAMS # Output the number of files matching the pattern to the NUM_STREAMS variable
+
+    3d:
+      - operation_type: "file_management"
+        enabled: false
+        target_directories:
+          - "${VSS_DATA_DIR}/videos/${SAMPLE_VIDEO_DATASET}"
+        file_management:
+          action: "file_count"       # Count files matching pattern
+          parameters:
+            pattern: "*.mp4"          # File pattern to match
+          output_variable: NUM_STREAMS # Output the number of files matching the pattern to the NUM_STREAMS variable
+    mv3dt:
+      - operation_type: "file_management"
+        enabled: false
+        target_directories:
+          - "${VSS_DATA_DIR}/videos/${SAMPLE_VIDEO_DATASET}"
+        file_management:
+          action: "file_count"       # Count files matching pattern
+          parameters:
+            pattern: "*.mp4"          # File pattern to match
+          output_variable: NUM_STREAMS # Output the number of files matching the pattern to the NUM_STREAMS variable
+  variable_validation:
+    2d:
+      # VSS path variables must be set to real paths, not placeholders or empty
+      - variable: VSS_APPS_DIR
+        required: true
+        disallowed_values: ["", "/path/to/deploy/docker"]
+        error_message: "VSS_APPS_DIR must be set to a valid deployment path and must not be empty or the placeholder '/path/to/deploy/docker'"
+      - variable: VSS_DATA_DIR
+        required: true
+        disallowed_values: ["", "/path/to/vss-warehouse-app-data"]
+        error_message: "VSS_DATA_DIR must be set to a valid data path and must not be empty or the placeholder '/path/to/vss-warehouse-app-data'"
+      - variable: HOST_IP
+        required: true
+        disallowed_values: ["", "<HOST_IP>"]
+        error_message: "HOST_IP must be set to the host IP address and must not be empty or the placeholder '<HOST_IP>'"
+
+      - variable: BP_PROFILE
+        allowed_values: ["bp_wh", "bp_wh_kafka", "bp_wh_redis", "bp_wh_auto_calib"]
+
+      # bp_wh 2d profile is not supported on IGX-THOR or DGX-SPARK
+      - variable: HARDWARE_PROFILE
+        condition:
+          variable: BP_PROFILE
+          equals: "bp_wh"
+        disallowed_values: ["IGX-THOR", "DGX-SPARK"]
+        error_message: "BP_PROFILE=bp_wh in 2d mode is not supported on IGX-THOR or DGX-SPARK"
+
+      # STREAM_TYPE can only be "kafka" or "redis"
+      - variable: STREAM_TYPE
+        allowed_values: ["kafka", "redis"]
+  
+      # LLM_MODE can only be "none", "local", "local_shared" or "remote"
+      - variable: LLM_MODE
+        # required: false
+        allowed_values: ["none", "local", "local_shared", "remote"]
+
+      # VLM_MODE can only be "none", "local", "local_shared" or "remote"
+      - variable: VLM_MODE
+        # required: false
+        allowed_values: ["none", "local", "local_shared", "remote"]
+
+      # STREAM_TYPE is derived from BP_PROFILE; keep the pair consistent.
+      - variable: BP_PROFILE
+        condition:
+          variable: STREAM_TYPE
+          equals: "redis"
+        allowed_values: ["bp_wh_redis"]
+        error_message: "STREAM_TYPE=redis requires BP_PROFILE=bp_wh_redis"
+
+      - variable: BP_PROFILE
+        # required: false
+        condition:
+          variable: STREAM_TYPE
+          equals: "kafka"
+        disallowed_values: ["bp_wh_redis"]
+        error_message: "STREAM_TYPE=kafka is not valid with BP_PROFILE=bp_wh_redis"
+
+      # SBSA hardware profiles require SBSA image tags.
+      - variable: VSS_RT_CV_TAG
+        condition:
+          variable: HARDWARE_PROFILE
+          in: ["GB300", "DGX-SPARK"]
+        allowed_patterns:
+          - "*sbsa*"
+        error_message: "When HARDWARE_PROFILE is GB300 or DGX-SPARK, VSS_RT_CV_TAG must contain 'sbsa'"
+
+      # SAMPLE_VIDEO_DATASET selects a directory under
+      # <app>/calibration/sample-data/, and only matters when the sample videos
+      # are the stream source. Other sensor sources take their sensors from
+      # elsewhere and are left unconstrained.
+      - variable: SAMPLE_VIDEO_DATASET
+        condition:
+          variable: SENSOR_INFO_SOURCE
+          equals: "nvstreamer"
+        required: true
+        disallowed_values: [""]
+        error_message: "SENSOR_INFO_SOURCE=nvstreamer streams the sample dataset, so SAMPLE_VIDEO_DATASET must name a directory under <app>/calibration/sample-data (for example nv-warehouse-4cams). Set NUM_STREAMS to the camera count of the dataset you pick."
+
+      # NUM_STREAMS must match the camera count of the selected dataset. It
+      # drives nv_streamer_sync_file_count, which decides how many video files
+      # nvstreamer waits for, as well as the DS batch size, the pgie engine
+      # name, and on 3d the fusion sensor count and preprocess input shape. A
+      # value larger than the dataset has leaves nvstreamer waiting for a file
+      # that does not exist; smaller silently drops cameras the calibration
+      # still describes.
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "nv-warehouse-4cams"
+        allowed_values: ["4"]
+        error_message: "SAMPLE_VIDEO_DATASET=nv-warehouse-4cams has 4 cameras, so NUM_STREAMS must be 4."
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "warehouse-loading-dock-3cams-synthetic"
+        allowed_values: ["3"]
+        error_message: "SAMPLE_VIDEO_DATASET=warehouse-loading-dock-3cams-synthetic has 3 cameras, so NUM_STREAMS must be 3."
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "warehouse-4cams-20mx20m-synthetic"
+        allowed_values: ["4"]
+        error_message: "SAMPLE_VIDEO_DATASET=warehouse-4cams-20mx20m-synthetic has 4 cameras, so NUM_STREAMS must be 4."
+
+    3d:
+      # VSS path variables must be set to real paths, not placeholders or empty
+      - variable: VSS_APPS_DIR
+        required: true
+        disallowed_values: ["", "/path/to/deploy/docker"]
+        error_message: "VSS_APPS_DIR must be set to a valid deployment path and must not be empty or the placeholder '/path/to/deploy/docker'"
+      - variable: VSS_DATA_DIR
+        required: true
+        disallowed_values: ["", "/path/to/vss-warehouse-app-data"]
+        error_message: "VSS_DATA_DIR must be set to a valid data path and must not be empty or the placeholder '/path/to/vss-warehouse-app-data'"
+      - variable: HOST_IP
+        required: true
+        disallowed_values: ["", "<HOST_IP>"]
+        error_message: "HOST_IP must be set to the host IP address and must not be empty or the placeholder '<HOST_IP>'"
+
+      # Sparse4D model, anchor, and labels are selected by this explicit dataset family.
+      - variable: DATASET_TYPE
+        required: true
+        allowed_values: ["real", "synthetic"]
+        error_message: "DATASET_TYPE must be either real or synthetic"
+
+      # BP_PROFILE can only be "bp_wh_kafka", "bp_wh_redis", or "bp_wh_auto_calib"
+      - variable: BP_PROFILE
+        allowed_values: ["bp_wh_kafka", "bp_wh_redis", "bp_wh_auto_calib"]
+
+      # STREAM_TYPE can only be "kafka" or "redis"
+      - variable: STREAM_TYPE
+        allowed_values: ["kafka", "redis"]
+
+      # LLM_MODE can only be "none", "local", "local_shared" or "remote"
+      - variable: LLM_MODE
+        # required: false
+        allowed_values: ["none"]
+
+      # VLM_MODE can only be "none", "local", "local_shared" or "remote"
+      - variable: VLM_MODE
+        # required: false
+        allowed_values: ["none"]
+
+      # STREAM_TYPE is derived from BP_PROFILE; keep the pair consistent.
+      - variable: BP_PROFILE
+        # required: false
+        condition:
+          variable: STREAM_TYPE
+          equals: "redis"
+        allowed_values: ["bp_wh_redis"]
+        error_message: "STREAM_TYPE=redis requires BP_PROFILE=bp_wh_redis"
+
+      - variable: BP_PROFILE
+        # required: false
+        condition:
+          variable: STREAM_TYPE
+          equals: "kafka"
+        disallowed_values: ["bp_wh_redis"]
+        error_message: "STREAM_TYPE=kafka is not valid with BP_PROFILE=bp_wh_redis"
+
+      # SBSA hardware profiles require SBSA image tags.
+      - variable: VSS_RT_CV_TAG
+        condition:
+          variable: HARDWARE_PROFILE
+          in: ["GB300", "DGX-SPARK"]
+        allowed_patterns:
+          - "*sbsa*"
+        error_message: "When HARDWARE_PROFILE is GB300 or DGX-SPARK, VSS_RT_CV_TAG must contain 'sbsa'"
+
+      # SAMPLE_VIDEO_DATASET selects a directory under
+      # <app>/calibration/sample-data/, and only matters when the sample videos
+      # are the stream source. Other sensor sources take their sensors from
+      # elsewhere and are left unconstrained.
+      - variable: SAMPLE_VIDEO_DATASET
+        condition:
+          variable: SENSOR_INFO_SOURCE
+          equals: "nvstreamer"
+        required: true
+        disallowed_values: [""]
+        error_message: "SENSOR_INFO_SOURCE=nvstreamer streams the sample dataset, so SAMPLE_VIDEO_DATASET must name a directory under <app>/calibration/sample-data (for example nv-warehouse-4cams). Set NUM_STREAMS to the camera count of the dataset you pick."
+
+      # NUM_STREAMS must match the camera count of the selected dataset. It
+      # drives nv_streamer_sync_file_count, which decides how many video files
+      # nvstreamer waits for, as well as the DS batch size, the pgie engine
+      # name, and on 3d the fusion sensor count and preprocess input shape. A
+      # value larger than the dataset has leaves nvstreamer waiting for a file
+      # that does not exist; smaller silently drops cameras the calibration
+      # still describes.
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "nv-warehouse-4cams"
+        allowed_values: ["4"]
+        error_message: "SAMPLE_VIDEO_DATASET=nv-warehouse-4cams has 4 cameras, so NUM_STREAMS must be 4."
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "warehouse-loading-dock-3cams-synthetic"
+        allowed_values: ["3"]
+        error_message: "SAMPLE_VIDEO_DATASET=warehouse-loading-dock-3cams-synthetic has 3 cameras, so NUM_STREAMS must be 3."
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "warehouse-4cams-20mx20m-synthetic"
+        allowed_values: ["4"]
+        error_message: "SAMPLE_VIDEO_DATASET=warehouse-4cams-20mx20m-synthetic has 4 cameras, so NUM_STREAMS must be 4."
+
+    mv3dt:
+      # MDX path variables must be set to real paths, not placeholders or empty
+      - variable: VSS_APPS_DIR
+        required: true
+        disallowed_values: ["", "/path/to/deployments"]
+        error_message: "VSS_APPS_DIR must be set to a valid deployment path and must not be empty or the placeholder '/path/to/deployments'"
+      - variable: VSS_DATA_DIR
+        required: true
+        disallowed_values: ["", "/path/to/vss-warehouse-app-data"]
+        error_message: "VSS_DATA_DIR must be set to a valid data path and must not be empty or the placeholder '/path/to/vss-warehouse-app-data'"
+      - variable: HOST_IP
+        required: true
+        disallowed_values: ["", "<HOST_IP>"]
+        error_message: "HOST_IP must be set to the host IP address and must not be empty or the placeholder '<HOST_IP>'"
+
+      # BP_PROFILE can only be "bp_wh_kafka", "bp_wh_redis", or "bp_wh_auto_calib"
+      - variable: BP_PROFILE
+        allowed_values: ["bp_wh_kafka", "bp_wh_redis", "bp_wh_auto_calib"]
+
+      # STREAM_TYPE can only be "kafka" or "redis"
+      - variable: STREAM_TYPE
+        allowed_values: ["kafka", "redis"]
+
+      # LLM_MODE can only be "none"
+      - variable: LLM_MODE
+        allowed_values: ["none"]
+
+      # VLM_MODE can only be "none"
+      - variable: VLM_MODE
+        allowed_values: ["none"]
+
+      # STREAM_TYPE is derived from BP_PROFILE; keep the pair consistent.
+      - variable: BP_PROFILE
+        condition:
+          variable: STREAM_TYPE
+          equals: "redis"
+        allowed_values: ["bp_wh_redis"]
+        error_message: "STREAM_TYPE=redis requires BP_PROFILE=bp_wh_redis"
+
+      - variable: BP_PROFILE
+        condition:
+          variable: STREAM_TYPE
+          equals: "kafka"
+        disallowed_values: ["bp_wh_redis"]
+        error_message: "STREAM_TYPE=kafka is not valid with BP_PROFILE=bp_wh_redis"
+
+      # SBSA hardware profiles require SBSA image tags.
+      - variable: VSS_RT_CV_TAG
+        condition:
+          variable: HARDWARE_PROFILE
+          in: ["GB300", "DGX-SPARK"]
+        allowed_patterns:
+          - "*sbsa*"
+        error_message: "When HARDWARE_PROFILE is GB300 or DGX-SPARK, VSS_RT_CV_TAG must contain 'sbsa'"
+
+      # SAMPLE_VIDEO_DATASET selects a directory under
+      # <app>/calibration/sample-data/, and only matters when the sample videos
+      # are the stream source. Other sensor sources take their sensors from
+      # elsewhere and are left unconstrained.
+      - variable: SAMPLE_VIDEO_DATASET
+        condition:
+          variable: SENSOR_INFO_SOURCE
+          equals: "nvstreamer"
+        required: true
+        disallowed_values: [""]
+        error_message: "SENSOR_INFO_SOURCE=nvstreamer streams the sample dataset, so SAMPLE_VIDEO_DATASET must name a directory under <app>/calibration/sample-data (for example nv-warehouse-4cams). Set NUM_STREAMS to the camera count of the dataset you pick."
+
+      # NUM_STREAMS must match the camera count of the selected dataset. It
+      # drives nv_streamer_sync_file_count, which decides how many video files
+      # nvstreamer waits for, as well as the DS batch size, the pgie engine
+      # name, and on 3d the fusion sensor count and preprocess input shape. A
+      # value larger than the dataset has leaves nvstreamer waiting for a file
+      # that does not exist; smaller silently drops cameras the calibration
+      # still describes.
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "nv-warehouse-4cams"
+        allowed_values: ["4"]
+        error_message: "SAMPLE_VIDEO_DATASET=nv-warehouse-4cams has 4 cameras, so NUM_STREAMS must be 4."
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "warehouse-loading-dock-3cams-synthetic"
+        allowed_values: ["3"]
+        error_message: "SAMPLE_VIDEO_DATASET=warehouse-loading-dock-3cams-synthetic has 3 cameras, so NUM_STREAMS must be 3."
+      - variable: NUM_STREAMS
+        condition:
+          variable: SAMPLE_VIDEO_DATASET
+          equals: "warehouse-4cams-20mx20m-synthetic"
+        allowed_values: ["4"]
+        error_message: "SAMPLE_VIDEO_DATASET=warehouse-4cams-20mx20m-synthetic has 4 cameras, so NUM_STREAMS must be 4."
+
+  variables:
+    2d:
+      - trim_sample_videos: 'False if "${SENSOR_INFO_SOURCE}" == "file" else True'
+      - effective_max_streams_supported: 'int("${max_streams_supported}") if "${max_streams_supported}" != "$" + "{max_streams_supported}" and "${max_streams_supported}" != "" else ${NUM_STREAMS}'
+      - final_stream_count: "min(${NUM_STREAMS}, ${effective_max_streams_supported})"
+      # pre_cluster_threshold: 0.6 for nv-warehouse-4cams, else 0.5 (used in ds-pgie-config.yml)
+      - pre_cluster_threshold: '"0.6" if "${SAMPLE_VIDEO_DATASET}" == "nv-warehouse-4cams" else "0.5"'
+      - person_detection_threshold: '"0.5" if "${SAMPLE_VIDEO_DATASET}" == "warehouse-loading-dock-3cams-synthetic" else "0.6"'
+      - msg-broker-conn-str: '"redis;6379;" if "${STREAM_TYPE}" == "redis" else "kafka;29092;mdx-raw"'
+      - msg-broker-config: '"ds-redis-config.txt" if "${STREAM_TYPE}" == "redis" else "ds-kafka-config.txt"'
+      - msg-broker-proto-lib: '"/opt/nvidia/deepstream/deepstream/lib/libnvds_redis_proto.so" if "${STREAM_TYPE}" == "redis" else "/opt/nvidia/deepstream/deepstream/lib/libnvds_kafka_proto.so"'
+      # vss-behavior-analytics app.sourceType / app.sinkType (MDX uses "redisStream", not "redis")
+      - warehouse_source_sink_type: '"redisStream" if "${STREAM_TYPE}" == "redis" else "kafka"'
+      # vss-video-analytics-api: kafka.brokers null when using Redis streams; broker list when using Kafka
+      - vss_video_analytics_kafka_brokers: 'None if "${STREAM_TYPE}" == "redis" else ["kafka:29092"]'
+    3d:
+      - trim_sample_videos: 'False if "${SENSOR_INFO_SOURCE}" == "file" else True'
+      - effective_max_streams_supported: 'int("${max_streams_supported}") if "${max_streams_supported}" != "$" + "{max_streams_supported}" and "${max_streams_supported}" != "" else ${NUM_STREAMS}'
+      - final_stream_count: "min(${NUM_STREAMS}, ${effective_max_streams_supported})"
+      # Synthetic datasets use Sparse4D v2.3; real datasets use v3.0.
+      - sparse4d_onnx_file: '"/opt/storage/sparse4d/sparse4d_warehouse_v2.3.onnx" if "${DATASET_TYPE}" == "synthetic" else "/opt/storage/sparse4d/sparse4d_warehouse_v3.0.onnx"'
+      - sparse4d_engine_file: '"/opt/storage/sparse4d/sparse4d_warehouse_v2.3_b${final_stream_count}.engine" if "${DATASET_TYPE}" == "synthetic" else "/opt/storage/sparse4d/sparse4d_warehouse_v3.0_b${final_stream_count}.engine"'
+      - sparse4d_labels_file: '"/opt/nvidia/deepstream/deepstream/sources/sparse4d/label/labels-${DATASET_TYPE}.txt"'
+      - sparse4d_anchor_file: '"/opt/storage/sparse4d/_ov_kmeans900_v2.3_r50.npy" if "${DATASET_TYPE}" == "synthetic" else "/opt/storage/sparse4d/_ov_kmeans900_v3.0_r50.npy"'
+      - sparse4d_anchor_source: '"_ov_kmeans900_v2.3_r50.npy" if "${DATASET_TYPE}" == "synthetic" else "_ov_kmeans900_v3.0_r50.npy"'
+      - sparse4d_anchor_destination: '"sparse4d/_ov_kmeans900_v2.3_r50.npy" if "${DATASET_TYPE}" == "synthetic" else "sparse4d/_ov_kmeans900_v3.0_r50.npy"'
+      - sparse4d_model: '"nvidia/tao/sparse4d_rn50:deployable_v2.3" if "${DATASET_TYPE}" == "synthetic" else "nvidia/tao/sparse4d_rn50:deployable_v3.0"'
+      - sparse4d_model_source: '"sparse4d_warehouse_v2.3_r50.onnx" if "${DATASET_TYPE}" == "synthetic" else "sparse4d_warehouse_v3.0_r50.onnx"'
+      - sparse4d_model_destination: '"sparse4d/sparse4d_warehouse_v2.3.onnx" if "${DATASET_TYPE}" == "synthetic" else "sparse4d/sparse4d_warehouse_v3.0.onnx"'
+
+      - msg-broker-conn-str: '"redis;6379;" if "${STREAM_TYPE}" == "redis" else "kafka;29092;mdx-bev"'
+      - msg-broker-config: '"ds-redis-config.txt" if "${STREAM_TYPE}" == "redis" else "ds-kafka-config.txt"'
+      - msg-broker-proto-lib: '"/opt/nvidia/deepstream/deepstream/lib/libnvds_redis_proto.so" if "${STREAM_TYPE}" == "redis" else "/opt/nvidia/deepstream/deepstream/lib/libnvds_kafka_proto.so"'
+      # vss-behavior-analytics app.sourceType / app.sinkType (MDX uses "redisStream", not "redis")
+      - warehouse_source_sink_type: '"redisStream" if "${STREAM_TYPE}" == "redis" else "kafka"'
+      # vss-video-analytics-api: kafka.brokers null when using Redis streams; broker list when using Kafka
+      - vss_video_analytics_kafka_brokers: 'None if "${STREAM_TYPE}" == "redis" else ["kafka:29092"]'
+    mv3dt:
+      - trim_sample_videos: 'False if "${SENSOR_INFO_SOURCE}" == "file" else True'
+      - effective_max_streams_supported: 'int("${max_streams_supported}") if "${max_streams_supported}" != "$" + "{max_streams_supported}" and "${max_streams_supported}" != "" else ${NUM_STREAMS}'
+      - final_stream_count: "min(${NUM_STREAMS}, ${effective_max_streams_supported})"
+      - msg-broker-conn-str: '"redis;6379;" if "${STREAM_TYPE}" == "redis" else "kafka;29092;mdx-raw"'
+      - msg-broker-config: '"ds-redis-config.txt" if "${STREAM_TYPE}" == "redis" else "ds-kafka-config.txt"'
+      - msg-broker-proto-lib: '"/opt/nvidia/deepstream/deepstream/lib/libnvds_redis_proto.so" if "${STREAM_TYPE}" == "redis" else "/opt/nvidia/deepstream/deepstream/lib/libnvds_kafka_proto.so"'
+      # vss-behavior-analytics app.sourceType / app.sinkType (MDX uses "redisStream", not "redis")
+      - warehouse_source_sink_type: '"redisStream" if "${STREAM_TYPE}" == "redis" else "kafka"'
+      # vss-video-analytics-api: kafka.brokers null when using Redis streams; broker list when using Kafka
+      - vss_video_analytics_kafka_brokers: 'None if "${STREAM_TYPE}" == "redis" else ["kafka:29092"]'
+      - ds_config_latency: '"2000" if "${STREAM_TYPE}" == "redis" else "10000"'
+
+  file_operations:
+    2d:
+      # Update DeepStream main config 
+      - operation_type: "text_config_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-2d-app/deepstream/configs/ds-main-config.txt"
+        backup: true
+        updates:
+          num-source-bins: "0"
+          max-batch-size: "${final_stream_count}"
+          batch-size: "${final_stream_count}"
+          msg-broker-conn-str: "${msg-broker-conn-str}"
+          msg-broker-config: "${msg-broker-config}"
+          msg-broker-proto-lib: "${msg-broker-proto-lib}"
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/services/nvstreamer/configs/vst-config.json"
+        backup: true 
+        updates:
+          data.nv_streamer_sync_file_count: ${final_stream_count}
+
+      # Update the VST Configs
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-2d-app/vst/configs/vst_config.json"
+        backup: true
+        updates:
+          onvif.max_devices_supported: ${effective_max_streams_supported}
+          data.always_recording: true
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-2d-app/vst/configs/notification_config.json"
+        backup: true
+        updates:
+          message_broker.use_message_broker_consumer: "${STREAM_TYPE}"
+
+      # Warehouse: source/sink driver — kafka vs redisStream (see warehouse_source_sink_type)
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-2d-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json"
+        backup: true
+        array_kv_updates:
+          - list_key: app
+            match_field: name
+            updates:
+              - match: sourceType
+                set_key: value
+                set_value: "${warehouse_source_sink_type}"
+              - match: sinkType
+                set_key: value
+                set_value: "${warehouse_source_sink_type}"
+
+      # vss-video-analytics-api (compose mounts VSS_APPS_DIR/services/analytics/video-analytics-api/configs/...)
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/services/analytics/video-analytics-api/configs/vss-video-analytics-api-config.json"
+        backup: true
+        updates:
+          kafka.brokers: "${vss_video_analytics_kafka_brokers}"
+
+      # Update DeepStream YAML config
+      - operation_type: "yaml_update"
+        target_file: "${DS_CONFIG_DIR}/ds-pgie-config.yml"
+        backup: true
+        updates:
+          property.model-engine-file: /opt/storage/rtdetr_warehouse_v1.0.2.fp16.onnx_b${final_stream_count}_gpu0_fp16.engine
+          class-attrs-all.pre-cluster-threshold: "${pre_cluster_threshold}"
+          class-attrs-0.pre-cluster-threshold: "${person_detection_threshold}"
+        
+      - operation_type: "file_management"
+        enabled: false
+        target_directories:
+          - "${VSS_DATA_DIR}/videos/${SAMPLE_VIDEO_DATASET}"
+        file_management:
+          action: "keep_count" # Keep only the last ${final_stream_count} videos in the directory
+          parameters:
+            count: ${final_stream_count}
+            pattern: "*.mp4"
+
+    3d:
+      # Update DeepStream YAML config
+      - operation_type: "yaml_update"
+        target_file: "${DS_CONFIG_DIR}/config.yaml"
+        backup: true
+        updates:
+          num_sensors: ${final_stream_count}
+          onnx_file: "${sparse4d_onnx_file}"
+          engine_file: "${sparse4d_engine_file}"
+          labels_file: "${sparse4d_labels_file}"
+          anchor: "${sparse4d_anchor_file}"
+
+      # Download only the Sparse4D model selected for this dataset.
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-3d-app/models-download.json"
+        backup: true
+        array_kv_updates:
+          - list_key: downloads
+            match_field: artifact
+            updates:
+              - match: "model"
+                set_key: model
+                set_value: "${sparse4d_model}"
+              - match: "model"
+                set_key: sourcePath
+                set_value: "${sparse4d_model_source}"
+              - match: "model"
+                set_key: destPath
+                set_value: "${sparse4d_model_destination}"
+              - match: "anchor"
+                set_key: model
+                set_value: "${sparse4d_model}"
+              - match: "anchor"
+                set_key: sourcePath
+                set_value: "${sparse4d_anchor_source}"
+              - match: "anchor"
+                set_key: destPath
+                set_value: "${sparse4d_anchor_destination}"
+
+      # Update DeepStream main config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-main-config.txt"
+        backup: true
+        updates:
+          num-source-bins: "0"
+          list: ""
+          sensor-id-list: ""
+          sensor-name-list: ""
+          max-batch-size: "${final_stream_count}"
+          batch-size: "${final_stream_count}"
+          msg-broker-conn-str: "${msg-broker-conn-str}"
+          msg-broker-config: "${msg-broker-config}"
+          msg-broker-proto-lib: "${msg-broker-proto-lib}"
+
+      # Update DeepStream preprocess config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-mtmc-preprocess-config.txt"
+        backup: true
+        updates:
+          network-input-shape: "${final_stream_count};3;540;960"
+
+      # Update VST Configs
+      - operation_type: "json_update"
+        target_file: ${VSS_APPS_DIR}/services/nvstreamer/configs/vst-config.json
+        backup: true 
+        updates:
+          data.nv_streamer_sync_file_count: ${final_stream_count}
+          onvif.max_devices_supported: ${effective_max_streams_supported}
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-3d-app/vst/configs/vst_config.json"
+        backup: true
+        updates:
+          onvif.max_devices_supported: ${effective_max_streams_supported}
+          data.always_recording: true
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-3d-app/vst/configs/notification_config.json"
+        backup: true
+        updates:
+          message_broker.use_message_broker_consumer: "${STREAM_TYPE}"
+
+      # Warehouse: source/sink driver — kafka vs redisStream (see warehouse_source_sink_type)
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-3d-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json"
+        backup: true
+        array_kv_updates:
+          - list_key: app
+            match_field: name
+            updates:
+              - match: sourceType
+                set_key: value
+                set_value: "${warehouse_source_sink_type}"
+              - match: sinkType
+                set_key: value
+                set_value: "${warehouse_source_sink_type}"
+
+      # vss-video-analytics-api (compose mounts VSS_APPS_DIR/services/analytics/video-analytics-api/configs/...)
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/services/analytics/video-analytics-api/configs/vss-video-analytics-api-config.json"
+        backup: true
+        updates:
+          kafka.brokers: "${vss_video_analytics_kafka_brokers}"
+
+      - operation_type: "file_management"
+        enabled: false
+        target_directories:
+          - "${VSS_DATA_DIR}/videos/${SAMPLE_VIDEO_DATASET}"
+        file_management:
+          action: "keep_count" # Keep only the last ${final_stream_count} videos in the directory
+          parameters:
+            count: ${final_stream_count}
+            pattern: "*.mp4"
+
+      # For file-based RTSP, use camera_name values from SENSOR_FILE_PATH.
+      # Otherwise, run after keep_count and use retained video filename stems.
+      - operation_type: "recompute_bev_groups"
+        enabled: "${RECOMPUTE_BEV_CENTERS_ENABLED}"
+        required_mode: "3d"
+        required_calibration_mode: "mount"
+        sensor_file: "${SENSOR_FILE_PATH}"
+        video_directories:
+          - "${VSS_DATA_DIR}/videos/${SAMPLE_VIDEO_DATASET}"
+        video_patterns:
+          - "*.mp4"
+          - "*.mkv"
+        calibration_file: "${CALIBRATION_DIR_MOUNT_PATH}/${CALIBRATION_FILE_NAME}"
+        expected_camera_count: "${NUM_STREAMS}"
+        n_sensor_groups: 1
+
+    mv3dt:
+      # Update DeepStream main config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-main-config-mv3dt.txt"
+        backup: true
+        updates:
+          num-source-bins: "0"
+          list: ""
+          sensor-id-list: ""
+          sensor-name-list: ""
+          config-file: "ds-pgie-config.yml"
+          max-batch-size: "${final_stream_count}"
+          batch-size: "${final_stream_count}"
+          msg-broker-conn-str: "${msg-broker-conn-str}"
+          msg-broker-config: "${msg-broker-config}"
+          msg-broker-proto-lib: "${msg-broker-proto-lib}"
+          latency: "${ds_config_latency}"
+
+      # Update DeepStream YAML config to avoid rebuilding the engine when the batch size changes
+      - operation_type: "yaml_update"
+        target_file: "${DS_CONFIG_DIR}/ds-pgie-config.yml"
+        backup: true
+        updates:
+          property.model-engine-file: /opt/storage/rtdetr_warehouse_v1.0.2.fp16.onnx_b${final_stream_count}_gpu0_fp16.engine
+
+      # Keep the tracker's ReIDService port in step with the port vss-reid-embed-mv3dt
+      # actually binds; DeepStream does not expand env vars in its own configs.
+      # text_replace rather than yaml_update so the surrounding ReID block keeps
+      # its inline comments, which a round-trip through a YAML parser would put
+      # at risk. servicePort occurs once, hence the line-anchored pattern.
+      - operation_type: "text_replace"
+        target_file: "${DS_CONFIG_DIR}/ds-mv3dt-tracker-config.yml"
+        backup: true
+        operations:
+          - action: "replace"
+            pattern: '(?m)^(\s*)servicePort:.*$'
+            replacement: '\1servicePort: ${REID_SERVICE_PORT}'
+            regex: true
+
+      # Update NVStreamer configs
+      - operation_type: "json_update"
+        target_file: ${VSS_APPS_DIR}/services/nvstreamer/configs/vst-config.json
+        backup: true
+        updates:
+          data.nv_streamer_sync_file_count: ${final_stream_count}
+          onvif.max_devices_supported: ${effective_max_streams_supported}
+
+      # Update VST config
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vst/configs/vst_config.json"
+        backup: true
+        updates:
+          onvif.max_devices_supported: ${effective_max_streams_supported}
+          data.always_recording: true
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vst/configs/notification_config.json"
+        backup: true
+        updates:
+          message_broker.use_message_broker_consumer: "${STREAM_TYPE}"
+
+      # Warehouse: source/sink driver — kafka vs redisStream (see warehouse_source_sink_type)
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json"
+        backup: true
+        array_kv_updates:
+          - list_key: app
+            match_field: name
+            updates:
+              - match: sourceType
+                set_key: value
+                set_value: "${warehouse_source_sink_type}"
+              - match: sinkType
+                set_key: value
+                set_value: "${warehouse_source_sink_type}"
+
+      # vss-video-analytics-api (compose mounts VSS_APPS_DIR/services/analytics/video-analytics-api/configs/...)
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/services/analytics/video-analytics-api/configs/vss-video-analytics-api-config.json"
+        backup: true
+        updates:
+          kafka.brokers: "${vss_video_analytics_kafka_brokers}"
+
+      - operation_type: "file_management"
+        enabled: false
+        target_directories:
+          - "${VSS_DATA_DIR}/videos/${SAMPLE_VIDEO_DATASET}"
+        file_management:
+          action: "keep_count" # Keep only the last ${final_stream_count} videos in the directory
+          parameters:
+            count: ${final_stream_count}
+            pattern: "*.mp4"
+
+      # For file-based RTSP, use camera_name values from SENSOR_FILE_PATH.
+      # Otherwise, run after keep_count and use retained video filename stems.
+      - operation_type: "recompute_bev_groups"
+        enabled: "${RECOMPUTE_BEV_CENTERS_ENABLED}"
+        required_mode: "mv3dt"
+        required_calibration_mode: "mount"
+        sensor_file: "${SENSOR_FILE_PATH}"
+        video_directories:
+          - "${VSS_DATA_DIR}/videos/${SAMPLE_VIDEO_DATASET}"
+        video_patterns:
+          - "*.mp4"
+          - "*.mkv"
+        calibration_file: "${CALIBRATION_DIR_MOUNT_PATH}/${CALIBRATION_FILE_NAME}"
+        expected_camera_count: "${NUM_STREAMS}"
+        n_sensor_groups: 1
+
+# ========================================================================================================
+# HARDWARE PROFILES
+# ========================================================================================================
+# 3D stream limits use the lower result across Sparse4D v2.3 and v3.0 when
+# the model versions differ. Profiles run at 30 FPS unless their tuning below
+# sets interval: "1", in which case the effective inference rate is 15 FPS.
+
+H100:
+  # H100 NVL and H100 80GB HBM3 share this profile. The 2D and 3D limits use
+  # the lower H100 NVL results.
+  2d:
+    max_streams_supported: 61
+  3d:
+    max_streams_supported: 19
+  mv3dt:
+    max_streams_supported: 61
+
+GB300:
+  2d:
+    max_streams_supported: 161
+  3d:
+    # Conservative limit: Sparse4D v2.3 supports 74 and v3.0 supports 71.
+    max_streams_supported: 71
+
+L40S:
+  2d:
+    max_streams_supported: 28
+  3d:
+    max_streams_supported: 9
+  mv3dt:
+    max_streams_supported: 23
+
+RTXPRO6000BW:
+  2d:
+    max_streams_supported: 52
+  3d:
+    max_streams_supported: 21
+  mv3dt:
+    max_streams_supported: 39
+
+# RTX PRO 6000 Blackwell Server Edition.
+RTXPRO6000BW-SE:
+  2d:
+    max_streams_supported: 47
+  3d:
+    max_streams_supported: 20
+  mv3dt:
+    max_streams_supported: 39
+
+RTXPRO4500BW:
+  2d:
+    max_streams_supported: 20
+  3d:
+    max_streams_supported: 9
+
+IGX-THOR:
+  2d:
+    max_streams_supported: 9
+    file_operations:
+      # Update DeepStream main config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-main-config.txt"
+        updates:
+          drop-on-latency: "1"
+          msg-conv-msg2p-lib: /opt/nvidia/deepstream/deepstream/lib/libnvds_msgconv.so
+          compute-hw: "2"
+          low-latency-mode: "0"
+
+      - operation_type: "yaml_update"
+        target_file: "${DS_CONFIG_DIR}/ds-nvdcf-accuracy-tracker-config.yml"
+        backup: true
+        updates:
+          TargetManagement.maxTargetsPerStream: 50
+          VisualTracker.visualTrackerType: 2
+          VisualTracker.vpiBackend4DcfTracker: 1
+
+  3d:
+    # interval: 1 below runs Sparse4D at an effective 15 FPS.
+    max_streams_supported: 8
+    file_operations:
+      # Update DeepStream main config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-main-config.txt"
+        updates:
+          batched-push-timeout: "67000"
+          low-latency-mode: "0"
+
+      - operation_type: "yaml_update"
+        target_file: "${DS_CONFIG_DIR}/config.yaml"
+        backup: true
+        updates:
+          interval: "1"
+
+      # Update VST config
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-3d-app/vst/configs/vst_config.json"
+        backup: true
+        updates:
+          onvif.max_devices_supported: ${max_streams_supported}
+          overlay.enable_overlay_skip_frame: true
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-3d-app/vst/configs/notification_config.json"
+        backup: true
+        updates:
+          message_broker.use_message_broker_consumer: "${STREAM_TYPE}"
+  mv3dt:
+    max_streams_supported: 7
+    file_operations:
+      # Update DeepStream main config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-main-config-mv3dt.txt"
+        updates:
+          batched-push-timeout: "67000"
+          low-latency-mode: "0"
+
+      # Update VST config
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vst/configs/vst_config.json"
+        backup: true
+        updates:
+          onvif.max_devices_supported: ${max_streams_supported}
+          overlay.enable_overlay_skip_frame: true
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vst/configs/notification_config.json"
+        backup: true
+        updates:
+          message_broker.use_message_broker_consumer: "${STREAM_TYPE}"
+
+DGX-SPARK:
+  2d:
+    max_streams_supported: 7
+    file_operations:
+      # Update DeepStream main config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-main-config.txt"
+        updates:
+          msg-conv-msg2p-lib: /opt/nvidia/deepstream/deepstream/lib/libnvds_msgconv.so
+
+  3d:
+    # interval: 1 below runs Sparse4D at an effective 15 FPS.
+    max_streams_supported: 7
+    file_operations:
+      # Update DeepStream main config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-main-config.txt"
+        updates:
+          batched-push-timeout: "67000"
+
+      - operation_type: "yaml_update"
+        target_file: "${DS_CONFIG_DIR}/config.yaml"
+        backup: true
+        updates:
+          interval: "1"
+
+      # Update VST config
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-3d-app/vst/configs/vst_config.json"
+        backup: true
+        updates:
+          onvif.max_devices_supported: ${max_streams_supported}
+          overlay.enable_overlay_skip_frame: true
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-3d-app/vst/configs/notification_config.json"
+        backup: true
+        updates:
+          message_broker.use_message_broker_consumer: "${STREAM_TYPE}"
+  mv3dt:
+    max_streams_supported: 7
+    file_operations:
+      # Update DeepStream main config
+      - operation_type: "text_config_update"
+        target_file: "${DS_CONFIG_DIR}/ds-main-config-mv3dt.txt"
+        updates:
+          batched-push-timeout: "67000"
+
+      # Update VST config
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vst/configs/vst_config.json"
+        backup: true
+        updates:
+          onvif.max_devices_supported: ${max_streams_supported}
+          overlay.enable_overlay_skip_frame: true
+
+      - operation_type: "json_update"
+        target_file: "${VSS_APPS_DIR}/industry-profiles/warehouse-operations/warehouse-mv3dt-app/vst/configs/notification_config.json"
+        backup: true
+        updates:
+          message_broker.use_message_broker_consumer: "${STREAM_TYPE}"

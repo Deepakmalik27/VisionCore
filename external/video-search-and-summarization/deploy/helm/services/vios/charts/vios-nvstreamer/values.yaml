@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+enabled: false
+global: {}
+
+image:
+  repository: ghcr.io/nvidia-ai-blueprints/vss/vss-vios-nvstreamer
+  tag: "develop-latest"
+  pullPolicy: IfNotPresent
+replicas: 1
+
+# K8s service addresses (default: release-based). Override if services are in another namespace.
+kafkaServerAddress: ""   # default: kafka-kafka:9092 (<release>-kafka-kafka:9092 if global.useReleaseNamePrefix)
+redisServerAddress: ""   # default: <release>-redis:6379 (host:port for redis_server_env_var or direct address)
+videoMetadataServerUrl: ""   # default: http://<release>-elasticsearch:9200/mdx-raw*
+maxDevicesSupported: ""
+
+# Comma-separated static TURN URLs (username:password@host:port). Empty = STUN only,
+# so WebRTC playback fails off-network/behind NAT.
+turnServerUrl: ""
+
+# nv_streamer_sync_file_count. Compose gets this from the blueprint configurator
+# (final_stream_count); set it to the stream count or nvstreamer serves no media.
+syncFileCount: 0
+
+# nv_streamer_sync_data_arrival_timeout_secs. When syncFileCount > 0, how long a
+# synced stream waits for media (all synced clients to PLAY) before it is dropped.
+syncDataArrivalTimeoutSecs: 150
+
+# RTSP port range Service/Deployment must expose; keep in sync with vst-config.json
+rtsp:
+  basePort: 31554
+  instanceCount: 8
+
+env:
+  ADAPTOR: "streamer"
+  HTTP_PORT: "31000"
+  # Public UI/API path. A non-empty value requires the upstream proxy to strip it.
+  NVSTREAMER_UI_BASE_PATH: ""
+  NVSTREAMER_INSTALL_ADDITIONAL_PACKAGES: "true"
+  # Point APT at an internal/nearby mirror. Empty uses the public archive.
+  VST_APT_MIRROR: ""
+
+service:
+  port: 31000
+  type: ClusterIP
+  # Set when type is NodePort (e.g. 31000) for installs without an ingress controller.
+  nodePort: null
+
+# Run as root (0:0) to match Compose user
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+
+# streamer_videos backing store. Same shape as vios-streamprocessing.persistence.
+# hostPath is the path for customer videos already staged on the node; it wins
+# over the PVC when set, and pins the pod to that node.
+persistence:
+  streamerVideos:
+    enabled: false
+    existingClaim: ""
+    hostPath: ""
+    hostPathType: DirectoryOrCreate
+
+# Sample videos from the NGC warehouse app-data bundle. Skipped if videos exist.
+# fromExistingClaim reuses the bundle the rtvi-cv job pulled, so no second
+# download. RWO claims pin both to one node, so that path is single-node only.
+# Multi-node: use RWX storage, or clear fromExistingClaim and set resourceVersion.
+ngcVideoSeed:
+  enabled: false
+  # Dataset directory under vss-warehouse-app-data/videos. Empty copies them all.
+  dataset: ""
+  fromExistingClaim: ""
+  # How long to wait for fromExistingClaim to be populated by the NGC job.
+  waitSeconds: 3600
+  resourceVersion: ""
+  org: nvidia
+  apiKeySecretName: ngc-api
+  apiKeySecretKey: NGC_CLI_API_KEY
+  image:
+    repository: docker.io/library/ubuntu
+    tag: "22.04"
+    pullPolicy: IfNotPresent
+
+# vst_data stays on emptyDir
+resources: {}
+nodeSelector: {}
+tolerations: []

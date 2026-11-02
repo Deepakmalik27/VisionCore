@@ -1,0 +1,575 @@
+from __future__ import annotations
+
+# Hybrid-SORT-ReID with ECC + ReID (explicit config, BaseTracker-style)
+# - Assumes detection input is M x [x1, y1, x2, y2, conf, cls]
+# - ECC via shared CMC factory and BaseTracker.apply_cmc(...)
+# - ReID consumes supplied embeddings or generates them from a Frame
+# - Uses the validated Detections/NumPy/Frame update boundary from BaseTracker
+# - Emits rows: [x1,y1,x2,y2, track_id, conf, cls, det_ind]
+# - Preserves detector class IDs and frame-global det_ind values
+from typing import List
+
+import numpy as np
+from typing_extensions import Unpack
+
+from boxmot.reid.protocols import AppearanceEncoder
+from boxmot.reid.specs import ReIDConfig
+from boxmot.trackers.common.appearance import (
+    ema_update_embedding,
+    resolve_batch_embeddings,
+)
+from boxmot.trackers.common.association import (
+    apply_motion_fusion,
+    feature_distance,
+    fuse_iou,
+    fuse_score,
+    solve_assignment,
+)
+from boxmot.trackers.common.association.hybrid import (
+    associate_hybrid,
+    associate_hybrid_with_reid,
+    confidence_difference,
+)
+from boxmot.trackers.common.box.base import BoxTracker
+from boxmot.trackers.common.constructor import BoxTrackerOptions, validate_runtime_options
+from boxmot.trackers.common.motion.batching import (
+    current_track_boxes,
+    observation_output_boxes,
+    predict_tracks,
+    update_tracks,
+)
+from boxmot.trackers.common.motion.cmc.registry import create_cmc
+from boxmot.trackers.common.motion.kalman_filters.config import KalmanConfig
+from boxmot.trackers.common.tracking.observations import k_previous_obs
+from boxmot.trackers.hybridsort.config import HybridSortConfig
+from boxmot.trackers.hybridsort.track import KalmanBoxTracker
+from boxmot.trackers.ocsort.track import KalmanBoxTracker as OBBKalmanBoxTracker
+
+
+class HybridSort(BoxTracker):
+    """Track AABB or OBB detections using motion, confidence, and optional appearance.
+
+    Attributes:
+        use_embeddings (bool): Whether appearance features are enabled.
+        cmc: Camera-motion compensation method.
+        active_tracks (list[KalmanBoxTracker]): Currently active tracks.
+    """
+
+    accepts_embeddings = True
+
+    supports_variable_dt = True
+    uses_frame_dimensions_for_association = True
+
+    def __init__(
+        self,
+        config: HybridSortConfig | None = None,
+        *,
+        kalman: KalmanConfig | None = None,
+        reid: ReIDConfig | AppearanceEncoder | None = None,
+        **kwargs: Unpack[BoxTrackerOptions],
+    ) -> None:
+        """Configure HybridSORT association, confidence prediction, and appearance memory.
+
+        Detection selection uses the shared det_thresh. The OBB path uses geometric
+        and appearance matching without the AABB confidence-prediction, TCM, or
+        long-term-bank stages.
+
+        Args:
+            config: Immutable algorithm settings. None selects HybridSortConfig defaults.
+            kalman: Immutable filter noise, timing, and supported behavior settings.
+                None preserves tracker defaults.
+            reid: Immutable encoder configuration or a canonical appearance encoder.
+                Missing embeddings are generated lazily; None selects the default encoder.
+            **kwargs: Runtime ``per_class``, ``is_obb``, ``class_ids``, ``class_names``,
+                ``mask_guidance``, and ``edgetam`` settings.
+        """
+        config = HybridSortConfig.resolve(config)
+        validate_runtime_options(kwargs)
+        self.config = config
+        super().__init__(
+            det_thresh=config.det_thresh,
+            max_age=config.max_age,
+            max_obs=config.max_obs,
+            min_hits=config.min_hits,
+            iou_threshold=config.iou_threshold,
+            asso_func=config.asso_func,
+            centroid_max_distance=config.centroid_max_distance,
+            kalman=kalman,
+            reid=reid,
+            **kwargs,
+        )
+
+        # store core knobs
+        self.low_thresh = float(config.low_thresh)
+        self.delta_t = int(config.delta_t)
+        self.inertia = float(config.inertia)
+        self.use_byte = bool(config.use_byte)
+
+        self.longterm_bank_length = int(config.longterm_bank_length)
+        self.alpha = float(config.alpha)
+        self.adapfs = bool(config.adapfs)
+        self.track_thresh = float(config.track_thresh)
+        self.confidence_floor = config.confidence_floor
+
+        self.eg_weight_high_score = float(config.eg_weight_high_score)
+        self.eg_weight_low_score = float(config.eg_weight_low_score)
+        self.tcm_first_step = bool(config.tcm_first_step)
+        self.tcm_byte_step = bool(config.tcm_byte_step)
+        self.tcm_byte_step_weight = float(config.tcm_byte_step_weight)
+        self.with_longterm_reid = bool(config.with_longterm_reid)
+        self.longterm_reid_weight = float(config.longterm_reid_weight)
+        self.with_longterm_reid_correction = bool(config.with_longterm_reid_correction)
+        self.longterm_reid_correction_thresh = float(config.longterm_reid_correction_thresh)
+        self.longterm_reid_correction_thresh_low = float(config.longterm_reid_correction_thresh_low)
+        self.use_embeddings = config.use_embeddings
+
+        # ECC CMC (BotSort-style)
+        self.cmc = create_cmc(config.cmc_method, enabled=config.use_cmc)
+
+        # container
+        self.active_tracks: List[KalmanBoxTracker] = []
+        self._requires_frame = self._requires_frame or self.cmc is not None
+        self._requires_frame_dimensions_only = self._requires_frame_dimensions_only and self.cmc is None
+
+    def _first_pass_similarity(
+        self, similarity: np.ndarray, boxes: np.ndarray, scores: np.ndarray
+    ) -> np.ndarray:
+        """Optionally score-fuse geometry before the existing guidance and gate."""
+        if self.config.fuse_detection_score:
+            similarity = 1.0 - fuse_score((1.0 - similarity).T, scores).T
+        return self._condition_similarity(similarity, self.active_tracks, boxes, threshold=self.iou_threshold)
+
+    def _first_pass_cost(self, costs: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+        """Apply optional Kalman fusion after HybridSORT's own ranking cues."""
+        return apply_motion_fusion(
+            (1.0 + costs).T,
+            self.active_tracks,
+            boxes,
+            mode=self.config.motion_fusion,
+            only_position=self.config.motion_fusion_only_position,
+            lambda_=self.config.motion_fusion_lambda,
+        ).T - 1.0
+
+    def _track_detections(
+        self,
+        dets: np.ndarray,
+        img: np.ndarray,
+        embs: np.ndarray = None,
+        masks: np.ndarray = None,
+    ) -> np.ndarray:
+        """
+        dets: ndarray [N,6] -> [x1,y1,x2,y2,conf,cls]
+        img: HxWxC image
+        embs: optional [N,D] appearance features resolved by the public boundary.
+        Returns: ndarray [M,8]: [x1,y1,x2,y2,track_id,conf,cls,det_ind]
+        """
+        if self.is_obb:
+            return self._update_obb(dets, img, embs, masks)
+        association_function = self.asso_func
+        self.frame_count += 1
+
+        batch = self._make_detection_batch(dets, embs=embs, masks=masks, copy=False)
+
+        def _safe_cls(x: int) -> int:
+            xi = int(x)
+            self._validate_kernel_class_ids([xi])
+            return xi
+
+
+        if self.use_embeddings:
+            batch = batch.with_embs(
+                resolve_batch_embeddings(
+                    batch,
+                    placeholder_dim=128,
+                    placeholder_value=0.0,
+                )
+            )
+
+        # FIRST/SECOND stage split (Hybrid semantics)
+        high_batch, second_batch = batch.split_by_confidence(
+            high_thresh=self.det_thresh,
+            low_thresh=self.low_thresh,
+        )
+        cls_keep = high_batch.clss.astype(int)
+        cls_second = second_batch.clss.astype(int)
+
+        id_feature_keep = resolve_batch_embeddings(
+            high_batch,
+            enabled=self.use_embeddings,
+            placeholder_value=0.0,
+        )
+        id_feature_second = resolve_batch_embeddings(
+            second_batch,
+            enabled=self.use_embeddings,
+            placeholder_value=0.0,
+        )
+
+        # Build dets arrays used by original hybrid code (no det_ind in the math)
+        dets_first = high_batch.as_box_conf_detections(dtype=dets.dtype)
+        dets_low = second_batch.as_box_conf_detections(dtype=dets.dtype)
+
+        # carry det_ind arrays aligned with above
+        det_inds_keep = high_batch.det_inds.astype(int)
+        det_inds_second = second_batch.det_inds.astype(int)
+
+        # ---- Predict step for existing tracks
+        trks = np.zeros((len(self.active_tracks), 6))
+        predictions = predict_tracks(self.active_tracks, dt=self._prediction_dt)
+        if self.cmc is not None:
+            self.apply_cmc(img, dets, self.active_tracks)
+            trks[:, :4] = current_track_boxes(self.active_tracks, is_obb=False)
+        else:
+            trks[:, :4] = np.asarray([prediction[0] for prediction in predictions]).reshape(-1, 4)
+        trks[:, 4:] = np.asarray([prediction[1:] for prediction in predictions]).reshape(-1, 2)
+        valid = np.isfinite(trks).all(axis=1)
+        if not valid.all():
+            self.active_tracks = [track for track, keep in zip(self.active_tracks, valid, strict=True) if keep]
+            trks = trks[valid]
+
+        # Prepare motion cues
+        velocities_lt = np.array(
+            [t.velocity_lt if t.velocity_lt is not None else (0, 0) for t in self.active_tracks]
+        )
+        velocities_rt = np.array(
+            [t.velocity_rt if t.velocity_rt is not None else (0, 0) for t in self.active_tracks]
+        )
+        velocities_lb = np.array(
+            [t.velocity_lb if t.velocity_lb is not None else (0, 0) for t in self.active_tracks]
+        )
+        velocities_rb = np.array(
+            [t.velocity_rb if t.velocity_rb is not None else (0, 0) for t in self.active_tracks]
+        )
+        k_observations = np.array([k_previous_obs(t.observations, t.age, self.delta_t) for t in self.active_tracks])
+
+        # ===== First association (optionally embedding-guided)
+        if (
+            self.use_embeddings
+            and self.eg_weight_high_score > 0
+            and self.tcm_first_step
+            and len(dets_first)
+            and len(trks)
+        ):
+            track_features = np.asarray([t.smooth_feat for t in self.active_tracks], dtype=float)
+            emb_dists = feature_distance(track_features, id_feature_keep).T
+            ranking_emb_dists = (
+                fuse_iou(emb_dists.T, trks[:, :4], high_batch.boxes).T if self.config.fuse_iou else None
+            )
+
+            long_emb_dists = None
+            if self.with_longterm_reid:
+                long_track_features = np.asarray(
+                    [t.get_longterm_feature() for t in self.active_tracks],
+                    dtype=float,
+                )
+                long_emb_dists = feature_distance(long_track_features, id_feature_keep).T
+                if self.config.fuse_iou:
+                    long_emb_dists = fuse_iou(long_emb_dists.T, trks[:, :4], high_batch.boxes).T
+
+            matched, unmatched_dets, unmatched_trks = associate_hybrid_with_reid(
+                dets_first,
+                trks,
+                self.iou_threshold,
+                (velocities_lt, velocities_rt, velocities_lb, velocities_rb),
+                k_observations,
+                self.inertia,
+                association_function,
+                embedding_cost=emb_dists,
+                ranking_embedding_cost=ranking_emb_dists,
+                embedding_weight=self.eg_weight_high_score,
+                longterm_embedding_cost=long_emb_dists,
+                longterm_embedding_weight=self.longterm_reid_weight,
+                correct_with_appearance=self.with_longterm_reid_correction,
+                appearance_threshold=self.longterm_reid_correction_thresh,
+                gate_before_assignment=self._asso_func_base_name == "centroid",
+                geometry_conditioner=lambda similarity: self._first_pass_similarity(
+                    similarity, high_batch.boxes, high_batch.confs
+                ),
+                cost_conditioner=(lambda costs: self._first_pass_cost(costs, high_batch.boxes))
+                if self.config.motion_fusion != "off" else None,
+            )
+        elif self.tcm_first_step and len(dets_first) and len(trks):
+            matched, unmatched_dets, unmatched_trks = associate_hybrid(
+                dets_first,
+                trks,
+                self.iou_threshold,
+                (velocities_lt, velocities_rt, velocities_lb, velocities_rb),
+                k_observations,
+                self.inertia,
+                association_function,
+                gate_before_assignment=self._asso_func_base_name == "centroid",
+                geometry_conditioner=lambda similarity: self._first_pass_similarity(
+                    similarity, high_batch.boxes, high_batch.confs
+                ),
+                cost_conditioner=(lambda costs: self._first_pass_cost(costs, high_batch.boxes))
+                if self.config.motion_fusion != "off" else None,
+            )
+        else:
+            matched = np.empty((0, 2), dtype=int)
+            unmatched_dets = np.arange(len(dets_first))
+            unmatched_trks = np.arange(len(trks))
+
+        # Update matched (update features here)  —— pass cls & det_ind (safe)
+        update_tracks(
+            [self.active_tracks[t] for _, t in matched],
+            [dets_first[d] for d, _ in matched],
+            [id_feature_keep[d] for d, _ in matched],
+            cls=[_safe_cls(cls_keep[d]) for d, _ in matched],
+            det_ind=[int(det_inds_keep[d]) for d, _ in matched],
+        )
+
+        # ===== BYTE / low-score association (optional)
+        if self.use_byte and len(dets_low) > 0 and unmatched_trks.shape[0] > 0:
+            u_trks = trks[unmatched_trks]
+            similarity = np.asarray(association_function(dets_low, u_trks))
+            similarity = self._condition_similarity(
+                similarity,
+                [self.active_tracks[idx] for idx in unmatched_trks],
+                second_batch.boxes,
+                threshold=self.iou_threshold,
+            )
+            threshold_similarity = similarity.copy()
+            if self.tcm_byte_step:
+                similarity -= confidence_difference(dets_low, u_trks) * self.tcm_byte_step_weight
+
+            if similarity.max() > self.iou_threshold or (
+                self._asso_func_base_name == "centroid" and threshold_similarity.max() >= self.iou_threshold
+            ):
+                if self.eg_weight_low_score > 0 and self.use_embeddings:
+                    u_tracklets = [self.active_tracks[idx] for idx in unmatched_trks]
+                    u_track_features = np.asarray([t.smooth_feat for t in u_tracklets], dtype=float)
+                    emb_dists_low = feature_distance(u_track_features, id_feature_second).T
+                    assignment_cost = -similarity + self.eg_weight_low_score * emb_dists_low
+                    if self._asso_func_base_name == "centroid":
+                        allowed = threshold_similarity >= self.iou_threshold
+                        if self.with_longterm_reid_correction:
+                            allowed &= emb_dists_low <= self.longterm_reid_correction_thresh_low
+                        assignment_cost = np.where(allowed, assignment_cost, np.inf)
+                    matched_indices = solve_assignment(assignment_cost)
+                else:
+                    assignment_cost = -similarity
+                    if self._asso_func_base_name == "centroid":
+                        assignment_cost = np.where(threshold_similarity >= self.iou_threshold, assignment_cost, np.inf)
+                    matched_indices = solve_assignment(assignment_cost)
+                to_remove_trk_indices = []
+                accepted_detections = []
+                for mm in matched_indices:
+                    det_rel, trk_rel = mm[0], mm[1]
+                    trk_ind = unmatched_trks[trk_rel]
+                    if self.with_longterm_reid_correction and self.eg_weight_low_score > 0 and self.use_embeddings:
+                        poor_geometry = threshold_similarity[det_rel, trk_rel] < self.iou_threshold
+                        bad_emb = emb_dists_low[det_rel, trk_rel] > self.longterm_reid_correction_thresh_low
+                        if poor_geometry or bad_emb:
+                            continue
+                    else:
+                        if threshold_similarity[det_rel, trk_rel] < self.iou_threshold:
+                            continue
+                    accepted_detections.append(det_rel)
+                    to_remove_trk_indices.append(trk_ind)
+                update_tracks(
+                    [self.active_tracks[t] for t in to_remove_trk_indices],
+                    [dets_low[d] for d in accepted_detections],
+                    [id_feature_second[d] for d in accepted_detections],
+                    update_feature=[False] * len(accepted_detections),
+                    cls=[_safe_cls(cls_second[d]) for d in accepted_detections],
+                    det_ind=[int(det_inds_second[d]) for d in accepted_detections],
+                )
+                unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
+
+        # ===== Final chance: IoU vs last boxes
+        if unmatched_dets.shape[0] > 0 and unmatched_trks.shape[0] > 0:
+            left_dets = dets_first[unmatched_dets]
+            left_trks = np.asarray([self.active_tracks[index].last_observation for index in unmatched_trks])
+            similarity = np.asarray(association_function(left_dets, left_trks))
+            similarity = self._condition_similarity(
+                similarity,
+                [self.active_tracks[idx] for idx in unmatched_trks],
+                high_batch.boxes[unmatched_dets],
+                threshold=self.iou_threshold,
+            )
+            if similarity.max() > self.iou_threshold or (
+                self._asso_func_base_name == "centroid" and similarity.max() >= self.iou_threshold
+            ):
+                assignment_cost = -similarity
+                if self._asso_func_base_name == "centroid":
+                    assignment_cost = np.where(similarity >= self.iou_threshold, assignment_cost, np.inf)
+                rematched = solve_assignment(assignment_cost)
+                to_remove_det_indices = []
+                to_remove_trk_indices = []
+                for mm in rematched:
+                    det_rel, trk_rel = mm[0], mm[1]
+                    if similarity[det_rel, trk_rel] < self.iou_threshold:
+                        continue
+                    det_abs = unmatched_dets[det_rel]
+                    trk_abs = unmatched_trks[trk_rel]
+                    to_remove_det_indices.append(det_abs)
+                    to_remove_trk_indices.append(trk_abs)
+                update_tracks(
+                    [self.active_tracks[t] for t in to_remove_trk_indices],
+                    [dets_first[d] for d in to_remove_det_indices],
+                    [id_feature_keep[d] for d in to_remove_det_indices],
+                    update_feature=[False] * len(to_remove_det_indices),
+                    cls=[_safe_cls(cls_keep[d]) for d in to_remove_det_indices],
+                    det_ind=[int(det_inds_keep[d]) for d in to_remove_det_indices],
+                )
+                unmatched_dets = np.setdiff1d(unmatched_dets, np.array(to_remove_det_indices))
+                unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
+
+        # Mark remaining unmatched tracks
+        for m in unmatched_trks:
+            self.active_tracks[m].update(None, None)
+
+        # Create new trackers for unmatched high-score detections
+        for i in unmatched_dets:
+            trk = KalmanBoxTracker(
+                dets_first[i, :],
+                id_feature_keep[i, :],
+                delta_t=self.delta_t,
+                longterm_bank_length=self.longterm_bank_length,
+                max_obs=self.max_obs,
+                alpha=self.alpha,
+                confidence_floor=self.confidence_floor,
+                adapfs=self.adapfs,
+                track_thresh=self.track_thresh,
+                cls=_safe_cls(cls_keep[i]),
+                det_ind=int(det_inds_keep[i]) if len(det_inds_keep) else -1,
+                id_allocator=self.id_allocator,
+                noise_config=self.kalman_noise_config,
+                kalman_type=self.kalman_config.type,
+            )
+            self.active_tracks.append(trk)
+
+        # Collect outputs (match BotSort/OcSort style)
+        output_tracks = []
+        i = len(self.active_tracks)
+        for trk in reversed(self.active_tracks):
+            # Only output fresh tracks and valid det_ind for this frame
+            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                output_tracks.append(trk)
+            i -= 1
+            if trk.time_since_update > self.max_age:
+                self.active_tracks.pop(i)
+
+        return self.format_outputs(
+            output_tracks,
+            boxes=observation_output_boxes(output_tracks, is_obb=False),
+            dtype=np.float32,
+        )
+
+    def _update_obb(self, dets, img, embs=None, masks=None):
+        """HybridSORT adaptation using oriented DIoU, ReID, and XYWHA motion state."""
+        self.frame_count += 1
+        batch = self._make_detection_batch(dets, embs=embs, masks=masks, copy=False)
+        high, low = batch.split_by_confidence(high_thresh=self.det_thresh, low_thresh=self.low_thresh)
+        high_dets = high.as_indexed_detections(dtype=dets.dtype)
+        low_dets = low.as_indexed_detections(dtype=dets.dtype)
+        high_embs = resolve_batch_embeddings(high, enabled=self.use_embeddings, placeholder_value=0.0)
+
+        predictions = predict_tracks(self.active_tracks, dt=self._prediction_dt)
+        if self.cmc is not None:
+            self.apply_cmc(img, dets, self.active_tracks)
+            predicted = current_track_boxes(self.active_tracks, is_obb=True).astype(np.float32)
+        else:
+            predicted = np.asarray([prediction[0][:5] for prediction in predictions], dtype=np.float32).reshape(-1, 5)
+        valid = np.isfinite(predicted).all(axis=1)
+        if not valid.all():
+            self.active_tracks = [track for track, keep in zip(self.active_tracks, valid, strict=True) if keep]
+            predicted = predicted[valid]
+
+        unmatched_dets = np.arange(len(high_dets))
+        unmatched_tracks = np.arange(len(self.active_tracks))
+        if len(high_dets) and len(predicted):
+            similarity = self.asso_func(high.boxes, predicted)
+            if self.config.fuse_detection_score:
+                similarity = 1.0 - fuse_score((1.0 - similarity).T, high.confs).T
+            embedding_cost = None
+            if self.use_embeddings:
+                track_embs = np.asarray([track.smooth_feat for track in self.active_tracks])
+                embedding_cost = feature_distance(track_embs, high_embs).T
+            assignment_cost = -similarity
+            if embedding_cost is not None:
+                ranking_embedding_cost = (
+                    fuse_iou(embedding_cost.T, predicted, high.boxes, is_obb=True).T
+                    if self.config.fuse_iou else embedding_cost
+                )
+                assignment_cost += self.eg_weight_high_score * ranking_embedding_cost
+            eligible = self.association_eligibility(high.boxes, predicted)
+            if self._asso_func_base_name == "centroid" or self.config.motion_fusion != "off":
+                accepted_geometry = similarity >= self.iou_threshold
+                if embedding_cost is not None:
+                    accepted_geometry |= embedding_cost <= self.longterm_reid_correction_thresh
+                eligible &= accepted_geometry
+            assignment_cost = np.where(eligible, assignment_cost, np.inf)
+            if self.config.motion_fusion != "off":
+                assignment_cost = self._first_pass_cost(assignment_cost, high.boxes)
+            pairs = solve_assignment(assignment_cost)
+            accepted = []
+            for det_index, track_index in pairs:
+                if not eligible[det_index, track_index]:
+                    continue
+                poor_geometry = similarity[det_index, track_index] < self.iou_threshold
+                # Without appearance evidence, geometry must pass on its own.
+                # Treating a missing embedding matrix as "good appearance"
+                # accepted arbitrary Hungarian pairs, including zero OBB IoU.
+                poor_appearance = embedding_cost is None or (
+                    embedding_cost[det_index, track_index] > self.longterm_reid_correction_thresh
+                )
+                if not (poor_geometry and poor_appearance):
+                    accepted.append((det_index, track_index))
+            update_tracks(
+                [self.active_tracks[t] for _, t in accepted],
+                [high_dets[d, :6] for d, _ in accepted],
+                [high.clss[d] for d, _ in accepted],
+                [high.det_inds[d] for d, _ in accepted],
+            )
+            for det_index, track_index in accepted:
+                track = self.active_tracks[track_index]
+                track.smooth_feat = ema_update_embedding(track.smooth_feat, high_embs[det_index], alpha=self.alpha)
+                track.conf = high.confs[det_index]
+            unmatched_dets = np.setdiff1d(unmatched_dets, [pair[0] for pair in accepted])
+            unmatched_tracks = np.setdiff1d(unmatched_tracks, [pair[1] for pair in accepted])
+
+        if self.use_byte and len(low_dets) and len(unmatched_tracks):
+            similarity = self.asso_func(low.boxes, predicted[unmatched_tracks])
+            eligible = self.association_eligibility(low.boxes, predicted[unmatched_tracks])
+            if self._asso_func_base_name == "centroid":
+                similarity = np.where(eligible & (similarity >= self.iou_threshold), similarity, -np.inf)
+            pairs = solve_assignment(-similarity)
+            accepted = [(d, t) for d, t in pairs if similarity[d, t] >= self.iou_threshold]
+            update_tracks(
+                [self.active_tracks[unmatched_tracks[t]] for _, t in accepted],
+                [low_dets[d, :6] for d, _ in accepted],
+                [low.clss[d] for d, _ in accepted],
+                [low.det_inds[d] for d, _ in accepted],
+            )
+            unmatched_tracks = np.setdiff1d(unmatched_tracks, [unmatched_tracks[pair[1]] for pair in accepted])
+
+        for track_index in unmatched_tracks:
+            self.active_tracks[track_index].update(None, None, None)
+        for det_index in unmatched_dets:
+            track = OBBKalmanBoxTracker(
+                high_dets[det_index, :6],
+                high.clss[det_index],
+                high.det_inds[det_index],
+                delta_t=self.delta_t,
+                max_obs=self.max_obs,
+                is_obb=True,
+                id_allocator=self.id_allocator,
+                noise_config=self.kalman_noise_config,
+                kalman_type=self.kalman_config.type,
+            )
+            track.smooth_feat = high_embs[det_index]
+            self.active_tracks.append(track)
+
+        output_tracks = []
+        for track in reversed(self.active_tracks):
+            if track.time_since_update < 1 and (track.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                output_tracks.append(track)
+        self.active_tracks = [track for track in self.active_tracks if track.time_since_update <= self.max_age]
+        return self.format_outputs(
+            output_tracks,
+            boxes=observation_output_boxes(output_tracks, is_obb=True),
+            dtype=np.float32,
+        )
+
+    def reset(self):
+        self._reset_common_state()

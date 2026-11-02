@@ -1,0 +1,2564 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Run one skills-eval leg under a process-held Brev box lock.
+
+This wrapper owns BOTH fleet selection and the per-instance flock: it
+reads the task's hardware requirements from the dataset's task.toml,
+snapshots `brev ls --json`, and walks the eligible `vss-eval-*`
+candidates with NON-BLOCKING lock attempts — claiming the first box it
+can actually lock. The lock file descriptor stays open while Harbor
+runs, so the mutex is a real kernel lock instead of a shell-FD
+convention spread across multiple agent tool calls.
+
+Why selection lives here and not in the agent: two legs that snapshot
+the fleet at the same moment both see the same "best" lock-free box
+(neither has acquired yet — check-then-act TOCTOU) and converge on it,
+serialising for hours while other eligible boxes idle (observed:
+run 29373239241, both lvs legs picked vss-eval-rtx-1g-2 and the second
+waited 16 min with rtx-1g-3 free). Try-lock-in-order makes the pick and
+the reservation one atomic step.
+
+`--instance` remains as an explicit operator override (pinned box).
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+
+# Self-contained instrumentation with its own module state. Split out because
+# this file is long enough that a reader looking for the lock or the Harbor
+# command should not have to scroll past it. Read the phase label through
+# leg_timing.current_phase(); importing the global copies it once.
+import leg_timing
+from leg_timing import HEARTBEAT_SEC, leg_log, phase
+from model_config import (
+    SkillEvalModelRoutes,
+    anthropic_api_root,
+    resolve_model_routes,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SKILL_EVAL_PYTHON_VERSION = (3, 12)
+HARBOR_REQUIREMENT = "harbor==0.20.0"
+STEP_COUNT_RE = re.compile(r"^\s*step_count\s*=\s*(\d+)\s*$", re.MULTILINE)
+SAFE_PART_RE = re.compile(r"[^A-Za-z0-9_-]+")
+RTX4090_PREFIX = "vss-eval-geforce-rtx4090-"
+# RTX 4090 capability-routing is opt-in at the spec level via gpu_type.
+# These tables are intentionally empty: a test runs on RTX 4090 only when
+# its spec metadata declares gpu_type that matches GEFORCE RTX 4090.
+RTX4090_ALL_TESTS: frozenset[str] = frozenset()
+RTX4090_TESTS: dict[str, frozenset[str]] = {}
+# Shared root served by the coordinator's persistent `harbor-view.service`
+# (AGENTS.md § Harbor viewer). Fixed path — the viewer is started once for
+# the host, not per leg, so every leg publishes its trials in here.
+VIEWER_ROOT = Path("/tmp/skill-eval/results/_viewer")
+AGENT_RUN_MARKER_OVERRIDE_ENV = "SKILL_EVAL_AGENT_RUN_MARKER"
+DEFER_AGENT_REAP_ENV = "SKILL_EVAL_DEFER_AGENT_REAP"
+REMOTE_AGENT_RUN_PREFIX = "skill-eval-"
+AGENT_ROUTE_API_KEY_ENV = "SKILL_EVAL_AGENT_ROUTE_API_KEY"
+AGENT_ROUTE_BASE_URL_ENV = "SKILL_EVAL_AGENT_ROUTE_BASE_URL"
+
+
+# Harbor phase budgets. Adapters set the task's base agent timeout to the same
+# 600-second base used by Harbor for environment build and verification; these
+# multipliers are also passed on the command line below. Keep the outer process
+# backstop strictly beyond every phase plus recovery time so Harbor gets a
+# chance to record the real phase outcome, download logs, and stop the Brev
+# environment before this wrapper intervenes.
+HARBOR_BASE_PHASE_TIMEOUT_SEC = 600
+HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER = 3.0
+# Cold local NIMs download both the image and model weights before Harbor can
+# install its agent. DGX Spark Qwen3-32B weights can take over 30 minutes to
+# download, so give that environment phase room without extending hosted jobs.
+LOCAL_NIM_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER = 10.0
+NEMOCLAW_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER = 10.0
+# Deploy steps pull container images and model weights before the scenario's
+# own work starts, so a one-hour scenario budget left them finishing at
+# 1h02-1h04 with single-digit turn counts - waiting on pulls, not reasoning.
+# Which spec tipped over varied with the box's image cache, making the failing
+# set reshuffle between runs. 90 minutes matches what cold provisioning already
+# gets below and keeps the phase total under DEFAULT_HARBOR_TIMEOUT_SEC.
+HARBOR_AGENT_TIMEOUT_MULTIPLIER = 9.0
+# Cold base-profile deployments can legitimately outlive the normal one-hour
+# scenario budget while pulling model weights. Keep provisioning bounded at
+# 90 minutes; together with Harbor's other phase and recovery ceilings this
+# remains below DEFAULT_HARBOR_TIMEOUT_SEC.
+NEMOCLAW_SETUP_AGENT_TIMEOUT_MULTIPLIER = 9.0
+NEMOCLAW_SETUP_AGENT_BUDGET_SEC = int(
+    HARBOR_BASE_PHASE_TIMEOUT_SEC * NEMOCLAW_SETUP_AGENT_TIMEOUT_MULTIPLIER
+)
+HARBOR_VERIFIER_TIMEOUT_MULTIPLIER = 3.0
+HARBOR_ENVIRONMENT_BUILD_BUDGET_SEC = int(
+    HARBOR_BASE_PHASE_TIMEOUT_SEC
+    * HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER
+)
+# Harbor applies a separate six-minute ceiling while installing/configuring
+# the selected agent, before the task's [agent] timeout begins.
+HARBOR_AGENT_SETUP_BUDGET_SEC = 360
+HARBOR_AGENT_BUDGET_SEC = int(
+    HARBOR_BASE_PHASE_TIMEOUT_SEC * HARBOR_AGENT_TIMEOUT_MULTIPLIER
+)
+HARBOR_VERIFIER_BUDGET_SEC = int(
+    HARBOR_BASE_PHASE_TIMEOUT_SEC * HARBOR_VERIFIER_TIMEOUT_MULTIPLIER
+)
+HARBOR_PHASE_BUDGET_SEC = (
+    HARBOR_ENVIRONMENT_BUILD_BUDGET_SEC
+    + HARBOR_AGENT_SETUP_BUDGET_SEC
+    + HARBOR_AGENT_BUDGET_SEC
+    + HARBOR_VERIFIER_BUDGET_SEC
+)
+# brev_env.py caps each upload/download API, including active work and process
+# reaping, to this duration. These VSS tasks serially perform no more than four
+# transfer windows around post-agent output/recovery, so reserve all four before
+# the outer backstop.
+HARBOR_TRANSFER_OPERATION_BUDGET_SEC = 630
+HARBOR_RECOVERY_TRANSFER_OPERATION_COUNT = 4
+HARBOR_CLEANUP_RECOVERY_HEADROOM_SEC = (
+    HARBOR_TRANSFER_OPERATION_BUDGET_SEC
+    * HARBOR_RECOVERY_TRANSFER_OPERATION_COUNT
+)
+MIN_HARBOR_BACKSTOP_SEC = (
+    HARBOR_PHASE_BUDGET_SEC + HARBOR_CLEANUP_RECOVERY_HEADROOM_SEC
+)
+# Stay above the local-NIM phase total too, with room for scheduling jitter
+# and bounded teardown that does not transfer files.
+DEFAULT_HARBOR_TIMEOUT_SEC = 17_400
+
+# A single remote agent command must not be killed by Brev before Harbor's own
+# agent deadline can fire and drive normal artifact/environment cleanup.
+MIN_BREV_EXEC_TIMEOUT_SEC = (
+    HARBOR_AGENT_BUDGET_SEC + HARBOR_TRANSFER_OPERATION_BUDGET_SEC
+)
+NEMOCLAW_SETUP_BREV_EXEC_TIMEOUT_SEC = (
+    NEMOCLAW_SETUP_AGENT_BUDGET_SEC
+    + HARBOR_TRANSFER_OPERATION_BUDGET_SEC
+)
+
+# Emergency-only escalation after the outer backstop. SIGINT gives Harbor's
+# asyncio runner enough time to complete Harbor 0.20's two serialized recovery
+# pulls (agent logs, then task artifacts) before TERM/KILL. This preserves the
+# primary timeout record instead of interrupting artifact recovery halfway.
+HARBOR_SIGINT_GRACE_SEC = (
+    2 * HARBOR_TRANSFER_OPERATION_BUDGET_SEC + 120
+)
+HARBOR_SIGTERM_GRACE_SEC = 30
+HARBOR_SIGKILL_GRACE_SEC = 10
+PROCESS_GROUP_POLL_INTERVAL_SEC = 0.1
+HARBOR_SHUTDOWN_GRACE_SEC = (
+    HARBOR_SIGINT_GRACE_SEC
+    + HARBOR_SIGTERM_GRACE_SEC
+    + HARBOR_SIGKILL_GRACE_SEC
+)
+HARBOR_POSTPROCESS_HEADROOM_SEC = 60
+AGENT_VERDICT_RESERVE_SEC = 30 * 60
+DEFAULT_WHOLE_LEG_BUDGET_SEC = 12 * 60 * 60 - AGENT_VERDICT_RESERVE_SEC
+WORK_DEADLINE_ENV = "SKILL_EVAL_HARBOR_DEADLINE_MONOTONIC"
+SDK_DEADLINE_ENV = "SKILL_EVAL_WORK_DEADLINE_MONOTONIC"
+TRANSPORT_PGID_REGISTRY_ENV = "BREV_TRANSPORT_PGID_FILE"
+GATEWAY_CANCEL_CLEANUP_ROOT_ENV = "SKILL_EVAL_GATEWAY_CANCEL_CLEANUP_ROOT"
+
+
+@dataclasses.dataclass(frozen=True)
+class HarborInvocation:
+    """One concrete `uvx harbor run` invocation."""
+
+    harbor_root: Path
+    include_task_name: str
+    chain_key: str
+    step_index: int | None = None
+    step_count: int | None = None
+
+
+class LockTimeoutError(RuntimeError):
+    pass
+
+
+class LegDeadlineError(RuntimeError):
+    pass
+
+
+class _RunCommandInterrupted(BaseException):
+    def __init__(self, signum: int):
+        self.signum = signum
+        super().__init__(f"run_leg received signal {signum}")
+
+
+def _read_step_count(task_toml: Path) -> int | None:
+    match = STEP_COUNT_RE.search(task_toml.read_text())
+    return int(match.group(1)) if match else None
+
+
+def _max_step_number(platform_dir: Path) -> int:
+    max_step = 0
+    for child in platform_dir.iterdir():
+        if not child.is_dir():
+            continue
+        match = re.fullmatch(r"step-(\d+)", child.name)
+        if match:
+            max_step = max(max_step, int(match.group(1)))
+    return max_step
+
+
+def _chain_key(dataset_root: Path, harbor_root: Path) -> str:
+    try:
+        rel = harbor_root.relative_to(dataset_root)
+    except ValueError:
+        rel = harbor_root
+    return SAFE_PART_RE.sub("_", rel.as_posix()).strip("_") or harbor_root.name
+
+
+def discover_invocations(dataset_root: Path) -> list[HarborInvocation]:
+    """Discover single-step tasks or ordered multi-step task chains."""
+    dataset_root = dataset_root.resolve()
+    step1_tomls = sorted(dataset_root.rglob("step-1/task.toml"))
+    if step1_tomls:
+        invocations: list[HarborInvocation] = []
+        seen_roots: set[Path] = set()
+        for step1_toml in step1_tomls:
+            platform_dir = step1_toml.parent.parent
+            if platform_dir in seen_roots:
+                continue
+            seen_roots.add(platform_dir)
+            step_count = _read_step_count(step1_toml) or _max_step_number(platform_dir)
+            if step_count < 1:
+                raise ValueError(f"invalid step_count for {platform_dir}")
+            key = _chain_key(dataset_root, platform_dir)
+            for idx in range(1, step_count + 1):
+                task_toml = platform_dir / f"step-{idx}" / "task.toml"
+                if not task_toml.exists():
+                    raise FileNotFoundError(
+                        f"missing task.toml for step-{idx}: {task_toml}"
+                    )
+                invocations.append(
+                    HarborInvocation(
+                        harbor_root=platform_dir,
+                        include_task_name=f"step-{idx}",
+                        chain_key=key,
+                        step_index=idx,
+                        step_count=step_count,
+                    )
+                )
+        return invocations
+
+    task_tomls = sorted(dataset_root.rglob("task.toml"))
+    if not task_tomls:
+        raise FileNotFoundError(f"no task.toml found under {dataset_root}")
+
+    invocations = []
+    for task_toml in task_tomls:
+        task_dir = task_toml.parent
+        invocations.append(
+            HarborInvocation(
+                harbor_root=task_dir.parent,
+                include_task_name=task_dir.name,
+                chain_key=_chain_key(dataset_root, task_dir),
+            )
+        )
+    return invocations
+
+
+def select_setup_invocations(invocations: list[HarborInvocation], spec_path: str) -> list[HarborInvocation]:
+    """Select each operational chain's original setup task without changing it."""
+    if not spec_path.startswith("skills/operations/"):
+        raise ValueError("setup_only requires an operational spec")
+    setups = [item for item in invocations if item.step_index in (None, 1)]
+    if not setups:
+        raise ValueError("no deployment/setup task found")
+    return setups
+
+
+def _api_base_v1(base_url: str) -> str:
+    stripped = base_url.rstrip("/")
+    if stripped.endswith("/v1"):
+        return stripped
+    return f"{stripped}/v1"
+
+
+def validate_harbor_timeout_sec(timeout_sec: int) -> int:
+    """Require the outer backstop to leave every Harbor phase recovery room."""
+    if timeout_sec <= MIN_HARBOR_BACKSTOP_SEC:
+        raise ValueError(
+            "harbor timeout must be greater than "
+            f"{MIN_HARBOR_BACKSTOP_SEC}s: environment "
+            f"{HARBOR_ENVIRONMENT_BUILD_BUDGET_SEC}s + agent setup "
+            f"{HARBOR_AGENT_SETUP_BUDGET_SEC}s + agent "
+            f"{HARBOR_AGENT_BUDGET_SEC}s + verifier "
+            f"{HARBOR_VERIFIER_BUDGET_SEC}s + cleanup/recovery "
+            f"{HARBOR_CLEANUP_RECOVERY_HEADROOM_SEC}s"
+        )
+    return timeout_sec
+
+
+def resolve_work_deadline() -> float:
+    """Return the Harbor deadline, preserving time for the agent's verdict."""
+    raw_deadline = os.environ.get(WORK_DEADLINE_ENV)
+    if raw_deadline is None and SDK_DEADLINE_ENV in os.environ:
+        try:
+            deadline = float(os.environ[SDK_DEADLINE_ENV])
+        except ValueError as exc:
+            raise ValueError(
+                f"{SDK_DEADLINE_ENV} must be a monotonic timestamp"
+            ) from exc
+        raw_deadline = str(deadline - AGENT_VERDICT_RESERVE_SEC)
+    if raw_deadline is None:
+        return time.monotonic() + DEFAULT_WHOLE_LEG_BUDGET_SEC
+    try:
+        deadline = float(raw_deadline)
+    except ValueError as exc:
+        raise ValueError(f"{WORK_DEADLINE_ENV} must be a monotonic timestamp") from exc
+    if deadline <= time.monotonic():
+        raise LegDeadlineError("skill-eval work deadline has already expired")
+    return deadline
+
+
+def invocation_reserve_sec(harbor_timeout_sec: int) -> int:
+    """Wall-clock room required before safely starting one Harbor child."""
+    return (
+        harbor_timeout_sec
+        + HARBOR_SHUTDOWN_GRACE_SEC
+        + HARBOR_POSTPROCESS_HEADROOM_SEC
+    )
+
+
+def build_harbor_command(
+    invocation: HarborInvocation,
+    results_root: Path,
+    model: str,
+    anthropic_base_url: str,
+    agent: str = "claude-code",
+    agent_timeout_multiplier: float = HARBOR_AGENT_TIMEOUT_MULTIPLIER,
+    local_nim: bool = False,
+) -> list[str]:
+    environment_import_path = "envs.brev_env:BrevEnvironment"
+    environment_build_timeout_multiplier = (
+        LOCAL_NIM_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER
+        if local_nim else HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER
+    )
+    if agent == "codex":
+        # Custom NvCodex subclass (agents/nv_codex.py) keeps the full
+        # provider-prefixed model id — harbor's stock codex strips it to the
+        # last path segment, which the NVIDIA gateway 401s on. Endpoint via
+        # `--ak api_base`; route endpoint/key values are resolved from the
+        # Harbor process environment into agent-only `--ae` variables below,
+        # so the key never lands on the CLI and the verifier route stays intact.
+        agent_flags = [
+            "-a", "agents.nv_codex:NvCodex",
+            "--model", model,
+            "--ak", f"api_base={_api_base_v1(anthropic_base_url)}",
+            "--ae", f"OPENAI_API_KEY=${{{AGENT_ROUTE_API_KEY_ENV}}}",
+            "--ae", f"OPENAI_BASE_URL=${{{AGENT_ROUTE_BASE_URL_ENV}}}",
+        ]
+    elif agent == "claude-code":
+        agent_flags = [
+            "-a", "agents.nv_claude_code:NvClaudeCode",
+            "--model", model,
+            "--ae", f"ANTHROPIC_API_KEY=${{{AGENT_ROUTE_API_KEY_ENV}}}",
+            "--ae", f"ANTHROPIC_BASE_URL=${{{AGENT_ROUTE_BASE_URL_ENV}}}",
+            "--ae", "CLAUDE_CODE_DISABLE_THINKING=1",
+        ]
+    elif agent == "nemoclaw":
+        environment_import_path = (
+            "envs.nemoclaw_brev_env:NemoClawBrevEnvironment"
+        )
+        environment_build_timeout_multiplier = (
+            NEMOCLAW_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER
+        )
+        agent_flags = [
+            "-a", "agents.nemoclaw:NemoClaw",
+            "--model", model,
+        ]
+    else:
+        raise ValueError(
+            f"unsupported agent {agent!r} "
+            "(expected claude-code | codex | nemoclaw)"
+        )
+    return [
+        "uvx",
+        "--python",
+        sys.executable,
+        "--from",
+        HARBOR_REQUIREMENT,
+        "harbor",
+        "run",
+        "--environment-import-path",
+        environment_import_path,
+        "-p",
+        str(invocation.harbor_root),
+        "--include-task-name",
+        invocation.include_task_name,
+        *agent_flags,
+        "--environment-build-timeout-multiplier",
+        str(environment_build_timeout_multiplier),
+        "--agent-timeout-multiplier",
+        str(agent_timeout_multiplier),
+        "--verifier-timeout-multiplier",
+        str(HARBOR_VERIFIER_TIMEOUT_MULTIPLIER),
+        "--max-retries",
+        "0",
+        "-n",
+        "1",
+        "--yes",
+        "-o",
+        str(results_root),
+    ]
+
+
+def harbor_env(instance: str) -> dict[str, str]:
+    env = os.environ.copy()
+    workspace = env.get("GITHUB_WORKSPACE") or str(REPO_ROOT)
+    skill_eval_path = str(Path(workspace) / ".github" / "skill-eval")
+    pythonpath = env.get("PYTHONPATH", "")
+    if skill_eval_path not in pythonpath.split(":"):
+        pythonpath = f"{skill_eval_path}:{pythonpath}" if pythonpath else skill_eval_path
+    env["PYTHONPATH"] = pythonpath
+    env["PATH"] = f"{Path.home() / '.local' / 'bin'}:{env.get('PATH', '')}"
+    env["BREV_INSTANCE"] = instance
+    env["CLAUDE_CODE_DISABLE_THINKING"] = "1"
+    try:
+        configured_brev_timeout = int(env.get("BREV_EXEC_TIMEOUT", "0"))
+    except ValueError as exc:
+        raise ValueError(
+            "BREV_EXEC_TIMEOUT must be an integer number of seconds"
+        ) from exc
+    env["BREV_EXEC_TIMEOUT"] = str(
+        max(configured_brev_timeout, MIN_BREV_EXEC_TIMEOUT_SEC)
+    )
+    # The outer backstop's recovery budget is derived from this exact per-call
+    # cap. Do not let a larger inherited runner value invalidate that bound.
+    env["BREV_TRANSFER_TOTAL_TIMEOUT_SEC"] = str(
+        HARBOR_TRANSFER_OPERATION_BUDGET_SEC
+    )
+    return env
+
+
+def _read_dataset_metadata(dataset_root: Path) -> dict:
+    """[metadata] of the first task.toml under the dataset (all steps of a
+    leg share one platform, so any task.toml carries the leg's hardware
+    requirements)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python < 3.11 on the coordinator
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    task_toml = next(iter(sorted(dataset_root.rglob("task.toml"))), None)
+    if task_toml is None:
+        return {}
+    return tomllib.loads(task_toml.read_text()).get("metadata", {}) or {}
+
+
+def _parse_brev_json(raw: str | None) -> list[dict]:
+    """Strip trailing walkthrough text and parse JSON from brev CLI.
+
+    Handles both the legacy bare-array format (``[{...}, ...]``) and the
+    newer wrapped format (``{"workspaces": [{...}, ...]}``) introduced in
+    recent brev CLI versions.
+    """
+    import json
+
+    if not raw:
+        return []
+    # Try full parse first (handles both formats without bracket heuristics)
+    stripped = raw.strip()
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict) and "workspaces" in parsed:
+            return parsed["workspaces"]
+        return []
+    except json.JSONDecodeError:
+        pass
+    # Fallback: strip trailing walkthrough text after last `]`
+    bracket = raw.rfind("]")
+    if bracket < 0:
+        return []
+    try:
+        parsed = json.loads(raw[: bracket + 1])
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict) and "workspaces" in parsed:
+            return parsed["workspaces"]
+        return []
+    except json.JSONDecodeError:
+        pass
+    # Last resort: extract the inner array from {"workspaces": [...]}
+    start = raw.find("[")
+    if start >= 0 and bracket > start:
+        try:
+            return json.loads(raw[start: bracket + 1])
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def _list_brev_instances() -> list[dict]:
+    """Snapshot `brev ls --json` with retries for transient RPC flakes.
+    An org with zero managed instances prints `null` — authoritative-empty."""
+    for attempt in range(4):
+        try:
+            proc = subprocess.run(
+                ["brev", "ls", "--json"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(f"[run-leg] brev ls failed (attempt {attempt + 1}): {exc}", flush=True)
+            time.sleep(5)
+            continue
+        raw = (proc.stdout or "").strip()
+        if raw.startswith("null"):
+            return []
+        if raw and raw.rfind("]") >= 0:
+            return _parse_brev_json(raw)
+        print(f"[run-leg] brev ls returned empty stdout (attempt {attempt + 1})", flush=True)
+        time.sleep(5)
+    return []
+
+
+def _list_registered_nodes() -> list[dict]:
+    """Snapshot registered external nodes from ``brev ls nodes --json``.
+
+    The CLI intentionally keeps registered nodes out of ``brev ls --json``.
+    Treat a well-formed empty array (or ``null``) as authoritative, but retry
+    empty/malformed output because transient auth/RPC failures otherwise make
+    the external pool disappear for the whole lock wait.
+    """
+    for attempt in range(4):
+        try:
+            proc = subprocess.run(
+                ["brev", "ls", "nodes", "--json"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(
+                f"[run-leg] brev ls nodes failed (attempt {attempt + 1}): {exc}",
+                flush=True,
+            )
+            time.sleep(5)
+            continue
+        raw = (proc.stdout or "").strip()
+        if raw.startswith("null"):
+            return []
+        if raw and raw.rfind("]") >= 0:
+            return _parse_brev_json(raw)
+        print(
+            f"[run-leg] brev ls nodes returned empty stdout "
+            f"(attempt {attempt + 1})",
+            flush=True,
+        )
+        time.sleep(5)
+    return []
+
+
+def _registered_gpu_hint(name: str) -> str:
+    """Infer hardware only for operator-controlled ``vss-eval-*`` names.
+
+    ``brev ls nodes --json`` currently reports name/status but no GPU model.
+    The pool's documented prefixes are therefore the only available hardware
+    contract. Unknown prefixes return empty so GPU-requiring legs fail closed.
+    """
+    normalized = name.lower()
+    if normalized.startswith(RTX4090_PREFIX):
+        return "GEFORCE RTX 4090"
+    # Use a more specific prefix to avoid matching RTX 4090 nodes whose names
+    # begin with "vss-eval-rtx" (e.g. "vss-eval-rtx4090-*") as RTX PRO 6000.
+    if normalized.startswith("vss-eval-rtx-"):
+        return "RTX PRO 6000"
+    if normalized.startswith("vss-eval-l40s"):
+        return "L40S"
+    if normalized.startswith("vss-eval-h100"):
+        return "H100"
+    return ""
+
+
+def _parse_pool_names(raw: str) -> set[str]:
+    return {
+        name.lower()
+        for name in re.split(r"[\s,]+", raw.strip())
+        if name
+    }
+
+
+def _rtx4090_supports(skill: str | None, spec_stem: str | None) -> bool:
+    """Whether resource data supports this exact test on a 24 GB RTX 4090."""
+    if not skill or not spec_stem:
+        return False
+    return (
+        skill in RTX4090_ALL_TESTS
+        or spec_stem in RTX4090_TESTS.get(skill, ())
+    )
+
+
+def _registered_pool_allowlist(
+    skill: str | None = None,
+    spec_stem: str | None = None,
+) -> set[str]:
+    """Registered nodes approved for this test.
+
+    ``BREV_REGISTERED_POOL`` contains full-capability workers. The separate
+    RTX 4090 pool is intentionally capability-routed because those 24 GB
+    cards cannot safely satisfy every RTX PRO 6000 task.
+    """
+    names = _parse_pool_names(os.environ.get("BREV_REGISTERED_POOL", ""))
+    if _rtx4090_supports(skill, spec_stem):
+        names.update(_parse_pool_names(os.environ.get("BREV_RTX4090_POOL", "")))
+    return names
+
+
+def _list_pool_instances(
+    skill: str | None = None,
+    spec_stem: str | None = None,
+) -> list[dict]:
+    """Return managed instances plus connected registered pool nodes."""
+    instances = list(_list_brev_instances())
+    seen = {(inst.get("name") or "").lower() for inst in instances}
+    registered_allowlist = _registered_pool_allowlist(skill, spec_stem)
+    rtx4090_allowlist = _parse_pool_names(
+        os.environ.get("BREV_RTX4090_POOL", "")
+    )
+    if not registered_allowlist:
+        return instances
+    for node in _list_registered_nodes():
+        name = (node.get("name") or "").strip()
+        if (
+            not name
+            or name.lower() in seen
+            or name.lower() not in registered_allowlist
+        ):
+            continue
+        status = (node.get("status") or "").upper()
+        instances.append({
+            **node,
+            "name": name,
+            # Managed instances say RUNNING; registered nodes say Connected.
+            "status": "RUNNING" if status == "CONNECTED" else status,
+            "gpu": _registered_gpu_hint(name),
+            "instance_type": "registered-external-node",
+            "_registered": True,
+            "_rtx4090_capability_routed": (
+                name.lower() in rtx4090_allowlist
+                and name.lower().startswith(RTX4090_PREFIX)
+            ),
+        })
+        seen.add(name.lower())
+    return instances
+
+
+def _loose_gpu_match(want: str, have: str) -> bool:
+    """`RTX PRO 6000` ⊆ `RTX PRO SERVER 6000` — all tokens of `want` must
+    appear in `have` (substring fallback for dashed variants). Mirrors
+    envs.brev_env._check_instance_matches."""
+    want_tokens = set(want.replace("-", " ").split())
+    have_tokens = set(have.replace("-", " ").split())
+    return want_tokens.issubset(have_tokens) or want in have
+
+
+# How many refusals a leg absorbs before reporting the last one. The pool is
+# small and `remaining_candidates()` already ends the loop when every eligible
+# box has refused; this only bounds a fleet that refuses indefinitely.
+_MAX_BOX_REJECTIONS = 4
+
+_CATALOG_GPU_COUNTS: dict[str, int] | None = None
+
+
+def _catalog_gpu_counts() -> dict[str, int]:
+    """`{instance_type: gpu_count}` from `brev search gpu --json`, cached.
+
+    `brev ls --json` carries no gpu_count -- only {name, gpu, instance_type,
+    status} -- which is why fleet naming became the stand-in. The catalog is
+    the same source `envs/brev_env.py` consults before it falls back to a live
+    nvidia-smi count, so filtering on it here rejects an undersized box while
+    it is still a candidate rather than after it has been locked.
+
+    Returns `{}` when the catalog is unavailable. Callers MUST treat an absent
+    SKU as "not disqualifying": a catalog outage that filtered everything out
+    would turn a slow schedule into a hard blocker.
+    """
+    global _CATALOG_GPU_COUNTS
+    if _CATALOG_GPU_COUNTS is not None:
+        return _CATALOG_GPU_COUNTS
+    counts: dict[str, int] = {}
+    try:
+        proc = subprocess.run(
+            ["brev", "search", "gpu", "--json"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode == 0:
+            for row in _parse_brev_json(proc.stdout):
+                sku = row.get("type")
+                try:
+                    count = int(row.get("gpu_count", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if sku:
+                    counts[sku] = count
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"[run-leg] brev search gpu failed: {exc}", flush=True)
+    if not counts:
+        # Do not cache an outage: this process can live for hours, and a
+        # single transient `brev search` failure would otherwise blind
+        # scheduling for the rest of the leg.
+        print("[run-leg] gpu catalog unavailable; managed box sizes unknown "
+              "this round (brev_env still validates the pick)", flush=True)
+        return {}
+    _CATALOG_GPU_COUNTS = counts
+    return counts
+
+
+def _instance_gpu_count(inst: dict) -> int | None:
+    """Best available gpu_count for a pool box, or None when unknown.
+
+    Registered nodes are named by the operator to the fleet convention, so the
+    name is what there is. Managed instances carry a catalog SKU, which is
+    authoritative; their names are only a convention and can go stale when a
+    box is resized.
+    """
+    if inst.get("_registered"):
+        # Operator-controlled names, and the only signal these nodes carry.
+        return _name_gpu_count_hint(inst.get("name") or "")
+    # Managed: the catalog SKU is authoritative and the name is not -- a
+    # resized box keeps its old name. An unlisted SKU stays unknown rather
+    # than falling back to the name, so a catalog gap can never filter the
+    # fleet down to nothing; brev_env validates the pick, and a refusal is
+    # now recoverable.
+    return _catalog_gpu_counts().get(inst.get("instance_type") or "")
+
+
+def _name_gpu_count_hint(name: str) -> int | None:
+    """Fleet-naming gpu_count hint: `*-1g*` → 1, `*-2g*` → 2 (AGENTS.md
+    pool convention). None when the name encodes nothing."""
+    if name.lower().startswith(RTX4090_PREFIX):
+        return 1
+    match = re.search(r"-(\d)g(?:-|$)", name)
+    return int(match.group(1)) if match else None
+
+
+def pool_candidates(
+    metadata: dict,
+    spec_stem: str | None = None,
+) -> list[str]:
+    """Eligible `vss-eval-*` boxes for this leg, best-first.
+
+    Hardware-hard, software-free (AGENTS.md § 5a): RUNNING + gpu_type
+    token match. Dedicated registered nodes sort before managed cloud
+    instances; exact name-hinted gpu_count matches sort first within each
+    tier. Over-provisioned boxes remain valid — brev_env validates the final
+    pick with live nvidia-smi and the box is reset either way.
+    gpu_count == 0 (remote-all / GPU-independent) accepts any RUNNING box.
+    """
+    required_type = (metadata.get("gpu_type") or "").upper()
+    required_count = int(metadata.get("gpu_count", 1) or 0)
+    skill = metadata.get("skill") or os.environ.get("EVAL_SKILL") or None
+    spec_stem = (
+        spec_stem
+        or metadata.get("spec_stem")
+        or os.environ.get("EVAL_SPEC_STEM")
+        or None
+    )
+
+    candidates: list[tuple[str, bool]] = []
+    for inst in _list_pool_instances(skill, spec_stem):
+        name = inst.get("name") or ""
+        if not name.startswith("vss-eval-"):
+            continue
+        if (inst.get("status") or "").upper() != "RUNNING":
+            continue
+        # Brev can report a running VM whose SSH shell is explicitly NOT
+        # READY. Do not prefer that broken worker merely because its name
+        # matches the requested GPU count. Missing legacy fields remain valid.
+        if any(
+            str(inst.get(field) or "").strip().upper().replace("_", " ").replace("-", " ")
+            in {"NOT READY", "UNHEALTHY", "DISCONNECTED", "STOPPED"}
+            for field in ("shell_status", "health_status")
+        ):
+            continue
+        if required_count > 0:
+            # Applies to managed instances too, not just registered nodes.
+            # Skipping them here is what let a `*-1g-*` box be locked for a
+            # 2-GPU spec and then rejected by brev_env, killing the leg
+            # before it ran a trial. An unknown count never disqualifies.
+            known_count = _instance_gpu_count(inst)
+            if known_count is not None and known_count < required_count:
+                continue
+        if required_count > 0 and required_type:
+            gpu = (inst.get("gpu") or "").upper()
+            itype = (inst.get("instance_type") or "").upper()
+            capability_routed = (
+                bool(inst.get("_rtx4090_capability_routed"))
+                and _rtx4090_supports(skill, spec_stem)
+            )
+            # Accept via instance_type when `gpu` is a transient "-"/"" flake
+            # (brev catalog refresh) — same soft-fail brev_env applies.
+            if not (_loose_gpu_match(required_type, gpu)
+                    or _loose_gpu_match(required_type, itype)
+                    or capability_routed):
+                continue
+        candidates.append((name, bool(inst.get("_registered"))))
+
+    def sort_key(candidate: tuple[str, bool]) -> tuple[int, int, str]:
+        name, registered = candidate
+        hint = _name_gpu_count_hint(name)
+        exact = 0 if (required_count > 0 and hint == required_count) else 1
+        # Use the dedicated registered pool before consuming managed cloud
+        # capacity. Within each pool tier, preserve exact-count partitioning.
+        # BrevEnvironment validates the chosen node with live nvidia-smi.
+        return (0 if registered else 1, exact, name.lower())
+
+    return [name for name, _ in sorted(candidates, key=sort_key)]
+
+
+def nemoclaw_sandbox_name(run_id: str, leg_slug: str) -> str:
+    """Return the short, per-leg sandbox name owned by a CI evaluation.
+
+    Build Vision AI treats a sandbox as part of a build. A shared
+    ``skill-eval`` name lets a later leg reuse a previous leg's gateway and
+    sessions, so CI derives one name from its run and leg instead. Keep it
+    compact because NemoClaw limits sandbox names to 19 characters.
+    """
+    safe_run_id = SAFE_PART_RE.sub("-", run_id.lower()).strip("-") or "manual"
+    identity = f"{run_id}:{leg_slug}".encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:8]
+    # ``se-`` + six run-id characters + ``-`` + eight digest characters =
+    # 18 characters: valid for the 19-character NemoClaw limit.
+    return f"se-{safe_run_id[-6:]}-{digest}"
+
+
+def attempt_lock_timeout(
+    base: int, work_deadline: float | None, reserve: int
+) -> int:
+    """Lock budget for one attempt: `base`, capped by what the leg has left.
+
+    Reads the clock itself rather than taking `now`: `work_deadline` is on the
+    monotonic clock, and a caller that passed `time.time()` instead would
+    silently collapse every attempt to the floor -- the first one too, not
+    just retries. `reserve` keeps room for one complete Harbor invocation.
+    """
+    if work_deadline is None:
+        return base
+    remaining = int(work_deadline - time.monotonic() - reserve)
+    return max(1, min(base, remaining))
+
+
+# brev_env refuses a box it considers unsuitable for the task's hardware.
+# Matched against Harbor's structured `exception_info`, never against log or
+# transcript text: eval agents quote these very sentences while diagnosing a
+# failure, and a transcript match would discard a healthy box and hide the
+# real result behind a retry.
+_BOX_REFUSAL_MARKERS = (
+    "GPU(s) (live nvidia-smi); task requires at least",
+    "does not meet task",
+)
+
+
+def box_rejected_for_capacity(results_root: Path, since: float) -> str | None:
+    """The refusal message if this leg's box was refused, else None.
+
+    Three conditions, all required, so an ordinary failed trial can never be
+    mistaken for a refusal:
+
+    * the finding comes from `result.json`'s `exception_info` -- structured
+      output Harbor writes, not something an agent can print;
+    * the trial recorded no `agent_execution`, i.e. nothing ever ran;
+    * the file was written since `since`, so a refusal from an earlier
+      attempt in the same results tree cannot re-trigger a retry.
+    """
+    import json as _json
+
+    try:
+        paths = [
+            q for q in results_root.rglob("result.json")
+            if q.is_file() and q.stat().st_mtime >= since
+        ]
+    except OSError:
+        return None
+    for q in paths:
+        try:
+            payload = _json.loads(q.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        info = payload.get("exception_info")
+        if not info:
+            continue
+        # A trial that reached the agent is a real result, whatever it says.
+        if payload.get("agent_execution") or payload.get("agent_result"):
+            continue
+        text = info if isinstance(info, str) else _json.dumps(info)
+        for marker in _BOX_REFUSAL_MARKERS:
+            if marker in text:
+                return " ".join(text.split())[:240]
+    return None
+
+
+@contextlib.contextmanager
+def hold_pool_lock(candidates_fn, lock_dir: Path, timeout_sec: int):
+    """Claim the first candidate whose flock succeeds NON-BLOCKINGLY.
+
+    Selection and reservation are one atomic step: a busy box fails the
+    try-lock and we move to the next candidate, so concurrent legs fan
+    out across the pool instead of herding onto one "best" box. When
+    every candidate is held (or none is eligible), re-snapshot the fleet
+    and retry every 60s until `timeout_sec` — the pool is operator-managed
+    and a box may come online mid-run.
+
+    Yields the claimed instance name; the lock FD stays open until exit.
+    """
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_sec
+    chosen: str | None = None
+    fp = None
+    while True:
+        names = candidates_fn()
+        for name in names:
+            if "/" in name or name in {"", ".", ".."}:
+                raise ValueError(f"invalid Brev instance name for lock file: {name!r}")
+            lock_path = lock_dir / f"{name}.lock"
+            candidate_fp = lock_path.open("a+")
+            try:
+                fcntl.flock(candidate_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                candidate_fp.close()
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                continue
+            chosen, fp = name, candidate_fp
+            print(f"[run-leg] selected instance: {name} (lock acquired: {lock_path})",
+                  flush=True)
+            break
+        if chosen:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LockTimeoutError(
+                f"no eligible pool box became free before timeout "
+                f"(last candidates: {', '.join(names) or 'none'})"
+            )
+        print(
+            f"[run-leg] all candidates busy or none eligible "
+            f"({', '.join(names) or 'no RUNNING hardware match'}); "
+            f"retrying in 60s ({int(remaining)}s remaining)",
+            flush=True,
+        )
+        time.sleep(min(60, remaining))
+    try:
+        yield chosen
+    finally:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+        fp.close()
+        print(f"[run-leg] lock released: {chosen}", flush=True)
+
+
+def _process_group_exists(pgid: int) -> bool:
+    """Return whether any process still belongs to *pgid*."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # We own the spawned group in normal operation. If permissions ever
+        # change, fail safe by treating an unprobeable group as still alive.
+        return True
+    except OSError as exc:
+        print(f"[run-leg] process-group probe failed for {pgid}: {exc!r}", flush=True)
+        return True
+    return True
+
+
+def _process_start_ticks(pid: int) -> str | None:
+    """Return Linux /proc start ticks, which disambiguate PID reuse."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    closing_paren = stat.rfind(")")
+    if closing_paren < 0:
+        return None
+    fields_from_state = stat[closing_paren + 2 :].split()
+    # /proc/<pid>/stat field 3 is the first token after the command; starttime
+    # is field 22, therefore index 19 in this tail.
+    return fields_from_state[19] if len(fields_from_state) > 19 else None
+
+
+def _registry_environment_groups(registry_path: Path) -> set[int]:
+    """Find every process group carrying this invocation's unique marker."""
+    expected_env = (
+        f"{TRANSPORT_PGID_REGISTRY_ENV}={registry_path}".encode()
+    )
+    try:
+        proc_entries = list(Path("/proc").iterdir())
+    except OSError:
+        return set()
+    groups: set[int] = set()
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            closing_paren = stat.rfind(")")
+            fields_from_state = stat[closing_paren + 2 :].split()
+            member_pgid = int(fields_from_state[2])
+            environ = (entry / "environ").read_bytes().split(b"\0")
+        except (
+            FileNotFoundError,
+            ProcessLookupError,
+            PermissionError,
+            OSError,
+            ValueError,
+            IndexError,
+        ):
+            continue
+        if expected_env in environ and _process_group_exists(member_pgid):
+            groups.add(member_pgid)
+    return groups
+
+
+def _registered_transport_groups(registry_path: Path | None) -> list[int]:
+    """Return still-live, identity-matched detached Brev transport PGIDs."""
+    if registry_path is None:
+        return []
+    try:
+        lines = registry_path.read_text().splitlines()
+    except (FileNotFoundError, PermissionError, OSError):
+        return []
+
+    # Scanning the unique inherited environment marker catches grandchildren
+    # that create another session internally (for example a CLI spawning its
+    # own setsid ssh), not only the direct PGIDs written by brev_env.py.
+    groups = _registry_environment_groups(registry_path)
+    for line in lines:
+        try:
+            pid_text, expected_start = line.split(maxsplit=1)
+            pid = int(pid_text)
+        except (TypeError, ValueError):
+            continue
+        if not _process_group_exists(pid):
+            continue
+        leader_matches = _process_start_ticks(pid) == expected_start
+        if leader_matches:
+            groups.add(pid)
+    return sorted(groups)
+
+
+def _signal_registered_transport_groups(
+    registry_path: Path | None,
+    sig: signal.Signals,
+    exclude_pgid: int | None = None,
+) -> None:
+    for pgid in _registered_transport_groups(registry_path):
+        if pgid == exclude_pgid:
+            continue
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            print(
+                f"[run-leg] {sig.name} delivery to transport PGID {pgid} "
+                f"failed: {exc!r}",
+                flush=True,
+            )
+
+
+def _wait_for_process_group_exit(
+    proc: subprocess.Popen,
+    pgid: int,
+    grace_sec: float,
+    registry_path: Path | None = None,
+) -> bool:
+    """Wait for Harbor's group and every registered transport group to exit."""
+    deadline = time.monotonic() + max(grace_sec, 0)
+    try:
+        proc.wait(timeout=max(grace_sec, 0))
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError as exc:
+        print(f"[run-leg] wait for Harbor leader failed: {exc!r}", flush=True)
+
+    # The Harbor leader can exit while a `brev exec`/SSH descendant remains in
+    # its original group. Do not report successful cancellation until PGID 0
+    # probing says the whole group is gone.
+    while (
+        _process_group_exists(pgid)
+        or _registered_transport_groups(registry_path)
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(PROCESS_GROUP_POLL_INTERVAL_SEC, remaining))
+    return True
+
+
+def _signal_process_group_and_wait(
+    proc: subprocess.Popen,
+    pgid: int,
+    sig: signal.Signals,
+    grace_sec: float,
+    registry_path: Path | None = None,
+) -> bool:
+    """Signal Harbor plus detached transports and wait a bounded time."""
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        # The Harbor leader/group won the race. Detached registered transport
+        # sessions can still exist, so continue through the combined probe.
+        with contextlib.suppress(OSError):
+            proc.poll()
+    except OSError as exc:
+        print(f"[run-leg] {sig.name} delivery failed: {exc!r}", flush=True)
+    _signal_registered_transport_groups(registry_path, sig, exclude_pgid=pgid)
+
+    return _wait_for_process_group_exit(
+        proc, pgid, grace_sec, registry_path
+    )
+
+
+def _cancel_process_tree(
+    proc: subprocess.Popen,
+    pgid: int,
+    registry_path: Path,
+    *, external: bool = False,
+) -> bool:
+    """Escalate INT → TERM → KILL across Harbor and detached transports."""
+    exited = _signal_process_group_and_wait(
+        proc,
+        pgid,
+        signal.SIGINT,
+        30 if external else HARBOR_SIGINT_GRACE_SEC,
+        registry_path,
+    )
+    if not exited:
+        print(
+            "[run-leg] Harbor tree did not exit after SIGINT; escalating to SIGTERM",
+            flush=True,
+        )
+        exited = _signal_process_group_and_wait(
+            proc,
+            pgid,
+            signal.SIGTERM,
+            15 if external else HARBOR_SIGTERM_GRACE_SEC,
+            registry_path,
+        )
+    if not exited:
+        print(
+            "[run-leg] Harbor tree did not exit after SIGTERM; escalating to SIGKILL",
+            flush=True,
+        )
+        exited = _signal_process_group_and_wait(
+            proc,
+            pgid,
+            signal.SIGKILL,
+            HARBOR_SIGKILL_GRACE_SEC,
+            registry_path,
+        )
+    return exited
+
+
+def run_command(cmd: list[str], env: dict[str, str], timeout_sec: int) -> int:
+    print(f"[run-leg] exec: {' '.join(cmd)}", flush=True)
+    registry_fd, registry_name = tempfile.mkstemp(
+        prefix="skill-eval-transport-pgids-",
+    )
+    os.close(registry_fd)
+    registry_path = Path(registry_name)
+    child_env = env.copy()
+    child_env[TRANSPORT_PGID_REGISTRY_ENV] = str(registry_path)
+    proc: subprocess.Popen | None = None
+    pgid: int | None = None
+    pending_signal: int | None = None
+    harbor_rc: int | None = None
+    cleanup_started = False
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def forward_external_signal(signum, _frame):  # noqa: ANN001
+        nonlocal cleanup_started, pending_signal
+        # Install before Popen to close the parent-signal race. If a signal
+        # lands while Popen is still constructing the child, remember it and
+        # start teardown immediately after Popen returns a usable handle.
+        if proc is None or pgid is None:
+            pending_signal = signum
+            return
+        if cleanup_started:
+            return
+        cleanup_started = True
+        raise _RunCommandInterrupted(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, forward_external_signal)
+        except ValueError:
+            # Defensive for library callers that invoke run_command off the
+            # main thread. The production wrapper always runs on MainThread.
+            for installed_sig, previous in previous_handlers.items():
+                with contextlib.suppress(ValueError):
+                    signal.signal(installed_sig, previous)
+            previous_handlers.clear()
+            break
+
+    try:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(REPO_ROOT),
+                env=child_env,
+                start_new_session=True,
+            )
+            # start_new_session=True makes the Harbor leader's PID its PGID.
+            # Preserve it now so a leader exit cannot hide descendants.
+            pgid = proc.pid
+            if pending_signal is not None:
+                cleanup_started = True
+                raise _RunCommandInterrupted(pending_signal)
+
+            try:
+                rc = proc.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                cleanup_started = True
+                outcome = 124
+                reason = f"outer timeout after {timeout_sec}s"
+            else:
+                if rc < 0:
+                    cleanup_started = True
+                    outcome = 128 + abs(rc)
+                    try:
+                        signal_name = signal.Signals(abs(rc)).name
+                    except ValueError:
+                        signal_name = str(abs(rc))
+                    reason = f"Harbor exited from signal {signal_name}"
+                else:
+                    detached = _registered_transport_groups(registry_path)
+                    if not detached:
+                        cleanup_started = True
+                        return rc
+                    cleanup_started = True
+                    # Harbor finished on its own; only its transports linger.
+                    # Remember the real result: if the bounded cleanup below
+                    # reaps them, the trial stands and this is housekeeping,
+                    # not a timeout.
+                    harbor_rc = rc
+                    outcome = 124
+                    reason = (
+                        "Harbor exited while detached transport groups remained: "
+                        + ", ".join(map(str, detached))
+                    )
+        except _RunCommandInterrupted as exc:
+            cleanup_started = True
+            outcome = 128 + exc.signum
+            reason = f"external {signal.Signals(exc.signum).name}"
+
+        if proc is None or pgid is None:
+            return outcome
+
+        cleanup_started = True
+        print(
+            f"[run-leg] {reason}; "
+            "requesting graceful Harbor cancellation with SIGINT",
+            flush=True,
+        )
+        # Ignore repeated workflow signals while bounded cleanup owns the
+        # process tree. A later SIGKILL remains the unavoidable hard ceiling.
+        for sig in previous_handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        if outcome >= 128 and env.get(GATEWAY_CANCEL_CLEANUP_ROOT_ENV) and env.get("BREV_INSTANCE"):
+            # The locked leg is terminal. Remove its narrowly owned firewall
+            # rule before Harbor's long shutdown grace keeps the lock occupied
+            # and an outer CI agent can kill this wrapper before its finally.
+            try:
+                cleanup_gateway_network_policy(
+                    env["BREV_INSTANCE"], Path(env[GATEWAY_CANCEL_CLEANUP_ROOT_ENV]),
+                    timeout_sec=20,
+                )
+            except Exception as exc:
+                print(f"[run-leg] cancellation gateway cleanup failed: {type(exc).__name__}", file=sys.stderr)
+        if outcome >= 128:
+            exited = _cancel_process_tree(proc, pgid, registry_path, external=True)
+        else:
+            exited = _cancel_process_tree(proc, pgid, registry_path)
+        if not exited:
+            print(
+                "[run-leg] Harbor tree could not be reaped after SIGKILL; "
+                "preserving primary outcome",
+                flush=True,
+            )
+        elif harbor_rc is not None:
+            # Harbor completed and the strays are now gone. Reporting 124
+            # here discards a finished trial -- and because rc == 124 also
+            # writes skip markers, it takes every later step of a multi-step
+            # spec with it. A step that scored 1.0 was recorded as a timeout
+            # and its successors never ran.
+            print(
+                f"[run-leg] detached transports reaped; keeping Harbor's "
+                f"result rc={harbor_rc}",
+                flush=True,
+            )
+            return harbor_rc
+        return outcome
+    finally:
+        for sig, previous in previous_handlers.items():
+            with contextlib.suppress(ValueError):
+                signal.signal(sig, previous)
+        registry_path.unlink(missing_ok=True)
+
+
+def latest_reward(
+    results_root: Path,
+    include_task_name: str,
+    started_at: float | None = None,
+) -> str | None:
+    matches = list(results_root.glob(f"*/{include_task_name}__*/verifier/reward.txt"))
+    if started_at is not None:
+        matches = [p for p in matches if p.stat().st_mtime >= started_at]
+    if not matches:
+        return None
+    latest = max(matches, key=lambda p: p.stat().st_mtime)
+    return latest.read_text().strip()
+
+
+def latest_trial_exception(
+    results_root: Path,
+    include_task_name: str,
+    started_at: float,
+) -> str | None:
+    """Read this invocation's structured failure, independent of its reward.
+
+    Harbor can exit zero and run the verifier after an agent timeout. A
+    passing reward in that case does not mean setup finished successfully.
+    Ignore earlier invocations and job-level aggregate result files.
+    """
+    matches = [
+        path
+        for path in results_root.glob(f"*/{include_task_name}__*/result.json")
+        if path.stat().st_mtime >= started_at
+    ]
+    if not matches:
+        return None
+    latest = max(matches, key=lambda path: path.stat().st_mtime)
+    try:
+        payload = json.loads(latest.read_text())
+    except (OSError, ValueError):
+        return "unreadable trial result"
+    if not isinstance(payload, dict):
+        return "invalid trial result"
+    info = payload.get("exception_info")
+    if not info:
+        return None
+    # Log the exception type only; messages and tracebacks can contain secrets.
+    if isinstance(info, dict):
+        exception_type = info.get("exception_type")
+        if isinstance(exception_type, str) and re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{0,100}", exception_type
+        ):
+            return exception_type
+    return "Harbor trial exception"
+
+
+def _coordinator_env_id() -> str | None:
+    """Brev env id of the COORDINATOR host — the box running `harbor view`.
+
+    Never derive this from `brev ls`: that yields a per-trial instance id,
+    and the resulting URL points at a subdomain with no viewer behind it.
+    """
+    env_id = os.environ.get("BREV_ENV_ID", "").strip()
+    if env_id:
+        return env_id
+    try:
+        for line in Path("/etc/environment").read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "BREV_ENV_ID":
+                return value.strip().strip('"').strip("'") or None
+    except OSError:
+        pass
+    return None
+
+
+def trace_url(result_json: Path, job_name: str) -> str | None:
+    """Harbor viewer deep-link for one finished trial.
+
+    Every segment is read from the trial's own result.json, so the link
+    cannot drift from what the viewer indexes. `task_name` in particular is
+    Harbor's fully-qualified name (`nvidia-vss/<dataset>-step-N`), NOT the
+    `--include-task-name` filter (`step-N`) that selects the task here — the
+    viewer resolves its task route by the former. A bare `step-N` matches
+    nothing and renders a BLANK PAGE rather than a 404, because the viewer
+    is a client-side SPA where every route returns the same HTTP 200 shell.
+    That failure mode is indistinguishable from missing trace data, which is
+    why the URL is built here instead of being assembled by hand.
+    """
+    env_id = _coordinator_env_id()
+    if not env_id:
+        return None
+    try:
+        data = json.loads(result_json.read_text())
+    except (OSError, ValueError):
+        return None
+    agent_info = data.get("agent_info") or {}
+    model_info = agent_info.get("model_info") or {}
+    parts = [
+        data.get("source"),
+        agent_info.get("name"),
+        model_info.get("provider"),
+        model_info.get("name"),
+        data.get("task_name"),
+    ]
+    if not all(parts):
+        return None
+    # safe="" so the slashes inside <model> and <task> encode as %2F — the
+    # viewer expects them as single path segments, not extra path levels.
+    encoded = "/".join(urllib.parse.quote(str(part), safe="") for part in parts)
+    return f"https://harbor-{env_id}.brevlab.com/jobs/{job_name}/tasks/{encoded}"
+
+
+def publish_trace(
+    results_root: Path,
+    invocation: HarborInvocation,
+    started_at: float,
+    leg_slug: str,
+    run_id: str,
+) -> str | None:
+    """Copy a finished trial into the viewer root and record its trace URL.
+
+    Returns None when the trial produced no result.json (errored or timed
+    out before the verifier ran) — such a step has no trace to link.
+    """
+    matches = [
+        path.parent
+        for path in results_root.glob(
+            f"*/{invocation.include_task_name}__*/result.json"
+        )
+        if path.stat().st_mtime >= started_at
+    ]
+    if not matches:
+        return None
+    trial_dir = max(matches, key=lambda path: path.stat().st_mtime)
+    date_dir = trial_dir.parent
+    job_name = f"{leg_slug}__{run_id}__{date_dir.name}"
+    viewer_job = VIEWER_ROOT / job_name
+    viewer_job.mkdir(parents=True, exist_ok=True)
+    # Copy (never move) the date dir's *contents*: the workflow's "Collect
+    # results" step runs after this and tars results_root for the artifact,
+    # and copying the dir itself would nest a later trial under
+    # <job>/<date>/ where the viewer cannot see it.
+    shutil.copytree(date_dir, viewer_job, dirs_exist_ok=True)
+    url = trace_url(trial_dir / "result.json", job_name)
+    if url:
+        with (results_root / "trace-urls.tsv").open("a") as handle:
+            handle.write(
+                f"{invocation.include_task_name}\t{trial_dir.name}\t{url}\n"
+            )
+        print(
+            f"[run-leg] trace: {invocation.include_task_name} -> {url}",
+            flush=True,
+        )
+    return url
+
+
+def _reward_value(reward: str | None) -> float:
+    if reward is None:
+        return 0.0
+    try:
+        return float(reward)
+    except ValueError:
+        return 0.0
+
+
+def _safe_part(value: str) -> str:
+    return SAFE_PART_RE.sub("_", value).strip("_") or "unknown"
+
+
+def write_skip_markers(
+    scratch: Path,
+    spec_stem: str,
+    platform: str,
+    failed_step: int,
+    reward: str | None,
+    step_count: int,
+) -> None:
+    scratch.mkdir(parents=True, exist_ok=True)
+    stem = _safe_part(spec_stem or "spec")
+    plat = _safe_part(platform or "platform")
+    reward_text = reward if reward is not None else "missing"
+    for step in range(failed_step + 1, step_count + 1):
+        marker = scratch / f"skipped-{stem}-{plat}-step-{step}.txt"
+        marker.write_text(
+            f"skipped (prior-step fail, step={failed_step} reward={reward_text})\n"
+        )
+        print(f"[run-leg] wrote skip marker: {marker}", flush=True)
+
+
+def record_machine(
+    results_root: Path, instance: str, leg_slug: str, run_id: str
+) -> None:
+    """Persist the (machine, run, leg) triple the moment the box is claimed.
+
+    This is the only point in the pipeline where all three coexist, and
+    ``run_leg.py`` runs as a Bash *tool call* inside the outer agent session —
+    so its stdout is swallowed by the SDK and never reaches the CI job log.
+    Absent this, the box a leg ran on is unrecoverable after the run
+    (``BREV_INSTANCE`` lives only in the Harbor child's env; ``result.json``,
+    the saved trajectory, and the results artifact all omit it).
+
+    Two best-effort writes, independent of stdout capture:
+      * ``results_root/machine.txt`` — tarred into the per-leg results artifact
+        (run/slug-keyed), and dashboard-ingestible.
+      * ``$GITHUB_STEP_SUMMARY`` — surfaces in the Actions run UI + API, with
+        far longer retention than the 7-day artifact.
+
+    Never raises: a debug signal must not fail the leg.
+    """
+    def _say(msg: str) -> None:
+        # Even the diagnostics must not raise: a broken or unencodable stdout
+        # (e.g. the outer agent closed the pipe) would otherwise propagate out
+        # of a sink's except block and fail the leg.
+        try:
+            print(msg, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _say(f"[run-leg] machine: {instance} leg={leg_slug} run={run_id}")
+    # Broad excepts + explicit utf-8: a non-UTF-8 runner locale would otherwise
+    # raise UnicodeEncodeError (not an OSError) and fail the leg. Nothing here
+    # may propagate.
+    try:
+        (results_root / "machine.txt").write_text(
+            f"{instance}\t{leg_slug}\t{run_id}\n", encoding="utf-8"
+        )
+    except Exception as exc:  # noqa: BLE001
+        _say(f"[run-leg] machine.txt write failed: {exc!r}")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(
+                    f"- leg `{leg_slug}` -> **{instance}** (run {run_id})\n"
+                )
+        except Exception as exc:  # noqa: BLE001
+            _say(f"[run-leg] step-summary write failed: {exc!r}")
+
+
+def deferred_agent_run_marker(run_id: str, leg_slug: str) -> str:
+    """Return the stable marker shared by setup and end-of-leg cleanup."""
+    digest = hashlib.sha256(f"{run_id}:{leg_slug}".encode()).hexdigest()[:32]
+    return f"{REMOTE_AGENT_RUN_PREFIX}{digest}"
+
+
+def cleanup_deferred_agent_run(instance: str, marker: str) -> None:
+    """Best-effort end-of-leg cleanup for services left by setup Claude."""
+    try:
+        result = subprocess.run(
+            [
+                "uvx",
+                "--python",
+                sys.executable,
+                "--from",
+                HARBOR_REQUIREMENT,
+                "python",
+                "-c",
+                (
+                    "import asyncio,sys; "
+                    "from envs.brev_env import reap_remote_agent_run; "
+                    "asyncio.run(reap_remote_agent_run(sys.argv[1], sys.argv[2]))"
+                ),
+                instance,
+                marker,
+            ],
+            cwd=REPO_ROOT,
+            env=os.environ.copy(),
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"cleanup subprocess exited {result.returncode}")
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[run-leg] deferred agent cleanup failed: {exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def allocate_gateway_ports(instance: str, owner: str, preferred: list[int], env: dict[str, str], *, exact=False) -> list[int]:
+    """Claim an available namespace on the locked worker before Harbor starts."""
+    script = (REPO_ROOT / ".github/skill-eval/nemoclaw/gateway_state.py").read_text()
+    args = [owner, *(str(port) for port in preferred), "--allocate"]
+    if exact:
+        args.append("--exact")
+    command = "python3 -c " + shlex.quote(script) + " " + shlex.join(args)
+    result = subprocess.run(
+        ["uvx", "--python", sys.executable, "--from", HARBOR_REQUIREMENT, "python", "-c",
+         "import asyncio,sys; from envs.brev_env import _run_brev_exec_retry; "
+         "r=asyncio.run(_run_brev_exec_retry(sys.argv[1],sys.argv[2],timeout=30)); "
+         "print(r.stdout or ''); print(r.stderr or '',file=sys.stderr); sys.exit(r.return_code)",
+         instance, command],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=150, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError("NemoClaw gateway allocation failed: " + (result.stderr or result.stdout or "")[-1000:])
+    records = [json.loads(line.split("=", 1)[1]) for line in (result.stdout or "").splitlines() if line.startswith("NEMOCLAW_GATEWAY_ALLOCATION=")]
+    if len(records) != 1 or records[0].get("owner") != owner:
+        raise RuntimeError("missing or mismatched gateway allocation receipt")
+    ports = records[0].get("ports")
+    if not isinstance(ports, list) or len(ports) != 3 or any(type(p) is not int or not 1024 <= p <= 65535 for p in ports) or len(set(ports)) != 3 or ports[0] == 8080:
+        raise RuntimeError("invalid gateway allocation ports")
+    if exact and ports != preferred:
+        raise RuntimeError("gateway allocation changed explicitly requested ports")
+    print(f"[run-leg] selected eval gateway/dashboard/relay ports: {ports}", flush=True)
+    return ports
+
+
+def _probe_spark_ssh(name: str, status: str | None) -> None:
+    """Retry only the read-only reachability check after transient disconnects."""
+    deadline = resolve_work_deadline()
+    transient_errors = (
+        "connection reset", "connection refused", "connection timed out",
+        "connection closed", "connection lost", "broken pipe",
+        "no route to host", "network is unreachable",
+        "temporary failure in name resolution",
+    )
+    permanent_errors = (
+        "permission denied", "authentication failed", "host key verification failed",
+        "remote host identification has changed",
+    )
+    for attempt in range(3):
+        if deadline - time.monotonic() < 20:
+            raise ValueError(f"Spark worker {name} SSH probe failed: work deadline exhausted")
+        try:
+            probe = subprocess.run(
+                ["ssh", "-T", "-o", "BatchMode=yes", "-o",
+                 "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
+                 name.lower(), "true"],
+                capture_output=True, text=True, timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            detail = "TimeoutExpired"
+            transient = True
+        except OSError as exc:
+            raise ValueError(
+                f"Spark worker {name} reports {status!r} "
+                f"and its SSH probe failed ({type(exc).__name__})"
+            ) from exc
+        else:
+            if probe.returncode == 0:
+                return
+            output = ((probe.stderr or "") + "\n" + (probe.stdout or "")).lower()
+            detail = f"exit {probe.returncode}"
+            transient = (
+                probe.returncode == 255
+                and any(error in output for error in transient_errors)
+                and not any(error in output for error in permanent_errors)
+            )
+        if not transient or attempt == 2:
+            raise ValueError(
+                f"Spark worker {name} reports {status!r} "
+                f"and its SSH probe failed ({detail}); "
+                "verify the coordinator's Brev SSH alias and connection"
+            )
+        delay = 10 * (2 ** attempt)
+        if deadline - time.monotonic() < delay + 20:
+            raise ValueError(f"Spark worker {name} SSH probe failed: work deadline exhausted")
+        print(
+            f"[run-leg] Spark SSH probe failed ({detail}); "
+            f"retry {attempt + 1}/2 in {delay}s",
+            flush=True,
+        )
+        time.sleep(delay)
+
+
+def cleanup_gateway_network_policy(instance: str, results_root: Path, *, timeout_sec: int = 120) -> None:
+    """Remove only this leg's gateway firewall chain while its worker lock is held."""
+    slug = os.environ.get("EVAL_SLUG") or results_root.parent.name
+    run_id = os.environ.get("GITHUB_RUN_ID") or results_root.name
+    owner = hashlib.sha256(f"{run_id}:{slug}".encode()).hexdigest()
+    script = (REPO_ROOT / ".github/skill-eval/nemoclaw/gateway_state.py").read_text()
+    command = "python3 -c " + shlex.quote(script) + " " + shlex.join([owner, "--cleanup-firewall"])
+    try:
+        result = subprocess.run(
+            ["uvx", "--python", sys.executable, "--from", HARBOR_REQUIREMENT, "python", "-c",
+             "import asyncio,sys; from envs.brev_env import _run_brev_exec_retry; "
+             "r=asyncio.run(_run_brev_exec_retry(sys.argv[1],sys.argv[2],timeout=int(sys.argv[3]))); "
+             "print(r.stdout or ''); print(r.stderr or '',file=sys.stderr); sys.exit(r.return_code)",
+             instance, command, str(min(90, max(1, timeout_sec - 10)))],
+            cwd=REPO_ROOT, env=harbor_env(instance), timeout=timeout_sec, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"cleanup exited {result.returncode}")
+    except Exception as exc:
+        print(f"[run-leg] owned gateway network policy cleanup failed: {type(exc).__name__}", file=sys.stderr)
+
+
+
+def _process_start_time(pid: int) -> str:
+    # comm can contain spaces and parentheses; field 22 follows the final ')'.
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
+def _record_wrapper_owner(results_root: Path, instance: str, slug: str, run_id: str) -> None:
+    """Identify the locked wrapper, including PID reuse and workflow reruns."""
+    try:
+        value = {
+            "pid": os.getpid(), "start_time": _process_start_time(os.getpid()),
+            "run_id": run_id, "attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+            "slug": slug, "instance": instance,
+        }
+        fd, name = tempfile.mkstemp(prefix=".wrapper-owner-", dir=results_root)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(value, stream)
+            os.replace(name, results_root / "wrapper-owner.json")
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name)
+    except OSError as exc:
+        print(f"[run-leg] wrapper owner receipt unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
+def _signal_cancelled_wrapper(results_root: Path, instance: str, slug: str, run_id: str) -> bool:
+    """Signal only the recorded live wrapper from this exact cancelled attempt."""
+    pidfd = None
+    try:
+        with os.fdopen(os.open(results_root / "wrapper-owner.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "r") as stream:
+            metadata = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                    or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_size > 4096):
+                return False
+            value = json.loads(stream.read(4097))
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+        if (not isinstance(value, dict) or not attempt
+                or any(value.get(k) != v for k, v in {
+                    "run_id": run_id, "attempt": attempt, "slug": slug, "instance": instance,
+                }.items())):
+            return False
+        pid = value.get("pid")
+        if type(pid) is not int or pid <= 1 or pid == os.getpid():
+            return False
+        # Pin the kernel process identity before validation. No raw-PID fallback:
+        # an unsupported host or a recycled PID must leave other legs untouched.
+        pidfd = os.pidfd_open(pid)
+        proc = Path(f"/proc/{pid}")
+        if proc.stat().st_uid != os.geteuid() or _process_start_time(pid) != value.get("start_time"):
+            return False
+        argv = (proc / "cmdline").read_bytes().split(b"\0")
+        if len(argv) < 2:
+            return False
+        script = Path(os.fsdecode(argv[1]))
+        if not script.is_absolute():
+            script = (proc / "cwd").resolve() / script
+        if script.resolve() != REPO_ROOT / ".github/skill-eval/run_leg.py":
+            return False
+        environment = dict(item.split(b"=", 1) for item in (proc / "environ").read_bytes().split(b"\0") if b"=" in item)
+        if any(environment.get(k.encode()) != v.encode() for k, v in {
+            "GITHUB_RUN_ID": run_id, "GITHUB_RUN_ATTEMPT": attempt, "EVAL_SLUG": slug,
+        }.items()):
+            return False
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        return True
+    except (OSError, ValueError, AttributeError, IndexError):
+        return False
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+
+
+def cleanup_after_agent_exit(results_root: Path, *, lock_dir: Path = Path("/tmp/brev"), cancelled: bool = False) -> str:
+    """Workflow fallback when the outer agent kills run_leg before its finally."""
+    slug = os.environ.get("EVAL_SLUG", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    receipt = results_root / "machine.txt"
+    if not receipt.exists():
+        return "not_claimed"
+    if receipt.is_symlink() or not receipt.is_file() or receipt.stat().st_size > 4096:
+        raise ValueError("invalid cleanup worker receipt")
+    fields = receipt.read_text().strip().split("\t")
+    if len(fields) != 3 or fields[1:] != [slug, run_id] or not slug or not run_id:
+        raise ValueError("cleanup worker receipt does not match this leg")
+    instance = fields[0]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", instance):
+        raise ValueError("invalid cleanup worker name")
+    if cancelled:
+        stopped = _signal_cancelled_wrapper(results_root, instance, slug, run_id)
+        print(f"[run-leg] cancelled wrapper signal delivered: {stopped}", flush=True)
+    try:
+        # Never reconcile even an owned chain while a sibling holds the worker.
+        # A busy worker remains untouched; the fallback has a bounded CI budget.
+        with hold_pool_lock(lambda: [instance], lock_dir, 120 if cancelled else 60):
+            cleanup_gateway_network_policy(instance, results_root)
+        return "attempted"
+    except LockTimeoutError:
+        print("[run-leg] gateway cleanup deferred: worker is busy", file=sys.stderr)
+        return "worker_busy"
+
+
+def spark_instance() -> str:
+    """Resolve the operator-selected external node, never a cloud fallback."""
+    from local_nim import SPARK_NODE_ID, SPARK_NODE_NAME
+
+    def node_id(node: dict) -> str | None:
+        return node.get("external_node_id") or node.get("id")
+
+    nodes = _list_registered_nodes()
+    matches = [node for node in nodes if node_id(node) == SPARK_NODE_ID]
+    if not matches:
+        matches = [
+            node
+            for node in nodes
+            if (node.get("name") or "").casefold() == SPARK_NODE_NAME.casefold()
+        ]
+        if any(node_id(node) and node_id(node) != SPARK_NODE_ID for node in matches):
+            raise ValueError("Spark node name now belongs to a different Brev node ID")
+    if len(matches) != 1:
+        raise ValueError(
+            f"Spark worker {SPARK_NODE_NAME} ({SPARK_NODE_ID}) is missing or ambiguous"
+        )
+    node = matches[0]
+    name = node["name"]
+    if (node.get("status") or "").lower() != "connected":
+        if node_id(node) != SPARK_NODE_ID:
+            raise ValueError("Disconnected Spark worker lacks its registered node ID")
+        # Registered-node status can lag a working Brev SSH connection.
+        # Only the explicitly selected, identity-checked Spark may use this
+        # fallback; automatic pool selection still requires Connected.
+        print(
+            f"[run-leg] Spark registry status: {node.get('status')!r}; "
+            "checking SSH reachability before rejecting worker",
+            flush=True,
+        )
+        _probe_spark_ssh(name, node.get("status"))
+        print("[run-leg] Spark SSH probe succeeded despite registry status", flush=True)
+    return name
+
+
+def selected_instance(instance: str | None, metadata: dict, platform: str) -> str | None:
+    """Keep the Spark checkbox authoritative over platform and instance hints."""
+    from local_nim import SPARK_NODE_NAME
+
+    if os.environ.get("SKILLS_EVAL_SPARK_RUNNER") == "true":
+        pinned = spark_instance()
+        if instance and instance.casefold() != pinned.casefold():
+            raise ValueError("--instance conflicts with the selected Spark worker")
+        return pinned
+    pinned = instance or metadata.get("brev_instance") or None
+    if (
+        platform == "DGX-SPARK"
+        or (metadata.get("gpu_type") or "").upper() == "GB10"
+        or (pinned and pinned.casefold() == SPARK_NODE_NAME.casefold())
+    ):
+        raise ValueError("Spark trials require SKILLS_EVAL_SPARK_RUNNER=true (select the Spark checkbox)")
+    return pinned
+
+
+def cleanup_local_nims(instance: str, owner: str) -> None:
+    # Use the same transport as Harbor (registered nodes use SSH). The file
+    # is uploaded before start, so cleanup also covers interrupted readiness.
+    command = f"python3 /tmp/skill-eval-nim-{owner}.py cleanup --owner {owner}"
+    result = subprocess.run(
+        [
+            "uvx",
+            "--python",
+            sys.executable,
+            "--from",
+            HARBOR_REQUIREMENT,
+            "python",
+            "-c",
+            "import asyncio,sys; from envs.brev_env import _run_brev_exec; "
+            "r=asyncio.run(_run_brev_exec(sys.argv[1],sys.argv[2],timeout=90)); "
+            "print(r.stdout or ''); print(r.stderr or '',file=sys.stderr); sys.exit(r.return_code)",
+            instance,
+            command,
+        ],
+        cwd=REPO_ROOT,
+        env=harbor_env(instance),
+        timeout=120,
+        check=False,
+    )
+    if result.returncode:
+        print(
+            "[run-leg] local NIM cleanup failed; next worker reset will reconcile containers",
+            file=sys.stderr,
+        )
+
+
+def run_invocations(
+    invocations: list[HarborInvocation],
+    instance: str,
+    results_root: Path,
+    scratch: Path,
+    spec_stem: str,
+    platform: str,
+    harbor_timeout_sec: int,
+    model_routes: SkillEvalModelRoutes,
+    work_deadline: float | None = None,
+) -> int:
+    from local_nim import LOCAL_NIM_CLIENT_KEY, PROXY_PORT
+
+    routes = [
+        r
+        for r in (model_routes.coding, model_routes.operational)
+        if r.provider == "local-nim"
+    ]
+    if not routes:
+        return _run_invocations(
+            invocations,
+            instance,
+            results_root,
+            scratch,
+            spec_stem,
+            platform,
+            harbor_timeout_sec,
+            model_routes,
+            work_deadline,
+        )
+    owner = hashlib.sha256(str(results_root).encode()).hexdigest()[:24]
+    plan = {
+        "owner": owner,
+        "routes": [
+            {"role": r.role, "model": r.model, "runtime": r.runtime} for r in routes
+        ],
+    }
+
+    def local_route(route):
+        endpoint_url = f"http://127.0.0.1:{PROXY_PORT}/v1"
+        if route.runtime == "claude-code":
+            endpoint_url = anthropic_api_root(endpoint_url)
+        return (
+            dataclasses.replace(
+                route, api_key=LOCAL_NIM_CLIENT_KEY,
+                endpoint_url=endpoint_url,
+            )
+            if route.provider == "local-nim"
+            else route
+        )
+
+    resolved = SkillEvalModelRoutes(
+        coding=local_route(model_routes.coding),
+        operational=local_route(model_routes.operational),
+    )
+    results_root.mkdir(parents=True, exist_ok=True)
+    (results_root / "model-deployments.json").write_text(
+        json.dumps(
+            {
+                "worker": instance,
+                "routes": [
+                    {"role": r.role, "deployment": r.provider, "model": r.model}
+                    for r in (resolved.coding, resolved.operational)
+                ],
+            },
+            indent=2,
+        )
+    )
+    try:
+        return _run_invocations(
+            invocations,
+            instance,
+            results_root,
+            scratch,
+            spec_stem,
+            platform,
+            harbor_timeout_sec,
+            resolved,
+            work_deadline,
+            nim_plan=plan,
+        )
+    finally:
+        try:
+            cleanup_local_nims(instance, owner)
+        except Exception as exc:
+            print(
+                f"[run-leg] local NIM cleanup failed: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+
+
+def _run_invocations(
+    invocations: list[HarborInvocation],
+    instance: str,
+    results_root: Path,
+    scratch: Path,
+    spec_stem: str,
+    platform: str,
+    harbor_timeout_sec: int,
+    model_routes: SkillEvalModelRoutes,
+    work_deadline: float | None = None,
+    nim_plan: dict | None = None,
+) -> int:
+    env = harbor_env(instance)
+    if nim_plan is not None:
+        env["SKILL_EVAL_LOCAL_NIM_PLAN"] = json.dumps(nim_plan)
+
+    results_root.mkdir(parents=True, exist_ok=True)
+    # skills-eval.yml passes --results-root as <...>/results/<slug>/<run_id>;
+    # the env vars are the authoritative source when the agent exports them.
+    leg_slug = os.environ.get("EVAL_SLUG") or results_root.parent.name
+    run_id = os.environ.get("GITHUB_RUN_ID") or results_root.name
+    # Record which box this leg locked BEFORE the first Harbor invocation, so a
+    # leg that dies inside BrevEnvironment.start() (e.g. a disk-full box) still
+    # leaves a trail pointing at the machine to inspect.
+    record_machine(results_root, instance, leg_slug, run_id)
+    # Skill location is the phase contract: coding/deployment/tool specs use
+    # the coding route throughout. Operational specs use expects[0] as their
+    # coding-agent deployment contract, then switch to the operational route.
+    spec_path = os.environ.get("EVAL_SPEC_PATH", "")
+    operational_eval = spec_path.startswith("skills/operations/")
+    if operational_eval and not invocations:
+        print("FATAL: no operational Harbor invocation to run", file=sys.stderr)
+        return 1
+
+    coding_setups: dict[str, HarborInvocation] = {}
+    if operational_eval:
+        for invocation in invocations:
+            coding_setups.setdefault(invocation.chain_key, invocation)
+
+    nemoclaw_setups: dict[str, HarborInvocation] = {}
+    host_fixtures: dict[int, dict] = {}
+    deferred_agent_marker: str | None = None
+    operational_config = model_routes.operational
+    env["SKILLS_EVAL_OPERATIONAL_HARNESS"] = operational_config.runtime
+    env.pop(GATEWAY_CANCEL_CLEANUP_ROOT_ENV, None)
+    if operational_eval and operational_config.runtime == "nemoclaw":
+        _record_wrapper_owner(results_root, instance, leg_slug, run_id)
+        env[GATEWAY_CANCEL_CLEANUP_ROOT_ENV] = str(results_root)
+        nemoclaw_setups = coding_setups
+
+        derived_sandbox_name = nemoclaw_sandbox_name(run_id, leg_slug)
+        sandbox_name = os.environ.get("NEMOCLAW_SANDBOX_NAME") or derived_sandbox_name
+        # Provisioning and later scenarios address one per-leg sandbox, so a
+        # warm worker cannot inherit another evaluation's sessions.
+        env["NEMOCLAW_SANDBOX_NAME"] = sandbox_name
+        # A sandbox name does not isolate NemoClaw's provider-global inference
+        # route. Non-default gateway ports select separate host registries.
+        # Keep one gateway/dashboard/relay triplet through every step of this
+        # leg; the worker claims its namespace before the coding agent starts.
+        identity = hashlib.sha256(f"{run_id}:{leg_slug}".encode()).hexdigest()
+        gateway_port = 21000 + 3 * (int(identity[:8], 16) % 3000)
+        for key, port in (
+            ("NEMOCLAW_GATEWAY_PORT", gateway_port),
+            ("NEMOCLAW_DASHBOARD_PORT", gateway_port + 1),
+            ("NEMOCLAW_DASHBOARD_RELAY_PORT", gateway_port + 2),
+        ):
+            env.setdefault(key, str(port))
+        env["SKILL_EVAL_NEMOCLAW_GATEWAY_OWNER"] = identity
+        port_keys = ("NEMOCLAW_GATEWAY_PORT", "NEMOCLAW_DASHBOARD_PORT", "NEMOCLAW_DASHBOARD_RELAY_PORT")
+        with phase("allocate:nemoclaw-gateway"):
+            selected_ports = allocate_gateway_ports(
+                instance, identity, [int(env[key]) for key in port_keys], env,
+                exact=any(key in os.environ for key in port_keys),
+            )
+        env.update({key: str(port) for key, port in zip(port_keys, selected_ports)})
+        # Fixture requirements belong to the spec, not appended prompts.
+        fixture_spec = REPO_ROOT / spec_path
+        env.pop("SKILL_EVAL_NEMOCLAW_FIXTURES", None)
+        if fixture_spec.is_file():
+            fixture_declarations = json.loads(fixture_spec.read_text())
+            fixtures = fixture_declarations.get("sandbox_fixtures", [])
+            if fixtures:
+                env["SKILL_EVAL_NEMOCLAW_FIXTURES"] = json.dumps(fixtures)
+            host_fixtures = {
+                step: task["host_fixture"]
+                for step, task in enumerate(fixture_declarations.get("expects", []), 1)
+                if "host_fixture" in task
+            }
+        env.setdefault("NEMOCLAW_RECREATE_SANDBOX", "0")
+        env.update(
+            {
+                "NEMOCLAW_POLICY_MODE": os.environ.get("NEMOCLAW_POLICY_MODE", "skip"),
+                # Build Vision AI calls an OpenAI-compatible endpoint a
+                # "custom" provider. For local NIM the worker replaces the
+                # loopback URL with its routable host address during start().
+                "NEMOCLAW_PROVIDER": "custom",
+                "NEMOCLAW_ENDPOINT_URL": operational_config.endpoint_url,
+                "NEMOCLAW_MODEL": operational_config.model,
+            }
+        )
+        env["COMPATIBLE_API_KEY"] = operational_config.api_key
+        if operational_config.provider == "local-nim":
+            # Clients require a non-empty API key even though the job-owned
+            # proxy does not authenticate it. Never forward a hosted key.
+            env["SKILL_EVAL_LOCAL_NIM_API_KEY"] = operational_config.api_key
+            # NemoClaw's inference proxy rewrites private endpoints to HTTPS
+            # on port 443. The worker NIM adapter serves plain HTTP on 18400.
+            env["NEMOCLAW_INFERENCE_PROXY"] = "0"
+        env["BREV_EXEC_TIMEOUT"] = str(
+            max(
+                int(env.get("BREV_EXEC_TIMEOUT", "0")),
+                NEMOCLAW_SETUP_BREV_EXEC_TIMEOUT_SEC,
+            )
+        )
+        deferred_agent_marker = deferred_agent_run_marker(run_id, leg_slug)
+    skipped_after: dict[str, int] = {}
+    overall_rc = 0
+
+    def finish(rc: int) -> int:
+        if deferred_agent_marker is not None:
+            cleanup_deferred_agent_run(instance, deferred_agent_marker)
+        return rc
+
+    for invocation in invocations:
+        if (
+            invocation.step_index is not None
+            and invocation.chain_key in skipped_after
+            and invocation.step_index > skipped_after[invocation.chain_key]
+        ):
+            continue
+
+        if work_deadline is not None:
+            remaining = work_deadline - time.monotonic()
+            required = invocation_reserve_sec(harbor_timeout_sec)
+            if remaining < required:
+                print(
+                    "[run-leg] whole-leg deadline leaves only "
+                    f"{max(0, int(remaining))}s; refusing to start "
+                    f"{invocation.include_task_name}, which requires "
+                    f"{required}s including teardown",
+                    flush=True,
+                )
+                if (
+                    invocation.step_index is not None
+                    and invocation.step_count is not None
+                ):
+                    write_skip_markers(
+                        scratch,
+                        spec_stem,
+                        platform or invocation.chain_key,
+                        invocation.step_index - 1,
+                        "whole-leg-deadline",
+                        invocation.step_count,
+                    )
+                return finish(124)
+
+        is_coding_setup = invocation is coding_setups.get(invocation.chain_key)
+        is_nemoclaw_setup = invocation is nemoclaw_setups.get(invocation.chain_key)
+        if is_coding_setup:
+            # Every generated platform/mode chain owns an independent setup.
+            # Its first task must start from a clean deployment even when an
+            # earlier chain in this leg successfully enabled preservation.
+            env.pop("SKILL_EVAL_PRESERVE_DEPLOYMENT", None)
+        if is_nemoclaw_setup:
+            assert deferred_agent_marker is not None
+            # The setup coding agent may start the NemoClaw gateway or other
+            # services required by later expects[]. Keep those descendants
+            # alive only after a successful agent exit; failures and
+            # cancellation still trigger immediate marker-scoped cleanup.
+            env[AGENT_RUN_MARKER_OVERRIDE_ENV] = deferred_agent_marker
+            env[DEFER_AGENT_REAP_ENV] = "1"
+        invocation_config = (
+            model_routes.coding
+            if not operational_eval or is_coding_setup
+            else model_routes.operational
+        )
+        invocation_agent = invocation_config.runtime
+        command_kwargs = {}
+        if is_nemoclaw_setup:
+            command_kwargs["agent_timeout_multiplier"] = (
+                NEMOCLAW_SETUP_AGENT_TIMEOUT_MULTIPLIER
+            )
+            print(
+                "[run-leg] running expects[0] with Build Vision AI to deploy "
+                "VSS and NemoClaw",
+                flush=True,
+            )
+        invocation_model = invocation_config.model
+        invocation_base_url = invocation_config.endpoint_url
+        cmd = build_harbor_command(
+            invocation,
+            results_root,
+            invocation_model,
+            invocation_base_url,
+            invocation_agent,
+            local_nim=nim_plan is not None,
+            **command_kwargs,
+        )
+        invocation_env = env.copy()
+        invocation_env.pop("SKILL_EVAL_NEMOCLAW_HOST_FIXTURE", None)
+        if invocation_agent == "nemoclaw" and invocation.step_index in host_fixtures:
+            invocation_env["SKILL_EVAL_NEMOCLAW_HOST_FIXTURE"] = json.dumps(host_fixtures[invocation.step_index])
+        if invocation_agent == "claude-code":
+            # Harbor resolves the ${...} --ae templates from its process env,
+            # then scopes the resulting ANTHROPIC_* values to agent setup/run.
+            # The parent ANTHROPIC_* values therefore remain the coordinator's
+            # verifier route rather than being replaced by the evaluated route.
+            invocation_env[AGENT_ROUTE_API_KEY_ENV] = invocation_config.api_key
+            invocation_env[AGENT_ROUTE_BASE_URL_ENV] = invocation_base_url
+        elif invocation_agent == "codex":
+            invocation_env[AGENT_ROUTE_API_KEY_ENV] = invocation_config.api_key
+            invocation_env[AGENT_ROUTE_BASE_URL_ENV] = _api_base_v1(
+                invocation_base_url
+            )
+        started_at = time.time() - 1.0
+        with phase(f"harbor:{invocation.include_task_name}"):
+            rc = run_command(cmd, invocation_env, harbor_timeout_sec)
+        # Publish before the rc checks below: a timed-out (rc=124) trial
+        # returns early, and its partial trace is exactly what needs reading.
+        try:
+            publish_trace(results_root, invocation, started_at, leg_slug, run_id)
+        except Exception as exc:  # noqa: BLE001
+            # A trace link is reporting convenience; the verdict comes from
+            # trial result and reward. A viewer-publish error does not fail the leg.
+            print(f"[run-leg] trace publish failed: {exc!r}", flush=True)
+        if rc != 0 and overall_rc == 0:
+            overall_rc = rc
+
+        reward: str | None = None
+        trial_exception = latest_trial_exception(
+            results_root, invocation.include_task_name, started_at
+        )
+        if trial_exception is not None and overall_rc == 0:
+            overall_rc = 1
+        if is_coding_setup or (
+            invocation.step_index is not None and invocation.step_count is not None
+        ):
+            reward = latest_reward(results_root, invocation.include_task_name, started_at)
+            reward_value = _reward_value(reward)
+            print(
+                f"[run-leg] {invocation.chain_key}/{invocation.include_task_name} "
+                f"rc={rc} reward={reward if reward is not None else 'missing'} "
+                f"exception={trial_exception or 'none'}",
+                flush=True,
+            )
+            if (
+                invocation.step_index is not None
+                and invocation.step_count is not None
+                and (
+                    rc == 124 or rc >= 128 or reward_value < 1.0
+                    or trial_exception is not None
+                )
+            ):
+                write_skip_markers(
+                    scratch,
+                    spec_stem,
+                    platform or invocation.chain_key,
+                    invocation.step_index,
+                    reward,
+                    invocation.step_count,
+                )
+                skipped_after[invocation.chain_key] = invocation.step_index
+
+        if is_coding_setup:
+            if rc != 0 or _reward_value(reward) < 1.0 or trial_exception is not None:
+                if overall_rc == 0:
+                    overall_rc = rc or 1
+                if (
+                    invocation.step_index is not None
+                    and invocation.step_count is not None
+                    and invocation.chain_key not in skipped_after
+                ):
+                    write_skip_markers(
+                        scratch,
+                        spec_stem,
+                        platform or invocation.chain_key,
+                        invocation.step_index,
+                        reward,
+                        invocation.step_count,
+                    )
+                    skipped_after[invocation.chain_key] = invocation.step_index
+                print(
+                    f"[run-leg] {invocation.chain_key} expects[0] "
+                    "deployment/setup failed; this chain's operational "
+                    "scenarios were not started",
+                    file=sys.stderr,
+                )
+                env.pop(AGENT_RUN_MARKER_OVERRIDE_ENV, None)
+                env.pop(DEFER_AGENT_REAP_ENV, None)
+            else:
+                # Later tasks in this chain must reuse the VSS containers,
+                # checked-out repository, and sandbox created by setup.
+                env["SKILL_EVAL_PRESERVE_DEPLOYMENT"] = "1"
+                env.pop(AGENT_RUN_MARKER_OVERRIDE_ENV, None)
+                env.pop(DEFER_AGENT_REAP_ENV, None)
+
+        # An outer Harbor timeout is terminal for the entire locked leg, not
+        # only a multi-step chain. Continuing could wipe/reuse the same Brev
+        # box while descendants from the timed-out process are still settling.
+        # For chained tasks the block above writes every applicable skip marker
+        # before this return.
+        if rc == 124 or rc >= 128:
+            return finish(rc)
+
+    return finish(overall_rc)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--instance",
+        default=os.environ.get("BREV_INSTANCE") or None,
+        help="Operator override: pin the leg to this Brev instance instead "
+             "of pool selection (still lock-guarded; waits if held)",
+    )
+    parser.add_argument("--dataset-root", required=True, type=Path, help="Per-leg generated dataset root")
+    parser.add_argument("--results-root", required=True, type=Path, help="Per-leg Harbor results root")
+    parser.add_argument(
+        "--scratch",
+        default=Path(f"/tmp/skill-eval/{run_id}"),
+        type=Path,
+        help="Per-run scratch root for skip marker files",
+    )
+    parser.add_argument("--spec-stem", default=os.environ.get("EVAL_SPEC_STEM", ""))
+    parser.add_argument("--platform", default=os.environ.get("EVAL_PLATFORM", ""))
+    parser.add_argument("--lock-dir", default=Path("/tmp/brev"), type=Path)
+    parser.add_argument("--lock-timeout-sec", default=21000, type=int)
+    parser.add_argument(
+        "--harbor-timeout-sec",
+        default=DEFAULT_HARBOR_TIMEOUT_SEC,
+        type=int,
+    )
+    args = parser.parse_args(argv)
+    try:
+        validate_harbor_timeout_sec(args.harbor_timeout_sec)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
+
+
+def _terminate(signum: int, _frame) -> None:
+    """Turn SIGTERM into an unwinding exit so cleanup actually runs.
+
+    Python converts only SIGINT into an exception; SIGTERM keeps SIG_DFL and
+    terminates the interpreter without unwinding, so no `finally` and no
+    context-manager exit fires. That matters here because `skills-eval.yml`
+    sets `cancel-in-progress: true`: every push to a pull request SIGTERMs the
+    in-flight legs, up to `max-parallel` of them at once. Without this, a
+    cancelled leg never reaches the phase-timing write in main()'s finally, so
+    it produces no artifact at all -- and a leg cancelled after an hour in the
+    lock queue is one of the most informative things this feature can record.
+    """
+    raise SystemExit(128 + signum)
+
+
+def main(argv: list[str] | None = None) -> int:
+    actual_python = sys.version_info[:2]
+    if actual_python != SKILL_EVAL_PYTHON_VERSION:
+        expected = ".".join(map(str, SKILL_EVAL_PYTHON_VERSION))
+        found = ".".join(map(str, actual_python))
+        print(
+            f"FATAL: run_leg requires Python {expected}.x; found {found}",
+            file=sys.stderr,
+        )
+        return 1
+    with contextlib.suppress(ValueError, OSError):
+        # ValueError if not on the main thread; never fatal either way.
+        signal.signal(signal.SIGTERM, _terminate)
+    args = parse_args(argv or sys.argv[1:])
+    try:
+        model_routes = resolve_model_routes(os.environ)
+    except ValueError as exc:
+        print(
+            f"FATAL: invalid skill-eval model route: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    # Instrumentation must not be able to fail the leg, and starting a thread
+    # can: a runner at its thread limit raises RuntimeError here. Losing the
+    # heartbeat costs visibility, while raising costs the whole leg, so this
+    # degrades to no heartbeat and says so.
+    heartbeat: threading.Thread | None = None
+    stop_heartbeat: threading.Event | None = None
+    try:
+        heartbeat, stop_heartbeat = leg_timing.start_heartbeat()
+    except Exception as exc:  # noqa: BLE001 - telemetry is never load-bearing
+        leg_log(f"heartbeat unavailable ({exc!r}); leg continues without it")
+    try:
+        invocations = discover_invocations(args.dataset_root)
+        if os.environ.get("SKILLS_EVAL_SETUP_ONLY") == "true":
+            invocations = select_setup_invocations(invocations, os.environ.get("EVAL_SPEC_PATH", ""))
+            print("[run-leg] setup-only scope: operational steps were not requested", flush=True)
+        print(f"[run-leg] discovered {len(invocations)} harbor invocation(s)", flush=True)
+        for invocation in invocations:
+            print(
+                f"[run-leg] target: -p {invocation.harbor_root} "
+                f"--include-task-name {invocation.include_task_name}",
+                flush=True,
+            )
+        metadata = _read_dataset_metadata(args.dataset_root)
+        work_deadline = resolve_work_deadline()
+        required = invocation_reserve_sec(args.harbor_timeout_sec)
+        max_lock_wait = int(work_deadline - time.monotonic() - required)
+        if max_lock_wait <= 0:
+            raise LegDeadlineError(
+                "whole-leg deadline cannot fit one complete Harbor invocation"
+            )
+        effective_lock_timeout = min(args.lock_timeout_sec, max_lock_wait)
+        # Pin precedence: CLI/--instance (incl. BREV_INSTANCE env default)
+        # > task.toml brev_instance > pool selection.
+        pinned = selected_instance(args.instance, metadata, args.platform)
+        if pinned:
+            print(f"[run-leg] pinned instance: {pinned} (pool selection skipped)",
+                  flush=True)
+            candidates_fn = lambda: [pinned]  # noqa: E731
+        else:
+            candidates_fn = (  # noqa: E731
+                lambda: pool_candidates(metadata, args.spec_stem)
+            )
+        # Timed either side of the lock: the wait for a free box is the leg's
+        # least visible cost and the one the pickup analysis most needs split
+        # out from the Harbor run itself.
+        lock_wait_started = leg_timing.leg_elapsed()
+        lock_acquired = False
+        # The heartbeat's LABEL, not just the recorded interval. The lock wait
+        # is the longest gap a leg can have -- 16 minutes in the run that
+        # motivated this, and bounded only by lock_timeout_sec -- and it ran
+        # entirely under the label "startup", so every tick during the one
+        # phase the log most needed to name reported the wrong thing.
+        outer_phase = leg_timing.current_phase()
+        leg_timing.set_phase("lock-wait")
+        # A box refused by brev_env is not a failed trial -- nothing ran. Drop
+        # it and take the next candidate instead of reporting the leg dead,
+        # which is what turned one mis-sized box into a red leg. Bounded:
+        # each attempt costs a lock wait, and a fleet that refuses every box
+        # is an operator problem the log should name rather than a loop.
+        rejected: set[str] = set()
+        attempt_timeout = effective_lock_timeout
+        try:
+            for attempt in range(_MAX_BOX_REJECTIONS + 1):
+                def remaining_candidates() -> list[str]:
+                    return [n for n in candidates_fn() if n not in rejected]
+
+                # Nothing left to try: say so now. Handing an empty list to
+                # hold_pool_lock would burn the whole lock timeout waiting for
+                # a box that has already been ruled out -- and with a pinned
+                # instance, one refusal always lands here.
+                if rejected and not remaining_candidates():
+                    raise LegDeadlineError(
+                        "every eligible box refused this task's hardware "
+                        f"requirement: {', '.join(sorted(rejected))}"
+                    )
+                # Each retry costs another lock wait, so spend only what is
+                # left of the leg rather than the full timeout again.
+                attempt_timeout = attempt_lock_timeout(
+                    effective_lock_timeout, work_deadline, required
+                )
+                with hold_pool_lock(
+                    remaining_candidates, args.lock_dir, attempt_timeout
+                ) as instance:
+                    lock_acquired = True
+                    leg_timing.record_phase(
+                        "lock-wait", lock_wait_started, leg_timing.leg_elapsed()
+                    )
+                    # The wait is over the moment the lock is held; the Harbor
+                    # phases below set their own labels.
+                    leg_timing.set_phase(outer_phase)
+                    dispatch_started = time.time()
+                    try:
+                        rc = run_invocations(
+                            invocations,
+                            instance,
+                            args.results_root,
+                            args.scratch,
+                            args.spec_stem,
+                            args.platform,
+                            args.harbor_timeout_sec,
+                            model_routes,
+                            work_deadline,
+                        )
+                    finally:
+                        if (
+                            model_routes.operational.runtime == "nemoclaw"
+                            and os.environ.get("EVAL_SPEC_PATH", "").startswith("skills/operations/")
+                        ):
+                            cleanup_gateway_network_policy(instance, args.results_root)
+                    if rc == 0:
+                        return rc
+                    refusal = box_rejected_for_capacity(
+                        args.results_root, dispatch_started
+                    )
+                    if not refusal:
+                        # A real result. Report it.
+                        return rc
+                    rejected.add(instance)
+                    print(
+                        f"[run-leg] {instance} refused this task and ran no "
+                        f"trial ({refusal})",
+                        flush=True,
+                    )
+                    if attempt == _MAX_BOX_REJECTIONS:
+                        # Out of attempts; the refusal is the honest outcome.
+                        return rc
+                    print(
+                        f"[run-leg] trying another box "
+                        f"({attempt + 1}/{_MAX_BOX_REJECTIONS})", flush=True,
+                    )
+                # Re-enter the lock wait for the next candidate.
+                lock_wait_started = leg_timing.leg_elapsed()
+                lock_acquired = False
+                leg_timing.set_phase("lock-wait")
+        except LockTimeoutError:
+            leg_timing.record_phase(
+                "lock-wait-timeout", lock_wait_started, leg_timing.leg_elapsed()
+            )
+            # The budget that actually expired, which a retry may have
+            # shortened -- comparing the original would report a trimmed
+            # retry wait as whole-leg deadline exhaustion.
+            if attempt_timeout < args.lock_timeout_sec:
+                raise LegDeadlineError(
+                    "whole-leg deadline expired while reserving room for Harbor"
+                )
+            raise
+        except BaseException:
+            # Every exit from the lock gets a phase, including the ones nobody
+            # expects: an invalid instance name raises ValueError, a bad lock
+            # dir raises OSError. A leg that died selecting a box still spent
+            # that time, and an artifact with no lock interval is
+            # indistinguishable from one where the wait was zero.
+            #
+            # BaseException, not Exception, and the difference is the common
+            # case rather than an exotic one. `skills-eval.yml` sets
+            # cancel-in-progress, so a push cancels in-flight legs, and a
+            # cancellation arriving during the lock wait raises
+            # KeyboardInterrupt. Catching only Exception dropped the wait from
+            # the artifact for precisely the legs that spent longest in it.
+            if not lock_acquired:
+                leg_timing.record_phase(
+                    "lock-wait-failed", lock_wait_started, leg_timing.leg_elapsed()
+                )
+            raise
+        finally:
+            # Every exit restores the label, including the ones that raise past
+            # the resets above. A stuck "lock-wait" would misreport the rest of
+            # the leg for as long as it ran.
+            leg_timing.set_phase(outer_phase)
+    except LockTimeoutError:
+        target = args.instance or f"pool ({args.platform or 'platform'})"
+        print(f"BLOCKED: lock timeout on {target}", flush=True)
+        return 75
+    except LegDeadlineError as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        return 124
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: run_leg failed: {exc!r}", file=sys.stderr)
+        return 1
+    finally:
+        if stop_heartbeat is not None:
+            stop_heartbeat.set()
+        # Joined, not just signalled. A daemon still writing to stdout while
+        # the interpreter tears down its buffered streams is how a clean leg
+        # turns into a fatal abort at exit.
+        if heartbeat is not None:
+            heartbeat.join(timeout=HEARTBEAT_SEC + 5)
+        # This whole block runs on the return path of a leg that already has
+        # its outcome. Nothing here may replace it.
+        try:
+            leg_timing.write_phase_timings(args.results_root)
+        except Exception as exc:  # noqa: BLE001
+            leg_log(f"phase timing write failed: {exc!r}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

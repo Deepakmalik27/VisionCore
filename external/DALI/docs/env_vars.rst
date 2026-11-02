@@ -1,0 +1,320 @@
+DALI Environment Variables
+==========================
+
+This page lists environment variables used by DALI.
+Note that those variables often control internal behavior of DALI and are subject to change
+without notice.
+
+Memory management
+~~~~~~~~~~~~~~~~~
+
+`DALI_USE_DEVICE_MEM_POOL`
+--------------------------
+
+Values: 0, 1
+
+Default: 1
+
+If nonzero, DALI uses a memory pool for device memory; otherwise plain ``cudaMalloc`` is used.
+
+.. warning::
+    Specify 0 for debugging only, doing so will drastically degrade performance.
+
+`DALI_USE_VMM`
+--------------
+
+Values: 0, 1
+
+Default: 1
+
+If nonzero, DALI uses a memory pool based on virtual memory management functions
+(``cuMemCreate``, ``cuMemMap``, etc) when possible. If disabled, DALI will use a pool based on
+`cudaMalloc`.
+
+`DALI_USE_PINNED_MEM_POOL`
+--------------------------
+
+Values: 0, 1
+
+Default: 1
+
+If nonzero, DALI uses a memory pool for device-accessible host memory; otherwise plain
+``cudaMallocHost`` is used.
+
+.. warning::
+    Specify 0 for debugging only, doing so will drastically degrade performance.
+
+`DALI_USE_CUDA_MALLOC_ASYNC`
+----------------------------
+
+Values: 0, 1
+
+Default: 0
+
+If enabled, DALI will use ``cudaMallocAsync`` as the device memory allocation mechanism.
+This flag is not compatible with ``DALI_USE_DEVICE_MEM_POOL=0`` and explicitly enabling
+``DALI_USE_VMM=1``.
+
+`DALI_MALLOC_POOL_THRESHOLD`
+----------------------------
+
+Values: >= 0, optionally followed by k for KiB or M for MiB.
+
+Default: 0
+
+If nonzero, dali uses an internal memory pool for regular host memory below the specified size.
+
+`DALI_GDS_CHUNK_SIZE`
+---------------------
+
+Values: powers of 2, 4k to 16M, with optional k or M suffix
+
+Default: 2M
+
+The size of memory chunk used by GPU Direct Storage in DALI.
+
+`DALI_HOST_BUFFER_SHRINK_THRESHOLD`
+-----------------------------------
+
+Values: floating point, 0..1
+
+Default: 0.5
+
+If set, buffers resized to below the given fraction of capacity will be shrunk to fit the data.
+
+`DALI_BUFFER_GROWTH_FACTOR`
+---------------------------
+
+Values: floating point, >=1
+
+Default: 1.1
+
+When greater than 1, buffers are allocated with allowance to avoid frequent reallocation.
+
+`DALI_HOST_BUFFER_GROWTH_FACTOR`
+--------------------------------
+
+Specialized version of `DALI_BUFFER_GROWTH_FACTOR` for CPU buffers only.
+
+`DALI_DEVICE_BUFFER_GROWTH_FACTOR`
+----------------------------------
+
+Specialized version of `DALI_BUFFER_GROWTH_FACTOR` for GPU buffers only.
+
+`DALI_RESTRICT_PINNED_MEM`
+--------------------------
+
+Values: 0, 1
+
+Default: 0
+
+If enabled, DALI will reduce the use of pinned host memory; useful on systems where the amount
+of pinned memory is restricted (e.g. WSL).
+
+Image decoding
+~~~~~~~~~~~~~~
+
+`DALI_MAX_JPEG_SCANS`
+---------------------
+
+Values: >= 1
+
+Default: 256
+
+The maximum number of progressive JPEG scans. Specify lower values to mitigate maliciously malformed
+JPEGs, designed for denial of service attacks.
+
+`DALI_NVIMGCODEC_LOG_LEVEL`
+---------------------------
+
+Values: 1..5
+
+Default: 2
+
+The verbosity of logs produced by nvJPEG
+
+Miscellaneous
+~~~~~~~~~~~~~
+
+`DALI_OPTIMIZE_GRAPH`
+---------------------
+
+Values: 0, 1
+
+Default: 1
+
+For debugging only; if set to 0, all DALI graph optimizations are disabled.
+
+`DALI_ENABLE_CSE`
+-----------------
+
+Values: 0, 1
+
+Default: 1
+
+For debugging only; if set to 0, the common subexpression elimination (CSE) graph optimization
+is disabled. If `DALI_OPTIMIZE_GRAPH` is disabled, this flag has no effect.
+
+
+`DALI_USE_EXEC2`
+----------------
+
+Values: 0, 1
+
+Default: 0
+
+If set, DALI will use the default execution model (as if ``exec_dynamic=True`` was set in the Pipeline)
+whenever the default asynchronous pipelined execution with uniform queue size is specified.
+Enabling this flag can potentially improve memory consumption.
+
+.. note::
+    This flag is used in the backend only; the Python frontend is unaware of it and doesn't enable
+    the new features and optimizations that would be enabled by specifying ``exec_dynamic=True``
+    in the pipeline.
+
+`DALI_AFFINITY_MASK`
+--------------------
+
+Values: comma-separated list of CPU IDs
+
+Default: empty
+
+Sets the thread affinity. The number of entries in the list must match the ``num_threads`` passed
+to the pipeline.
+Requires NVML.
+
+
+`DALI_PRELOAD_PLUGINS`
+----------------------
+
+Values: colon-separated list of paths
+
+Default: empty
+
+If specified, DALI will preload plugins specified in this list.
+
+`DALI_DISABLE_NVML`
+-------------------
+
+Values: 0, 1
+
+Default: 0
+
+If set, DALI doesn't try to use NVML. Useful on systems without NVML support, e.g. WSL2.
+
+Network
+~~~~~~~
+
+`AWS_ENDPOINT_URL`
+------------------
+
+Values: a URL, e.g. ``http://127.0.0.1:9000``
+
+Default: unset (the AWS SDK resolves the regional S3 endpoint)
+
+Overrides the endpoint used for ``s3://`` paths, which allows DALI to read from an S3-compatible
+service such as MinIO. The value must include the scheme; without it the AWS SDK assumes ``https://``.
+
+.. note::
+    DALI uses the AWS SDK default addressing mode. When the endpoint host is a host name, requests
+    are addressed as ``<scheme>://<bucket>.<host>``, which requires a matching DNS entry to exist.
+    When the host is an IP literal, path-style addressing (``<scheme>://<host>/<bucket>``) is used
+    instead.
+
+.. note::
+    The value is read once, when the S3 client is created on the first ``s3://`` access in the
+    process. Changing it afterwards has no effect.
+
+Credentials and region are taken from the standard AWS variables (``AWS_ACCESS_KEY_ID``,
+``AWS_SECRET_ACCESS_KEY``, ``AWS_DEFAULT_REGION``).
+
+`DALI_S3_NO_VERIFY_SSL`
+-----------------------
+
+Values: 0, 1
+
+Default: 0
+
+If set, DALI will not verify SSL certificates when communicating with S3 services.
+
+By default, DALI uses SSL when communicating with S3 services, which includes verifying SSL certificates.
+This option allows you to override the default behavior of verifying SSL certificates.
+
+`DALI_GCS_ENDPOINT_URL`
+-----------------------
+
+Values: a URL, e.g. ``http://127.0.0.1:4443``
+
+Default: unset (the client talks to Google Cloud Storage)
+
+Overrides the endpoint used for ``gs://`` paths, which allows DALI to read from a Google Cloud
+Storage emulator. The value must include the scheme.
+
+.. note::
+  The value is read once, when the GCS client is created on the first ``gs://`` access in the
+  process. Changing it afterwards has no effect.
+
+`DALI_GCS_ANONYMOUS`
+--------------------
+
+Values: 0, 1
+
+Default: 0
+
+If set, DALI accesses ``gs://`` paths without credentials. By default the client uses Application
+Default Credentials, which neither a public bucket nor a local emulator requires - reading either
+one means opting out of authentication explicitly.
+
+.. note::
+  The value is read once, when the GCS client is created on the first ``gs://`` access in the
+  process. Changing it afterwards has no effect.
+
+`DALI_GCS_VERIFY_CHECKSUMS`
+---------------------------
+
+Values: 0, 1
+
+Default: 0
+
+If set, DALI validates the CRC32C checksum of the data it downloads from ``gs://`` paths.
+
+DALI only ever issues ranged reads, while Google Cloud Storage reports checksums for whole objects
+only, so a per-read checksum cannot be validated end to end - which is why this is off by default
+and costs CPU in the data loading path when turned on. It is meant for debugging.
+
+.. note::
+  The value is read once, when the GCS client is created on the first ``gs://`` access in the
+  process. Changing it afterwards has no effect.
+
+`DALI_GCS_REQUEST_TIMEOUT_SEC`
+------------------------------
+
+Values: a non-negative integer number of seconds
+
+Default: 60
+
+Bounds how long a single ``gs://`` request may take. A transfer that receives no bytes for this
+long is aborted, and the retry loop around it gives up once this much time has elapsed, so an
+unreachable endpoint surfaces an error after roughly twice this value in the worst case.
+
+Transient errors from Google Cloud Storage are still retried with exponential backoff; the
+default leaves room for about six attempts. Set the value to 0 to restore the google-cloud-cpp
+defaults instead - a 120 second stall timeout and a 15 minute retry window - which lets the
+pipeline hang for up to a quarter of an hour with no output against a dead or misrouted endpoint.
+
+.. note::
+  The value is read once, when the GCS client is created on the first ``gs://`` access in the
+  process. Changing it afterwards has no effect.
+
+Testing
+~~~~~~~
+
+`DALI_EXTRA_PATH`
+-----------------
+
+Values: path
+
+Default: empty
+
+The path to where the contents of `DALI_extra <https://github.com/NVIDIA/DALI_extra>`_ repository
+reside. Necessary to run DALI tests.

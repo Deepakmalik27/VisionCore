@@ -1,0 +1,442 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Background HTTP health polling for workload pods.
+
+Polls each pod's configurable health-check URL on a fixed interval and tracks
+per-pod healthy/unhealthy state. Used to:
+
+- Gate stream assignment to healthy pods only
+- Drive PodErrorWatcher transitions (especially Docker, replacing socket status)
+- Wait for readiness before issuing /add calls
+"""
+
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from typing import Callable, Dict, Iterable, List, Optional, Set
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+
+class WorkloadUnhealthyError(RuntimeError):
+    """The target workload pod failed its immediate pre-add health probe."""
+
+
+def build_health_url(pod_info: dict, health_path: str) -> str:
+    """Build health URL from docker/K8s inventory + configurable path only.
+
+    Prefer ``provisioning_address`` from ``docker_cluster_config.json``
+    (``host:port``). Otherwise fall back to ``podIp``/``podPort`` from the
+    cluster inventory. Only ``health_path`` (``WDM_WL_HEALTH_CHECK_URL``) is
+    configurable — host and port always come from pod inventory.
+    """
+    path = health_path if str(health_path).startswith("/") else f"/{health_path}"
+    provisioning_address = pod_info.get("provisioning_address")
+    if provisioning_address is not None and str(provisioning_address).strip():
+        return f"http://{str(provisioning_address).strip()}{path}"
+
+    host = (
+        pod_info.get("podIp")
+        or pod_info.get("poddns")
+        or pod_info.get("podName")
+        or ""
+    )
+    port = pod_info.get("podPort")
+    if port is None or str(port).strip() == "":
+        return f"http://{host}{path}"
+    return f"http://{host}:{port}{path}"
+
+
+def probe_pod_health(
+    pod_info: dict,
+    health_path: str,
+    timeout: float,
+) -> bool:
+    """Return True only when GET on the pod health endpoint returns HTTP 200."""
+    url = build_health_url(pod_info, health_path)
+    try:
+        response = requests.get(url, timeout=timeout)
+    except requests.RequestException as exc:
+        logger.debug(
+            "Health probe failed for pod=%s url=%s: %s",
+            pod_info.get("podName"),
+            url,
+            exc,
+        )
+        return False
+
+    return response.status_code == 200
+
+
+class WorkloadHealthWatcher:
+    """Poll workload pods and publish healthy/unhealthy transitions."""
+
+    def __init__(
+        self,
+        app_config: dict,
+        resolve_pods: Callable[[], List[dict]],
+        logger_override=None,
+    ):
+        self.app_config = app_config
+        self.resolve_pods = resolve_pods
+        self.log = logger_override or logger
+
+        self._lock = threading.RLock()
+        # podName -> bool; missing means not yet probed (treated as unhealthy)
+        self._pod_healthy: Dict[str, bool] = {}
+        self._pod_info: Dict[str, dict] = {}
+        # Pods enter this set only after a real healthy -> unhealthy
+        # transition emitted a down event. A later healthy observation emits
+        # recovery only for those pods, so initial application startup
+        # (unhealthy -> healthy) establishes a baseline without being mistaken
+        # for recovery. Keep the entry when inventory temporarily loses a pod
+        # so a StatefulSet pod returning with the same name can still recover.
+        self._recovery_pending: Set[str] = set()
+        # Persisted assignments can require stream reapplication after SDRC
+        # restarts while their workload is down. They are only armed for
+        # recovery if their first health observation is unhealthy; an already
+        # healthy workload merely establishes the normal startup baseline.
+        self._startup_recovery_candidates: Set[str] = set()
+        # Preserve the origin of a pending/event recovery so the consumer can
+        # reapply only the assignments captured at startup.
+        self._startup_recovery_pending: Set[str] = set()
+        self._startup_recovery_events: Set[str] = set()
+        self._events: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
+
+    @property
+    def health_path(self) -> str:
+        return (
+            self.app_config.get("WDM_WL_HEALTH_CHECK_URL")
+            or "/api/v1/stream/add"
+        )
+
+    @property
+    def interval(self) -> float:
+        return float(
+            self.app_config.get("WDM_HEALTH_CHECK_INTERVAL", 2.0)
+        )
+
+    @property
+    def timeout(self) -> float:
+        return float(
+            self.app_config.get("WDM_HEALTH_CHECK_TIMEOUT", 2.0)
+        )
+
+    def start(self) -> None:
+        """Start the background polling thread (idempotent)."""
+        with self._lock:
+            if self._started and self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            # Warm the inventory immediately so assignment / ifPodDown do not
+            # treat every pod as unknown until the first background tick.
+            try:
+                self.poll_once()
+            except Exception:
+                self.log.exception("Initial workload health poll failed")
+            self._thread = threading.Thread(
+                target=self._poll_loop,
+                name="workload-health-watcher",
+                daemon=True,
+            )
+            self._thread.start()
+            self._started = True
+            self.log.info(
+                "Workload health watcher started (path=%s interval=%ss timeout=%ss)",
+                self.health_path,
+                self.interval,
+                self.timeout,
+            )
+
+    def stop(self, join_timeout: float = 2.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=join_timeout)
+        self._started = False
+
+    def is_pod_healthy(self, pod_name: str) -> bool:
+        """Return True only when the latest probe marked the pod healthy."""
+        with self._lock:
+            return bool(self._pod_healthy.get(pod_name, False))
+
+    def is_pod_known(self, pod_name: str) -> bool:
+        with self._lock:
+            return pod_name in self._pod_healthy
+
+    def healthy_count(self) -> int:
+        with self._lock:
+            return sum(1 for ok in self._pod_healthy.values() if ok)
+
+    def unhealthy_pod_names(self) -> List[str]:
+        with self._lock:
+            return [name for name, ok in self._pod_healthy.items() if not ok]
+
+    def healthy_pod_names(self) -> List[str]:
+        with self._lock:
+            return [name for name, ok in self._pod_healthy.items() if ok]
+
+    def snapshot(self) -> Dict[str, bool]:
+        with self._lock:
+            return dict(self._pod_healthy)
+
+    def seed_startup_recovery_candidates(
+        self, pod_names: Iterable[str]
+    ) -> None:
+        """Mark workloads with persisted streams as startup recovery candidates."""
+        candidates = {str(name) for name in pod_names if name}
+        with self._lock:
+            self._startup_recovery_candidates.update(candidates)
+        if candidates:
+            self.log.info(
+                "Seeded startup recovery candidates for saved workloads: %s",
+                sorted(candidates),
+            )
+
+    def consume_startup_recovery(self, pod_name: str) -> bool:
+        """Return whether the next recovery event came from the startup snapshot."""
+        with self._lock:
+            if pod_name not in self._startup_recovery_events:
+                return False
+            self._startup_recovery_events.remove(pod_name)
+            return True
+
+    def check_pod(self, pod_info: dict) -> bool:
+        """One-shot probe; also updates tracked state and may emit a transition."""
+        healthy = probe_pod_health(
+            pod_info,
+            self.health_path,
+            self.timeout,
+        )
+        self._apply_result(pod_info, healthy)
+        return healthy
+
+    def wait_until_healthy(
+        self,
+        pod_info: dict,
+        timeout_sec: Optional[float] = None,
+        poll_interval: Optional[float] = None,
+    ) -> bool:
+        """Block until ``pod_info`` is healthy or ``timeout_sec`` elapses.
+
+        ``timeout_sec == -1`` waits forever. ``None`` uses
+        ``WDM_ADD_HEALTH_CHECK_TIMEOUT`` when set, otherwise
+        ``WDM_API_WAIT_MAX_RETRIES_IN_SEC`` (default 30). ``0`` means a
+        single probe with no additional wait.
+        """
+        if timeout_sec is None:
+            if "WDM_ADD_HEALTH_CHECK_TIMEOUT" in self.app_config:
+                timeout_sec = float(
+                    self.app_config.get("WDM_ADD_HEALTH_CHECK_TIMEOUT")
+                )
+            else:
+                timeout_sec = float(
+                    self.app_config.get("WDM_API_WAIT_MAX_RETRIES_IN_SEC", 30)
+                )
+        if poll_interval is None:
+            poll_interval = min(self.interval, 1.0)
+
+        pod_name = pod_info.get("podName")
+        timeout_val = float(timeout_sec)
+        forever = timeout_val == -1
+        deadline = None if forever else time.time() + max(0.0, timeout_val)
+        while forever or time.time() <= deadline:
+            if self.check_pod(pod_info):
+                self.log.info(
+                    "Pod %s health check passed (%s)",
+                    pod_name,
+                    build_health_url(pod_info, self.health_path),
+                )
+                return True
+            if forever:
+                time.sleep(poll_interval)
+                continue
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval, remaining))
+
+        self.log.info(
+            "Pod %s health check did not become ready within %ss",
+            pod_name,
+            timeout_sec,
+        )
+        return False
+
+    def wait_until_any_healthy(
+        self,
+        timeout_sec: Optional[float] = None,
+        poll_interval: Optional[float] = None,
+    ) -> bool:
+        """Block until at least one inventoried pod is healthy."""
+        if timeout_sec is None:
+            timeout_sec = float(
+                self.app_config.get("WDM_API_WAIT_MAX_RETRIES_IN_SEC", 30)
+            )
+        if poll_interval is None:
+            poll_interval = min(self.interval, 1.0)
+
+        deadline = time.time() + max(0.0, float(timeout_sec))
+        while time.time() <= deadline:
+            self.poll_once()
+            if self.healthy_count() > 0:
+                return True
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval, remaining))
+        return False
+
+    def iter_transitions(self):
+        """Blocking generator of ``(is_down, pod_name, generate_name)`` events.
+
+        Compatible with ``PodErrorWatcher`` / ``watchPodState`` consumers.
+        """
+        while not self._stop.is_set():
+            try:
+                event = self._events.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            yield event
+
+    def poll_once(self) -> Dict[str, bool]:
+        """Probe all currently resolved pods once and return the snapshot.
+
+        A failed lookup keeps the last snapshot. It is not an empty inventory,
+        so tracked pods are not marked down or forgotten. A successful empty
+        inventory still marks pods that disappeared as down.
+        """
+        try:
+            pods = self.resolve_pods() or []
+        except Exception:
+            self.log.exception(
+                "Failed resolving pods for health poll; keeping last snapshot"
+            )
+            return self.snapshot()
+
+        seen = set()
+        for pod in pods:
+            pod_name = pod.get("podName")
+            if not pod_name:
+                continue
+            seen.add(pod_name)
+            healthy = probe_pod_health(
+                pod,
+                self.health_path,
+                self.timeout,
+            )
+            self._apply_result(pod, healthy)
+
+        # A saved workload absent from a successful inventory lookup is also
+        # genuinely unavailable at startup. Arm recovery without emitting a
+        # synthetic down event; when its stable pod name returns healthy, the
+        # consumer can reapply its persisted streams.
+        with self._lock:
+            absent_candidates = self._startup_recovery_candidates - seen
+            self._startup_recovery_candidates.difference_update(absent_candidates)
+            self._recovery_pending.update(absent_candidates)
+            self._startup_recovery_pending.update(absent_candidates)
+
+        # Pods that disappeared from inventory are treated as down.
+        with self._lock:
+            missing = [name for name in list(self._pod_healthy) if name not in seen]
+        for name in missing:
+            stale = {"podName": name}
+            with self._lock:
+                stale = self._pod_info.get(name, stale)
+            self._apply_result(stale, False)
+            with self._lock:
+                self._pod_healthy.pop(name, None)
+                self._pod_info.pop(name, None)
+
+        return self.snapshot()
+
+    def _poll_loop(self) -> None:
+        self.log.info("Workload health poll loop running")
+        while not self._stop.is_set():
+            try:
+                self.poll_once()
+            except Exception:
+                self.log.exception("Unhandled error in workload health poll")
+            self._stop.wait(self.interval)
+        self.log.info("Workload health poll loop stopped")
+
+    def _apply_result(self, pod_info: dict, healthy: bool) -> None:
+        pod_name = pod_info.get("podName")
+        if not pod_name:
+            return
+
+        transition = None
+        initial_baseline = False
+        with self._lock:
+            previous = self._pod_healthy.get(pod_name)
+            self._pod_healthy[pod_name] = healthy
+            self._pod_info[pod_name] = dict(pod_info)
+
+            if previous is None:
+                if healthy and pod_name in self._recovery_pending:
+                    # The pod disappeared after a real down event and has now
+                    # returned with the same name.
+                    self._recovery_pending.remove(pod_name)
+                    if pod_name in self._startup_recovery_pending:
+                        self._startup_recovery_pending.remove(pod_name)
+                        self._startup_recovery_events.add(pod_name)
+                    transition = False
+                elif healthy:
+                    self._startup_recovery_candidates.discard(pod_name)
+                    initial_baseline = True
+                elif pod_name in self._startup_recovery_candidates:
+                    # This workload had saved stream assignments when SDRC
+                    # started, and it is actually down. Arm its first later
+                    # healthy observation as a recovery so streams are reapplied.
+                    self._startup_recovery_candidates.remove(pod_name)
+                    self._recovery_pending.add(pod_name)
+                    self._startup_recovery_pending.add(pod_name)
+            elif previous and not healthy:
+                self._recovery_pending.add(pod_name)
+                transition = True
+            elif (not previous) and healthy:
+                if pod_name in self._recovery_pending:
+                    self._recovery_pending.remove(pod_name)
+                    if pod_name in self._startup_recovery_pending:
+                        self._startup_recovery_pending.remove(pod_name)
+                        self._startup_recovery_events.add(pod_name)
+                    transition = False
+                else:
+                    initial_baseline = True
+
+        if transition is True:
+            self.log.info("Pod %s marked unhealthy by health check", pod_name)
+            self._emit(True, pod_name)
+        elif transition is False:
+            self.log.info("Pod %s recovered (health check passed)", pod_name)
+            self._emit(False, pod_name)
+        elif initial_baseline:
+            self.log.info(
+                "Pod %s established initial healthy baseline", pod_name
+            )
+
+    def _emit(self, is_down: bool, pod_name: str) -> None:
+        # generate_name mirrors docker watchPodState (pod name used for both).
+        self._events.put((is_down, pod_name, pod_name))

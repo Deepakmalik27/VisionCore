@@ -1,0 +1,14 @@
+---
+title: "Known Limitations"
+description: ""
+position: 1
+---
+- Only the default NIMs (LLM and VLM) have been tested to run on shared GPU. Use Dedicated GPUs or Remote NIMs for other models.
+
+- **WebRTC based video playback in the UI**: In the reference Video Analytics UI, video playback may not be available. If the video streaming service runs behind a private network where the WebRTC TURN server is unreachable or not set up appropriately, playback fails while the rest of the pipeline continues to work normally.
+
+- VSS UI queries targeting multiple sensors are expected to take several tens of seconds.
+
+- The Cosmos3 Reasoner NIM and VIOS microservices may crash over long duration runs.
+
+- In the event that the [RTVI CV](/system-components/vision-microservices/object-detection-and-tracking) or VIOS microservice crashes/restarts, streams may no longer be processed. To get around this, either manually restart the `perception-sdr-smc` container or delete and re-add all streams in the VST UI.

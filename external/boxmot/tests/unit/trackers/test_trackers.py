@@ -1,0 +1,370 @@
+"""Algorithm-level tracker tests using canonical v24 structures."""
+
+from __future__ import annotations
+
+from dataclasses import fields
+
+import numpy as np
+import pytest
+import torch
+
+from boxmot import HybridSortConfig, OcSortConfig, SFSORTConfig
+from boxmot.engine.tuning.search_space import flatten_yaml_config, load_yaml_config
+from boxmot.structures import Boxes, Detections, Frame, MaskBatch, OrientedBoxes, Tracks
+from boxmot.trackers import Tracker, TrackerRequirements, TrackerSpec, create_tracker
+from boxmot.trackers.common.config import get_tracker_config_class, load_tracker_config, load_tracker_defaults
+from boxmot.trackers.common.registry import TRACKER_DEFINITIONS
+from boxmot.trackers.deepocsort.tracker import DeepOcSort
+from boxmot.trackers.ocsort.tracker import OcSort
+from boxmot.trackers.sfsort.tracker import SFSORT
+
+TRACKER_NAMES = tuple(
+    name for name, definition in TRACKER_DEFINITIONS.items() if not definition.capabilities.requires_detections_3d
+)
+TRACKER_GEOMETRIES = tuple(
+    (name, kind.value)
+    for name, definition in TRACKER_DEFINITIONS.items()
+    if not definition.capabilities.requires_detections_3d
+    for kind in sorted(definition.capabilities.geometry_kinds, key=lambda kind: kind.value)
+)
+
+
+def _frame(sample_id: str, frame_index: int, *, height: int = 96, width: int = 128) -> Frame:
+    return Frame(
+        image=torch.zeros((3, height, width), dtype=torch.uint8),
+        sample_id=sample_id,
+        sequence_id="sequence",
+        frame_index=frame_index,
+    )
+
+
+def _masks_for_rows(rows: np.ndarray, *, height: int = 96, width: int = 128) -> MaskBatch:
+    values = torch.zeros((len(rows), height, width), dtype=torch.bool)
+    for index, row in enumerate(rows):
+        if rows.shape[1] == 7:
+            cx, cy, box_width, box_height = row[:4]
+            x1, x2 = cx - box_width / 2, cx + box_width / 2
+            y1, y2 = cy - box_height / 2, cy + box_height / 2
+        else:
+            x1, y1, x2, y2 = row[:4]
+        left = max(0, min(width - 1, int(np.floor(x1))))
+        right = max(left + 1, min(width, int(np.ceil(x2))))
+        top = max(0, min(height - 1, int(np.floor(y1))))
+        bottom = max(top + 1, min(height, int(np.ceil(y2))))
+        values[index, top:bottom, left:right] = True
+    return MaskBatch(values)
+
+
+def _detections(
+    rows: np.ndarray,
+    *,
+    sample_id: str,
+    embeddings: bool = False,
+    masks: bool = False,
+) -> Detections:
+    rows = np.ascontiguousarray(rows, dtype=np.float32)
+    geometry_width = 5 if rows.shape[1] == 7 else 4
+    geometry_values = torch.from_numpy(rows[:, :geometry_width].copy())
+    geometry = OrientedBoxes(geometry_values) if geometry_width == 5 else Boxes(geometry_values)
+    return Detections(
+        geometry=geometry,
+        scores=torch.from_numpy(rows[:, geometry_width].copy()),
+        class_ids=torch.from_numpy(rows[:, geometry_width + 1].astype(np.int64, copy=True)),
+        sample_id=sample_id,
+        masks=_masks_for_rows(rows) if masks else None,
+        embeddings=(
+            torch.nn.functional.normalize(
+                torch.arange(len(rows) * 4, dtype=torch.float32).reshape(len(rows), 4) + 1,
+                dim=1,
+            )
+            if embeddings and len(rows)
+            else torch.empty((0, 4), dtype=torch.float32)
+            if embeddings
+            else None
+        ),
+    )
+
+
+def _update(tracker: Tracker, rows: np.ndarray, *, frame_index: int) -> Tracks:
+    sample_id = f"sequence/{frame_index:06d}"
+    detections = _detections(
+        rows,
+        sample_id=sample_id,
+        embeddings=tracker.requirements.embeddings,
+        masks=tracker.requirements.masks,
+    )
+    frame = _frame(sample_id, frame_index) if tracker.requirements.frame else None
+    return tracker.update(detections, frame)
+
+
+def _aabb_rows() -> np.ndarray:
+    return np.array(
+        [[14, 21, 40, 48, 0.92, 0], [62, 28, 88, 67, 0.91, 65]],
+        dtype=np.float32,
+    )
+
+
+def _obb_rows() -> np.ndarray:
+    return np.array(
+        [[27, 35, 26, 27, 0.2, 0.92, 0], [75, 47, 26, 39, -0.3, 0.91, 65]],
+        dtype=np.float32,
+    )
+
+
+def _empty_rows(*, is_obb: bool) -> np.ndarray:
+    return np.empty((0, 7 if is_obb else 6), dtype=np.float32)
+
+
+def _output_after_hits(tracker: Tracker, rows: np.ndarray, *, attempts: int = 6) -> Tracks:
+    result = _update(tracker, rows, frame_index=0)
+    for frame_index in range(1, attempts):
+        if len(result) == len(rows):
+            break
+        result = _update(tracker, rows, frame_index=frame_index)
+    return result
+
+
+@pytest.mark.parametrize(("tracker_name", "geometry"), TRACKER_GEOMETRIES)
+def test_trackers_emit_structured_rows_for_supported_geometry_modes(tracker_name: str, geometry: str) -> None:
+    tracker = create_tracker(TrackerSpec(tracker_name, geometry=geometry, options=(("min_hits", 1),)))
+    rows = _obb_rows() if geometry == "obb" else _aabb_rows()
+
+    output = _output_after_hits(tracker, rows)
+
+    assert isinstance(output, Tracks)
+    assert output.geometry.values.shape == (len(output), 5 if geometry == "obb" else 4)
+    assert (output.to_obb_rows() if geometry == "obb" else output.to_aabb_rows()).shape[1] == (
+        9 if geometry == "obb" else 8
+    )
+    if tracker.requirements.masks:
+        assert output.masks is not None
+        assert output.masks.values.shape == (len(output), 96, 128)
+
+
+@pytest.mark.parametrize(("tracker_name", "geometry"), TRACKER_GEOMETRIES)
+def test_trackers_accept_completed_empty_structured_batches(tracker_name: str, geometry: str) -> None:
+    tracker = create_tracker(TrackerSpec(tracker_name, geometry=geometry))
+
+    output = _update(tracker, _empty_rows(is_obb=geometry == "obb"), frame_index=0)
+
+    assert len(output) == 0
+    assert output.is_obb is (geometry == "obb")
+    if tracker.requirements.masks:
+        assert output.masks is not None
+        assert output.masks.values.shape == (0, 96, 128)
+
+
+@pytest.mark.parametrize("tracker_name", TRACKER_NAMES)
+def test_track_ids_remain_stable_across_matching_frames(tracker_name: str) -> None:
+    tracker = create_tracker(TrackerSpec(tracker_name, options=(("min_hits", 1),)))
+    rows = _aabb_rows()[:1]
+
+    first = _output_after_hits(tracker, rows)
+    second = _update(tracker, rows, frame_index=7)
+
+    assert len(first) == len(second) == 1
+    assert first.track_ids.item() == second.track_ids.item()
+
+
+def test_dynamic_max_obs_is_large_enough_for_track_lifetime() -> None:
+    tracker = OcSort(
+        config=OcSortConfig(max_age=400),
+    )
+
+    assert tracker.max_obs == 405
+
+
+def test_hybridsort_config_covers_constructor_and_conditionals() -> None:
+    runtime_config = load_tracker_defaults("hybridsort")
+    tuning_config = load_yaml_config("hybridsort")
+    flat_tuning_config = flatten_yaml_config(tuning_config)
+    expected = {field.name for field in fields(HybridSortConfig)}
+    expected.update({"det_thresh", "max_age", "max_obs", "min_hits", "iou_threshold", "asso_func"})
+
+    assert expected <= {name.split(".", 1)[0] for name in runtime_config}
+    assert set(flat_tuning_config) <= set(runtime_config)
+    assert set(tuning_config["use_byte"]["activates"]) == {"low_thresh", "tcm_byte_step"}
+    assert "longterm_bank_length" in tuning_config["use_embeddings"]["activates"]
+
+
+@pytest.mark.parametrize("custom_profile", [False, True])
+def test_hybridsort_resolved_config_roundtrips_through_spec_and_factory(tmp_path, custom_profile: bool) -> None:
+    config_path = None
+    if custom_profile:
+        config_path = tmp_path / "hybridsort.yaml"
+        config_path.write_text(
+            "eg_weight_high_score: 3.5\n"
+            "eg_weight_low_score: 1.1\n"
+            "tcm_first_step: false\n"
+            "tcm_byte_step: false\n"
+            "tcm_byte_step_weight: 0.7\n"
+        )
+    resolved = load_tracker_config("hybridsort", config_path)
+    spec = TrackerSpec("hybridsort", options=tuple(sorted(resolved.items())))
+
+    tracker = create_tracker(spec)
+
+    assert spec.option_dict == resolved
+    for key in (
+        "eg_weight_high_score",
+        "eg_weight_low_score",
+        "tcm_first_step",
+        "tcm_byte_step",
+        "tcm_byte_step_weight",
+    ):
+        assert getattr(tracker, key) == resolved[key]
+
+
+@pytest.mark.parametrize("tracker_name", ["ocsort", "deepocsort"])
+@pytest.mark.parametrize("geometry", ["aabb", "obb"])
+@pytest.mark.parametrize("velocity_scale", [1.0, 5.0])
+def test_ocsort_process_priors_preserve_default_geometry_and_shared_calibration(
+    tracker_name: str, geometry: str, velocity_scale: float
+) -> None:
+    tracker = create_tracker(
+        TrackerSpec(tracker_name, geometry=geometry, options=(("kalman.noise.process_velocity_scale", velocity_scale),))
+    )
+    rows = (_obb_rows() if geometry == "obb" else _aabb_rows())[:1]
+    _update(tracker, rows, frame_index=0)
+    kalman = tracker.active_tracks[0].kf
+    velocity_priors = [0.01, 0.01, 0.0001, 0.0001] if geometry == "obb" else [0.01, 0.01, 0.0001]
+    prior = np.diag([1.0] * kalman.dim_z + velocity_priors)
+    np.testing.assert_allclose(kalman.Q, prior)
+
+    kalman.P.fill(0.0)
+    kalman.predict()
+
+    expected = prior.copy()
+    expected[kalman.dim_z :, kalman.dim_z :] *= velocity_scale
+    np.testing.assert_allclose(kalman.P, expected)
+    np.testing.assert_allclose(kalman.Q, prior)
+
+
+@pytest.mark.parametrize("tracker_name, tracker_type", [("ocsort", OcSort), ("deepocsort", DeepOcSort)])
+@pytest.mark.parametrize("parameter", ["Q_xy_scaling", "Q_s_scaling", "Q_a_scaling"])
+@pytest.mark.parametrize("source", ["constructor", "config"])
+def test_removed_sort_noise_parameters_are_rejected(tmp_path, tracker_name, tracker_type, parameter, source) -> None:
+    with pytest.raises(TypeError, match=parameter):
+        if source == "constructor":
+            tracker_type(**{parameter: 0.2})
+        else:
+            config = tmp_path / "tracker.yaml"
+            config.write_text(f"{parameter}: 0.2\n")
+            options = load_tracker_config(tracker_name, config)
+            algorithm_options = {key: value for key, value in options.items() if "." not in key}
+            get_tracker_config_class(tracker_name).from_mapping(algorithm_options)
+
+
+def test_per_class_tracking_accepts_sparse_detector_class_ids() -> None:
+    tracker = create_tracker(
+        TrackerSpec(
+            "bytetrack",
+            per_class=True,
+            class_ids=(0, 65),
+            class_names=((0, "person"), (65, "remote")),
+            options=(("min_hits", 1),),
+        )
+    )
+
+    output = _output_after_hits(tracker, _aabb_rows())
+
+    assert sorted(output.class_ids.tolist()) == [0, 65]
+    assert sorted(output.detection_indices.tolist()) == [0, 1]
+
+
+def test_configured_class_catalog_rejects_unknown_detector_class() -> None:
+    tracker = create_tracker(TrackerSpec("bytetrack", class_ids=(0,)))
+    sample_id = "sequence/000000"
+    detections = _detections(_aabb_rows(), sample_id=sample_id)
+
+    with pytest.raises(ValueError, match="not present in the tracker class catalog"):
+        tracker.update(detections)
+
+
+def test_mask_tracker_rejects_detection_masks_without_foreground() -> None:
+    tracker = create_tracker(TrackerSpec("maf_hda"))
+    sample_id = "sequence/000000"
+    rows = _aabb_rows()[:1]
+    detections = Detections(
+        geometry=Boxes(torch.from_numpy(rows[:, :4].copy())),
+        scores=torch.from_numpy(rows[:, 4].copy()),
+        class_ids=torch.from_numpy(rows[:, 5].astype(np.int64, copy=True)),
+        sample_id=sample_id,
+        masks=MaskBatch(torch.zeros((1, 96, 128), dtype=torch.bool)),
+    )
+
+    with pytest.raises(ValueError, match="foreground in every non-empty detection mask"):
+        tracker.update(detections, _frame(sample_id, 0))
+
+
+@pytest.mark.parametrize("geometry", ("aabb", "obb"))
+def test_sfsort_low_score_second_pass_keeps_identity(geometry: str) -> None:
+    tracker = SFSORT(
+        config=SFSORTConfig(high_th=0.6, low_th=0.1, new_track_th=0.5, match_th_second=0.3, dynamic_tuning=False),
+        is_obb=geometry == "obb",
+    )
+    rows = (_obb_rows() if geometry == "obb" else _aabb_rows())[:1]
+
+    first = _update(tracker, rows, frame_index=0)
+    low = rows.copy()
+    low[:, -2] = 0.3
+    second = _update(tracker, low, frame_index=1)
+
+    assert first.track_ids.item() == second.track_ids.item()
+    assert len(tracker.active_tracks) == 1
+    assert not tracker.lost_tracks
+
+
+@pytest.mark.parametrize(
+    ("options", "requirements"),
+    (
+        ({}, TrackerRequirements(frame=True, frame_dimensions_only=True)),
+        ({"central_timeout": 5, "marginal_timeout": 1}, TrackerRequirements(frame=True, frame_dimensions_only=True)),
+        ({"asso_func": "centroid"}, TrackerRequirements(frame=True, frame_dimensions_only=True)),
+        ({"frame_width": 128, "frame_height": 96}, TrackerRequirements()),
+        (
+            {"central_timeout": 5, "marginal_timeout": 1, "frame_width": 128, "frame_height": 96},
+            TrackerRequirements(),
+        ),
+        ({"asso_func": "centroid", "frame_width": 128, "frame_height": 96}, TrackerRequirements()),
+    ),
+)
+def test_sfsort_requires_only_frame_dimensions_unless_they_are_configured(
+    options: dict[str, object],
+    requirements: TrackerRequirements,
+) -> None:
+    tracker = SFSORT(
+        config=SFSORTConfig(**options),
+    )
+
+    assert tracker.requirements == requirements
+
+
+@pytest.mark.parametrize(
+    "options",
+    (
+        {"frame_width": 128},
+        {"frame_height": 96},
+        {"frame_width": 0, "frame_height": 96},
+        {"frame_width": 128, "frame_height": -1},
+    ),
+)
+def test_sfsort_rejects_partial_or_nonpositive_frame_dimensions(options: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="frame_width|frame_height"):
+        SFSORT(
+            config=SFSORTConfig(**options),
+        )
+
+
+def test_sfsort_obb_angle_motion_is_damped() -> None:
+    tracker = SFSORT(config=SFSORTConfig(obb_theta_damping=0.8), is_obb=True)
+    first_row = np.array([[64, 48, 40, 20, 0.0, 0.95, 0]], dtype=np.float32)
+    rotated = first_row.copy()
+    rotated[:, 4] = 0.4
+
+    first = _update(tracker, first_row, frame_index=0)
+    second = _update(tracker, rotated, frame_index=1)
+
+    assert first.track_ids.item() == second.track_ids.item()
+    tracked_delta = abs(float(second.geometry.values[0, 4] - first.geometry.values[0, 4]))
+    assert 0.0 < tracked_delta < 0.4

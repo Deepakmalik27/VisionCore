@@ -1,0 +1,14 @@
+dataset:
+  ref: sportsmot
+  split: val
+
+detector:
+  ref: yolox-x-sportsmot
+  checkpoint: default
+
+reid:
+  ref: lmbn-n-duke
+
+evaluation:
+  class_map:
+    player: person

@@ -1,0 +1,155 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# @nv-metropolis-bp-vss-ui/chat
+
+VSS chat interface for the chat tab and the docked sidebar.
+
+Its primary transport is the versioned VSS agent API exposed by the embedded
+adapter. The original OpenAI-shaped chat-SSE transport remains available for
+deployments that have not enabled that adapter.
+
+## Usage
+
+```tsx
+import { ChatPanel } from '@nv-metropolis-bp-vss-ui/chat';
+import '@nv-metropolis-bp-vss-ui/chat/lib/chat.css';
+
+<ChatPanel
+  endpoint={{
+    url: '/api/agent',
+    transport: 'agent-api',
+    surface: 'vss-ui-sidebar',
+    mediaProxyUrl: '/api/proxy',
+    uploadUrlBase: vstApiBase,
+  }}
+  title="Vision Agent"
+  theme="dark"
+  storageKeyPrefix="appSidebar"
+  features={{ uploadFile: true, messageCopy: false }}
+  onAnswer={(answer, conversationId) => forwardToSearchTab(answer, conversationId)}
+  onSubmit={() => clearStaleResults()}
+  onSubmitMessageReady={(submit) => (submitRef.current = submit)}
+  onAddQueryContextReady={(add) => (addContextRef.current = add)}
+  onControlsReady={(handlers) => setSidebarControls(handlers)}
+/>
+```
+
+## Features
+
+| Area | Feature | Flag |
+|---|---|---|
+| Conversations | multiple threads, new / rename / delete / clear | — |
+| | tab-scoped IndexedDB persistence, `storageKeyPrefix` | — |
+| | search over names and message text | — |
+| | export / import (conversation JSON v1–v4) | — |
+| | send full thread vs. latest turn | `CHAT_HISTORY_DEFAULT_ON` |
+| | legacy `vss-agent` human-in-the-loop response modal | `ENABLE_HITL` |
+| Input | context chips + `[Context: …]` prefix | — |
+| | chunked video upload, drag & drop, progress, cancel | `CHAT_UPLOAD_FILE_ENABLE` |
+| | per-file upload metadata | `CHAT_UPLOAD_FILE_METADATA_ENABLED` |
+| | post-upload auto-prompt | `CHAT_UPLOAD_FILE_HIDDEN_MESSAGE_TEMPLATE` |
+| | agent parameter panel | `CHAT_API_CUSTOM_AGENT_PARAMS_JSON` |
+| | speech-to-text | `CHAT_INPUT_MIC_ENABLED` |
+| | regenerate, stop, scroll-to-latest, auto-grow textarea | — |
+| Messages | streaming markdown, GFM tables, math | — |
+| | images (fullscreen, download), video, charts, incidents | — |
+| | code blocks (highlight, copy, download) | — |
+| | `<agent-think>` reasoning traces | — |
+| | nested intermediate-step tree (see caveat below) | `ENABLE_INTERMEDIATE_STEPS` |
+| | copy / speak / edit / delete | `CHAT_MESSAGE_{COPY,SPEAKER,EDIT}_ENABLED` |
+| | caller-info card (sanitised HTML from the host) | — |
+| Shell | welcome screen with drop zone, header menu, theme toggle | `SHOW_THEME_TOGGLE_BUTTON` |
+| Embedding | `onAnswer`, `onAnswerComplete`, `onSubmit` | — |
+| | `onSubmitMessageReady`, `onMessageSubmitted` | — |
+| | `onAddQueryContextReady`, `onChatVideoUploadComplete` | — |
+| | `onBusyChange`, `onControlsReady`, `isActive` | — |
+
+### Per-surface configuration
+
+The chat tab and the docked sidebar are configured independently: the sidebar
+overrides any main variable by re-declaring it under `NEXT_PUBLIC_SIDEBAR_CHAT_`,
+and falls back to the main value otherwise. This deployment relies on it — the
+sidebar runs a different agent from the chat tab and exposes its own parameter
+fields (search source type, critic toggle). `Home.tsx` resolves both surfaces
+through `surfaceEnv`.
+
+### Deliberately not ported
+
+- **WebSocket transport** and its `webSocketSchema` / connection toggle. Both
+  supported transports are HTTP + SSE, and the deployment ships
+  `NEXT_PUBLIC_WEB_SOCKET_DEFAULT_ON=false`.
+- **Adapter human-in-the-loop interaction responses.** Structured interaction
+  UI is opt-in. The legacy `vss-agent` chat-SSE transport exposes its response
+  modal only while `ENABLE_HITL=true`.
+  Current adapter connectors advertise `interaction_responses: false`, so an
+  interaction event is shown as unsupported instead of presenting a form that
+  cannot submit a response. External OpenClaw deployments set the flag false
+  and ask follow-up questions as ordinary completed chat turns.
+- **Folders and prompt templates.** Never surfaced in VSS. Import still accepts
+  and preserves both keys so an export round-trips.
+- **`GraphPlot` charts** (`react-force-graph-2d`). Not installed in this
+  workspace and not emitted by any VSS workflow; the type renders as
+  "unsupported" rather than pulling in a graph engine for a case that never
+  fires.
+
+### Deliberate differences
+
+- **Intermediate steps are a React tree, not serialised HTML.** The tree stays
+  structured here; the repairs are kept only for markup the *model* emits
+  mid-stream (`markdown/streaming.ts`).
+- **Pie slice colours are a fixed palette.** Random colours inside render would
+  recolour the chart on every streamed token.
+- **Syntax highlighting loads on demand.** Prism and its grammars are several
+  hundred kilobytes and only needed once a fenced block has stopped changing.
+
+## Wire protocol
+
+With `transport: 'agent-api'`, a turn creates a run through `POST /runs` and then
+reads the returned `events_url` as SSE. Every `data:` payload is a versioned
+agent API event.
+
+| Agent API event | UI behavior |
+|---|---|
+| `run.started`, `run.completed` | run status step and terminal state |
+| `message.delta` | assistant text |
+| `reasoning.delta` | reasoning step |
+| `tool.*` | keyed tool-step updates |
+| `artifact.created` | validated artifact delivered to `onAnswer`, not rendered as prose |
+| `interaction.required` | unsupported-interaction error (no response UI) |
+| `run.failed`, `run.cancelled` | terminal error |
+
+Absolute `*_url` values in artifact payloads are rewritten through
+`mediaProxyUrl`. Aborting a turn also posts to the run's `cancel_url`.
+
+When `transport` is omitted or set to `chat-sse`, the compatibility parser
+accepts the original line protocol:
+
+| Legacy line | Meaning |
+|---|---|
+| `data: {"choices":[{"delta":{"content":"…"}}]}` | assistant text |
+| `data: [DONE]` | turn complete |
+| `intermediate_data: {…}` | tool/skill step (`parent_id` nests it) |
+| `artifact_data: {…}` | validated artifact delivered to `onAnswer`, not rendered as prose |
+| `error_data: {…}` | turn-level failure |
+| `interaction_data: {…}` | unsupported-interaction error |
+| `: keepalive` | ignored |
+
+`artifact_data` carries the same `{version, kind, payload}` frame as the agent
+API's `artifact.created`, is validated the same way, and gets the same
+`mediaProxyUrl` rewriting. Any `vss.*` kind travels; which tab acts on one is
+decided by that tab's answer handler, so a new kind needs no transport change.
+Without this frame an agent answering in prose leaves the feature tabs empty,
+and embedding the payload in the reply text costs tokens and invites truncated
+or invented fields.
+
+Legacy content is also read from `choices[0].message.content` and the plain
+`value` / `output` / `answer` fields because agent servers differ.
+
+## Tests
+
+`npm test` runs two Jest projects: `logic` (node, no DOM) for the parsers,
+import/export and markdown repairs, and `components` (jsdom) which drives
+`ChatPanel` against a faked SSE stream.

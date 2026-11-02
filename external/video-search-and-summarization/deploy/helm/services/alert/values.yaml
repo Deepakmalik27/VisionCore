@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# vss-alert-bridge: VLM alert verification. Compose: vss-alert-verification, entrypoint env-substitute + command enhance_alert_with_vlm.py
+enabled: false
+global: {}
+
+# OpenTelemetry tracing. Off by default; the tuning (sampling ratio, content
+# gate) lives in configs/config.yml under alert_agent.tracing, and this is the
+# switch that makes it reachable. Without an otel-collector in the cluster the
+# endpoint below has nothing behind it — the compose profile ships one, the
+# Helm tree does not yet.
+tracing:
+  enabled: false
+  # Falls back to global.otelExporterOtlpEndpoint, then to the in-cluster
+  # default that every other VSS chart already names.
+  otlpEndpoint: ""
+  serviceName: "vss-alert-ms"
+  # The lever for a collector that is not there. Metrics fall back to this, so
+  # "none" silences both: without it the OTLP exporter retries three times with
+  # backoff and blocks roughly seven seconds at pod termination. Declared here
+  # rather than left implicit -- the template reads it either way, but an
+  # operator greping values.yaml for the variable the code documents would
+  # otherwise find nothing.
+  tracesExporter: "otlp"
+  # Defaults to tracesExporter when unset; set it only to diverge from traces.
+  metricsExporter: ""
+  # Comma-separated key=value pairs merged into every span's Resource. The SDK
+  # reads OTEL_RESOURCE_ATTRIBUTES directly, so leaving this "" renders an empty
+  # env var and lets the SDK's built-in defaults through. Useful for tagging
+  # spans with cluster/environment identifiers when the same trace backend fans
+  # in from multiple deployments.
+  resourceAttributes: ""
+  # Metric export cadence and per-export timeout, in milliseconds. Matches the
+  # code-side defaults in meters.py (60000 / 5000); declared here so an operator
+  # greping values.yaml for the levers the docker compose exposes finds them.
+  metricExportIntervalMillis: 60000
+  metricExportTimeoutMillis: 5000
+  # Span attributes are lifted from Kafka messages that never passed through
+  # AlertRequestEntity, and the SDK leaves this unlimited by default.
+  attributeValueLengthLimit: 4096
+
+image:
+  repository: ghcr.io/nvidia-ai-blueprints/vss/vss-alert-ms
+  tag: develop-latest
+  pullPolicy: IfNotPresent
+replicas: 1
+
+# Parameterized from parent / profile. In K8s use service names. Leave "" for release-based defaults.
+# Redis has been removed from Alert MS: dedup/filter state is in-process
+# and durable state (verdict protection, alert configs) lives in Elasticsearch.
+kafkaBootstrapServers: ""
+elasticHosts: ""
+vlmBaseUrl: ""
+vlmName: "nvidia/cosmos3-nano-reasoner"
+# VST base for Alert Bridge media lookup (vst_config.base_url). Default: in-cluster
+# vss-vios-ingress service (Docker parity: always ${VST_INTERNAL_URL}). Public URLs
+# for remote VLM are rewritten via url_transform + EXTERNAL_IP/INTERNAL_IP, not by
+# flipping vst_config to global.externalHost.
+vstBaseUrl: ""
+
+externalIp: ""
+# Host:port for url_transform internal side (default: in-cluster vss-vios-ingress:30888).
+internalIp: ""
+
+# RTVI_VLM_MODEL_TO_USE passed to the container (default: vlmName)
+rtviVlmModelToUse: ""
+# Inline YAML content for realtime-config.yml (always-on VLM alert rules). Leave "" for empty default.
+realtimeConfig: ""
+# Start the always_on_rules from realtime-config.yml when VIOS posts
+# camera_streaming to /api/v1/realtime/always-on. Off by default: only
+# profiles that wire that webhook in their sdrc config should enable it.
+alwaysOn: false
+
+# Base directory for media used during alert review (optional). Leave "" if not set.
+alertReviewMediaBaseDir: ""
+
+# Config variant: "" (default) or "edge-local-vlm" (DGX-SPARK, IGX-THOR, AGX-THOR with local VLM)
+# When "edge-local-vlm", uses EDGE-LOCAL-VLM-config.yml content (adds request_timeout, use_vlm_media_defaults).
+configVariant: ""
+
+# App listens on 9080 (see logs: "Uvicorn running on http://0.0.0.0:9080")
+service:
+  port: 9080
+  type: ClusterIP
+  nodePort: ""
+
+# Seconds the pod gets to shut down. Must stay above the shutdown budget: at
+# alert_agent.processes: 1 that is up to 10s for the API child, up to 15s of
+# drain, up to 5s to close the event-loop clients and up to 15s to stop the
+# runtime -- 45s bounded. Lowering it cuts in-flight work instead of draining.
+terminationGracePeriodSeconds: 60
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+
+# Block the main container until Kafka and Elasticsearch accept TCP (avoids
+# startup crashes when alert-bridge runs before infra stack services are listening).
+# Redis is no longer a dependency of Alert MS.
+waitForDependencies:
+  enabled: false
+  image:
+    repository: docker.io/library/busybox
+    tag: "1.38.0"
+    pullPolicy: IfNotPresent
+  kafkaHost: ""
+  kafkaPort: "9092"
+  elasticsearchHost: ""
+  elasticsearchPort: "9200"
+  maxRetries: "90"
+  retryInterval: "2"
+  # Optional HTTP readiness endpoint; empty skips the VLM startup gate.
+  # Evaluated as a Helm template. Requires waitForDependencies.enabled.
+  vlmReadyUrl: ""
+  vlmTimeoutSeconds: 1800

@@ -1,0 +1,78 @@
+#!/bin/bash -e
+
+test_py_with_framework() {
+    # numpy seems to be extremly slow with sanitizers to dissable it
+    if [ -n "$DALI_ENABLE_SANITIZERS" ]; then
+        FILTER_PATTERN="test_external_source_parallel.py\|test_external_source_parallel_custom_serialization\|test_external_source_parallel_garbage_collection_order"
+    else
+        FILTER_PATTERN="#"
+    fi
+
+    for test_script in $(ls test_external_source_dali.py test_external_source_numpy.py \
+      test_external_source_parallel_garbage_collection_order.py \
+      test_external_source_parallel_custom_serialization.py \
+      test_pool.py test_external_source_parallel.py test_external_source_parallel_shared_batch.py \
+      test_external_source_parallel_large_sample.py \
+      | sed "/$FILTER_PATTERN/d"); do
+        ${python_new_invoke_test} -A '!slow,!pytorch,!cupy,!numba' ${test_script%.py}
+    done
+    # run this test explicitly as it needs not GPU context in the process
+    if [ -z "$DALI_ENABLE_SANITIZERS" ]; then
+        ${python_new_invoke_test} -A '!slow,!pytorch,!cupy,!numba' test_external_source_parallel.TestParallelFork._test_parallel_fork_cpu_only
+        ${python_new_invoke_test} -A '!slow,!pytorch,!cupy,!numba' test_external_source_parallel.TestParallelFork._test_parallel_fork
+        ${python_new_invoke_test} -A '!slow,!pytorch,!cupy,!numba' test_external_source_parallel_custom_serialization._test_no_pickling_in_forking_mode
+    fi
+
+
+    if [ -n "$DALI_ENABLE_SANITIZERS" ]; then
+      # test_s3 spawns a mock S3 server subprocess, and test_gcs spawns a fake-gcs-server
+      # subprocess; both would inherit LD_PRELOAD=libasan, and qa/leak.sup has no suppressions
+      # for the AWS SDK, google-cloud-cpp, libcurl or OpenSSL globals
+      SKIP_TESTS="test_numpy.py test_s3.py test_gcs.py"
+      READER_TESTS=""
+
+      for test_script in $(ls reader/test_*); do
+          test_script=(${test_script//// })
+          test_script=${test_script[1]}
+
+          if [[ "$SKIP_TESTS" != *"$test_script"* ]]; then
+              test_script=${test_script::-3}
+              READER_TESTS="$READER_TESTS $test_script"
+          fi
+      done
+
+      ${python_new_invoke_test} -s reader $READER_TESTS
+    else
+      ${python_new_invoke_test} -s reader
+    fi
+
+
+    if [ -z "$DALI_ENABLE_SANITIZERS" ]; then
+      ${python_new_invoke_test} -A '!jpeg_scans_limit' -s decoder
+    else
+      ${python_new_invoke_test} -A '!jpeg_scans_limit,!sanitizer_skip' -s decoder
+    fi
+
+    ${python_new_invoke_test} -s input
+}
+
+test_jpeg_scan_limit() {
+    if [ -z "$DALI_ENABLE_SANITIZERS" ]; then
+      # test various broken cases with smaller limit to make the test faster
+      NVIMGCODEC_MAX_JPEG_SCANS=30 ${python_new_invoke_test} -s decoder test_jpeg_scan_limit
+      # test default limit for one case
+      ${python_new_invoke_test} -s decoder test_jpeg_scan_limit.ProgressiveJpeg.test_scans_limit:1
+    else
+      # let's check if error handling does not lead to leaks
+      NVIMGCODEC_MAX_JPEG_SCANS=30 ${python_new_invoke_test} -s decoder test_jpeg_scan_limit.ProgressiveJpeg.test_scans_limit:1
+    fi
+}
+
+test_no_fw() {
+    test_py_with_framework
+    test_jpeg_scan_limit
+}
+
+run_all() {
+  test_no_fw
+}

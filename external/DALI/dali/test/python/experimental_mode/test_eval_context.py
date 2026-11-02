@@ -1,0 +1,537 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import threading
+import time
+
+import nvidia.dali.experimental.dynamic as ndd
+import nvidia.dali.backend as _backend
+from nose_utils import SkipTest, attr
+import numpy as np
+import os
+from nose2.tools import cartesian_params
+from test_utils import get_dali_extra_path
+
+
+def test_eval_context_get():
+    if _backend.GetCUDADeviceCount() == 0:
+        raise SkipTest("At least 1 device needed for the test")
+    ctx = ndd.EvalContext.current()
+    assert ctx is not None
+    assert ndd.EvalContext.current() is ctx  # get() should not create another context
+    assert ctx.device_id == _backend.GetCUDACurrentDevice()
+    s = ctx.cuda_stream
+    assert s is not None
+    assert ctx.cuda_stream is s
+    assert ctx is ndd.EvalContext.default()
+    assert ndd.EvalContext.current().cuda_stream == s  # get() should not recreate the stream
+
+
+def test_eval_context_context_manager():
+    other_device_id = 1 if _backend.GetCUDADeviceCount() > 1 else 0
+    if other_device_id == 0:
+        print("Warning: Only 1 GPU detected, weak test")
+    with ndd.EvalContext(device_id=0) as ctx0:
+        assert ndd.EvalContext.current() is ctx0
+        assert ndd.EvalContext.current().device_id == 0
+        with ndd.EvalContext(device_id=other_device_id) as ctx1:
+            assert ndd.EvalContext.current() is not ctx0
+            assert ndd.EvalContext.current() is ctx1
+            assert ndd.EvalContext.current().device_id == other_device_id
+        assert ndd.EvalContext.current() is ctx0
+        assert ndd.EvalContext.current().device_id == 0
+    assert ndd.EvalContext.current() is ndd.EvalContext.default()
+
+
+def test_eval_context_explicit_stream():
+    with ndd.EvalContext.current() as ctx:
+        s = ctx.cuda_stream
+        s2 = ndd.stream()
+        with ndd.EvalContext(cuda_stream=s2) as ctx2:
+            assert ndd.EvalContext.current() is ctx2
+            assert ndd.EvalContext.current().cuda_stream is s2
+        assert ndd.EvalContext.current().cuda_stream is s
+
+
+@attr("multi_gpu")
+def test_eval_context_multi_gpu():
+    if _backend.GetCUDADeviceCount() < 2:
+        raise SkipTest("At least 2 devices needed for the test")
+    assert _backend.GetCUDACurrentDevice() == 0, "Invalid initial device id"
+    with ndd.EvalContext(device_id=0) as ctx0:
+        assert ndd.EvalContext.current() is ctx0
+        with ndd.EvalContext(device_id=1) as ctx1:
+            assert ndd.EvalContext.current() is ctx1
+            assert ndd.EvalContext.current().device_id == 1
+        assert ndd.EvalContext.current() is ctx0
+        assert ndd.EvalContext.current().device_id == 0
+    assert ndd.EvalContext.current() is ndd.EvalContext.default()
+
+
+class PseudoInvocation:
+    def __init__(self, value, run_count_container=None):
+        self.value = value
+        self.run_count = 0
+        self.run_count_container = run_count_container
+
+    def run(self, ctx):
+        assert isinstance(ctx, ndd.EvalContext)
+        self.run_count += 1
+        if self.run_count_container is not None:
+            self.run_count_container.run_count += 1
+        ctx.cache_results(self, self.value)
+        return self.value
+
+
+def test_eval_context_evaluate_all():
+    with ndd.EvalContext() as ctx:
+        inv = PseudoInvocation(4321)
+        ctx._add_invocation(inv, weak=False)
+        assert inv.run_count == 0
+    assert inv.run_count == 1
+
+
+# TODO(michalz): Result caching disabled due to a bug. It needs a redesign.
+
+# def test_eval_context_cached_results():
+#     with ndd.EvalContext.current() as ctx:
+#         inv = PseudoInvocation(42)
+#         assert ctx.cached_results(inv) is None
+#         inv.run(ctx)
+#         assert inv.run_count == 1
+#         assert ctx.cached_results(inv) == 42
+
+
+# def test_eval_evaluate_all_skip_cached():
+#     with ndd.EvalContext() as ctx:
+#         inv = PseudoInvocation(42)
+#         assert ctx.cached_results(inv) is None
+#         assert inv.run_count == 0
+#         ctx.cache_results(inv, 123)
+#         assert ctx.cached_results(inv) == 123
+#         ctx._add_invocation(inv)
+#         ctx.evaluate_all()
+#         assert inv.run_count == 0  # cached
+#         ctx._cached_results = {}
+#         ctx._add_invocation(inv)
+#         ctx.evaluate_all()
+#         assert inv.run_count == 1
+#         assert ctx.cached_results(inv) == 42
+#         ctx.evaluate_all()
+#         assert inv.run_count == 1
+
+
+def test_eval_context_evaluate_all_weakref():
+    run_count_container = PseudoInvocation(0)
+    with ndd.EvalContext() as ctx:
+        inv = PseudoInvocation(1057, run_count_container)  # lost
+        ctx._add_invocation(inv, weak=True)
+        del inv
+    assert run_count_container.run_count == 0
+
+
+def test_eval_context_reentrancy():
+    with ndd.EvalContext() as ctx1:
+        inv = PseudoInvocation(42)
+        ctx1._add_invocation(inv, weak=False)
+
+        with ndd.EvalContext() as ctx2:
+            inv2 = PseudoInvocation(123)
+            ctx2._add_invocation(inv2, weak=False)
+            with ctx1:
+                inv3 = PseudoInvocation(2002)
+                ctx1._add_invocation(inv3, weak=False)
+
+        assert ndd.EvalContext.current() is ctx1
+        assert inv.run_count == 0, inv.run_count
+        assert inv3.run_count == 0
+
+    assert inv.run_count == 1
+    assert inv3.run_count == 1
+    assert ndd.EvalContext.current() is ndd.EvalContext.default()
+
+
+def _gpu_expr():
+    a = ndd.tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32), device="gpu")
+    b = ndd.tensor(np.array([4.0, 5.0, 6.0], dtype=np.float32), device="gpu")
+    return ndd.slice(a + b, end=[1], axes=[0])
+
+
+def _validate_gpu_expr_result(result, expected_device_id):
+    assert result.device.device_type == "gpu"
+    assert result.device.device_id == expected_device_id
+    assert result.shape == (1,)
+    result = result.evaluate()
+    result_cpu = result.to_device(ndd.Device("cpu"))
+    result_cpu = result_cpu.evaluate()
+    assert result_cpu.shape == (1,)
+    assert result_cpu.dtype == ndd.float32
+    assert result_cpu.device.device_type == "cpu"
+    assert result_cpu.device.device_id is None
+    np.testing.assert_array_equal(result_cpu, np.array([5.0], dtype=np.float32))
+
+
+@cartesian_params(
+    [
+        None,
+    ]
+    + list(range(_backend.GetCUDADeviceCount())),
+)
+def test_eval_context_evaluate_gpu_expr(device_id):
+    """
+    Test that operations executed on the device context used to create the invocation, regardless
+    of the current eval context.
+    """
+    if _backend.GetCUDADeviceCount() == 0:
+        raise SkipTest("At least 1 device needed for the test")
+
+    if device_id is None:
+        result = _gpu_expr()
+    else:
+        with ndd.Device(f"gpu:{device_id}"):
+            result = _gpu_expr()
+    actual_device_id = device_id if device_id is not None else 0
+    # It doesn't matter if the current eval context is different from the one used to create
+    # the invocation, since the eval context is captured when the invocation is created.
+    for eval_device_id in range(_backend.GetCUDADeviceCount()):
+        with ndd.EvalContext(device_id=eval_device_id):
+            _validate_gpu_expr_result(result, actual_device_id)
+
+
+def test_default_device_conversion_to_cpu():
+    """
+    Test that evaluating a GPU tensor converted to CPU doesn't trigger any device mismatch errors.
+    """
+    if _backend.GetCUDADeviceCount() == 0:
+        raise SkipTest("At least 1 device needed for the test")
+
+    cpu_arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    gpu_tensor = ndd.tensor(cpu_arr, device="gpu")
+    cpu_tensor = gpu_tensor.cpu()
+    cpu_tensor_result = cpu_tensor.evaluate()
+    np.testing.assert_array_equal(cpu_tensor_result, cpu_arr)
+
+
+@cartesian_params(
+    [
+        None,
+    ]
+    + list(range(_backend.GetCUDADeviceCount())),
+)
+def test_device_match_mixed_operator(device_id):
+    """
+    Test that mixed operators (such as decoders.image) correctly honor the active device context.
+    """
+    if _backend.GetCUDADeviceCount() == 0:
+        raise SkipTest("At least 1 device needed for the test")
+
+    image_path = os.path.join(
+        get_dali_extra_path(), "db", "single", "jpeg", "100", "swan-3584559_640.jpg"
+    )
+    encoded_data = np.fromfile(image_path, dtype=np.uint8)
+
+    if device_id is None:
+        decoded_gpu = ndd.decoders.image(encoded_data, device="gpu")
+    else:
+        with ndd.Device(f"gpu:{device_id}"):
+            decoded_gpu = ndd.decoders.image(encoded_data, device="gpu")
+
+    eval_device_id = device_id if device_id is not None else 0
+    with ndd.EvalContext(device_id=eval_device_id):
+        assert decoded_gpu.device.device_type == "gpu"
+        assert decoded_gpu.device.device_id == eval_device_id
+        output = decoded_gpu.evaluate()
+        # Image dimensions for swan-3584559_640.jpg
+        assert output.ndim == 3
+        assert output.shape == (408, 640, 3)
+        assert output.dtype == ndd.uint8
+
+
+@attr("multi_gpu")
+def test_set_device_via_context_mixed_op():
+    if _backend.GetCUDADeviceCount() < 2:
+        raise SkipTest("At least 2 devices needed for the test")
+
+    image_path = os.path.join(
+        get_dali_extra_path(), "db", "single", "jpeg", "100", "swan-3584559_640.jpg"
+    )
+    encoded_data = np.fromfile(image_path, dtype=np.uint8)
+
+    with ndd.EvalContext(device_id=0):
+        decoded = ndd.decoders.image(encoded_data, device="gpu")
+        output0 = decoded.evaluate()
+        assert output0.device == ndd.device("gpu:0")
+
+    with ndd.EvalContext(device_id=1):
+        decoded = ndd.decoders.image(encoded_data, device="gpu")
+        output1 = decoded.evaluate()
+        assert output1.device == ndd.device("gpu:1")
+        output0_cpu = output0.cpu()  # copy from device 0 with current device being 1
+
+    output1_cpu = output0.cpu()  # copy from device 1 with current device being 0
+
+    assert np.array_equal(output0_cpu, output1_cpu)
+
+
+def test_get_set_num_threads():
+    ndd.set_num_threads(None)
+    try:
+        assert ndd.get_num_threads() == len(os.sched_getaffinity(0))
+        ctx = ndd.EvalContext()
+        assert ctx.thread_pool.num_threads == len(os.sched_getaffinity(0))
+        ndd.set_num_threads(42)
+        assert ndd.get_num_threads() == 42
+        assert ctx.num_threads == 42
+        assert ctx.thread_pool.num_threads == 42
+        ndd.set_num_threads(None)
+        assert ndd.get_num_threads() == len(os.sched_getaffinity(0))
+        assert ctx.num_threads == len(os.sched_getaffinity(0))
+        assert ctx.thread_pool.num_threads == len(os.sched_getaffinity(0))
+    finally:
+        ndd.set_num_threads(None)
+
+
+def test_default_stream():
+    ndd.set_default_stream(None)
+    try:
+        s1 = ndd.EvalContext.current().cuda_stream
+        s2 = ndd.EvalContext.current().cuda_stream
+        assert s1 is s2
+        s = ndd.stream()
+        assert s is not s1
+        ndd.set_default_stream(s)
+        assert ndd.get_default_stream() is s
+        s3 = ndd.EvalContext.current().cuda_stream
+        assert s3 is s
+
+        ndd.set_default_stream(None)
+        s4 = ndd.EvalContext.current().cuda_stream
+        assert s4 is not s3
+        s5 = ndd.EvalContext.current().cuda_stream
+        assert s5 is s4
+    finally:
+        ndd.set_default_stream(None)
+
+
+def _ctx_test_op(check_func):
+    class Flip2(ndd._ops.Flip):
+        def _run(self, ctx, *inputs, **args):
+            check_func(ctx)
+            return ndd._ops.Flip._run(self, ctx, *inputs, **args)
+
+    flip2_func = ndd._op_builder.build_fn_wrapper(Flip2, "flip2", False)
+    return flip2_func
+
+
+def test_global_param_change_delay():
+    calls = 0
+    expected_num_threads = 8
+    expected_stream = None
+
+    def check(ctx):
+        nonlocal calls
+        assert ctx.cuda_stream is expected_stream
+        assert ctx.thread_pool.num_threads == expected_num_threads
+        calls += 1
+
+    try:
+        with ndd.EvalMode.deferred:
+            expected_num_threads = 8
+            s0 = ndd.stream()
+            s1 = ndd.stream()
+            expected_stream = s0
+            ndd.set_num_threads(expected_num_threads)
+            ndd.set_default_stream(expected_stream)
+
+            op = _ctx_test_op(check)
+            data = ndd.tensor(np.zeros((480, 640, 3), dtype=np.int8))
+
+            t = op(data)  # this should use s0 and 8...
+            ndd.set_num_threads(42)
+            ndd.set_default_stream(s1)
+            assert calls == 0  # even though it wasn't evaluated before the global values changed
+
+            t.evaluate()  # evaluate now and...
+            assert calls == 1  # ...make sure the test function did run
+
+            expected_stream = s1
+            expected_num_threads = 42
+
+            t = op(data)  # this should use s1 and 42...
+            ndd.set_num_threads(None)
+            ndd.set_default_stream(None)
+            assert calls == 1
+            t.evaluate()
+            assert calls == 2  # make sure the test function ran again
+    finally:
+        ndd.set_num_threads(None)
+        ndd.set_default_stream(None)
+
+
+@attr("pytorch")
+def test_use_torch_stream():
+    import torch
+
+    try:
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            t = torch.arange(100000, dtype=torch.int32, device="cuda")
+            ndd.set_default_stream(s)
+            tensor = ndd.as_tensor(t).evaluate()
+            x = tensor + 1
+            cmp = x.cpu().evaluate()
+            assert np.array_equal(np.arange(1, 100001, dtype=np.int32), np.array(cmp))
+
+    finally:
+        ndd.set_num_threads(None)
+        ndd.set_default_stream(None)
+
+
+def test_non_default_ctx_stream():
+    try:
+        ctx0 = ndd.EvalContext()
+        s1 = ndd.stream()
+        ndd.set_default_stream(s1)
+        assert ctx0.cuda_stream != s1
+        assert ndd.get_default_stream() == s1
+        assert ndd.get_current_stream() == s1
+        assert ndd.EvalContext.default().cuda_stream == s1
+        ctx1 = ndd.EvalContext()
+        assert ctx1.cuda_stream == s1
+        s2 = ndd.stream()
+        ndd.set_current_stream(s2)
+        ctx2 = ndd.EvalContext()
+        assert ndd.get_current_stream() == s2
+        assert ndd.EvalContext.default().cuda_stream == s2
+        assert ctx2.cuda_stream == s2
+        assert ctx1.cuda_stream == s1
+
+        ndd.set_current_stream(None)
+        assert ndd.get_current_stream() == s1
+        assert ndd.EvalContext.default().cuda_stream == s1
+        assert ctx2.cuda_stream == s2
+        assert ctx1.cuda_stream == s1
+    finally:
+        ndd.set_default_stream(None)
+        ndd.set_current_stream(None)
+
+
+def test_ctx_with_thread_pool():
+    thread_pool = ndd.ThreadPool(7)
+    ctx = ndd.EvalContext(thread_pool=thread_pool)
+    assert ctx.thread_pool == thread_pool
+    assert ctx.num_threads == 7
+
+
+def test_ctx_with_num_threads():
+    ctx = ndd.EvalContext(num_threads=7)
+    assert ctx._thread_pool is not None
+    assert ctx.num_threads == 7
+
+
+def test_global_thread_pool_thread_safety():
+    # Check that there are no race conditions when accessing default thread pool while the
+    # default number of threads is changed concurrently.
+    # The test performs monotonic sweep of thread count and validates that all thread counts are
+    # seen in at least one sweep.
+    # The test also checks that there are no unnecessary updates to the default thread pool and
+    # that the threads see the same thread pool objects.
+    num_workers = 8
+    min_threads = 1
+    max_threads = 32
+    results = [set() for _ in range(num_workers)]
+    prev_pool = [None] * num_workers
+    stop_event = threading.Event()
+    run_event = threading.Event()
+    worker_errors = []
+    paused = threading.Semaphore(0)
+
+    def worker(idx):
+        try:
+            while not stop_event.is_set():
+                # The workers are paused after each sweep to prevent race condition
+                if not run_event.is_set():
+                    paused.release(1)
+                    run_event.wait()
+                pool = ndd._thread_pool._get_default_thread_pool(None)
+                if pool is not prev_pool[idx]:
+                    if prev_pool[idx] is not None:
+                        assert pool.num_threads != prev_pool[idx].num_threads, (
+                            f"Pool object changed but num_threads stayed at "
+                            f"{prev_pool[idx].num_threads}"
+                        )
+
+                    prev_pool[idx] = pool
+                results[idx].add(pool)
+                time.sleep(0)
+        except Exception as e:
+            print(f"Error in worker {idx}:\n{e}")
+            paused.release(1)
+            worker_errors.append(e)
+
+    threads = [
+        threading.Thread(target=worker, kwargs={"idx": idx}, daemon=True)
+        for idx in range(num_workers)
+    ]
+
+    # Start the workers at the first value in the sweep. Otherwise they may observe the
+    # platform default first and record two different pools if that value occurs in the sweep.
+    ndd.set_num_threads(min_threads)
+    run_event.set()
+    for t in threads:
+        t.start()
+
+    all_thread_counts_seen = False
+    try:
+        for _ in range(3):
+            for n in range(min_threads, max_threads + 1):
+                ndd.set_num_threads(n)
+                time.sleep(0.01)
+            # Pause the workers
+            run_event.clear()
+            for _ in range(num_workers):
+                paused.acquire()
+            if worker_errors:
+                raise worker_errors[0]
+            combined_results = set.union(*results)
+            # Check that the number of distinct thread pools seen is the same as the number
+            # of distinct thread counts seen. If it's different, there's an unnecessary pool
+            # created somewhere.
+            assert len(combined_results) == len(
+                set(p.num_threads for p in combined_results)
+            ), "The number of pool objects is different than the number of distinct thread counts."
+            if len(combined_results) == max_threads - min_threads + 1:
+                all_thread_counts_seen = True
+            ndd.set_num_threads(1)
+            for r in results:
+                r.clear()
+            # This prevents rare errors where the first pool to be seen has the same number of
+            # threads as the one last seen in previous sweep.
+            prev_pool = [None] * num_workers
+
+            # Now we can safely resume the workers
+            run_event.set()
+    finally:
+        run_event.set()
+        stop_event.set()
+        for t in threads:
+            t.join()
+        ndd.set_num_threads(None)
+
+    if worker_errors:
+        raise worker_errors[0]
+
+    assert (
+        all_thread_counts_seen
+    ), "Expected at least one sweep to observe all 32 distinct thread counts."

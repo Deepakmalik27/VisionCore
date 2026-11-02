@@ -1,0 +1,135 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Prefix-stripping routes for verification mode, default
+# global.useReleaseNamePrefix=false. Service names are unprefixed.
+# This object is <RELEASE_NAME>-vss-ingress-rewrites, a second Ingress.
+# It does not replace the Helm-owned <RELEASE_NAME>-vss-ingress.
+# Set vssIngress.enabled=false before applying either file.
+#
+# Main host matches the quick start: vss-alerts.<EXTERNAL_HOST>.nip.io.
+# /rtvi-cv is verification only; real-time disables vss-rtvi-cv, so delete
+# that path and its rewrite lines before a real-time apply.
+# /llm exists only while nims.nemotron35 is enabled.
+# /rtvi-vlm is enabled in both mode files.
+#
+# Regenerate rather than hand-editing:
+#   helm template <RELEASE_NAME> ./dev-profile-alerts \
+#     -f ./dev-profile-alerts/values-verification.yaml \
+#     --set-string global.externalHost=vss-alerts.<EXTERNAL_HOST>.nip.io \
+#     --show-only templates/vss-ingress.yaml
+#
+# As-is routes are in vss-ingress-example.yaml. Apply both only when the
+# chart Ingress is disabled.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: <RELEASE_NAME>-vss-ingress-rewrites
+  namespace: <NAMESPACE>
+  annotations:
+    haproxy.org/path-rewrite: |
+      ^/storage/(.*) /vst/storage/\1
+      ^/storage /vst/storage
+      /va-mcp/(.*) /\1
+      /va-mcp /
+      /alert-bridge/(.*) /\1
+      /alert-bridge /
+      /video-analytics-api/(.*) /\1
+      /video-analytics-api /
+      /elasticsearch/(.*) /\1
+      /elasticsearch /
+      /rtvi-cv/(.*) /\1
+      /rtvi-cv /
+      /rtvi-vlm/(.*) /\1
+      /rtvi-vlm /
+      /phoenix/(.*) /\1
+      /phoenix /
+      /llm/(.*) /\1
+      /llm /
+spec:
+  ingressClassName: haproxy
+  rules:
+  - host: vss-alerts.<EXTERNAL_HOST>.nip.io
+    http:
+      paths:
+      - path: /storage
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-vios-ingress
+            port:
+              number: 30888
+      - path: /va-mcp
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-va-mcp
+            port:
+              number: 9901
+      - path: /alert-bridge
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-alert-bridge
+            port:
+              number: 9080
+      - path: /video-analytics-api
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-video-analytics-api
+            port:
+              number: 8081
+      - path: /elasticsearch
+        pathType: Prefix
+        backend:
+          service:
+            name: elasticsearch
+            port:
+              number: 9200
+      # Verification only. Real-time disables vss-rtvi-cv; delete this path
+      # and the /rtvi-cv rewrite lines before a real-time apply.
+      - path: /rtvi-cv
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-rtvi-cv
+            port:
+              number: 9010
+      - path: /rtvi-vlm
+        pathType: Prefix
+        backend:
+          service:
+            name: vss-rtvi-vlm
+            port:
+              number: 8000
+      - path: /phoenix
+        pathType: Prefix
+        backend:
+          service:
+            name: phoenix
+            port:
+              number: 6006
+      # Only present when this profile runs its own LLM NIM (nims.nemotron35).
+      # Point a hosted-LLM deployment at the provider directly and drop this
+      # route rather than mounting it at a Service that does not exist.
+      - path: /llm
+        pathType: Prefix
+        backend:
+          service:
+            name: nemotron-35-lightning-30b-a3b
+            port:
+              number: 8000

@@ -1,0 +1,496 @@
+# mypy: disable-error-code="attr-defined, dict-item, assignment, union-attr, method-assign"
+"""Tests for Chime Public API methods."""
+
+from __future__ import annotations
+
+import copy
+import pickle
+import warnings
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+from tests.conftest import TEST_CHIME_EXISTS
+from uiprotect.data import PublicChime
+from uiprotect.exceptions import BadRequest, ChimeRingtoneNotSetError
+
+if TYPE_CHECKING:
+    from uiprotect.api import ProtectApiClient, PublicApiChimeRingSettingRequest
+    from uiprotect.data import Chime
+
+CHIME_ID = "6878d82800155803e45928e0"
+CAMERA_ID = "6878d82800215803e45928e1"
+RINGTONE_ID = "67ececbd02fe9603e40003f0"
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicChime.from_unifi_dict")
+async def test_get_chimes_public_success(
+    mock_create: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test successful chimes retrieval from public API."""
+    mock_chime1 = Mock()
+    mock_chime1.id = CHIME_ID
+    mock_chime1.name = "Chime 1"
+
+    mock_chime2 = Mock()
+    mock_chime2.id = "other-chime-id"
+    mock_chime2.name = "Chime 2"
+
+    mock_create.side_effect = [mock_chime1, mock_chime2]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": "1"}, {"id": "2"}])
+
+    result = await protect_client.get_chimes_public()
+
+    assert result is not None
+    assert len(result) == 2
+    assert result[0].id == CHIME_ID
+    assert result[1].id == "other-chime-id"
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/chimes", public_api=True
+    )
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicChime.from_unifi_dict")
+async def test_get_chime_public_success(
+    mock_create: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test successful single chime retrieval from public API."""
+    mock_chime = Mock()
+    mock_chime.id = CHIME_ID
+    mock_chime.name = "Smart PoE Chime"
+
+    mock_create.return_value = mock_chime
+    protect_client.api_request_obj = AsyncMock(return_value={"id": CHIME_ID})
+
+    result = await protect_client.get_chime_public(CHIME_ID)
+
+    assert result is not None
+    assert result.id == CHIME_ID
+    protect_client.api_request_obj.assert_called_with(
+        url=f"/v1/chimes/{CHIME_ID}", public_api=True
+    )
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicChime.from_unifi_dict")
+async def test_update_chime_public_name_only(
+    mock_create: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test updating only the name of a chime via public API."""
+    new_name = "Updated Chime Name"
+
+    mock_chime = Mock()
+    mock_chime.id = CHIME_ID
+    mock_chime.name = new_name
+    mock_create.return_value = mock_chime
+
+    mock_chime_data: dict[str, Any] = {"id": CHIME_ID, "name": new_name}
+    protect_client.api_request_obj = AsyncMock(return_value=mock_chime_data)
+
+    result = await protect_client.update_chime_public(CHIME_ID, name=new_name)
+
+    assert result is not None
+    assert result.name == new_name
+    protect_client.api_request_obj.assert_called_once_with(
+        url=f"/v1/chimes/{CHIME_ID}",
+        method="patch",
+        json={"name": new_name},
+        public_api=True,
+    )
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicChime.from_unifi_dict")
+async def test_update_chime_public_camera_ids(
+    mock_create: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test updating camera_ids via public API."""
+    camera_ids = [CAMERA_ID, "camera-2"]
+
+    mock_chime = Mock()
+    mock_chime.id = CHIME_ID
+    mock_create.return_value = mock_chime
+
+    mock_chime_data: dict[str, Any] = {"id": CHIME_ID, "cameraIds": camera_ids}
+    protect_client.api_request_obj = AsyncMock(return_value=mock_chime_data)
+
+    result = await protect_client.update_chime_public(CHIME_ID, camera_ids=camera_ids)
+
+    assert result is not None
+    protect_client.api_request_obj.assert_called_once_with(
+        url=f"/v1/chimes/{CHIME_ID}",
+        method="patch",
+        json={"cameraIds": camera_ids},
+        public_api=True,
+    )
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicChime.from_unifi_dict")
+async def test_update_chime_public_ring_settings(
+    mock_create: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test updating ring_settings via public API."""
+    ring_settings: list[PublicApiChimeRingSettingRequest] = [
+        {
+            "cameraId": CAMERA_ID,
+            "volume": 80,
+            "repeatTimes": 2,
+            "ringtoneId": RINGTONE_ID,
+        }
+    ]
+
+    mock_chime = Mock()
+    mock_chime.id = CHIME_ID
+    mock_create.return_value = mock_chime
+
+    mock_chime_data: dict[str, Any] = {"id": CHIME_ID, "ringSettings": ring_settings}
+    protect_client.api_request_obj = AsyncMock(return_value=mock_chime_data)
+
+    result = await protect_client.update_chime_public(
+        CHIME_ID, ring_settings=ring_settings
+    )
+
+    assert result is not None
+    protect_client.api_request_obj.assert_called_once_with(
+        url=f"/v1/chimes/{CHIME_ID}",
+        method="patch",
+        json={"ringSettings": ring_settings},
+        public_api=True,
+    )
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.data.public_devices.PublicChime.from_unifi_dict")
+async def test_update_chime_public_all_parameters(
+    mock_create: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test updating all chime parameters via public API."""
+    new_name = "Full Update Chime"
+    camera_ids = [CAMERA_ID]
+    ring_settings: list[PublicApiChimeRingSettingRequest] = [
+        {
+            "cameraId": CAMERA_ID,
+            "volume": 50,
+            "repeatTimes": 3,
+            "ringtoneId": RINGTONE_ID,
+        }
+    ]
+
+    mock_chime = Mock()
+    mock_chime.id = CHIME_ID
+    mock_chime.name = new_name
+    mock_create.return_value = mock_chime
+
+    mock_chime_data: dict[str, Any] = {
+        "id": CHIME_ID,
+        "name": new_name,
+        "cameraIds": camera_ids,
+        "ringSettings": ring_settings,
+    }
+    protect_client.api_request_obj = AsyncMock(return_value=mock_chime_data)
+
+    result = await protect_client.update_chime_public(
+        CHIME_ID,
+        name=new_name,
+        camera_ids=camera_ids,
+        ring_settings=ring_settings,
+    )
+
+    assert result is not None
+    protect_client.api_request_obj.assert_called_once_with(
+        url=f"/v1/chimes/{CHIME_ID}",
+        method="patch",
+        json={
+            "name": new_name,
+            "cameraIds": camera_ids,
+            "ringSettings": ring_settings,
+        },
+        public_api=True,
+    )
+
+
+@pytest.mark.asyncio()
+async def test_update_chime_public_no_parameters(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Test that update_chime_public raises BadRequest without parameters."""
+    with pytest.raises(BadRequest, match="At least one parameter must be provided"):
+        await protect_client.update_chime_public(CHIME_ID)
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("ringtone_id", [None, ""], ids=["missing", "empty"])
+async def test_update_chime_public_requires_ringtone_id(
+    protect_client: ProtectApiClient, ringtone_id: str | None
+) -> None:
+    """update_chime_public raises before sending when an entry has no ringtone."""
+    missing: dict[str, Any] = {"cameraId": "cam-b", "volume": 50, "repeatTimes": 1}
+    if ringtone_id is not None:
+        missing["ringtoneId"] = ringtone_id
+    protect_client.api_request_obj = AsyncMock()
+
+    with pytest.raises(ChimeRingtoneNotSetError) as exc_info:
+        await protect_client.update_chime_public(
+            CHIME_ID,
+            name="Chime",
+            ring_settings=[
+                {
+                    "cameraId": CAMERA_ID,
+                    "volume": 80,
+                    "repeatTimes": 2,
+                    "ringtoneId": RINGTONE_ID,
+                },
+                missing,
+            ],
+        )
+
+    assert exc_info.value.camera_id == "cam-b"
+    assert "cam-b" in str(exc_info.value)
+    protect_client.api_request_obj.assert_not_called()
+
+
+def _public_chime(
+    api: ProtectApiClient, ringtone_a: str | None, ringtone_b: str | None
+) -> PublicChime:
+    ring_settings: list[dict[str, Any]] = []
+    for camera_id, ringtone_id in (("cam-a", ringtone_a), ("cam-b", ringtone_b)):
+        entry: dict[str, Any] = {"cameraId": camera_id, "volume": 50, "repeatTimes": 1}
+        if ringtone_id is not None:
+            entry["ringtoneId"] = ringtone_id
+        ring_settings.append(entry)
+    return PublicChime.from_unifi_dict(
+        api=api,
+        id=CHIME_ID,
+        modelKey="chime",
+        state="CONNECTED",
+        mac="AABBCCDDEE03",
+        name="Chime",
+        cameraIds=["cam-a", "cam-b"],
+        ringSettings=ring_settings,
+    )
+
+
+async def _public_set_ring_settings(chime: PublicChime, camera_id: str) -> None:
+    await chime.set_ring_settings(
+        [
+            {
+                "cameraId": rs.camera_id,
+                "volume": 30 if rs.camera_id == camera_id else rs.volume,
+                "repeatTimes": rs.repeat_times,
+                "ringtoneId": rs.ringtone_id,
+            }
+            if rs.ringtone_id
+            else {
+                "cameraId": rs.camera_id,
+                "volume": rs.volume,
+                "repeatTimes": rs.repeat_times,
+            }
+            for rs in chime.ring_settings
+        ]
+    )
+
+
+_PUBLIC_CHIME_WRITERS = {
+    "set_ring_settings": _public_set_ring_settings,
+    "set_volume_for_camera": lambda chime, cid: chime.set_volume_for_camera(cid, 30),
+    "set_repeat_times_for_camera": lambda chime, cid: chime.set_repeat_times_for_camera(
+        cid, 3
+    ),
+    "set_volume_for_all_cameras": lambda chime, _cid: chime.set_volume_for_all_cameras(
+        30
+    ),
+    "set_repeat_times_for_all_cameras": lambda chime, _cid: (
+        chime.set_repeat_times_for_all_cameras(3)
+    ),
+}
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("writer", list(_PUBLIC_CHIME_WRITERS))
+@pytest.mark.parametrize(
+    ("ringtone_a", "ringtone_b", "missing_camera"),
+    [(None, RINGTONE_ID, "cam-a"), (RINGTONE_ID, None, "cam-b")],
+    ids=["target-missing", "other-missing"],
+)
+async def test_public_chime_writes_require_ringtone(
+    protect_client: ProtectApiClient,
+    writer: str,
+    ringtone_a: str | None,
+    ringtone_b: str | None,
+    missing_camera: str,
+) -> None:
+    """PublicChime ring writes raise and send nothing if any camera lacks a ringtone."""
+    chime = _public_chime(protect_client, ringtone_a, ringtone_b)
+    protect_client.api_request_obj = AsyncMock()
+
+    with pytest.raises(ChimeRingtoneNotSetError) as exc_info:
+        await _PUBLIC_CHIME_WRITERS[writer](chime, "cam-a")
+
+    assert exc_info.value.camera_id == missing_camera
+    protect_client.api_request_obj.assert_not_called()
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("writer", list(_PUBLIC_CHIME_WRITERS))
+async def test_public_chime_writes_send_every_ringtone(
+    protect_client: ProtectApiClient, writer: str
+) -> None:
+    """PublicChime ring writes carry ringtoneId for every entry."""
+    chime = _public_chime(protect_client, RINGTONE_ID, "other-ringtone")
+    protect_client.api_request_obj = AsyncMock(
+        return_value=chime.unifi_dict(),
+    )
+
+    await _PUBLIC_CHIME_WRITERS[writer](chime, "cam-a")
+
+    body = protect_client.api_request_obj.call_args.kwargs["json"]["ringSettings"]
+    assert [entry["ringtoneId"] for entry in body] == [RINGTONE_ID, "other-ringtone"]
+
+
+@pytest.mark.parametrize(
+    "clone",
+    [lambda e: pickle.loads(pickle.dumps(e)), copy.copy, copy.deepcopy],  # noqa: S301
+    ids=["pickle", "copy", "deepcopy"],
+)
+def test_chime_ringtone_not_set_error_survives_cloning(clone: Any) -> None:
+    """ChimeRingtoneNotSetError keeps camera_id and message across pickle/copy."""
+    err = ChimeRingtoneNotSetError("cam-1")
+
+    cloned = clone(err)
+
+    assert isinstance(cloned, ChimeRingtoneNotSetError)
+    assert cloned.camera_id == "cam-1"
+    assert str(cloned) == str(err)
+    assert "no ringtone set for camera cam-1" in str(cloned)
+
+
+@pytest.mark.skipif(not TEST_CHIME_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_chime_play_with_volume_minimum(chime_obj: Chime | None) -> None:
+    """Test that volume=1 (minimum in Protect UI) is properly handled."""
+    if chime_obj is None:
+        pytest.skip("No chime_obj found")
+
+    chime_obj.volume = 100
+    chime_obj.repeat_times = 1
+    chime_obj.api.api_request.reset_mock()
+
+    await chime_obj.play(volume=1)
+
+    # volume=1 should be sent, not ignored or replaced with default
+    chime_obj.api.api_request.assert_called_with(
+        f"chimes/{chime_obj.id}/play-speaker",
+        method="post",
+        json={
+            "volume": 1,
+            "repeatTimes": 1,
+        },
+    )
+
+
+@pytest.mark.skipif(not TEST_CHIME_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_chime_play_with_ringtone_id(chime_obj: Chime | None) -> None:
+    """Test playing chime with specific ringtone_id."""
+    if chime_obj is None:
+        pytest.skip("No chime_obj found")
+
+    chime_obj.volume = 50
+    chime_obj.repeat_times = 2
+    chime_obj.api.api_request.reset_mock()
+
+    await chime_obj.play(ringtone_id=RINGTONE_ID)
+
+    chime_obj.api.api_request.assert_called_with(
+        f"chimes/{chime_obj.id}/play-speaker",
+        method="post",
+        json={
+            "volume": 50,
+            "repeatTimes": 2,
+            "ringtoneId": RINGTONE_ID,
+        },
+    )
+
+
+@pytest.mark.skipif(not TEST_CHIME_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_play_speaker_track_no_deprecation_warning(
+    chime_obj: Chime | None,
+) -> None:
+    """Test that using track_no emits a deprecation warning."""
+    if chime_obj is None:
+        pytest.skip("No chime_obj found")
+
+    chime_obj.volume = 50
+    chime_obj.repeat_times = 1
+    chime_obj.api.api_request.reset_mock()
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        await chime_obj._api.play_speaker(chime_obj.id, track_no=1)
+
+        # Check deprecation warning was raised
+        assert len(w) == 1
+        assert issubclass(w[0].category, DeprecationWarning)
+        assert "track_no is deprecated" in str(w[0].message)
+
+    # trackNo should still be sent
+    chime_obj.api.api_request.assert_called_with(
+        f"chimes/{chime_obj.id}/play-speaker",
+        method="post",
+        json={
+            "volume": 50,
+            "repeatTimes": 1,
+            "trackNo": 1,
+        },
+    )
+
+
+@pytest.mark.skipif(not TEST_CHIME_EXISTS, reason="Missing testdata")
+@pytest.mark.asyncio()
+async def test_chime_play_track_no_deprecation_warning(
+    chime_obj: Chime | None,
+) -> None:
+    """Test that Chime.play() with track_no emits a deprecation warning."""
+    if chime_obj is None:
+        pytest.skip("No chime_obj found")
+
+    chime_obj.volume = 50
+    chime_obj.repeat_times = 1
+    chime_obj.api.api_request.reset_mock()
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        await chime_obj.play(track_no=1)
+
+        # Check deprecation warning was raised (from play() and play_speaker())
+        assert len(w) >= 1
+        deprecation_warnings = [
+            warning for warning in w if issubclass(warning.category, DeprecationWarning)
+        ]
+        assert len(deprecation_warnings) >= 1
+        assert any(
+            "track_no is deprecated" in str(warning.message)
+            for warning in deprecation_warnings
+        )
+
+    # trackNo should still be sent
+    chime_obj.api.api_request.assert_called_with(
+        f"chimes/{chime_obj.id}/play-speaker",
+        method="post",
+        json={
+            "volume": 50,
+            "repeatTimes": 1,
+            "trackNo": 1,
+        },
+    )

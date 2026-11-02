@@ -1,0 +1,187 @@
+---
+title: "Troubleshooting Guide"
+description: ""
+position: 4
+---
+This section uses a Problem/Symptom -> Cause -> Solution format to address common issues.
+
+**Checking FPS on 2D Perception**
+
+
+```bash
+# For 2d blueprint the PERF should be around 30 FPS
+docker logs -f vss-rtvi-cv
+
+Active sources : 4
+Fri Feb  6 10:48:29 2026
+**PERF:
+30.00000 (30.04256)     source_id : 3 stream_name Camera
+30.00000 (30.04256)     source_id : 2 stream_name Camera_03
+30.00000 (30.04213)     source_id : 1 stream_name Camera_02
+30.00000 (30.04256)     source_id : 0 stream_name Camera_01
+```
+
+## Check containers by profile
+
+Run the following command to inspect container names, images, and status:
+
+```bash
+docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+```
+
+`Up` means a container is running; `(healthy)` means its configured health check passed. Initialization containers normally finish with `Exited (0)`. An exited container is still listed by `docker ps -a`, so a row alone does not mean it is running. Investigate nonzero exit codes and services that unexpectedly stop or restart. Optional services vary with the selected profile and configuration; a locally hosted NIM appears only when enabled.
+
+### 2D Vision AI Profile with Minimal Deployment
+
+```text
+NAMES                            IMAGE                                                     STATUS
+vss-rtvi-cv                      nvcr.io/nvidia/vss-core/vss-rt-cv:3.3.0                   Up 4 minutes
+vss-vios-ingress                 nvcr.io/nvidia/vss-core/vss-vios-ingress:3.3.0            Up 4 minutes (healthy)
+vss-vios-sensor                  nvcr.io/nvidia/vss-core/vss-vios-sensor:3.3.0             Up 4 minutes (healthy)
+vss-vios-nvstreamer              nvcr.io/nvidia/vss-core/vss-vios-nvstreamer:3.3.0         Up 4 minutes
+vss-behavior-analytics           nvcr.io/nvidia/vss-core/vss-behavior-analytics:3.3.0      Up 4 minutes
+sdr-controller                   nvcr.io/nvidia/vss-core/sdr-mw-l:3.3.0                    Up 4 minutes
+sdrc-wait-for-redis              redis:8.10.0-alpine                                       Exited (0) 5 minutes ago
+vss-configurator                 nvcr.io/nvidia/vss-core/vss-configurator:3.3.0            Up 4 minutes (healthy)
+vss-kafka-topics                 vss-kafka-topic-init                                      Exited (0) 5 minutes ago
+vss-vios-streamprocessing        nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0   Up 5 minutes (healthy)
+vss-turnserver                   coturn/coturn:4.14.0                                      Up 5 minutes
+sdrc-wdm-env-from-config         alpine:3.24.1                                             Exited (0) 5 minutes ago
+vios-apt-cache-init              nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0   Exited (0) 5 minutes ago
+kafka                            confluentinc/cp-kafka:8.3.0                               Up 5 minutes (healthy)
+sdrc-render-config               alpine:3.24.1                                             Exited (0) 5 minutes ago
+redis                            redis:8.10.0-alpine                                       Up 5 minutes
+vss-turnserver-init              alpine:3.24.1                                             Exited (0) 5 minutes ago
+vss-broker-health-check          vss-broker-health-check                                   Exited (0) 4 minutes ago
+vss-vios-postgres                postgres:17.10-alpine                                     Up 5 minutes (healthy)
+sdrc-init-dirs                   alpine:3.24.1                                             Exited (0) 5 minutes ago
+sensor-bp-wait-bp-configurator   busybox:1.37.0                                            Exited (0) 4 minutes ago
+```
+
+### 2D Vision AI with Agents Profile
+
+```text
+NAMES                            IMAGE                                                     STATUS
+vss-rtvi-cv                      nvcr.io/nvidia/vss-core/vss-rt-cv:3.3.0                   Up 2 minutes
+vss-vios-ingress                 nvcr.io/nvidia/vss-core/vss-vios-ingress:3.3.0            Up 2 minutes (healthy)
+vss-agent-ui                     nvcr.io/nvidia/vss-core/vss-agent-ui:3.3.0                Up 4 seconds
+vss-vios-sensor                  nvcr.io/nvidia/vss-core/vss-vios-sensor:3.3.0             Up 2 minutes (healthy)
+vss-vios-nvstreamer              nvcr.io/nvidia/vss-core/vss-vios-nvstreamer:3.3.0         Up 2 minutes
+vss-behavior-analytics           nvcr.io/nvidia/vss-core/vss-behavior-analytics:3.3.0      Up 2 minutes
+vss-import-calibration-output    vss-import-calibration-output-container-2d                Exited (0) 2 minutes ago
+vss-agent                        nvcr.io/nvidia/vss-core/vss-agent:3.3.0                   Up 31 seconds (healthy)
+vss-alert-bridge                 nvcr.io/nvidia/vss-core/vss-alert-ms:3.3.0                Up 31 seconds
+vss-kibana-init                  vss-kibana-init-container-2d                              Exited (0) 3 minutes ago
+logstash                         docker.elastic.co/logstash/logstash:9.4.4                 Up 2 minutes
+sdr-controller                   nvcr.io/nvidia/vss-core/sdr-mw-l:3.3.0                    Up 2 minutes
+sdrc-wait-for-redis              redis:8.10.0-alpine                                       Exited (0) 3 minutes ago
+vss-rtvi-vlm                     nvcr.io/nvidia/vss-core/vss-rt-vlm:3.3.0                  Up 2 minutes (healthy)
+vss-configurator                 nvcr.io/nvidia/vss-core/vss-configurator:3.3.0            Up 2 minutes (healthy)
+vss-kafka-topics                 vss-kafka-topic-init                                      Exited (0) 3 minutes ago
+vss-vios-streamprocessing        nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0   Up 3 minutes (healthy)
+vss-turnserver                   coturn/coturn:4.14.0                                      Up 3 minutes
+kibana                           docker.elastic.co/kibana/kibana:9.4.4                     Up 3 minutes (healthy)
+vss-elasticsearch-init           vss-elasticsearch-init-container                          Exited (0) 3 minutes ago
+sdrc-wdm-env-from-config         alpine:3.24.1                                             Exited (0) 3 minutes ago
+kafka                            confluentinc/cp-kafka:8.3.0                               Up 3 minutes (healthy)
+vss-va-mcp                       nvcr.io/nvidia/vss-core/vss-agent:3.3.0                   Up 3 minutes (healthy)
+elasticsearch                    elasticsearch                                             Up 3 minutes (healthy)
+vss-vios-postgres                postgres:17.10-alpine                                     Up 3 minutes (healthy)
+redis                            redis:8.10.0-alpine                                       Up 3 minutes
+vss-cadvisor-1                   ghcr.io/google/cadvisor:0.60.5                            Up 3 minutes (healthy)
+prometheus                       quay.io/prometheus/prometheus:v3.13.1                     Up 3 minutes
+vios-apt-cache-init              nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0   Exited (0) 3 minutes ago
+grafana                          grafana/grafana:13.1.1-ubuntu                             Up 3 minutes
+vss-broker-health-check          vss-broker-health-check                                   Exited (0) 2 minutes ago
+phoenix                          arizephoenix/phoenix:19.8.0                               Up 3 minutes
+sensor-bp-wait-bp-configurator   busybox:1.37.0                                            Exited (0) 2 minutes ago
+vss-turnserver-init              alpine:3.24.1                                             Exited (0) 3 minutes ago
+sdrc-init-dirs                   alpine:3.24.1                                             Exited (0) 3 minutes ago
+sdrc-render-config               alpine:3.24.1                                             Exited (0) 3 minutes ago
+dcgm-exporter                    nvidia/dcgm-exporter:3.3.6-3.4.2-ubuntu22.04              Up 3 minutes
+vss-node-exporter-1              quay.io/prometheus/node-exporter:v1.12.1                  Up 3 minutes
+vss-haproxy-ingress              haproxy:3.4.2-alpine                                      Up 3 minutes
+vss-video-analytics-api          nvcr.io/nvidia/vss-core/vss-video-analytics-api:3.3.0     Up 3 minutes
+```
+
+### 3D Vision AI Profile with Minimal Deployment
+
+```text
+NAMES                            IMAGE                                                     STATUS
+vss-rtvi-cv-config-adaptor       nvcr.io/nvidia/vss-core/vss-rt-config-adaptor:3.3.0       Exited (0) 4 minutes ago
+vss-rtvi-cv                      nvcr.io/nvidia/vss-core/vss-rt-cv:3.3.0                   Up 4 minutes
+vss-vios-ingress                 nvcr.io/nvidia/vss-core/vss-vios-ingress:3.3.0            Up 4 minutes (healthy)
+vss-vios-nvstreamer              nvcr.io/nvidia/vss-core/vss-vios-nvstreamer:3.3.0         Up 4 minutes
+vss-behavior-analytics           nvcr.io/nvidia/vss-core/vss-behavior-analytics:3.3.0      Up 4 minutes
+sdr-controller                   nvcr.io/nvidia/vss-core/sdr-mw-l:3.3.0                    Up 5 minutes
+sdrc-wait-for-redis              redis:8.10.0-alpine                                       Exited (0) 5 minutes ago
+vss-vios-streamprocessing        nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0   Up 5 minutes (healthy)
+vss-configurator                 nvcr.io/nvidia/vss-core/vss-configurator:3.3.0            Up 5 minutes (healthy)
+vss-vios-sensor                  nvcr.io/nvidia/vss-core/vss-vios-sensor:3.3.0             Up 5 minutes (healthy)
+vss-kafka-topics                 vss-kafka-topic-init                                      Exited (0) 5 minutes ago
+vss-turnserver                   coturn/coturn:4.14.0                                      Up 6 minutes
+sdrc-wdm-env-from-config         alpine:3.24.1                                             Exited (0) 5 minutes ago
+kafka                            confluentinc/cp-kafka:8.3.0                               Up 6 minutes (healthy)
+vios-apt-cache-init              nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0   Exited (0) 5 minutes ago
+vss-vios-postgres                postgres:17.10-alpine                                     Up 6 minutes (healthy)
+vss-broker-health-check          vss-broker-health-check                                   Exited (0) 5 minutes ago
+sensor-bp-wait-bp-configurator   busybox:1.37.0                                            Exited (0) 5 minutes ago
+sdrc-render-config               alpine:3.24.1                                             Exited (0) 6 minutes ago
+vss-turnserver-init              alpine:3.24.1                                             Exited (0) 6 minutes ago
+sdrc-init-dirs                   alpine:3.24.1                                             Exited (0) 6 minutes ago
+redis                            redis:8.10.0-alpine                                       Up 6 minutes
+```
+
+### MV3DT Vision AI Profile with Minimal Deployment
+
+```text
+NAMES                            IMAGE                                                      STATUS
+vss-rtvi-cv-mv3dt                nvcr.io/nvidia/vss-core/vss-rt-cv:3.3.0                    Up 2 minutes
+vss-vios-ingress                 nvcr.io/nvidia/vss-core/vss-vios-ingress:3.3.0             Up 2 minutes (healthy)
+vss-vios-sensor                  nvcr.io/nvidia/vss-core/vss-vios-sensor:3.3.0              Up 2 minutes (healthy)
+sdr-controller                   nvcr.io/nvidia/vss-core/sdr-mw-l:3.3.0                     Up 3 minutes
+sdrc-wait-for-redis              redis:8.10.0-alpine                                        Exited (0) 3 minutes ago
+vss-reid-embed-mv3dt             nvcr.io/nvidia/vss-core/reid-embed:3.3.0                   Up 3 minutes (healthy)
+vss-vios-nvstreamer-mv3dt        nvcr.io/nvidia/vss-core/vss-vios-nvstreamer:3.3.0          Up 2 minutes
+vss-behavior-analytics-mv3dt     nvcr.io/nvidia/vss-core/vss-behavior-analytics:3.3.0       Up 2 minutes
+vss-kafka-topics                 vss-kafka-topic-init                                       Exited (0) 3 minutes ago
+sdrc-wdm-env-from-config         alpine:3.24.1                                              Exited (0) 3 minutes ago
+vss-vios-streamprocessing        nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0    Up 3 minutes (healthy)
+vss-configurator-mv3dt           nvcr.io/nvidia/vss-core/vss-configurator:3.3.0             Up 3 minutes (healthy)
+vss-rtvi-cv-bev-fusion           nvcr.io/nvidia/vss-core/vss-rt-cv-mv3dt-bev-fusion:3.3.0   Up 3 minutes (healthy)
+vss-reid-milvus-mv3dt            milvusdb/milvus:v2.5.12                                    Up 3 minutes (healthy)
+vss-turnserver                   coturn/coturn:4.14.0                                       Up 3 minutes
+vss-reid-embed-init-mv3dt        nvcr.io/nvidia/vss-core/reid-embed:3.3.0                   Exited (0) 3 minutes ago
+kafka                            confluentinc/cp-kafka:8.3.0                                Up 3 minutes (healthy)
+vios-apt-cache-init              nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0    Exited (0) 3 minutes ago
+vss-broker-health-check          vss-broker-health-check                                    Exited (0) 3 minutes ago
+sensor-bp-wait-bp-configurator   busybox:1.37.0                                             Exited (0) 2 minutes ago
+redis                            redis:8.10.0-alpine                                        Up 3 minutes
+sdrc-render-config               alpine:3.24.1                                              Exited (0) 3 minutes ago
+vss-reid-etcd-mv3dt              quay.io/coreos/etcd:v3.5.18                                Up 3 minutes (healthy)
+vss-reid-minio-mv3dt             cgr.dev/chainguard/minio:latest                            Up 3 minutes (healthy)
+mosquitto                        eclipse-mosquitto:2                                        Up 3 minutes (healthy)
+vss-turnserver-init              alpine:3.24.1                                              Exited (0) 3 minutes ago
+vss-vios-postgres                postgres:17.10-alpine                                      Up 3 minutes (healthy)
+sdrc-init-dirs                   alpine:3.24.1                                              Exited (0) 3 minutes ago
+```
+
+### Auto Calibration Profile
+
+```text
+NAMES                            IMAGE                                                     STATUS
+vss-vios-ingress                 nvcr.io/nvidia/vss-core/vss-vios-ingress:3.3.0            Up 2 minutes (healthy)
+vss-turnserver                   coturn/coturn:4.14.0                                      Up 2 minutes
+vss-vios-nvstreamer-amc          nvcr.io/nvidia/vss-core/vss-vios-nvstreamer:3.3.0         Up 2 minutes
+vss-vios-streamprocessing        nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0   Up 2 minutes (healthy)
+vss-vios-sensor                  nvcr.io/nvidia/vss-core/vss-vios-sensor:3.3.0             Up 2 minutes (healthy)
+vios-apt-cache-init              nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.3.0   Exited (0) 2 minutes ago
+vss-vios-postgres                postgres:17.10-alpine                                     Up 2 minutes (healthy)
+vss-configurator-base            nvcr.io/nvidia/vss-core/vss-configurator:3.3.0            Up 2 minutes (healthy)
+vss-auto-calibration             nvcr.io/nvidia/vss-core/vss-auto-calibration:3.3.0        Up 2 minutes (healthy)
+vss-turnserver-init              alpine:3.24.1                                             Exited (0) 2 minutes ago
+vss-haproxy-ingress              haproxy:3.4.2-alpine                                      Up 2 minutes
+vss-auto-calibration-ui          nvcr.io/nvidia/vss-core/vss-auto-calibration-ui:3.3.0     Up 2 minutes
+redis                            redis:8.10.0-alpine                                       Up 2 minutes
+sensor-bp-wait-bp-configurator   busybox:1.37.0                                            Exited (0) 2 minutes ago
+```

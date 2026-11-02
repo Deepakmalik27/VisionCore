@@ -1,0 +1,57 @@
+{
+  "skills": [
+    "vss-manage-alerts",
+    "vss-build-vision-ai"
+  ],
+  "resources": {
+    "platforms": {
+      "DGX-SPARK": {
+        "modes": [
+          "remote-all"
+        ],
+        "gpu_count": 1
+      },
+      "L40S": {
+        "modes": [
+          "remote-all"
+        ]
+      }
+    }
+  },
+  "deploy_mode": "real-time",
+  "description": "Routing boundary: Workflow C (query past incidents via `GET /api/v1/realtime/incidents`) vs Workflow D (list active subscription rules via the bare `GET /api/v1/realtime`). Both are direct Alert Bridge calls (no /generate); tests that the skill distinguishes 'what happened' from 'what is running'.",
+  "expects": [
+    {
+      "query": "Use `/vss-build-vision-ai` for the following deployment setup. Deploy the VSS alerts profile on {{platform}} in real-time (VLM) mode (`MODE=2d_vlm`) using remote LLM and remote VLM endpoints. This is a headless evaluation: public browser access and Brev secure links are optional, not deployment prerequisites. Use http://localhost:7777 for host-side VSS access and let the checked-in NemoClaw notebook select the sandbox-reachable deployment origin; do not point the sandbox at its own localhost. If no browser link is available, report the notebook's loopback/tunnel Agent UI URL rather than inventing a hostname. An absent or malformed Brev browser context must not prevent this authorized host-local deployment. This deployment uses the in-stack agent: deploy `vss-agent` as part of the service set and do not replace it with the evaluation harness. The operational evaluation harness is a separate client of this backend.\n\nThe selected operational harness is supplied in $SKILLS_EVAL_OPERATIONAL_HARNESS. If it is `nemoclaw`, first finish the above application deployment through Build Vision AI with its explicitly requested in-stack agent. Then bootstrap a separate evaluation client using the checked-in `deploy/docker/scripts/run_setup_notebook.py --notebook deploy/docker/scripts/deploy_nemoclaw.ipynb` and install `/vss-manage-alerts` in that sandbox. NemoClaw is evaluation infrastructure here, not the application's harness: do not select it in Build Vision AI's Q3 or change the application service set. Set `VSS_AGENT_ADAPTER_ENABLED=false` so the application's UI keeps its in-stack backend. Preserve the supplied $NEMOCLAW_SANDBOX_NAME, $NEMOCLAW_GATEWAY_PORT, $NEMOCLAW_DASHBOARD_PORT, $NEMOCLAW_DASHBOARD_RELAY_PORT, and model-provider environment values. These ports select this evaluation's isolated NemoClaw gateway and must stay consistent across setup and operational steps. Complete the documented readiness verification before finishing: `openshell sandbox get \"$NEMOCLAW_SANDBOX_NAME\"` must succeed, the sandbox gateway must be ready, and the installed VSS CLI must be configured against this deployment. Include the sandbox name and Agent UI link in your response. For other operational harnesses, finish the deployment readiness checks without onboarding NemoClaw. Run non-interactively using the query's choices and documented defaults.",
+      "checks": [
+        "`docker ps --format '{{.Names}}' | grep -qx vss-rtvi-vlm` returns exit 0 (continuous VLM processor — required for VLM real-time mode).",
+        "`! docker ps --format '{{.Names}}' | grep -qx vss-rtvi-cv` returns exit 0 (CV-only perception is NOT running — confirms VLM real-time, not verification).",
+        "The setup trajectory shows the agent reading or invoking the bundled `/vss-build-vision-ai` skill and using its workflow to deploy the requested backend; mentioning the skill only in the final answer is insufficient.",
+        "When `$SKILLS_EVAL_OPERATIONAL_HARNESS` is `nemoclaw`, the setup trajectory proves the supplied sandbox exists (`openshell sandbox get \"$NEMOCLAW_SANDBOX_NAME\"` succeeds), its gateway is ready, and the sandbox-installed `vss configure check` succeeds against this deployment. For a different selected operational harness, no NemoClaw sandbox is required."
+      ]
+    },
+    {
+      "query": "What alerts have been triggered today?",
+      "checks": [
+        "The trajectory queries incidents via a `GET` to the Alert Bridge incidents endpoint `/api/v1/realtime/incidents` (direct — NOT `POST /generate`); 'triggered today' means past incidents, routing to Workflow C.",
+        "The agent's final reply is an incident summary — what has happened / been triggered today (Workflow C) — not a listing of subscription rules. It must not answer this 'what happened' question by presenting the active-rules inventory.",
+        "`curl -sf --max-time 15 'http://localhost:9080/api/v1/realtime/incidents?limit=5'` returns HTTP 200 with a JSON body matching the Alert MS `IncidentListResponse` contract — top-level `status`, an `incidents` array, integer `count` and `total`, and a `timestamp`. Deterministic contract probe of the Alert Bridge incidents endpoint (the direct-API source Workflow C incident queries read from); an empty `incidents` array is valid."
+      ]
+    },
+    {
+      "query": "What alert rules are currently active?",
+      "checks": [
+        "The trajectory calls the bare Alert Bridge rules-list endpoint `GET /api/v1/realtime` (no `/incidents` suffix) — 'rules' + 'currently active' means subscription inventory, routing to Workflow D.",
+        "The agent's final reply lists active alert rules (subscription inventory from Workflow D), not triggered incidents or an incident summary.",
+        "The agent renders a human-readable summary of active rules (not raw JSON)."
+      ]
+    },
+    {
+      "query": "Any alerts so far today?",
+      "checks": [
+        "The trajectory queries incidents via a `GET` to the Alert Bridge incidents endpoint `/api/v1/realtime/incidents` (direct — NOT `POST /generate`); a casual incident query routes to Workflow C, not D's list-rules.",
+        "The agent's final reply is an incident summary — what alerts/incidents have occurred today (Workflow C) — not a listing of subscription rules. It must not answer this incident question by presenting the active-rules inventory."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+# Per-run staged/generated files (stage-configs.sh, generate-configs.sh outputs).
+generated/
+
+# Local venv for the utils/ Python scripts (created by scripts/ensure-venv.sh).
+utils/venv/
+
+# BEV visualizer offline output.
+bev-output/
+
+# Saved perception videos (SAVE_VIDEO=1).
+video-output/
+
+# Operator stream lists for add-streams.sh --file. The README suggests
+# my-streams.txt and the script's own usage shows streams.txt. Both hold
+# deployment-specific RTSP URLs that belong to one site, not to the repo.
+my-streams.txt
+streams.txt

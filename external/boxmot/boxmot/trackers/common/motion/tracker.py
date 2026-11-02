@@ -1,0 +1,56 @@
+from __future__ import annotations
+
+import numpy as np
+
+from boxmot.trackers.common.geometry.obb import xywha_to_xyxy
+from boxmot.trackers.common.motion.cmc import integration as cmc_utils
+
+
+class TrackerMotionMixin:
+    """Tracker-level motion and camera-motion helper methods."""
+
+    def cmc_detection_boxes(self, dets: np.ndarray) -> np.ndarray:
+        """Return native AABB/OBB boxes used for camera-motion estimation."""
+        threshold = getattr(getattr(self, "config", None), "cmc_min_conf", None)
+        return cmc_utils.cmc_detection_boxes(dets, self.detection_layout, min_conf=threshold)
+
+    def aabb_detections_for_association(self, dets: np.ndarray) -> np.ndarray:
+        """Return AABB-layout detections for AABB-only association functions."""
+        if not self.is_obb:
+            return dets
+
+        has_indices = dets.ndim == 2 and dets.shape[1] == self.detection_layout.det_cols + 1
+        out_cols = 7 if has_indices else 6
+        if dets.size == 0:
+            dtype = dets.dtype if hasattr(dets, "dtype") else np.float32
+            return np.empty((0, out_cols), dtype=dtype)
+
+        # Camera-motion estimators need native OBB geometry, while callers of
+        # this helper explicitly require AABB rows with confidence metadata.
+        boxes = xywha_to_xyxy(self.detection_layout.boxes(dets))
+        confs = self.detection_layout.confidences(dets).reshape(-1, 1)
+        clss = self.detection_layout.classes(dets).reshape(-1, 1)
+        columns = [boxes, confs, clss]
+        if has_indices:
+            columns.append(dets[:, self.detection_layout.det_cols].reshape(-1, 1))
+        return np.hstack(columns).astype(dets.dtype, copy=False)
+
+    def apply_cmc(
+        self,
+        img: np.ndarray | None,
+        dets: np.ndarray,
+        tracks,
+    ) -> np.ndarray | None:
+        """Apply CMC to tracks using OBB-safe detection boxes for estimation."""
+        return cmc_utils.apply_cmc_to_tracks(
+            getattr(self, "cmc", None),
+            img,
+            dets,
+            self.detection_layout,
+            tracks,
+            mask_boxes=self.cmc_detection_boxes(dets),
+        )
+
+    def _reset_cmc_state(self) -> None:
+        """Reset CMC adapters that keep frame-to-frame state."""
+        cmc_utils.reset_cmc(getattr(self, "cmc", None))

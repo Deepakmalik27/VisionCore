@@ -1,0 +1,302 @@
+[project]
+name = "uiprotect"
+version = "25.0.0"
+license = "MIT"
+description = "Python API for Unifi Protect (Unofficial)"
+authors = [{ name = "UI Protect Maintainers", email = "ui@koston.org" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["classifiers", "dependencies"]
+
+[project.optional-dependencies]
+cli = [
+    "typer>=0.27.3",
+    "rich>=15.0.0",
+    "pillow>=12.3.0",
+]
+
+[project.urls]
+"Repository" = "https://github.com/uilibs/uiprotect"
+"Documentation" = "https://uiprotect.readthedocs.io"
+"Bug Tracker" = "https://github.com/uilibs/uiprotect/issues"
+"Changelog" = "https://github.com/uilibs/uiprotect/blob/main/CHANGELOG.md"
+
+[project.scripts]
+uiprotect = "uiprotect.cli:app"
+
+[tool.poetry]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Build Tools",
+    "Development Status :: 5 - Production/Stable",
+]
+packages = [
+    { include = "uiprotect", from = "src" },
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+rich = { version = ">=15.0.0", optional = true }
+aiofiles = ">=24"
+aiohttp = ">=3.14.3"
+av = [
+    { version = ">=17.0.1", python = "<3.12" },
+    { version = ">=19.0.0", python = ">=3.12" },
+]
+orjson = ">=3.13.0"
+packaging = ">=26.3"
+pillow = { version = ">=12.3.0", optional = true }
+platformdirs = ">=4.13.0"
+pydantic = ">=2.13.5"
+yarl = ">=1.24.5"
+typer = { version = ">=0.27.3", optional = true }
+convertertools = ">=0.5.0"
+propcache = ">=0.5.4"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9.1.1,<10"
+pytest-cov = ">=3,<8"
+pytest-asyncio = ">=1.4.0,<1.5.0"
+pytest-benchmark = ">=5.3.0,<6"
+pytest-codspeed = "^5.0.3"
+pytest-sugar = "^1.1.1"
+pytest-timeout = "^2.4.0"
+pytest-xdist = "^3.7.0"
+types-aiofiles = ">=25.1.0.20260518,<26.0.0.0"
+mypy = "^2.4.0"
+pre-commit = "^4.7.0"
+blockbuster = ">=1.5.29,<2.0.0"
+jsonschema = ">=4.23.0,<5"
+
+[tool.poetry.group.docs]
+optional = true
+
+[tool.poetry.group.docs.dependencies]
+mike = "^2.2.0"
+mkdocs-material = "^9.7.7"
+mkdocs-material-extensions = "^1.3.1"
+pymdown-extensions = "^12.2.0"
+mkdocs-git-revision-date-localized-plugin = "^1.6.0"
+mkdocs-include-markdown-plugin = ">=7.3.0,<8.0.0"
+mkdocstrings = ">=1.0.7,<1.1.0"
+mkdocstrings-python = "^2.0.9"
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+version_variables = [
+    "src/uiprotect/__init__.py:__version__",
+]
+build_command = "pip install poetry && poetry build"
+
+[tool.semantic_release.commit_parser_options]
+parse_squash_commits = false
+
+[tool.semantic_release.changelog]
+exclude_commit_patterns = [
+    "chore*",
+    "ci*",
+]
+
+[tool.semantic_release.changelog.environment]
+keep_trailing_newline = true
+
+[tool.semantic_release.branches.main]
+match = "main"
+
+[tool.semantic_release.branches.noop]
+match = "(?!main$)"
+prerelease = true
+
+[tool.pytest.ini_options]
+addopts = "-v -Wdefault --cov=uiprotect --cov-report=term-missing:skip-covered -n=auto"
+pythonpath = ["src"]
+
+[tool.codespell]
+skip = "poetry.lock,*.lock,*/sample_data/*,*/openapi/*,CHANGELOG.md,*/site/*,site/*"
+# domain terms / protocol field names that are not English typos:
+# - aiport: UniFi AiPort device codename (AiPort/aiport/AIPORT)
+# - tempature: misspelled wire-format disk-health key served by Protect firmware
+ignore-words-list = "aiport,tempature"
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "@overload",
+    "if TYPE_CHECKING",
+    "raise NotImplementedError",
+    'if __name__ == "__main__":',
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+ignore = [
+    "S101", # use of assert
+    "D203", # 1 blank line required before class docstring
+    "D212", # Multi-line docstring summary should start at the first line
+    "D100", # Missing docstring in public module
+    "D101", # Missing docstring in public module
+    "D102", # Missing docstring in public method
+    "D103", # Missing docstring in public module
+    "D104", # Missing docstring in public package
+    "D105", # Missing docstring in magic method
+    "D107", # Missing docstring in `__init__`
+    "D400", # First line should end with a period
+    "D401", # First line of docstring should be in imperative mood
+    "D205", # 1 blank line required between summary line and description
+    "D415", # First line should end with a period, question mark, or exclamation point
+    "D417", # Missing argument descriptions in the docstring
+    "E501", # Line too long
+    "RUF012", # Mutable class attributes should be annotated with `typing.ClassVar`
+    "B008", # Do not perform function call
+    "S110", # `try`-`except`-`pass` detected, consider logging the exception
+    "D106", # Missing docstring in public nested class
+    "UP007", # typer needs Optional syntax
+    "S603", #  check for execution of untrusted input
+    "PERF203", # too many to fix right now
+    "PLR2004", # Magic value used in comparison
+    "PLR0913", # Too many arguments to function call
+    "PLR0917", # Too many positional arguments (public signatures and typer CLI args)
+    "PLW1641", # Object does not implement __hash__ method
+    # Mirrored from esphome/aioesphomeapi (see issue #872) — pre-ignored ahead
+    # of enabling the parent rule families in future tiers.
+    "TRY003",   # avoid specifying long messages outside the exception class
+    "ANN401",   # disallow Any
+    "ASYNC109", # async function with timeout parameter
+    "TID252",   # relative imports — this repo uses `from ..exceptions import ...` throughout
+]
+select = [
+    "A",    # flake8-builtins
+    "ASYNC", # flake8-async
+    "B",    # flake8-bugbear
+    "D",    # flake8-docstrings
+    "C4",   # flake8-comprehensions
+    "DTZ",  # flake8-datetimez
+    "ERA",  # eradicate (commented-out code)
+    "FA",   # flake8-future-annotations
+    "FLY",  # flynt (f-string conversion)
+    "G",    # flake8-logging-format
+    "ICN",  # flake8-import-conventions
+    "INP",  # flake8-no-pep420 (implicit namespace packages)
+    "ISC",  # flake8-implicit-str-concat
+    "LOG",  # flake8-logging
+    "N",    # pep8-naming
+    "PGH",  # pygrep-hooks
+    "PIE",  # flake8-pie
+    "PTH",  # flake8-use-pathlib
+    "PYI",  # flake8-pyi
+    "Q",    # flake8-quotes
+    "RSE",  # flake8-raise
+    "SLOT", # flake8-slots
+    "T10",  # flake8-debugger
+    "T20",  # flake8-print
+    "TC",   # flake8-type-checking
+    "TD",   # flake8-todos
+    "FIX",  # flake8-fixme
+    "YTT",  # flake8-2020
+    "S",    # flake8-bandit
+    "F",    # pyflake
+    "FURB", # refurb rules
+    "E",    # pycodestyle
+    "W",    # pycodestyle
+    "UP",   # pyupgrade
+    "I",    # isort
+    "PERF", # performance
+    "PL",   # pylint
+    "RET",  # return rules
+    "RUF",  # ruff specific
+    "SIM",  # simplify
+    "TRY300", # try-consider-else
+    "TRY301", # raise-within-try
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = [
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "S101",
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
+    "DTZ001", # tests intentionally construct naive datetimes
+    "DTZ005", # tests intentionally call datetime.now() without tz
+    "ERA001", # test fixtures keep commented-out reference snippets
+    "E402",   # optional-dependency guards (pytest.importorskip) precede imports
+]
+"setup.py" = ["D100"]
+"conftest.py" = ["D100"]
+"scripts/**/*" = [
+    "T201",   # standalone CLI scripts print to stderr by design
+    "INP001", # scripts/ is a runnable folder, not an importable package
+]
+"src/uiprotect/data/**/*" = [
+    # pydantic v2 model_rebuild() needs field-type classes resolvable at runtime
+    "TC001",
+    "TC002",
+    "TC003",
+]
+"src/uiprotect/events/**/*" = [
+    # pydantic v2 model field types must resolve at runtime for validation
+    "TC001",
+    "TC002",
+    "TC003",
+]
+"src/uiprotect/devices/**/*" = [
+    # pydantic v2 model field types must resolve at runtime for validation
+    "TC001",
+    "TC002",
+    "TC003",
+]
+"src/uiprotect/cli/**/*" = [
+    # typer inspects runtime annotations on command callbacks
+    "TC001",
+    "TC002",
+    "TC003",
+]
+"src/uiprotect/exceptions.py" = [
+    # public exception names — renaming would break the API consumers depend on
+    "N818",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["uiprotect", "tests"]
+
+[tool.mypy]
+disable_error_code = "import-untyped,unused-ignore"
+check_untyped_defs = true
+ignore_missing_imports = true
+disallow_any_generics = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+mypy_path = "src/"
+no_implicit_optional = true
+show_error_codes = true
+warn_unreachable = true
+warn_unused_ignores = true
+exclude = [
+    'docs/.*',
+    'setup.py',
+]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+allow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "docs.*"
+ignore_errors = true
+
+[build-system]
+requires = ["poetry-core>=2.1.0"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,139 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+import { useState, useCallback, useEffect } from 'react';
+import { FilterProps, SearchParams, StreamInfo } from '../types';
+
+// Centralized default constant - exported for use in other components
+export const DEFAULT_TOP_K = 10;
+
+const TOP_K_STORAGE_KEY = 'vss_filter_topK';
+
+function getStoredTopK(): number {
+  if (typeof sessionStorage === 'undefined') return DEFAULT_TOP_K;
+  try {
+    const stored = sessionStorage.getItem(TOP_K_STORAGE_KEY);
+    if (stored == null) return DEFAULT_TOP_K;
+    const num = Number(stored);
+    return Number.isFinite(num) && num >= 1 ? num : DEFAULT_TOP_K;
+  } catch {
+    return DEFAULT_TOP_K;
+  }
+}
+
+function setStoredTopK(value: number): void {
+  try {
+    sessionStorage.setItem(TOP_K_STORAGE_KEY, String(value));
+  } catch {
+    // ignore
+  }
+}
+
+/** Similarity is always shown. Blank or invalid values display as the default 0.00. */
+function similarityFilterTag(similarity: unknown): { key: string; title: string; value: string } {
+  const similarityNumber =
+    similarity === '' || similarity == null ? 0 : Number(similarity);
+  const value = Number.isFinite(similarityNumber) ? similarityNumber : 0;
+  return { key: 'similarity', title: 'Similarity', value: value.toFixed(2) };
+}
+
+export const useFilter = ({vstApiUrl}: FilterProps) => {
+  const [streams, setStreams] = useState<StreamInfo[]>([]);
+  const [filterParams, setFilterParamsState] = useState<SearchParams>(() => ({
+    videoSources: [],
+    similarity: 0,
+    agentMode: false,
+    query: '',
+    topK: getStoredTopK()
+  }));
+
+  const setFilterParams = useCallback((params: SearchParams | ((prev: SearchParams) => SearchParams)) => {
+    setFilterParamsState((prev) => {
+      const next = typeof params === 'function' ? params(prev) : { ...prev, ...(params ?? {}) };
+      const topK = next?.topK ?? prev?.topK;
+      if (topK !== undefined && topK !== null) {
+        const num = Number(topK);
+        const prevNum = prev?.topK != null ? Number(prev.topK) : NaN;
+        if (Number.isFinite(num) && num >= 1 && num !== prevNum) setStoredTopK(num);
+      }
+      return next;
+    });
+  }, []);
+  const [filterTags, setFilterTags] = useState(() => [
+    { key: 'similarity', title: 'Similarity', value: Number(filterParams.similarity ?? 0).toFixed(2) },
+    { key: 'topK', title: 'Show top K Results', value: String(filterParams.topK) },
+  ]);
+
+  const fetchSensorList = useCallback(async () => {
+    if (!vstApiUrl) return;
+    
+    try {
+      const response = await fetch(`${vstApiUrl}/v1/sensor/list`);
+      if (!response.ok) {
+        console.error(`Failed to fetch sensor list: ${response.status}`);
+        return;
+      }
+      const sensors = await response.json();
+      
+      const streamList: StreamInfo[] = [];
+      sensors.forEach((sensor: any) => {
+        if (sensor.name && sensor.sensorId && sensor.state === 'online') {
+          streamList.push({
+            sensorId: sensor.sensorId,
+            name: sensor.name,
+            type: sensor.type || ''
+          });
+        }
+      });
+      setStreams(streamList);
+    } catch (err) {
+      console.error('Error fetching sensor list:', err);
+    }
+  }, [vstApiUrl]);
+
+  const addFilter = useCallback((params?: any) => {
+    const paramsToUse = params || filterParams;
+    const { videoSources, similarity, topK } = paramsToUse;
+
+    const tags = [];
+    if (videoSources && videoSources.length > 0) {
+      tags.push({key: 'videoSources', title: 'Video sources', value: videoSources.join(', ')});
+    }
+    tags.push(similarityFilterTag(similarity));
+    // Always include topK tag (robust to numeric 0 or other non-truthy but valid numbers)
+    if (topK !== undefined && topK !== null) {
+      tags.push({key: 'topK', title: 'Show top K Results', value: topK.toString()});
+    }
+    setFilterTags(tags as any);
+  }, [filterParams]);
+
+  // Identity must stay stable across renders: consumers memoize on it, and a
+  // fresh function each render feeds back into Home's sidebar-controls state.
+  const removeFilterTag = useCallback((tag: any) => {
+    if (!tag) {
+      setFilterTags([
+        { key: 'similarity', title: 'Similarity', value: '0.00' },
+        { key: 'topK', title: 'Show top K Results', value: (filterParams.topK ?? DEFAULT_TOP_K).toString() },
+      ]);
+    } else {
+      setFilterTags((prev: any) => prev.filter((t: any) => t !== tag));
+    }
+  }, [filterParams.topK]);
+
+  const fetchData = useCallback(async () => {
+    await fetchSensorList();
+  }, [fetchSensorList]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  return {
+    streams,
+    filterParams,
+    setFilterParams,
+    refetch: fetchData,
+    addFilter,
+    filterTags,
+    removeFilterTag
+  };
+};

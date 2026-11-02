@@ -1,0 +1,946 @@
+---
+title: "Video Summarization"
+description: ""
+position: 1
+---
+The Video Summarization Workflow enables analysis and summarization of video content without being constrained by the standard VLM context window limitations, allowing for the analysis of long-form video content.
+
+**Capabilities**
+
+- Summarize uploaded videos that are longer than the standard VLM context window.
+- Generate reports for one or more uploaded videos.
+- Configure live streams for caption generation (experimental).
+- Summarize live streams over a time range (experimental).
+- Generate reports for live streams over a time range (experimental).
+- Review extracted events in the Kibana dashboard.
+
+**Use Cases**
+
+- Automated incident report generation
+- Event detection in extended video archives
+- Shift summaries and daily activity reports
+
+**Technical Approach**
+
+Standard VLMs are limited to processing short video clips, usually less than 1 minute, depending on the number of subsampled frames and level of detail required. This workflow uses the Video Summarization microservice to segment longer videos, analyze each segment with a VLM, and synthesize the results into coherent summaries with timestamped events. For live streams, the workflow can store VLM captions and events for stream summaries and reports. Stream summary and report generation are experimental.
+
+**Estimated Deployment Time:** 15-20 minutes
+
+The following diagram illustrates the video summarization architecture:
+
+![Vision Agent with Video Summarization Architecture](./assets/images/agent-workflows/profile-lvs-arch.png)
+
+**Key Features of the Vision Agent with Video Summarization:**
+
+- Generate narrative summaries for uploaded video files.
+- Generate reports for a single uploaded video or for multiple uploaded videos in one request.
+- Formulate timestamped highlights based on user-defined events.
+- Configure live streams for caption generation with a monitoring scenario, events, and optional objects of interest (experimental).
+- Summarize live streams and generate reports using stored captions and events (experimental).
+- Return results through the AI agent interface.
+
+## What's being deployed
+
+- **VSS Agent:** Agent service that uses a configured LLM endpoint to route requests and orchestrate tool calls to VSS microservices and model endpoints (LLM/VLM NIMs) to answer questions and generate outputs
+- **VSS Agent UI:** Web UI with chat, video upload, and different views
+- **VSS Video IO & Storage (VIOS):** Video ingestion, recording, and playback services used by the agent for video access and management
+- **Nemotron LLM (NIM):** LLM inference service used for reasoning, tool selection, and response generation
+- **Cosmos3 Nano Reasoner:** Integrated vision-language model checkpoint with physical reasoning capabilities, loaded by RTVI-VLM
+- **RTVI-VLM:** Real-Time Video Intelligence VLM service used by the Video Summarization profile for VLM calls
+- **VSS Video Summarization:** Microservice for segmenting and summarizing video content (uploaded files of any length, plus RTSP live streams)
+- **Kafka:** Message bus used for stream caption and summary events
+- **ELK:** Elasticsearch, Logstash, and Kibana stack for storing and reviewing Video Summarization events and captions
+- **Phoenix:** Observability and telemetry service for agent workflow monitoring
+
+This list describes the stock profile used by the manual Compose deployment.
+Build Vision AI customizes that profile for the requested capabilities. With
+the default NemoClaw harness, or with no harness, it does not deploy the
+in-stack VSS Agent or Phoenix. It also omits the Agent's local LLM unless
+another selected service needs it. Ask for the in-stack VSS Agent if you plan
+to use the Agent REST API or the manual Agent UI workflow below.
+
+## Prerequisites
+
+Before you begin, ensure all of the prerequisites are met. See [Prerequisites](/getting-started/prerequisites) for more details.
+
+## Deploy
+
+<Note>
+For instructions on downloading sample data and the deployment package, see [Download Sample Data and Deployment Package](/getting-started/quickstart#configure-ngc-access) in the Quickstart guide.
+</Note>
+
+### With Agent Skills
+
+#### Step 1: Deploy the Agent
+
+Use VSS Agent Skills from an agent such as Claude Code, Codex, or NemoClaw to deploy and operate the video summarization workflow.
+First, install the `vss-build-vision-ai` skill as described in [Agent Skills](/vision-agent/agent-skills) and make it
+accessible to your agent. The host must meet the same deployment requirements listed above (supported GPU/hardware for that profile)
+and must meet the [Prerequisites](/getting-started/prerequisites).
+
+The `vss-build-vision-ai` skill will choose the `<platform>` and `<mode>` to match your system, as detailed in [Development Profile GPU Requirements](/getting-started/prerequisites#development-profile-gpu-requirements).
+Refer to the requirements table for valid platform and mode combinations compatible with your hardware.
+
+**Deploy prompt structure**
+
+```text title="Deploy prompt structure"
+Deploy the VSS video summarization profile (lvs).
+```
+
+Name an image tag in the prompt to run a release's images instead of the
+`containers.env` default. See
+[Container image tag](/vision-agent/build-vision-ai-skill#container-image-tag).
+
+```text title="Deploy prompt with a release image tag"
+Deploy the VSS video summarization profile (lvs) with image tag ${VSS_DOCS_IMAGE_TAG:-develop-latest}.
+```
+
+What the agent does:
+
+1. Loads the `vss-build-vision-ai` skill and detects the repository, GPU hardware, and host networking values.
+2. Validates required credentials (such as `NGC_CLI_API_KEY`) and prompts you if any are missing.
+3. Selects the `lvs` profile and a platform and mode that fit your hardware, then builds the deployment configuration.
+4. Reviews the configuration with you, then deploys the containers.
+5. Waits until all services are healthy and returns the endpoints available for
+   the deployment, including the NemoClaw URL when that harness is selected.
+
+#### Step 2: Upload a Video
+
+To operate the video summarization and report generation workflow from your agent, install the `vss-manage-video-io-storage`, `vss-summarize-video`, and `vss-generate-video-report` skills as described in [Agent Skills](/vision-agent/agent-skills).
+Your agent can then upload videos, summarize them, and generate reports through VSS with natural-language prompts, without requiring manual interaction with the UI.
+
+Upload a video through the `vss-manage-video-io-storage` skill.
+
+**Upload a video to VIOS**
+
+```text title="Upload a video to VIOS"
+Upload warehouse_sample.mp4 to VIOS.
+```
+
+What the agent does:
+
+1. Loads the `vss-manage-video-io-storage` skill and verifies that VIOS is reachable.
+2. Uploads the video file to VIOS.
+3. Confirms that VIOS lists the new video.
+
+#### Step 3: Summarize a Video and Generate Reports
+
+Ask your agent to summarize an uploaded video or generate a structured report for it. The `vss-summarize-video` skill handles direct summary requests through the Video Summarization microservice (with a VLM fallback). For report requests, the `vss-generate-video-report` skill uses the Video Summarization MS path when the `lvs` profile is ready and renders the result into a report template.
+
+##### Summarize an Uploaded Video
+
+**Summarize an uploaded video**
+
+```text title="Summarize an uploaded video"
+Summarize warehouse_sample with scenario 'warehouse monitoring' and events ['boxes falling', 'forklift stuck', 'person entering restricted area'].
+Summarize warehouse_sample using the default scenario and events.
+```
+
+What the agent does:
+
+1. Loads the `vss-summarize-video` skill and probes the Video Summarization service readiness, routing to the Video Summarization MS when it is ready and to the VLM fallback otherwise.
+2. Resolves the clip URL, stream ID, and timeline through the `vss-manage-video-io-storage` skill.
+3. Collects the monitoring scenario, events, and optional objects of interest, or uses defaults when told to run autonomously.
+4. Calls the Video Summarization service with the clip URL, scenario, events, and chunking parameters.
+5. Renders the narrative summary and timestamped events.
+
+##### Generate a Report
+
+**Generate a report for an uploaded video**
+
+```text title="Generate a report for an uploaded video"
+Generate a report for warehouse_sample with scenario 'warehouse monitoring' and events ['boxes falling', 'forklift stuck', 'person entering restricted area'].
+Generate a report for warehouse_sample using the default scenario and events.
+```
+
+What the agent does:
+
+1. Loads the `vss-generate-video-report` skill and selects the per-clip report mode.
+2. Detects that the `lvs` profile is deployed (the Video Summarization service is ready), so it delegates to the `vss-summarize-video` skill for the summary and timestamped events instead of the VLM-direct path.
+3. Resolves a browser-playable clip URL through the `vss-manage-video-io-storage` skill for the clip links in the report.
+4. Renders the summary and events into the report template.
+5. Returns the rendered report.
+
+<Note>
+Stream summary and report generation are experimental and are not available
+through Agent Skills. They require the in-stack VSS Agent. To use them, ask
+Build Vision AI to deploy the in-stack Agent, as described in the Quickstart's
+[deployment-path comparison](/getting-started/quickstart#whats-being-deployed),
+or follow the manual deployment and [Step 4: Summarize and report on a live
+stream](/vision-agent/agent-workflows/video-summarization#step-4-summarize-and-report-on-a-live-stream)
+below.
+</Note>
+
+### With the VSS CLI
+
+The VSS CLI can upload media and run the Video Summarization service directly from the deployment host. Configure it once against the public VSS ingress, enable memory for persisted jobs, mint a clip URL for an uploaded video, and start a summary:
+
+```bash
+VSS_REPO_ROOT="${VSS_REPO_ROOT:-$HOME/video-search-and-summarization}"
+vss() { uv run --project "${VSS_REPO_ROOT}/libs/vss" vss "$@"; }
+
+vss configure --base-url "http://HOST_IP:7777"
+vss configure check
+vss configure memory --enable
+
+# From this output, record the video's name and sensor_id.
+vss vios list --type video
+
+# From this output, record media_url and start_time.
+vss vios clip --sensor "VIDEO_NAME"
+
+vss summarize run \
+  --url "MEDIA_URL" \
+  --video-id "SENSOR_ID" \
+  --creation-time "START_TIME" \
+  --scenario "warehouse monitoring" \
+  --event "boxes falling" \
+  --event "person entering restricted area"
+```
+
+Replace `HOST_IP`, `VIDEO_NAME`, `SENSOR_ID`, `MEDIA_URL`, and `START_TIME` with values from the deployment and command outputs. `vss summarize run` is synchronous and can take several minutes for a long video. With memory enabled, it records a job before starting the model request; use `vss summarize list` to find the job ID and `vss summarize status --job-id JOB_ID` or `vss summarize get --job-id JOB_ID` from another shell while it runs. Without `vss configure memory --enable`, the retrieval commands exit with code 4.
+
+### Manually
+
+#### Step 1: Deploy the Agent
+
+<Note>
+- Set the NGC CLI API key and authenticate Docker to `nvcr.io` before running the deploy commands. See [Verify Your NGC Access](/getting-started/prerequisites#verify-your-ngc-access).
+- Refer to [Configure the LLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-llm) and [Configure the VLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-vlm) for all LLM and VLM (local and remote) configuration options.
+- For advanced settings and Agent Customization, edit the profile `user-overrides.env`.
+</Note>
+
+```bash
+# Set NGC CLI API key
+export NGC_CLI_API_KEY='your_ngc_api_key'
+
+# Authenticate Docker for gated NIM and other nvcr.io images. The managed VSS
+# images on ghcr.io are public and do not require a registry login.
+printf '%s' "$NGC_CLI_API_KEY" | \
+  docker login nvcr.io --username '$oauthtoken' --password-stdin
+```
+
+See [Configuration](/system-components/configuration) for common variables,
+valid values, defaults, and env-file precedence. The complete profile-specific
+template is
+`deploy/docker/developer-profiles/dev-profile-lvs/overrides.env`.
+
+From the repository checkout root, enter the Compose deployment directory:
+
+```bash
+cd deploy/docker
+```
+
+`overrides.env` is the checked-in template. Copy it to any
+filename matching `*-overrides.env` before selecting a layout. Files matching
+that pattern are ignored by Git so local settings and credentials are not
+committed. The commands below use `user-overrides.env` as a concrete example;
+if you choose another name, use it consistently in every `--env-file` argument.
+Repeat the copy only when you want to discard prior layout changes:
+
+```bash
+PROFILE=lvs
+cp "developer-profiles/dev-profile-${PROFILE}/overrides.env" \
+  "developer-profiles/dev-profile-${PROFILE}/user-overrides.env"
+```
+
+Before starting Compose, complete the host settings and select one hardware
+layout below in `deploy/docker/developer-profiles/dev-profile-lvs/user-overrides.env`.
+
+**Environment-variable overrides:** In `deploy/docker/developer-profiles/dev-profile-lvs/user-overrides.env`, update existing values in place; add a variable only when it is absent. `COMPOSE_PROFILES` is derived from values above it, so appending duplicate model-mode or model-slug variables can select the wrong services.
+
+**Host-path and service-address overrides (all hardware profiles):**
+
+- `VSS_APPS_DIR`: Absolute path to this repository's `deploy/docker` directory.
+- `VSS_DATA_DIR`: Absolute writable host directory for downloaded models, videos, and service data.
+- `HOST_IP`: IP address or hostname that clients use to reach services on this VSS host. Set it to an address reachable by the intended clients.
+- `EXTERNAL_IP`: Address VSS puts in externally reachable service URLs. It defaults to `${HOST_IP}`; on a cloud host or when clients connect from outside the host network, set it to the instance's public address or external hostname.
+
+
+Set these required placeholder values in the existing assignments:
+
+```ini
+VSS_APPS_DIR=/absolute/path/to/video-search-and-summarization/deploy/docker
+VSS_DATA_DIR=/absolute/path/to/vss-apps-data
+HOST_IP=<reachable-host-ip-or-name>
+```
+
+**Prepare host data directories before starting Compose.** Export
+`VSS_DATA_DIR` with the same absolute path set above, then run this block. The
+guard stops before `mkdir` or `chmod` if the value is absent or is not absolute:
+
+```bash
+: "${VSS_DATA_DIR:?Export VSS_DATA_DIR with the value from user-overrides.env}"
+case "$VSS_DATA_DIR" in
+  /*) ;;
+  *) echo "VSS_DATA_DIR must be an absolute path" >&2; exit 1 ;;
+esac
+mkdir -p \
+  "$VSS_DATA_DIR/data_log/analytics_cache" \
+  "$VSS_DATA_DIR/data_log/calibration_toolkit" \
+  "$VSS_DATA_DIR/data_log/elastic/data" \
+  "$VSS_DATA_DIR/data_log/elastic/logs" \
+  "$VSS_DATA_DIR/data_log/kafka" \
+  "$VSS_DATA_DIR/data_log/nvstreamer/vst_data" \
+  "$VSS_DATA_DIR/data_log/redis/data" \
+  "$VSS_DATA_DIR/data_log/redis/log" \
+  "$VSS_DATA_DIR/data_log/vss_video_analytics_api" \
+  "$VSS_DATA_DIR/data_log/vst/clip_storage" \
+  "$VSS_DATA_DIR/agent_eval/dataset" \
+  "$VSS_DATA_DIR/agent_eval/results" \
+  "$VSS_DATA_DIR/models" \
+  "$VSS_DATA_DIR/videos/dev-profile-lvs"
+chmod -R a+rwx \
+  "$VSS_DATA_DIR/data_log" \
+  "$VSS_DATA_DIR/agent_eval" \
+  "$VSS_DATA_DIR/models" \
+  "$VSS_DATA_DIR/videos"
+```
+
+
+**Default container image tag**
+
+`containers.env` uses `VSS_CONTAINER_TAG` as the default tag for all images.
+Export the tag selected for this documentation branch before choosing a hardware
+layout:
+
+```bash
+export VSS_CONTAINER_TAG="${VSS_DOCS_IMAGE_TAG:-develop-latest}"
+```
+
+Any service-specific image tag or tag suffix shown inside a hardware tab
+supersedes or augments this common default. Use the SBSA settings shown in the
+GB300 and DGX Spark tabs when deploying on those platforms.
+
+
+<Tabs>
+<Tab title="H100">
+<Tabs>
+<Tab title="Shared GPU">
+
+```ini
+HARDWARE_PROFILE=H100
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.4
+```
+</Tab>
+<Tab title="Dedicated GPU">
+
+```ini
+HARDWARE_PROFILE=H100
+LLM_DEVICE_ID=0
+VLM_DEVICE_ID=1 # Any non-shared GPU; differ from LLM_DEVICE_ID when the LLM is local
+RT_VLM_DEVICE_ID=1 # Must match VLM_DEVICE_ID
+LLM_MODE=local
+VLM_MODE=local
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=H100
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=H100
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=H100
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="GB300">
+<Tabs>
+<Tab title="Default">
+
+```ini
+HARDWARE_PROFILE=GB300
+LLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_VIDEO_SUMMARIZATION_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.2
+RTVI_VLLM_ATTENTION_BACKEND=TRITON_ATTN
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=GB300
+VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_VIDEO_SUMMARIZATION_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.2
+RTVI_VLLM_ATTENTION_BACKEND=TRITON_ATTN
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=GB300
+LLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_VIDEO_SUMMARIZATION_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=GB300
+RT_VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_VIDEO_SUMMARIZATION_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="RTXPRO6000BW">
+<Tabs>
+<Tab title="Shared GPU">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.4
+```
+</Tab>
+<Tab title="Dedicated GPU">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+LLM_DEVICE_ID=0
+VLM_DEVICE_ID=1 # Any non-shared GPU; differ from LLM_DEVICE_ID when the LLM is local
+RT_VLM_DEVICE_ID=1 # Must match VLM_DEVICE_ID
+LLM_MODE=local
+VLM_MODE=local
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="L40S">
+<Tabs>
+<Tab title="Dedicated GPU">
+
+```ini
+HARDWARE_PROFILE=L40S
+LLM_DEVICE_ID=0
+VLM_DEVICE_ID=1 # Any non-shared GPU; differ from LLM_DEVICE_ID when the LLM is local
+RT_VLM_DEVICE_ID=1 # Must match VLM_DEVICE_ID
+LLM_MODE=local
+VLM_MODE=local
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.8
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=L40S
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.8
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=L40S
+LLM_MODE=local
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=L40S
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="OTHER">
+See [Local LLM and VLM deployments on OTHER hardware](/appendix/faq) for known limitations and constraints.
+
+<Tabs>
+<Tab title="Shared GPU">
+
+```ini
+HARDWARE_PROFILE=OTHER
+LLM_ENV_FILE=/path/to/llm.env
+VLM_ENV_FILE=/path/to/vlm.env
+```
+</Tab>
+<Tab title="Dedicated GPU">
+
+```ini
+HARDWARE_PROFILE=OTHER
+LLM_DEVICE_ID=0
+VLM_DEVICE_ID=1 # Any non-shared GPU; differ from LLM_DEVICE_ID when the LLM is local
+RT_VLM_DEVICE_ID=1 # Must match VLM_DEVICE_ID
+LLM_MODE=local
+VLM_MODE=local
+LLM_ENV_FILE=/path/to/llm.env
+VLM_ENV_FILE=/path/to/vlm.env
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=OTHER
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_ENV_FILE=/path/to/vlm.env
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=OTHER
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+LLM_ENV_FILE=/path/to/llm.env
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=OTHER
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+</Tabs>
+
+After replacing every placeholder in the selected layout, from `deploy/docker`
+validate the resolved configuration, then start the profile:
+
+```bash
+PROFILE=lvs
+docker compose -f compose.yml \
+  --env-file containers.env \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/.env" \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/user-overrides.env" \
+  config --quiet
+
+docker compose -f compose.yml \
+  --env-file containers.env \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/.env" \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/user-overrides.env" \
+  up --detach --pull always --force-recreate --build
+```
+
+On the first bring-up, Docker Compose pulls the required containers from the
+configured GHCR and NGC registries and builds five support images locally:
+Elasticsearch, its initializer, the Kafka topic
+initializer, the broker health checker, and the LVS Kibana initializer. Those
+builds pull base images from Docker Hub and `docker.elastic.co`; the Kafka
+support-image builds also download `jq` from GitHub. Allow outbound access and disk
+space for both pulls and local builds. Depending on your network speed, this
+may take a few minutes.
+
+**This deployment uses the following defaults:**
+
+- LLM model: `nvidia/nemotron-3.5-lightning-30b-a3b`
+- VLM model: `nim_nvidia_cosmos3-nano-reasoner_bf16-final` through RTVI-VLM
+
+<Note>
+When using a remote VLM of model-type `nim` (not `openai`), see [How does a remote `nim` VLM access videos?](/appendix/faq#how-does-a-remote-nim-vlm-access-videos) for access requirements.
+</Note>
+
+Once the deployment is complete, check that all the containers are running and healthy:
+
+```bash
+docker ps
+```
+
+Once all the containers are running, you can access the [Agent UI](/system-components/user-interface) at `http://<HOST_IP>:7777/`.
+
+<Note>
+Kubernetes deployment is supported by the Video Summarization Helm chart in `deploy/helm/developer-profiles/dev-profile-lvs`.
+Use the chart README and `values-lvs.yaml` in the source repository for the complete values reference.
+At minimum, configure the NGC API key, storage class, external host, and Kibana public URL before running
+`helm dependency build` and `helm upgrade --install`.
+</Note>
+
+#### Example prompts
+
+Use natural language prompts in the chat interface. The agent routes the request to the appropriate Video Summarization, VLM, VIOS, or report tool.
+
+| Task | Example prompt |
+| --- | --- |
+| Summarize an uploaded video | `Summarize video1.mp4` |
+| Generate a report for an uploaded video | `Generate a report for video1.mp4` |
+| Generate reports for multiple uploaded videos | `Generate reports for video1.mp4 and video2.mp4` |
+| Start stream captioning (experimental) | `Start generating captions for stream CAM_1` |
+| Summarize a stream (experimental) | `Summarize the stream CAM_1 from 45 seconds till now` |
+| Generate a report for a stream (experimental) | `Generate a report for stream CAM_1 from 45 seconds till now` |
+
+#### Step 2: Upload a video
+
+In the video management tab, drag and drop the video `warehouse_sample.mp4` into the upload area.
+
+Once the video is uploaded, the video will appear in the video list.
+
+#### Step 3: Generate a report for uploaded videos
+
+Ask the agent to generate a report about the uploaded video. Here is an example prompt:
+
+<Note>
+The screenshots in this step show the in-stack VSS Agent UI. VSS Agent collects the Video Summarization parameters in Human in the Loop (HITL) dialog windows and provides the finished report as a PDF download. With NemoClaw's OpenClaw runtime, HITL happens in the OpenClaw chat: the agent asks for needed parameters inline, you answer in the conversation, and the summary or report appears in the chat UI. The VSS Agent's structured HITL dialogs are not available through an external VSS UI connected to NemoClaw, so the dialog and PDF screenshots do not represent that experience.
+</Note>
+
+```bash
+Can you generate a report for warehouse_sample using video summarization?
+```
+
+To generate reports across multiple uploaded videos, include the video names in one prompt:
+
+```bash
+Generate reports for warehouse_sample_1 and warehouse_sample_2.
+```
+
+In the VSS Agent UI, the agent prompts you with four dialog windows to customize the Video Summarization microservice parameters.
+
+You can cancel the workflow at any time by typing "/cancel" in the pop-up input box.
+
+**Scenario**
+   Describe the monitoring context. For example:
+
+   ```text
+   warehouse monitoring
+   ```
+
+**Events** List events of interest to track. For example:
+
+<img src="./assets/images/agent-workflows/lvs-popup-scenario.png" alt="Pop-up for scenario input" width="410px" />
+
+   ```text
+   box falling, accident, person entering restricted area
+   ```
+
+**Objects of Interest** Specify objects to monitor. For example:
+
+<img src="./assets/images/agent-workflows/lvs-popup-events.png" alt="Pop-up for events input" width="410px" />
+
+   ```text
+   forklifts, pallets, workers
+   ```
+
+**Confirmation** Confirm the prompts by clicking 'Submit'.
+
+<img src="./assets/images/agent-workflows/lvs-popup-objects-of-interests.png" alt="Pop-up for objects of interest input" width="410px" />
+
+   You can also redo the prompts by typing "/redo" or cancel the workflow by typing "/cancel".
+
+If you did not cancel the workflow, the agent will show the intermediate steps of the agent's reasoning while the response is being generated and then output the final answer. You can download the report in PDF format by clicking on 'PDF Report' in the agent's response:
+
+<img src="./assets/images/agent-workflows/lvs-popup-confirmation.png" alt="Pop-up for confirmation" width="410px" />
+
+<img src="./assets/images/agent-workflows/lvs-response.png" alt="Report generated" width="410px" />
+
+#### Step 4: Summarize and report on a live stream
+
+<Note>
+Stream summary and stream report generation are experimental. The supported flow is to add a stream from the Video Management tab, ask the agent to start generating captions for the stream, wait for captions to accumulate, and then request a summary or a report for a timestamp range covered by stored captions.
+</Note>
+
+The Video Summarization profile can also analyze live streams. First add a stream from the Video Management tab, then ask the agent to start caption generation for that stream. The agent prompts for the same monitoring scenario, events, and optional objects of interest that are used for uploaded-video analysis.
+
+Example prompt:
+
+```bash
+Start generating captions for stream CAM_1.
+```
+
+After caption generation starts, allow time for captions to accumulate before requesting summaries or reports for the stream.
+
+| Task | Example prompt |
+| --- | --- |
+| Summarize a stream time range | `Summarize the stream CAM_1 from 45 seconds till now.` |
+| Generate a stream report for a time range | `Generate a report for stream CAM_1 from 45 seconds till now.` |
+
+If no captions are available in Elasticsearch for the requested stream and time period, the summary or report request can return empty results. This can happen when the requested time period is before caption generation started, or when the caption generation prompt causes no captions to be stored for that time period.
+
+If multiple agent sessions or agent instances connect to the same backend, the caption generation prompt is overwritten by the latest query. The agent does not have visibility into caption prompts set by other agent instances.
+
+<Note>
+If you ask for a stream summary or report before caption generation has been started for that stream, the agent prompts you to start caption generation first instead of running the request.
+</Note>
+
+<Note>
+Stream reports differ from uploaded-video reports in their format. For example, stream reports use ISO 8601 timestamps instead of seconds, and they do not include per-event screenshots, per-event `[Watch Clip]` links, or a `Resources` playback URL.
+</Note>
+
+#### Step 5: Search for specific events in the Dashboard
+
+On the left sidebar, click on "Dashboard" to open the Kibana dashboard in the main window. From the menu icon,
+choose the "Discover" tab.
+
+<Frame>
+  <img src="./assets/images/agent-workflows/lvs-dashboard-tab.png" alt="Dashboard tab" />
+</Frame>
+
+Set `default_*` in the `Data view` dropdown. Here you can see the events detected in the video or stream. When you click on a row item, a panel opens on the right side with details about the backend request and the event.
+
+<Frame>
+  <img src="./assets/images/agent-workflows/lvs-dashboard-discover.png" alt="Discover tab" />
+</Frame>
+
+#### Step 6: Teardown the Agent
+
+To teardown the agent, run the following command:
+
+```bash
+PROFILE=lvs
+docker compose -f compose.yml \
+  --env-file containers.env \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/.env" \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/user-overrides.env" \
+  down -v --remove-orphans
+```
+
+This command stops the manually deployed Video Summarization containers and
+removes their Compose volumes.
+
+## Service Endpoints
+
+The following endpoints apply to the stock manual Compose deployment. Build
+Vision AI reports the endpoints available in the deployment it creates; use
+that deployment summary instead of assuming every endpoint below is present.
+
+| Service | URL |
+| --- | --- |
+| VSS UI | `http://<HOST_IP>:7777` |
+| Kibana UI | `http://<HOST_IP>:7777/kibana/app/home#/` |
+| NVStreamer UI | `http://<HOST_IP>:31000/#/dashboard` |
+| VST UI | `http://<HOST_IP>:30888/vst/#/dashboard` |
+| Phoenix UI | `http://<HOST_IP>:7777/phoenix/projects` |
+
+## Optional: Use Nemotron Nano V3 Omni (audio-aware VLM)
+
+The Video Summarization profile defaults to **Cosmos3 Nano Reasoner** as the VLM.
+To swap in **Nemotron-Nano-V3-Omni-GA0420-FP8** for audio-aware
+summarization, export your Hugging Face token in the shell that will run Docker
+Compose:
+
+```bash
+export HF_TOKEN='<your_hf_token>'
+```
+
+Keep all Omni settings in
+`deploy/docker/developer-profiles/dev-profile-lvs/user-overrides.env`.
+The Step 1 Compose commands load this file after the profile `.env`, so values
+in `user-overrides.env` take precedence over values in `.env`.
+
+Uncomment the existing **Optional Nemotron Nano Omni RT-VLM override** block
+in your `user-overrides.env` copy. If the block is missing, copy it from
+`deploy/docker/developer-profiles/dev-profile-lvs/overrides.env` and uncomment
+it. Replace existing assignments for the same variables so each variable has
+one active value. The resulting Omni settings should be:
+
+```ini
+RTVI_VLM_MODEL_TO_USE=vllm-compatible
+RTVI_VLM_MODEL_PATH='git:https://huggingface.co/nvidia/Nemotron-Nano-V3-Omni-GA0420-FP8'
+VLM_NAME=Nemotron-Nano-V3-Omni-GA0420-FP8
+VLM_MODEL_SUPPORTS_AUDIO=true
+VLM_TRUST_REMOTE_CODE=true
+INSTALL_PROPRIETARY_CODECS=true
+ENABLE_AUDIO=true
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.45
+```
+
+Keep the template's `HF_TOKEN=${HF_TOKEN:-}` entry unchanged so Compose reads
+the exported credential without storing it in a repository file.
+`RTVI_VLLM_GPU_MEMORY_UTILIZATION` is hardware- and placement-dependent; `0.45`
+is the value for this example. Rerun the full Docker Compose command from Step 1.
+
+After the deployment is complete, verify with:
+
+```bash
+curl http://<HOST_IP>:8018/v1/models | jq
+```
+
+The response should show `"audio_support": true` and the model ID
+`Nemotron-Nano-V3-Omni-GA0420-FP8`, matching `VLM_NAME` in `user-overrides.env`.
+
+For full RTVI-VLM environment variable reference, see [Real-Time VLM Microservice](/system-components/vision-microservices/real-time-vlm).
+
+## Next steps
+
+To run long-video summarization and real-time VLM alerting in one deployment, use the documented [combined custom build](/vision-agent/build-vision-ai-skill#combine-real-time-alerting-and-video-summarization). Do not start the stock LVS and alerts profiles as separate stacks on the same host.
+
+Additionally, you can dive deeper into the agent tools for video management, report generation, and video understanding.
+
+### Known Issues
+
+- For OpenAI remote VLM endpoint, please use `gpt-4o` for now. Other models are not supported yet.
+- **Not supported:** OpenAI VLM with a build.nvidia.com LLM. When using a build.nvidia.com LLM, do not use an OpenAI VLM or set `OPENAI_API_KEY`.
+
+For known issues and limitations, see:
+
+- [Agent Known Issues](/vision-agent/vss-agents/agent-known-issues) - VSS Agent known issues and limitations
+- [Known Issues](/system-components/user-interface#known-issues) - VSS Agent UI known issues
+
+## Troubleshooting
+
+When encountering issues with the Video Summarization workflow:
+
+1. **View container logs** - See [Viewing Container Logs](/vision-agent/vss-agents/observability#viewing-container-logs) for instructions on viewing and analyzing container logs
+2. **Navigate the Phoenix UI** - See [Navigating the Phoenix UI](/vision-agent/vss-agents/observability#navigating-the-phoenix-ui) for step-by-step guidance on viewing traces and debugging agent workflows
+3. **Check known issues** - Review [Agent Known Issues](/vision-agent/vss-agents/agent-known-issues) (agent) and [Known Issues](/system-components/user-interface#known-issues) (UI) for documented limitations and workarounds

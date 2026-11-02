@@ -1,0 +1,227 @@
+---
+title: "Release Notes"
+description: ""
+position: 2
+---
+## Version 3.3.0
+
+### Features
+
+- Deployment profiles:
+
+  - Added Warehouse Helm charts for 2D, 3D, and MV3DT profiles, with optional agents in the 2D chart.
+  - Added support for RTX PRO 4500 Blackwell and GB300 hardware profiles.
+
+- Launchable and Skills:
+
+  - Added Warehouse deployment support to the Build Vision AI skill, covering 2D, 3D, MV3DT, and Auto Calibration profiles, Kafka / Redis variants, and minimal / extended configurations.
+  - Added the `vss-deploy-warehouse-helm` skill and a standalone `compute_stream_cap.py` helper to set stream limits based on GPU hardware.
+  - Updated Behavior Analytics skills for the Build Vision Agent to deploy standalone and combined Search + Alerts workloads, with guidance for proximity alerts, FOV counting, ROI bounding-box overlap, object speed, and people counting.
+  - Updated the Warehouse Brev launchable notebook for the refactored Docker Compose configuration and unified Auto Calibration profile.
+
+- Microservices:
+
+  - Behavior Analytics:
+
+    - Added `behaviorEmitOnce` to emit a final behavior when a track ends, with per-sensor event-time handling, behavior holdback, and shutdown flushing. Real-time emission remains the default, and `isComplete` identifies completed behaviors.
+    - Added configurable ROI ENTRY / EXIT detection based on bounding-box overlap.
+
+  - Auto Calibration: Added support for image-mode calibration
+  - Video IO & Storage (VIOS): Added DASH live-stream playback as an alternative to WebRTC.
+  - MV3DT: Integrated ReID embeddings with Kafka and Elasticsearch ingestion support.
+
+- Models - Core AI models for perception and analytics:
+
+  - [Sparse4D - 3D Warehouse Models v2.3 and v3.0](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/sparse-4-d) - Updated models for synthetic and real-world Warehouse datasets, respectively. `DATASET_TYPE` selects the matching model, anchor, labels, and TensorRT engine configuration.
+  - Perception models are now downloaded from the NGC TAO registry during deployment instead of being bundled in the Warehouse app-data archive.
+
+### Improvements
+
+- Docker Compose:
+
+  - Centralized NvStreamer, VSS Configurator, and Video Analytics API services and removed duplicated profile-specific configurations and Configurator initialization services.
+  - Unified the Warehouse Auto Calibration profile to deploy NvStreamer, VIOS, Auto Calibration, and VSS Configurator together.
+  - Reorganized `.env` and `overrides.env` configuration and updated Warehouse profile-selection defaults.
+
+- Microservices:
+
+  - Behavior Analytics:
+
+    - Combined Search and Alerts in a single Behavior Analytics main application script.
+    - Refactored restricted-area and confined-area violation detection and ROI information handling, simplified trajectory and state management, tuned default pipeline worker counts, and improved worker-lifecycle and fatal-error reporting.
+    - Enabled proximity, confined-area, and restricted-area incidents in the Warehouse 3D profile.
+    - Updated ROI output to report `restrictedAreaViolation=false` when no objects are present.
+  - Video Analytics API: Added readiness checks for Elasticsearch connectivity, the insertion-timestamp ingest pipeline, and required Kafka topics before starting the HTTP listener and accepting calibration uploads. Redis deployments ignore Kafka configuration.
+  - Logstash:
+
+    - Replicated Logstash ingestion pipelines and updated consumer groups per Kafka topic, with worker, batch, heap, and resource tuning to reduce Elasticsearch ingestion delays.
+    - Added the Redis Stream input plugin source code, build documentation, and tests to the repository.
+    - Improved Redis Stream plugin connection-pool lifecycle, graceful shutdown, duplicate-message handling, acknowledgment, and protobuf descriptor loading.
+
+- Models and hardware configuration:
+
+  - Updated the maximum number of streams per GPU for RT-DETR and Sparse4D models.
+  - Increased the RT-DETR Person-class detection limit from 20 to 50.
+  - Added batch-size suffixes to TensorRT engine filenames to prevent incompatible engine reuse.
+  - Tuned RTVI-VLM memory utilization and context length for RTX PRO 4500 Blackwell deployments.
+
+### Fixed Issues
+
+- Alerting and RTVI-VLM:
+
+  - Fixed real-time alerts failing to initialize when Elasticsearch shards were not yet ready.
+  - Fixed missing real-time VLM incidents caused by Redis message-field configuration.
+  - Fixed RTVI-VLM inference failures caused by multimodal processor caching and request serialization.
+
+- Behavior Analytics: Fixed validation of violation-duration thresholds and expiration windows to accept fractional seconds.
+- SDRC: Fixed a startup race with RTVI-CV by waiting for perception readiness before adding streams.
+- Video IO & Storage (VIOS):
+
+  - Fixed incorrect 3D bounding-box overlays caused by projecting boxes behind the camera.
+  - Fixed missing overlays in downloaded recordings when Elasticsearch throttles metadata requests.
+
+## Version 3.2.1
+
+### Features
+
+- Models - Core AI models:
+
+  - [CR](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/cosmos-reasoner) - Updated Cosmos3 Nano Reasoner (NIM) as the default VLM for Warehouse Blueprint.
+
+### Improvements
+
+- VSS Configurator: Fixed an issue with live RTSP stream configuration.
+
+## Version 3.2.0
+
+Initial GitHub release of the VSS Warehouse Blueprint.
+
+### Features
+
+- New profiles introduced:
+
+  - MV3DT profile.
+  - Auto Calibration profile.
+
+- Launchable and Skills:
+
+  - Warehouse deploy launchable notebook.
+  - Warehouse deploy and debug skills.
+  - Behavior Analytics standalone deploy skill.
+  - Video Analytics API standalone deploy skill.
+
+- Microservices:
+
+  - RTVI-VLM always-on alerts enabling Load Quality, PPE, Spillover, and Pathway / Unexpected Obstructions.
+  - Replacement of local VLM with RTVI-VLM.
+  - Auto Calibration:
+
+    - Support for 3D profile deployment.
+    - Support for image coordinates.
+    - Support for RTSP as input.
+
+  - Behavior Analytics: Added support for dynamic configuration changes.
+  - Added dynamic configuration support in Video Analytics API to store and audit configuration changes of Behavior Analytics.
+
+  - Spatial AI Data Utils:
+
+    - Enable region and group assignment to global ROIs and tripwires.
+    - Add evaluation tools for 3D IoU-based tracking evaluation.
+    - Implement data validation and evaluation for 3D inference data.
+    - Add visualization tools.
+
+  - VSS Configurator:
+
+    - Support toggling between Kafka and Redis configurations.
+    - Support editing JSON configuration files.
+
+  - SDR: Auto re-addition of streams on Docker restart for perception services.
+
+### Improvements
+
+- Docker Compose: Refactored to improve modularity of microservices.
+
+- Microservices:
+
+  - Video Analytics API: Retry mechanism for Kafka broker, Elasticsearch, and related services.
+  - Behavior Analytics: Retry mechanism for Kafka broker, Elasticsearch, Redis, MQTT, and related services.
+  - Spatial AI Data Utils: Improved camera grouping algorithms.
+  - VSS Configurator:
+
+    - Added backup and cleanup support for `calibration.json`.
+    - Ensured the calibration file schema is followed after VSS Configurator operations.
+
+  - Alerting service:
+
+    - VLM verification supports JSON output from VLM.
+    - Improved VLM verification accuracy for Near Miss Violation by tuning prompts.
+
+  - VIOS:
+
+    - Added top-view image visualization support on Thor and Spark platforms.
+    - Improved visualization of 3D bounding boxes by using individual camera timestamps when present.
+
+- Models - Core AI models for perception and analytics:
+
+  - [RT-DETR - 2D Warehouse Model v1.0.2](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/rt-detr) - Model for 2D Single-Camera Object Detection.
+  - [Sparse4D - 3D Warehouse Model v2.2](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/sparse-4-d) - Model for 3D Multi-Camera Object Detection and Tracking.
+
+## Version 3.1.0
+
+### Features
+
+- Introduced Minimal profile to deploy the minimal set of microservices to run on a machine with smaller resource footprint
+
+### Improvements
+
+- Microservices
+
+  - Perception:
+    - Perception microservice uses DeepStream SDK v9.0 to perform object detection and tracking.
+    - Performance improvement for IGX Thor.
+  - Behavior Analytics: Enhanced support for image coordinates based analytics.
+  - Agents: Improved the multi-turn conversation capabilities.
+
+- Models - Core AI models for perception and analytics
+  - [RT-DETR - 2D Warehouse Model v1.0.1](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/rt-detr) - Model for 2D Single-Camera Object Detection.
+  - [Sparse4D - 3D Warehouse Model v2.1](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/sparse-4-d) - Model for 3D Multi-Camera Object Detection and Tracking.
+
+### Fixed Issues
+
+- Video IO & Storage (VIOS): Fixed issues with storage service.
+- VSS Configurator: Fixed issues with live RTSP stream configuration.
+
+## Version 3.0.0
+
+Initial release of the VSS Warehouse Blueprint.
+
+### Features
+
+- [Warehouse Blueprint Profiles](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization) - Layered architecture profiles combining microservices, blueprints, and AI agents for 2D and 3D applications
+
+  - [2D Vision AI Profile](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/2-d-vision-ai-profile) - 2D single-camera detection (using RTDETR model), tracking, and analytics
+  - [2D Vision AI with Agents Profile](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/2-d-vision-ai-with-agents-profile) - 2D single-camera detection (using RTDETR model), tracking, analytics, and VSS agent integration
+  - [3D Vision AI Profile](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization/3-d-vision-ai-profile) - 3D multi-camera detection (using Sparse4D model), tracking, and analytics
+
+- Microservices - Core components including video I/O and storage, behavior analytics, RESTful APIs, operations UI, AI agents and Auto Calibration.
+
+  - [Video IO & Storage (VIOS)](/system-components/middleware/video-io-storage-vios) – Microservice for ingesting camera streams (RTSP, WebRTC), managing video recording, playback, and persistent storage
+  - [Behavior Analytics](/system-components/analytics-microservices/behavior-analytics) – Real-time detection and analysis of warehouse events including object tracking, zone monitoring, and behavior pattern recognition
+  - [Video Analytics APIs](/system-components/middleware/api-gateway-mcp/video-analytics-api) – RESTful APIs providing programmatic access to analytics data, event streams, and video workflow management
+  - **Reference Video Analytics UI** – Web-based dashboard for real-time monitoring, incident review, camera management, and analytics visualization
+  - [VSS Agent](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/microservice-configuration/agents) – Natural language interface powered by Nemotron Nano 9B v2 enabling conversational queries about incidents and automated report generation
+
+- Models - Core AI models for perception and analytics
+
+  - [RT-DETR - 2D Warehouse Model v1.0](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/rt-detr) - Model for 2D Single-Camera Object Detection.
+  - [Sparse4D - 3D Warehouse Model v2.0](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/sparse-4-d) - Model for 3D Multi-Camera Object Detection and Tracking.
+  - [CR](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/model-finetuning/cosmos-reasoner) - Reasoning Vision Language Model (VLM) enabling multi-step reasoning across visual and textual inputs.
+
+## Known Limitations
+
+See [Known Limitations](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/operations-monitoring-troubleshooting-faq-known-limitations/known-limitations) for current constraints and workarounds.
+
+## Related Topics
+
+- [Troubleshooting Guide](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/operations-monitoring-troubleshooting-faq-known-limitations/troubleshooting-guide)
+- [Blueprint Profiles](/vision-agent/agent-workflows/industry-specific-examples/warehouse-operations-blueprint/development-workflow/deployment-customization)

@@ -1,0 +1,930 @@
+# Copyright (c) 2019-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import nose_utils  # noqa:F401
+import contextlib
+import math
+from nvidia.dali.pipeline import Pipeline
+import nvidia.dali.fn as fn
+import nvidia.dali.ops as ops
+import nvidia.dali.tfrecord as tfrec
+import numpy as np
+import os
+import tempfile
+import webdataset_base as wds_base
+from test_utils import get_dali_extra_path
+
+
+class COCOReaderPipeline(Pipeline):
+    def __init__(
+        self,
+        data_paths,
+        batch_size,
+        num_threads,
+        shard_id,
+        num_gpus,
+        random_shuffle,
+        stick_to_shard,
+        shuffle_after_epoch,
+        pad_last_batch,
+        initial_fill=1024,
+        shuffle_after_epoch_seed=None,
+    ):
+        # use only 1 GPU, as we care only about shard_id
+        super().__init__(batch_size, num_threads, 0, prefetch_queue_depth=1)
+        self.input = ops.readers.COCO(
+            file_root=data_paths[0],
+            annotations_file=data_paths[1],
+            shard_id=shard_id,
+            num_shards=num_gpus,
+            random_shuffle=random_shuffle,
+            image_ids=True,
+            stick_to_shard=stick_to_shard,
+            shuffle_after_epoch=shuffle_after_epoch,
+            pad_last_batch=pad_last_batch,
+            initial_fill=initial_fill,
+            shuffle_after_epoch_seed=shuffle_after_epoch_seed,
+        )
+
+    def define_graph(self):
+        _, __, ___, ids = self.input(name="Reader")
+        return ids
+
+
+test_data_root = get_dali_extra_path()
+coco_folder = os.path.join(test_data_root, "db", "coco")
+datasets = [[os.path.join(coco_folder, "images"), os.path.join(coco_folder, "instances.json")]]
+
+
+def test_shuffling_patterns():
+    for dataset in datasets:
+        # get reference ids
+        ref_img_ids = []
+        pipe = COCOReaderPipeline(
+            batch_size=1,
+            num_threads=4,
+            shard_id=0,
+            num_gpus=1,
+            data_paths=dataset,
+            random_shuffle=False,
+            stick_to_shard=False,
+            shuffle_after_epoch=False,
+            pad_last_batch=False,
+        )
+        iters = pipe.epoch_size("Reader")
+        for _ in range(iters):
+            pipe.schedule_run()
+            ref_img_ids.append(np.concatenate(pipe.outputs()[0].as_array()))
+        ref_img_ids = set(np.concatenate(ref_img_ids))
+        for num_gpus in [1, 2, 3, 4]:
+            for batch_size in [1, 10, 100]:
+                for stick_to_shard in [True, False]:
+                    for shuffle_after_epoch in [True, False]:
+                        for dry_run_num in [0, 1, 2]:
+                            yield (
+                                check_shuffling_patterns,
+                                dataset,
+                                num_gpus,
+                                batch_size,
+                                stick_to_shard,
+                                shuffle_after_epoch,
+                                dry_run_num,
+                                len(ref_img_ids),
+                            )
+
+
+def check_shuffling_patterns(
+    dataset, num_gpus, batch_size, stick_to_shard, shuffle_after_epoch, dry_run_num, len_ref_img_ids
+):
+    random_shuffle = not shuffle_after_epoch
+    pad_last_batch = batch_size != 1
+    pipes = [
+        COCOReaderPipeline(
+            batch_size=batch_size,
+            num_threads=4,
+            shard_id=gpu,
+            num_gpus=num_gpus,
+            data_paths=dataset,
+            random_shuffle=random_shuffle,
+            stick_to_shard=stick_to_shard,
+            shuffle_after_epoch=shuffle_after_epoch,
+            pad_last_batch=pad_last_batch,
+            initial_fill=1,
+        )
+        for gpu in range(num_gpus)
+    ]
+
+    if stick_to_shard and shuffle_after_epoch:
+        return
+
+    [pipe.build() for pipe in pipes]
+    dataset_size = pipes[0].epoch_size("Reader")
+
+    # dry run
+    for j in range(dry_run_num):
+        for n in range(num_gpus):
+            mod = j
+            if stick_to_shard or shuffle_after_epoch:
+                mod = 0
+            if pad_last_batch:
+                shard_size = dataset_size // num_gpus
+            else:
+                shard_size = (
+                    dataset_size * (n + 1 + mod) // num_gpus - dataset_size * (n + mod) // num_gpus
+                )
+            iters = shard_size // batch_size
+            if shard_size != iters * batch_size:
+                iters += 1
+            for _ in range(iters):
+                pipes[n].run()
+
+    new_img_ids = []
+    for n in range(num_gpus):
+        mod = dry_run_num
+        if stick_to_shard or shuffle_after_epoch:
+            mod = 0
+        if pad_last_batch:
+            shard_size = dataset_size // num_gpus
+        else:
+            shard_size = (
+                dataset_size * (n + 1 + mod) // num_gpus - dataset_size * (n + mod) // num_gpus
+            )
+        iters = shard_size // batch_size
+        if shard_size != iters * batch_size:
+            iters += 1
+        for _ in range(iters):
+            val = np.concatenate(pipes[n].run()[0].as_array())
+            new_img_ids.append(val)
+    new_img_ids = set(np.concatenate(new_img_ids))
+
+    assert len(new_img_ids) == len_ref_img_ids
+
+
+def gather_ids(pipes, epochs_run=0, batch_size=1, num_gpus_arg=None, gpus_arg=None):
+    dataset_size = pipes[0].epoch_size("Reader")
+    num_gpus = len(pipes)
+    if num_gpus_arg:
+        num_gpus = num_gpus_arg
+    iterate_over = range(num_gpus)
+    if gpus_arg:
+        iterate_over = gpus_arg
+    img_ids_list = [[] for _ in pipes]
+
+    # Each GPU needs to iterate from `shard_id * data_size / num_gpus` samples
+    # to `(shard_id + 1)* data_size / num_gpus`.
+    # After each epoch, each GPU moves to the next shard.
+    # The `epochs_run` variable  takes into account that after epoch readers advance to the
+    # next shard. If shuffle_after_epoch or stick_to_shard is set, it doesn't matter
+    # and could/should be 0; it is relevant only if pad_last_batch is False, otherwise each
+    # shard has the same size due to padding.
+    for img_ids_l, pipe, n in zip(img_ids_list, pipes, iterate_over):
+        shard_size = (
+            dataset_size * (n + 1 + epochs_run) // num_gpus
+            - dataset_size * (n + epochs_run) // num_gpus
+        )
+        iters = int(math.ceil(shard_size / batch_size))
+        for _ in range(iters):
+            val = np.concatenate(pipe.run()[0].as_array())
+            img_ids_l.append(val)
+
+    set_list = []
+    for elm in img_ids_list:
+        set_list.append(set(np.concatenate(elm)))
+    if len(pipes) == 1:
+        return img_ids_list[0], set_list[0], epochs_run + 1
+    else:
+        return img_ids_list, set_list, epochs_run + 1
+
+
+def test_global_shuffle_random_shuffle():
+    num_gpus = 2
+    batch_size = 1
+    pipes = [
+        COCOReaderPipeline(
+            batch_size=batch_size,
+            num_threads=4,
+            shard_id=gpu,
+            num_gpus=num_gpus,
+            data_paths=datasets[0],
+            random_shuffle=False,
+            stick_to_shard=False,
+            shuffle_after_epoch=True,
+            pad_last_batch=False,
+        )
+        for gpu in range(num_gpus)
+    ]
+
+    _, img_ids_list_set, _ = gather_ids(pipes)
+    _, img_ids_list_set_new, _ = gather_ids(pipes)
+
+    assert img_ids_list_set[0] != img_ids_list_set_new[0]
+
+    assert img_ids_list_set[1] != img_ids_list_set_new[1]
+
+    assert img_ids_list_set[0].union(img_ids_list_set[1]) == img_ids_list_set_new[0].union(
+        img_ids_list_set_new[1]
+    )
+
+
+def test_global_shuffle_random_shuffle_2():
+    num_gpus = 1
+    batch_size = 1
+    pipes = [
+        COCOReaderPipeline(
+            batch_size=batch_size,
+            num_threads=4,
+            shard_id=gpu,
+            num_gpus=2,
+            data_paths=datasets[0],
+            random_shuffle=False,
+            stick_to_shard=False,
+            shuffle_after_epoch=True,
+            pad_last_batch=False,
+            initial_fill=1,
+        )
+        for gpu in range(num_gpus)
+    ]
+
+    img_ids_list, img_ids_list_set, _ = gather_ids(pipes, num_gpus_arg=2, gpus_arg=[0])
+    assert len(img_ids_list) == len(img_ids_list_set)
+
+    img_ids_list_new, img_ids_list_new_set, _ = gather_ids(pipes, num_gpus_arg=2, gpus_arg=[0])
+
+    assert len(img_ids_list_new) == len(img_ids_list_new_set)
+    assert len(img_ids_list_set.intersection(img_ids_list_new_set)) != 0
+
+
+def test_global_shuffle_dont_mix_epochs():
+    # with `random_shuffle=False` `shuffle_after_epoch=True` should
+    # still make data random between epochs
+    num_gpus = 2
+    batch_size = 1
+    pipes = [
+        COCOReaderPipeline(
+            batch_size=batch_size,
+            num_threads=4,
+            shard_id=gpu,
+            num_gpus=num_gpus,
+            data_paths=datasets[0],
+            random_shuffle=False,
+            stick_to_shard=False,
+            shuffle_after_epoch=True,
+            pad_last_batch=False,
+        )
+        for gpu in range(num_gpus)
+    ]
+
+    _, img_ids_list_set, _ = gather_ids(pipes)
+    _, img_ids_list_set_new, _ = gather_ids(pipes)
+
+    assert img_ids_list_set[0] != img_ids_list_set_new[0]
+    assert img_ids_list_set[1] != img_ids_list_set_new[1]
+    assert img_ids_list_set[0].union(img_ids_list_set[1]) == img_ids_list_set_new[0].union(
+        img_ids_list_set_new[1]
+    )
+
+
+def test_dont_mix_epochs():
+    # with `random_shuffle=False` `shuffle_after_epoch=False` GPU0 data
+    # from epoch 0 should equal to data from GPU1 from epoch 1
+    num_gpus = 2
+    batch_size = 1
+    pipes = [
+        COCOReaderPipeline(
+            batch_size=batch_size,
+            num_threads=4,
+            shard_id=gpu,
+            num_gpus=num_gpus,
+            data_paths=datasets[0],
+            random_shuffle=False,
+            stick_to_shard=False,
+            shuffle_after_epoch=False,
+            pad_last_batch=False,
+        )
+        for gpu in range(num_gpus)
+    ]
+
+    _, img_ids_list_set, epochs_run = gather_ids(pipes)
+    _, img_ids_list_set_new, _ = gather_ids(pipes, epochs_run)
+
+    assert img_ids_list_set[0] == img_ids_list_set_new[1]
+    assert img_ids_list_set[1] == img_ids_list_set_new[0]
+
+
+def create_pipeline(creator, batch_size, num_gpus):
+    iters = 0
+    # make sure that data size and batch are not divisible
+    while iters % batch_size == 0:
+        while iters != 0 and iters % batch_size == 0:
+            batch_size += 1
+
+        pipes = [creator(gpu) for gpu in range(num_gpus)]
+        [pipe.build() for pipe in pipes]
+        iters = pipes[0].epoch_size("Reader")
+        iters = iters // num_gpus
+    return pipes, iters
+
+
+def test_pad_last_batch_epoch_size():
+    pipe = COCOReaderPipeline(
+        batch_size=10,
+        num_threads=4,
+        shard_id=0,
+        num_gpus=1,
+        data_paths=datasets[0],
+        random_shuffle=True,
+        stick_to_shard=False,
+        shuffle_after_epoch=False,
+        pad_last_batch=True,
+    )
+    reference_size = pipe.epoch_size("Reader")
+
+    for num_gpus in range(1, 10):
+        pipe = COCOReaderPipeline(
+            batch_size=10,
+            num_threads=4,
+            shard_id=0,
+            num_gpus=num_gpus,
+            data_paths=datasets[0],
+            random_shuffle=True,
+            stick_to_shard=False,
+            shuffle_after_epoch=False,
+            pad_last_batch=True,
+        )
+        size = pipe.epoch_size("Reader")
+        print(reference_size, size, num_gpus)
+        assert size == int(math.ceil(reference_size * 1.0 / num_gpus)) * num_gpus
+
+
+def test_pad_last_batch():
+    num_gpus = 1
+    batch_size = 100
+
+    pipes, iters = create_pipeline(
+        lambda gpu: COCOReaderPipeline(
+            batch_size=batch_size,
+            num_threads=4,
+            shard_id=gpu,
+            num_gpus=num_gpus,
+            data_paths=datasets[0],
+            random_shuffle=True,
+            stick_to_shard=False,
+            shuffle_after_epoch=False,
+            pad_last_batch=True,
+        ),
+        batch_size,
+        num_gpus,
+    )
+
+    img_ids_list, _, epochs_run = gather_ids(pipes, batch_size=batch_size)
+
+    img_ids_list = np.concatenate(img_ids_list)
+    img_ids_list_set = set(img_ids_list)
+
+    # check number of repeated samples
+    remainder = int(math.ceil(iters * 1.0 / batch_size)) * batch_size - iters
+    # check if repeated samples are equal to the last one
+    mirrored_data = img_ids_list[-remainder - 1 :]
+    print(iters, remainder, set(mirrored_data), img_ids_list)
+    assert len(set(mirrored_data)) == 1
+    assert len(img_ids_list) != len(img_ids_list_set)
+
+    next_img_ids_list, _, _ = gather_ids(pipes, epochs_run, batch_size=batch_size)
+
+    next_img_ids_list = np.concatenate(next_img_ids_list)
+    next_img_ids_list_set = set(next_img_ids_list)
+
+    mirrored_data = next_img_ids_list[-remainder - 1 :]
+    print(set(mirrored_data))
+    assert len(set(mirrored_data)) == 1
+    assert len(next_img_ids_list) != len(next_img_ids_list_set)
+
+
+def _make_shuffle_seed_pipes(seed, num_gpus=2):
+    """Helper to create COCO pipelines with a given shuffle_after_epoch_seed."""
+    pipes = [
+        COCOReaderPipeline(
+            batch_size=1,
+            num_threads=4,
+            shard_id=gpu,
+            num_gpus=num_gpus,
+            data_paths=datasets[0],
+            random_shuffle=False,
+            stick_to_shard=False,
+            shuffle_after_epoch=True,
+            pad_last_batch=False,
+            shuffle_after_epoch_seed=seed,
+        )
+        for gpu in range(num_gpus)
+    ]
+    [pipe.build() for pipe in pipes]
+    return pipes
+
+
+def test_shuffle_after_epoch_seed_reproducible():
+    """Same seed should produce the same shuffling order across runs."""
+    seed = 12345
+    pipes1 = _make_shuffle_seed_pipes(seed)
+    pipes2 = _make_shuffle_seed_pipes(seed)
+
+    # Epoch 1 - both sets of pipes should yield the same order
+    ids1_e1, ids1_e1_set, _ = gather_ids(pipes1)
+    ids2_e1, ids2_e1_set, _ = gather_ids(pipes2)
+
+    assert (
+        ids1_e1_set[0] == ids2_e1_set[0]
+    ), "Same seed should produce the same shard 0 ordering in epoch 1"
+    assert (
+        ids1_e1_set[1] == ids2_e1_set[1]
+    ), "Same seed should produce the same shard 1 ordering in epoch 1"
+
+    # Epoch 2 - still the same order between runs
+    ids1_e2, ids1_e2_set, _ = gather_ids(pipes1)
+    ids2_e2, ids2_e2_set, _ = gather_ids(pipes2)
+
+    assert (
+        ids1_e2_set[0] == ids2_e2_set[0]
+    ), "Same seed should produce the same shard 0 ordering in epoch 2"
+    assert (
+        ids1_e2_set[1] == ids2_e2_set[1]
+    ), "Same seed should produce the same shard 1 ordering in epoch 2"
+
+    # Epochs 1 and 2 should still differ (different per-epoch shuffles)
+    assert ids1_e1_set[0] != ids1_e2_set[0], "Different epochs should produce different orderings"
+
+
+def test_shuffle_after_epoch_seed_different_seeds():
+    """Different seeds should produce different shuffling orders."""
+    pipes_seed1 = _make_shuffle_seed_pipes(seed=11111)
+    pipes_seed2 = _make_shuffle_seed_pipes(seed=99999)
+
+    _, ids_set1, _ = gather_ids(pipes_seed1)
+    _, ids_set2, _ = gather_ids(pipes_seed2)
+
+    # Different seeds should produce different shard orderings
+    # (with a small dataset this could theoretically collide, but is extremely unlikely)
+    assert (
+        ids_set1[0] != ids_set2[0] or ids_set1[1] != ids_set2[1]
+    ), "Different seeds should produce different shuffling patterns"
+
+    # But the union of both shards should still be the full dataset
+    assert ids_set1[0].union(ids_set1[1]) == ids_set2[0].union(
+        ids_set2[1]
+    ), "Both seeds should cover the full dataset"
+
+
+def test_shuffle_after_epoch_seed_backward_compat():
+    """Without shuffle_after_epoch_seed, two separate pipelines should get the same order
+    (old behavior: fixed default seed ensures reproducibility across training runs)."""
+
+    # Two pipelines with no explicit seed and same shard_id/num_shards
+    def make_no_seed_pipe(shard_id):
+        return COCOReaderPipeline(
+            batch_size=1,
+            num_threads=4,
+            shard_id=shard_id,
+            num_gpus=2,
+            data_paths=datasets[0],
+            random_shuffle=False,
+            stick_to_shard=False,
+            shuffle_after_epoch=True,
+            pad_last_batch=False,
+        )
+
+    pipes1 = [make_no_seed_pipe(g) for g in range(2)]
+    [p.build() for p in pipes1]
+    pipes2 = [make_no_seed_pipe(g) for g in range(2)]
+    [p.build() for p in pipes2]
+
+    _, ids_set1, _ = gather_ids(pipes1)
+    _, ids_set2, _ = gather_ids(pipes2)
+
+    assert (
+        ids_set1[0] == ids_set2[0]
+    ), "Without explicit seed, same shard should produce the same order (backward compat)"
+    assert (
+        ids_set1[1] == ids_set2[1]
+    ), "Without explicit seed, same shard should produce the same order (backward compat)"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  WebDataset shuffle_after_epoch tests
+# ────────────────────────────────────────────────────────────────────────────
+
+# Use 3 distinct tar shards so shard-level shuffling is observable.
+_wds_tars = [
+    os.path.join(get_dali_extra_path(), f"db/webdataset/MNIST/devel-{i}.tar") for i in range(3)
+]
+
+
+@contextlib.contextmanager
+def _make_wds_pipe(
+    shuffle_after_epoch, num_shards=1, shard_id=0, shuffle_after_epoch_seed=None, seed=42
+):
+    """Context manager: build a multi-shard WebDataset pipeline (3 tar files)."""
+    index_files = [wds_base.generate_temp_index_file(t) for t in _wds_tars]
+    kwargs = dict(
+        paths=_wds_tars,
+        index_paths=[f.name for f in index_files],
+        ext=["jpg", "cls"],
+        num_shards=num_shards,
+        shard_id=shard_id,
+        shuffle_after_epoch=shuffle_after_epoch,
+        random_shuffle=True,
+        pad_last_batch=False,
+        prefetch_queue_depth=1,
+        name="Reader",
+    )
+    if shuffle_after_epoch_seed is not None:
+        kwargs["shuffle_after_epoch_seed"] = shuffle_after_epoch_seed
+
+    @wds_base.pipeline_def(batch_size=1, num_threads=1, device_id=0, seed=seed)
+    def _pipe():
+        jpg, cls = fn.readers.webdataset(**kwargs)
+        return jpg, cls
+
+    try:
+        yield _pipe()
+    finally:
+        for f in index_files:
+            f.close()
+
+
+def _collect_wds_epoch(pipe):
+    """Run one full epoch; return list of (jpg_header_bytes, cls) fingerprints."""
+    values = []
+    epoch_size = pipe.epoch_size("Reader")
+    for _ in range(epoch_size):
+        jpg, cls = pipe.run()
+        # First 16 bytes of each JPEG are unique enough per image
+        jpg_bytes = bytes(jpg.as_array().flatten()[:16].tolist())
+        cls_byte = int(cls.as_array().flatten()[0])
+        values.append((jpg_bytes, cls_byte))
+    return values
+
+
+def test_wds_shuffle_after_epoch_changes_order():
+    """shuffle_after_epoch=True must produce different sample order across epochs."""
+    with _make_wds_pipe(shuffle_after_epoch=True) as pipe:
+        epoch1 = _collect_wds_epoch(pipe)
+        epoch2 = _collect_wds_epoch(pipe)
+        assert epoch1 != epoch2, "shuffle_after_epoch should change sample order between epochs"
+        assert sorted(epoch1) == sorted(epoch2), "All samples must be present in both epochs"
+
+
+def test_wds_no_shuffle_after_epoch_stable_order():
+    """shuffle_after_epoch=False: two pipelines with the same seed must produce identical output."""
+    with _make_wds_pipe(shuffle_after_epoch=False) as pipe1, _make_wds_pipe(
+        shuffle_after_epoch=False
+    ) as pipe2:
+        assert _collect_wds_epoch(pipe1) == _collect_wds_epoch(
+            pipe2
+        ), "Without shuffle_after_epoch, same-seed pipelines must produce identical output"
+
+
+def test_wds_shuffle_after_epoch_seed_reproducible():
+    """Same seed must produce the same order in independent pipelines."""
+    seed = 42
+    with _make_wds_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=seed
+    ) as pipe1, _make_wds_pipe(shuffle_after_epoch=True, shuffle_after_epoch_seed=seed) as pipe2:
+        epoch1_a = _collect_wds_epoch(pipe1)
+        epoch1_b = _collect_wds_epoch(pipe2)
+        assert epoch1_a == epoch1_b, "Same seed must produce the same order"
+        epoch2_a = _collect_wds_epoch(pipe1)
+        epoch2_b = _collect_wds_epoch(pipe2)
+        assert epoch2_a == epoch2_b, "Same seed must produce the same order in epoch 2"
+        assert epoch1_a != epoch2_a, "Different epochs should have different orderings"
+
+
+def test_wds_shuffle_after_epoch_different_seeds():
+    """Different seeds must (almost certainly) produce different orderings."""
+    with _make_wds_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=111
+    ) as pipe1, _make_wds_pipe(shuffle_after_epoch=True, shuffle_after_epoch_seed=999) as pipe2:
+        epoch1 = _collect_wds_epoch(pipe1)
+        epoch2 = _collect_wds_epoch(pipe2)
+        assert epoch1 != epoch2, "Different seeds should produce different orderings"
+        assert sorted(epoch1) == sorted(epoch2), "Both seeds must cover all samples"
+
+
+def test_wds_shuffle_after_epoch_different_seeds_first_epoch():
+    """Different seeds must produce different orderings already in the first epoch."""
+    with _make_wds_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=111
+    ) as pipe1, _make_wds_pipe(shuffle_after_epoch=True, shuffle_after_epoch_seed=999) as pipe2:
+        epoch1_a = _collect_wds_epoch(pipe1)
+        epoch1_b = _collect_wds_epoch(pipe2)
+        assert epoch1_a != epoch1_b, "Different seeds must differ in the first epoch"
+        assert sorted(epoch1_a) == sorted(epoch1_b), "Both seeds must cover all samples"
+
+
+def test_wds_shuffle_after_epoch_multi_shard_coverage():
+    """With 2 shards, the union of samples per epoch should cover the full dataset."""
+    with _make_wds_pipe(
+        shuffle_after_epoch=True, num_shards=2, shard_id=0
+    ) as pipe0, _make_wds_pipe(shuffle_after_epoch=True, num_shards=2, shard_id=1) as pipe1:
+        epoch1_shards = [_collect_wds_epoch(pipe0), _collect_wds_epoch(pipe1)]
+        epoch2_shards = [_collect_wds_epoch(pipe0), _collect_wds_epoch(pipe1)]
+        all_e1 = sorted(epoch1_shards[0] + epoch1_shards[1])
+        all_e2 = sorted(epoch2_shards[0] + epoch2_shards[1])
+        assert all_e1 == all_e2, "Union of all shards must be the same dataset in every epoch"
+        assert (
+            epoch1_shards[0] != epoch2_shards[0] or epoch1_shards[1] != epoch2_shards[1]
+        ), "At least one shard should change order between epochs"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  TFRecord shuffle_after_epoch tests
+# ────────────────────────────────────────────────────────────────────────────
+
+_tfrecord = os.path.join(get_dali_extra_path(), "db", "tfrecord", "train")
+_tfrecord_idx = os.path.join(get_dali_extra_path(), "db", "tfrecord", "train.idx")
+
+
+def _split_tfrecord_index():
+    """Split train.idx into three parts; return (tmp_idx0, tmp_idx1, tmp_idx2).
+
+    All three index files reference the same data file but cover non-overlapping
+    records.  Using three logical files ensures file-level shuffling produces an
+    observable reordering across epochs.
+    """
+    with open(_tfrecord_idx) as f:
+        lines = [line for line in f.readlines() if line.strip()]
+    n = len(lines)
+    t0 = tempfile.NamedTemporaryFile(mode="w", suffix=".idx", delete=False)
+    t1 = tempfile.NamedTemporaryFile(mode="w", suffix=".idx", delete=False)
+    t2 = tempfile.NamedTemporaryFile(mode="w", suffix=".idx", delete=False)
+    t0.writelines(lines[: n // 3])
+    t1.writelines(lines[n // 3 : 2 * n // 3])
+    t2.writelines(lines[2 * n // 3 :])
+    t0.close()
+    t1.close()
+    t2.close()
+    return t0.name, t1.name, t2.name
+
+
+@contextlib.contextmanager
+def _make_tfrecord_pipe(
+    shuffle_after_epoch, num_shards=1, shard_id=0, shuffle_after_epoch_seed=None, seed=42
+):
+    """Context manager: build a 3-shard TFRecord pipeline (same data file, split index).
+
+    Using three logical files ensures file-level shuffling produces an
+    observable reordering across epochs.
+    """
+    idx0, idx1, idx2 = _split_tfrecord_index()
+    kwargs = dict(
+        path=[_tfrecord, _tfrecord, _tfrecord],
+        index_path=[idx0, idx1, idx2],
+        features={"image/class/label": tfrec.FixedLenFeature([1], tfrec.int64, -1)},
+        num_shards=num_shards,
+        shard_id=shard_id,
+        shuffle_after_epoch=shuffle_after_epoch,
+        random_shuffle=True,
+        pad_last_batch=False,
+        prefetch_queue_depth=1,
+        name="Reader",
+    )
+    if shuffle_after_epoch_seed is not None:
+        kwargs["shuffle_after_epoch_seed"] = shuffle_after_epoch_seed
+
+    from nvidia.dali import pipeline_def
+
+    @pipeline_def(batch_size=1, num_threads=1, device_id=0, seed=seed)
+    def _pipe():
+        inputs = fn.readers.tfrecord(**kwargs)
+        return inputs["image/class/label"]
+
+    try:
+        yield _pipe()
+    finally:
+        for path in (idx0, idx1, idx2):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass  # file may not exist if creation failed
+
+
+def _collect_tfrecord_epoch(pipe):
+    """Run one full epoch and return a list of label values."""
+    values = []
+    epoch_size = pipe.epoch_size("Reader")
+    for _ in range(epoch_size):
+        out = pipe.run()
+        values.append(int(out[0].as_array().flatten()[0]))
+    return values
+
+
+def test_tfrecord_shuffle_after_epoch_changes_order():
+    """shuffle_after_epoch=True must produce different sample order across epochs."""
+    with _make_tfrecord_pipe(shuffle_after_epoch=True) as pipe:
+        epoch1 = _collect_tfrecord_epoch(pipe)
+        epoch2 = _collect_tfrecord_epoch(pipe)
+        assert sorted(epoch1) == sorted(epoch2), "All samples must be present in both epochs"
+        assert epoch1 != epoch2, "shuffle_after_epoch should change order between epochs"
+
+
+def test_tfrecord_no_shuffle_after_epoch_stable_order():
+    """shuffle_after_epoch=False: two pipelines with the same seed must produce identical output."""
+    with _make_tfrecord_pipe(shuffle_after_epoch=False) as pipe1, _make_tfrecord_pipe(
+        shuffle_after_epoch=False
+    ) as pipe2:
+        assert _collect_tfrecord_epoch(pipe1) == _collect_tfrecord_epoch(
+            pipe2
+        ), "Without shuffle_after_epoch, same-seed pipelines must produce identical output"
+
+
+def test_tfrecord_shuffle_after_epoch_seed_reproducible():
+    """Same seed must produce the same order across independent pipelines."""
+    seed = 77
+    with _make_tfrecord_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=seed
+    ) as pipe1, _make_tfrecord_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=seed
+    ) as pipe2:
+        epoch1_a = _collect_tfrecord_epoch(pipe1)
+        epoch1_b = _collect_tfrecord_epoch(pipe2)
+        assert epoch1_a == epoch1_b, "Same seed must produce the same order"
+        epoch2_a = _collect_tfrecord_epoch(pipe1)
+        epoch2_b = _collect_tfrecord_epoch(pipe2)
+        assert epoch2_a == epoch2_b, "Same seed must produce the same order in epoch 2"
+        assert epoch1_a != epoch2_a, "Different epochs should have different orderings"
+
+
+def test_tfrecord_shuffle_after_epoch_different_seeds_first_epoch():
+    """Different seeds must produce different orderings already in the first epoch."""
+    with _make_tfrecord_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=111
+    ) as pipe1, _make_tfrecord_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=999
+    ) as pipe2:
+        epoch1_a = _collect_tfrecord_epoch(pipe1)
+        epoch1_b = _collect_tfrecord_epoch(pipe2)
+        assert epoch1_a != epoch1_b, "Different seeds must differ in the first epoch"
+        assert sorted(epoch1_a) == sorted(epoch1_b), "Both seeds must cover all samples"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  MXNet / RecordIO shuffle_after_epoch tests
+# ────────────────────────────────────────────────────────────────────────────
+
+_mxnet_rec = os.path.join(get_dali_extra_path(), "db", "recordio", "train.rec")
+_mxnet_idx = os.path.join(get_dali_extra_path(), "db", "recordio", "train.idx")
+
+
+def _split_mxnet_rec():
+    """Split train.rec into three roughly equal parts at record boundaries.
+
+    RecordIOLoader accepts a single index file and uses the global offsets in it
+    to map records to files via cumulative file-size accounting.  Splitting the
+    .rec at record-boundary offsets (without touching the .idx) therefore works
+    transparently: the original index contains global offsets and the loader
+    correctly computes local offsets for each piece.
+
+    Returns (rec0_path, rec1_path, rec2_path).
+    """
+    # Parse sorted global offsets from the index
+    offsets = []
+    with open(_mxnet_idx) as f:
+        for line in f:
+            parts = line.strip().split()
+            if parts:
+                offsets.append(int(parts[1]))
+    offsets.sort()
+
+    n = len(offsets)
+    # Choose split points at 1/3 and 2/3 of the record list
+    split1 = offsets[n // 3]
+    split2 = offsets[2 * n // 3]
+
+    with open(_mxnet_rec, "rb") as f:
+        data = f.read()
+
+    f0 = tempfile.NamedTemporaryFile(suffix=".rec", delete=False)
+    f0.write(data[:split1])
+    f0.close()
+
+    f1 = tempfile.NamedTemporaryFile(suffix=".rec", delete=False)
+    f1.write(data[split1:split2])
+    f1.close()
+
+    f2 = tempfile.NamedTemporaryFile(suffix=".rec", delete=False)
+    f2.write(data[split2:])
+    f2.close()
+
+    return f0.name, f1.name, f2.name
+
+
+@contextlib.contextmanager
+def _make_mxnet_pipe(
+    shuffle_after_epoch, num_shards=1, shard_id=0, shuffle_after_epoch_seed=None, seed=42
+):
+    """Context manager: build a MXNet RecordIO pipeline using 3 split .rec files.
+
+    The original .idx file is reused unchanged – it stores global offsets and
+    the loader maps them to the correct file via cumulative file-size tracking.
+    Using three logical files ensures file-level shuffling produces an
+    observable reordering across epochs.
+    """
+    rec0, rec1, rec2 = _split_mxnet_rec()
+    kwargs = dict(
+        path=[rec0, rec1, rec2],
+        index_path=[_mxnet_idx],
+        num_shards=num_shards,
+        shard_id=shard_id,
+        shuffle_after_epoch=shuffle_after_epoch,
+        random_shuffle=True,
+        pad_last_batch=False,
+        prefetch_queue_depth=1,
+        name="Reader",
+    )
+    if shuffle_after_epoch_seed is not None:
+        kwargs["shuffle_after_epoch_seed"] = shuffle_after_epoch_seed
+
+    from nvidia.dali import pipeline_def
+
+    @pipeline_def(batch_size=1, num_threads=1, device_id=0, seed=seed)
+    def _pipe():
+        data, label = fn.readers.mxnet(**kwargs)
+        return data
+
+    try:
+        yield _pipe()
+    finally:
+        for path in (rec0, rec1, rec2):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass  # file may not exist if creation failed
+
+
+def _collect_mxnet_epoch(pipe):
+    """Run one full epoch, return list of per-sample fingerprints."""
+    values = []
+    epoch_size = pipe.epoch_size("Reader")
+    for _ in range(epoch_size):
+        out = pipe.run()
+        arr = out[0].as_array().flatten()
+        # JPEG JFIF header is identical for many images; sample bytes from
+        # multiple offsets for a unique per-sample fingerprint.
+        n = len(arr)
+        fp = bytes(arr[min(i, n - 1)] for i in [0, 20, 40, 60, 80, 100, 200, 300])
+        values.append(fp)
+    return values
+
+
+def test_mxnet_shuffle_after_epoch_changes_order():
+    """shuffle_after_epoch=True must produce different sample order across epochs."""
+    with _make_mxnet_pipe(shuffle_after_epoch=True) as pipe:
+        epoch1 = _collect_mxnet_epoch(pipe)
+        epoch2 = _collect_mxnet_epoch(pipe)
+        assert sorted(epoch1) == sorted(epoch2), "All samples must be present in both epochs"
+        assert epoch1 != epoch2, "shuffle_after_epoch should change order between epochs"
+
+
+def test_mxnet_no_shuffle_after_epoch_stable_order():
+    """shuffle_after_epoch=False: two pipelines with the same seed must produce identical output."""
+    with _make_mxnet_pipe(shuffle_after_epoch=False) as pipe1, _make_mxnet_pipe(
+        shuffle_after_epoch=False
+    ) as pipe2:
+        assert _collect_mxnet_epoch(pipe1) == _collect_mxnet_epoch(
+            pipe2
+        ), "Without shuffle_after_epoch, same-seed pipelines must produce identical output"
+
+
+def test_mxnet_shuffle_after_epoch_seed_reproducible():
+    """Same seed must produce the same order across independent pipelines."""
+    seed = 55
+    with _make_mxnet_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=seed
+    ) as pipe1, _make_mxnet_pipe(shuffle_after_epoch=True, shuffle_after_epoch_seed=seed) as pipe2:
+        epoch1_a = _collect_mxnet_epoch(pipe1)
+        epoch1_b = _collect_mxnet_epoch(pipe2)
+        assert epoch1_a == epoch1_b, "Same seed must produce the same order"
+        epoch2_a = _collect_mxnet_epoch(pipe1)
+        epoch2_b = _collect_mxnet_epoch(pipe2)
+        assert epoch2_a == epoch2_b, "Same seed must produce the same order in epoch 2"
+        assert epoch1_a != epoch2_a, "Different epochs should have different orderings"
+
+
+def test_mxnet_shuffle_after_epoch_different_seeds_first_epoch():
+    """Different seeds must produce different orderings already in the first epoch."""
+    with _make_mxnet_pipe(
+        shuffle_after_epoch=True, shuffle_after_epoch_seed=111
+    ) as pipe1, _make_mxnet_pipe(shuffle_after_epoch=True, shuffle_after_epoch_seed=999) as pipe2:
+        epoch1_a = _collect_mxnet_epoch(pipe1)
+        epoch1_b = _collect_mxnet_epoch(pipe2)
+        assert epoch1_a != epoch1_b, "Different seeds must differ in the first epoch"
+        assert sorted(epoch1_a) == sorted(epoch1_b), "Both seeds must cover all samples"

@@ -1,0 +1,168 @@
+// Copyright (c) 2017-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <string_view>
+#include "dali/pipeline/data/backend.h"
+#include "dali/pipeline/operator/builtin/conditional/split_merge.h"
+#include "dali/pipeline/operator/operator.h"
+
+namespace dali {
+
+inline bool IsVideoInput(const OpSchema& schema) {
+#if FFMPEG_ENABLED
+  return schema.name() == "experimental__inputs__Video";
+#else
+  return false;
+#endif
+}
+
+namespace {
+
+template <typename Backend, typename NameType>
+inline void ValidateMetadata(
+      const TensorList<Backend> &what,
+      const OpSpec::InOutDesc &against,
+      std::string_view category,
+      NameType &&index_or_name) {
+  if (what.num_samples() == 0)  // empty batch may have improper ndim/layout, but we don't care
+    return;
+  auto display_name = [&]() {
+    if constexpr (std::is_arithmetic_v<std::remove_cvref_t<NameType>>)
+      return index_or_name;
+    else
+      return make_string('"', index_or_name, '"');
+  };
+
+  if (against.ndim) {
+    if (what.sample_dim() != *against.ndim)
+      throw std::invalid_argument(make_string(
+        "Unexpected dimensionality of ", category, " ", display_name(), ". Got ",
+        what.sample_dim(), ", expected ", *against.ndim));
+  }
+  if (against.dtype) {
+    if (what.type() != *against.dtype)
+      throw std::invalid_argument(make_string(
+        "Unexpected data type of ", category, " ", display_name(), ". Got ",
+        what.type(), ", expected ", *against.dtype));
+  }
+  if (against.layout && !against.layout->empty()) {
+    if (what.GetLayout() != *against.layout)
+      throw std::invalid_argument(make_string(
+        "Unexpected layout of ", category, " ", display_name(), ". Got \"",
+        what.GetLayout(), "\", expected \"", *against.layout, "\""));
+  }
+}
+
+}  // namespace
+
+DLL_PUBLIC void ValidateInputMetadata(const Workspace &ws /* to validate */, const OpSpec &spec) {
+  bool debug;
+  if (spec.TryGetArgument(debug, "__debug") && debug)
+    return;  // legacy debug mode has incomplete OpSpec
+
+  if (ws.NumInput() != spec.NumRegularInput())
+    throw std::invalid_argument("The number of inputs in the workspace does not match op_spec");
+
+  for (int i = 0; i < spec.NumRegularInput(); i++) {
+    auto &desc = spec.InputDesc(i);
+    if (desc.has_metadata()) {
+      ws.WithInput(i, [&](auto &input) { ValidateMetadata(input, desc, "input", i); });
+    }
+  }
+
+  for (int i = spec.NumRegularInput(); i < spec.NumInput(); i++) {
+    auto &desc = spec.InputDesc(i);
+    if (desc.has_metadata()) {
+      const auto &name = spec.ArgumentInputName(i);
+      auto &tl = ws.ArgumentInput(name);
+      ValidateMetadata(tl, desc, "argument ", name);
+    }
+  }
+}
+
+DLL_PUBLIC void ValidateOutputMetadata(const Workspace &ws /* to_validate */, const OpSpec &spec) {
+  bool debug;
+  if (spec.TryGetArgument(debug, "__debug") && debug)
+    return;  // legacy debug mode has incomplete OpSpec
+
+  if (ws.NumOutput() != spec.NumOutput())
+    throw std::invalid_argument("The number of outputs in the workspace does not match op_spec");
+
+  for (int i = 0; i < spec.NumOutput(); i++) {
+    auto &desc = spec.OutputDesc(i);
+    if (desc.has_metadata()) {
+      ws.WithOutput(i, [&](auto &output) { ValidateMetadata(output, desc, "output", i); });
+    }
+  }
+}
+
+void OperatorBase::EnforceUniformInputBatchSize(const Workspace &ws) const {
+  // Builtin operators have relaxed checks for the purpose of conditional execution
+  if (IsSplitOrMerge(spec_.GetSchema())) {
+    return;
+  }
+  if (IsVideoInput(spec_.GetSchema())) {
+    return;
+  }
+  auto curr_batch_size = ws.NumInput() > 0 ? ws.GetInputBatchSize(0) : ws.GetRequestedBatchSize(0);
+  for (int i = 0; i < ws.NumInput(); i++) {
+    DALI_ENFORCE(curr_batch_size == ws.GetInputBatchSize(i),
+                 "Batch size has to be uniform across one iteration.");
+  }
+  for (const auto &arg : ws.ArgumentInputs()) {
+    DALI_ENFORCE(
+        curr_batch_size == static_cast<decltype(curr_batch_size)>(arg.cpu->num_samples()),
+        "ArgumentInput has to have the same batch size as an input.");
+  }
+}
+
+void OperatorBase::EnforceUniformOutputBatchSize(const Workspace &ws) const {
+  // Builtin operators have relaxed checks for the purpose of conditional execution
+  if (IsSplitOrMerge(spec_.GetSchema())) {
+    return;
+  }
+  if (IsVideoInput(spec_.GetSchema())) {
+    return;
+  }
+  auto ref_batch_size = ws.NumInput() > 0 ? ws.GetInputBatchSize(0) : ws.GetRequestedBatchSize(0);
+  for (int i = 0; i < ws.NumOutput(); i++) {
+    auto output_batch_size = ws.GetOutputBatchSize(i);
+    DALI_ENFORCE(ref_batch_size == output_batch_size,
+                 make_string("Batch size has to be uniform across one iteration. Expected: ",
+                             ref_batch_size, "; Actual: ", output_batch_size));
+  }
+}
+
+DALI_DEFINE_OPTYPE_REGISTRY(CPUOperator, OperatorBase);
+DALI_DEFINE_OPTYPE_REGISTRY(GPUOperator, OperatorBase);
+DALI_DEFINE_OPTYPE_REGISTRY(MixedOperator, OperatorBase);
+
+std::unique_ptr<OperatorBase> InstantiateOperator(const OpSpec &spec) {
+  string device = spec.GetArgument<string>("device");
+  // Aliases are not registered in the operator factories, but OpSpec resolves them,
+  // so SchemaName() is the name of the actual operator.
+  const std::string &name = spec.SchemaName();
+  // traverse devices by likelihood (gpu, cpu, mixed)
+  if (device == "gpu") {
+    return GPUOperatorRegistry::Registry().Create(name, spec, device);
+  } else if (device == "cpu") {
+    return CPUOperatorRegistry::Registry().Create(name, spec, device);
+  } else if (device == "mixed") {
+    return MixedOperatorRegistry::Registry().Create(name, spec, device);
+  } else {
+    DALI_FAIL("Unknown device: " + device);
+  }
+}
+
+}  // namespace dali

@@ -1,0 +1,303 @@
+#!/bin/bash
+
+# Force error checking
+set -e
+# Force tests to be verbose
+set -x
+
+# make python output unbuffered to get more accurate timestamps
+export PYTHONUNBUFFERED=1
+
+topdir=$(cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )/..
+# supress leaks that are false positive or not related to DALI
+export LSAN_OPTIONS=suppressions=$topdir/qa/leak.sup
+export ASAN_OPTIONS=start_deactivated=true:detect_leaks=0:detect_container_overflow=0:suppressions=$topdir/qa/address.sup
+
+source $topdir/qa/setup_test_common.sh
+
+# Set runner for python tests
+export PYTHONPATH=${PYTHONPATH}:$topdir/qa:$topdir/dali/test/python
+python_test_runner_package="nose2 nose2-test-timer"
+# Python test runner (nose2)
+python_new_test_runner="python -m nose2"
+python_new_test_args="--verbose --plugin=nose2_test_timer.plugin --with-timer --timer-color --timer-top-n 20"
+python_new_invoke_test="${python_new_test_runner} ${python_new_test_args}"
+
+# Set proper CUDA version for packages, requiring it
+pip_packages=$(eval "echo \"${pip_packages}\"" | sed "s/##CUDA_VERSION##/${CUDA_VERSION}/")
+last_config_index=$($topdir/qa/setup_packages.py -n -u $pip_packages --cuda ${CUDA_VERSION})
+
+install_pip_pkg() {
+    install_cmd="$@"
+    # pip refuses to uninstall a distribution whose metadata has no RECORD file - which is how
+    # distro package managers install Python packages - and aborts the whole command instead of
+    # upgrading it. That can happen with any package list, so recognize it here rather than at
+    # each call site. The message differs across pip versions: pip >= 23.3 tags it
+    # "uninstall-no-record-file", older pip just says "RECORD file not found"; the distutils
+    # sibling case has no reference tag at all.
+    local no_record_re='uninstall-no-record-file|RECORD file not found|distutils installed project'
+    local pip_log pip_status
+    pip_log=$(mktemp)
+    pip_status=$(mktemp)
+    # `tee` keeps the output streaming into the test log; the exit status has to be captured
+    # through a file rather than $? or $PIPESTATUS[0], because the `if` below runs the AND-OR
+    # list in a pipeline subshell - with `set -e` in force (as in every caller of this function)
+    # a non-zero status inside that subshell would abort it before any assignment after the list
+    # could run, so the status has to be written from inside the list itself.
+    {
+        # if no package was found in our download dir, so install it from index
+        if ${install_cmd} --no-index || ${install_cmd}; then
+            echo 0 >"${pip_status}"
+        else
+            echo $? >"${pip_status}"
+        fi
+    } 2>&1 | tee "${pip_log}"
+    local ret
+    ret=$(cat "${pip_status}" 2>/dev/null || echo 1)
+    if [ "${ret}" != "0" ] && grep -qE "${no_record_re}" "${pip_log}"; then
+        # this is what pip itself now suggests for this error; it leaves the stale .dist-info
+        # behind, so anything introspecting installed versions afterwards may see the old one
+        echo "pip cannot uninstall a preinstalled package, retrying with --ignore-installed"
+        if ${install_cmd} --ignore-installed --no-index || ${install_cmd} --ignore-installed; then
+            ret=0
+        else
+            ret=$?
+        fi
+    fi
+    rm -f "${pip_log}" "${pip_status}"
+    return "${ret}"
+}
+
+if [ -n "$gather_pip_packages" ]
+then
+    # early exit
+    return 0
+fi
+
+# disable sanitizer as in some OSes it hangs git clone
+export OLD_LD_PRELOAD=${LD_PRELOAD}
+export LD_PRELOAD=""
+source $topdir/qa/setup_dali_extra.sh
+export LD_PRELOAD=${OLD_LD_PRELOAD}
+
+target_dir=${target_dir-./}
+cd ${target_dir}
+
+# Limit to only one configuration (First version of each package)
+if [[ $one_config_only = true ]]; then
+    echo "Limiting test run to one configuration of packages (first version of each)"
+    last_config_index=$(( 0 > $last_config_index ? $last_config_index : 0 ))
+fi
+
+# some global test setup
+if [ "$(type -t do_once)" = 'function' ]; then
+    do_once
+fi
+
+prolog=${prolog-:}
+epilog=${epilog-:}
+# get the number of elements in `prolog` array
+numer_of_prolog_elms=${#prolog[@]}
+
+enable_sanitizer() {
+    # avoid python false positives
+    export PYTHONMALLOC=malloc
+    # if something calls dlclose on a module that leaks and it happens before asan can extract symbols we get "unknown module"
+    # in the stack trace, to prevent this provide dlclose that does nothing
+    echo "int dlclose(void* a) { return 0; }" > /tmp/fake_dlclose.c && gcc -shared -o /tmp/libfakeclose.so /tmp/fake_dlclose.c
+    export OLD_LD_PRELOAD=${LD_PRELOAD}
+    export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libasan.so /tmp/glibc_fix.so /tmp/libfakeclose.so /usr/lib/x86_64-linux-gnu/libstdc++.so"
+    # Workaround for bug in asan ignoring RPATHs https://bugzilla.redhat.com/show_bug.cgi?id=1449604
+    export OLD_LD_LIBRARY_PATH2=${LD_LIBRARY_PATH}  # OLD_LD_LIBRARY_PATH variable name already used
+    # LD_LIBRARY_PATH precedes RUNPATH, so prefer wheel libraries over inherited toolkit paths.
+    local cuda_wheel cuda_wheel_lib cuda_wheel_libdir
+    local cuda_wheels=(cufft npp nvjpeg libnvcomp)
+    # CUDA 13 wheels share a library directory; prepend it last so it takes priority.
+    if [[ "$CUDA_VERSION" == 13* ]]; then
+        cuda_wheels+=(cu13)
+    fi
+    for cuda_wheel in "${cuda_wheels[@]}"; do
+        cuda_wheel_libdir=lib
+        if [ "$cuda_wheel" = libnvcomp ]; then
+            cuda_wheel_libdir=lib64
+        fi
+        cuda_wheel_lib=$(python -c "
+import importlib.util
+import os
+spec = importlib.util.find_spec('nvidia.${cuda_wheel}')
+print(os.path.join(next(iter(spec.submodule_search_locations)), '${cuda_wheel_libdir}'))
+" 2>/dev/null) || continue
+        if [ -d "${cuda_wheel_lib}" ]; then
+            export LD_LIBRARY_PATH="${cuda_wheel_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        fi
+    done
+    # first provide paths to nvimgcodec deps then learn its location
+    export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:"$(python -c 'import nvidia.nvjpeg2k as n, os; print(os.path.dirname(n.__file__) + "/lib")' 2>/dev/null || echo '')"
+    export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:"$(python -c 'import nvidia.nvtiff as n, os; print(os.path.dirname(n.__file__) + "/lib")' 2>/dev/null || echo '')"
+    export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:"$(python -c 'import nvidia.nvimgcodec as n, os; print(os.path.dirname(n.__file__))' 2>/dev/null || echo '')"
+    # Keep system CUDA libraries after wheel directories to preserve wheel testing.
+    if [ -d /usr/local/cuda/lib64 ]; then
+        export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}/usr/local/cuda/lib64"
+    fi
+
+    export ASAN_OPTIONS=symbolize=1:protect_shadow_gap=0:log_path=sanitizer.log:start_deactivated=false:allocator_may_return_null=1:detect_leaks=1:fast_unwind_on_malloc=0:verify_asan_link_order=0:detect_container_overflow=0:suppressions=$topdir/qa/address.sup
+    export ASAN_SYMBOLIZER_PATH=$(which llvm-symbolizer)
+}
+
+# turn off sanitizer to avoid breaking any non-related system built-ins
+disable_sanitizer() {
+    export ASAN_OPTIONS=start_deactivated=true:detect_leaks=0:detect_container_overflow=0:suppressions=$topdir/qa/address.sup
+    export LD_PRELOAD=${OLD_LD_PRELOAD}
+    export LD_LIBRARY_PATH=${OLD_LD_LIBRARY_PATH2}
+    unset ASAN_SYMBOLIZER_PATH
+    unset PYTHONMALLOC
+}
+
+# Wrap the test_body in a subshell, where we can safely execute it with `set -e`
+# and turn it off in current shell to intercept the error code
+# when sanitizers are on, do set +e to run all the test no matter what the result is
+# and collect as much of sanitizers output as possible
+test_body_wrapper() {(
+    if [ -n "$DALI_ENABLE_SANITIZERS" ]; then
+        set +e
+        enable_sanitizer
+    else
+        set -e
+    fi
+
+    test_body
+
+    if [ -n "$DALI_ENABLE_SANITIZERS" ]; then
+        disable_sanitizer
+    fi
+)}
+
+process_sanitizers_logs() {
+    find $topdir -iname "sanitizer.log.*" -print0 | xargs -0 -I file cat file > $topdir/sanitizer.log
+    if [ -e $topdir/sanitizer.log ]; then
+        cat $topdir/sanitizer.log
+        grep -q ERROR $topdir/sanitizer.log && exit 1 || true
+    fi
+    find $topdir -iname "sanitizer.log*" -delete
+}
+
+# get extra index url for given packages - PEP 503 Python Package Index
+extra_indices=$($topdir/qa/setup_packages.py -u $pip_packages --cuda ${CUDA_VERSION} -e)
+extra_indices_string=""
+for e in ${extra_indices}; do
+    extra_indices_string="${extra_indices_string} --extra-index-url=${e}"
+done
+
+# get link index url for given packages -  a URL or path to an html file with links to archives
+link_indices=$($topdir/qa/setup_packages.py -u $pip_packages --cuda ${CUDA_VERSION} -k)
+link_indices_string=""
+for e in ${link_indices}; do
+    link_indices_string="${link_indices_string} -f ${e}"
+done
+
+# store the original LD_LIBRARY_PATH
+OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
+
+for i in `seq 0 $last_config_index`;
+do
+    echo "Test run $i"
+    # seq from 0 to number of elements in `prolog` array - 1
+    for variant in $(seq 0 $((${numer_of_prolog_elms}-1))); do
+        ${prolog[variant]}
+        echo "Test variant run: $variant"
+        # install the latest cuda wheel for CUDA 11.x and above tests if it is x86_64
+        # or we just want to use CUDA from system, not wheels
+        # or we are in conda
+        version_ge "${CUDA_VERSION}" "110" && \
+          if [ "$(uname -m)" == "x86_64" ] && [ -z "${DO_NOT_INSTALL_CUDA_WHEEL}" ] && [ -z "${CONDA_PREFIX}" ]; then
+            NPP_VERSION=$(if [[ $DALI_CUDA_MAJOR_VERSION == "12" ]]; then echo "==12.2.5.30"; else echo ""; fi)
+            if [ "$DALI_CUDA_MAJOR_VERSION" -ge 13 ]; then
+                install_pip_pkg "pip install --upgrade nvidia-npp~=${DALI_CUDA_MAJOR_VERSION}.0   \
+                                                       nvidia-nvjpeg~=${DALI_CUDA_MAJOR_VERSION}.0  \
+                                                       nvidia-cufft~=$((DALI_CUDA_MAJOR_VERSION-1)).0 \
+                                                       nvidia-nvjpeg2k-cu${DALI_CUDA_MAJOR_VERSION} \
+                                                       nvidia-nvtiff-cu${DALI_CUDA_MAJOR_VERSION} \
+                                                       -f /pip-packages"
+            else
+                install_pip_pkg "pip install --upgrade nvidia-npp-cu${DALI_CUDA_MAJOR_VERSION}${NPP_VERSION} \
+                                                       nvidia-nvjpeg-cu${DALI_CUDA_MAJOR_VERSION} \
+                                                       nvidia-nvjpeg2k-cu${DALI_CUDA_MAJOR_VERSION} \
+                                                       nvidia-nvtiff-cu${DALI_CUDA_MAJOR_VERSION} \
+                                                       nvidia-cufft-cu${DALI_CUDA_MAJOR_VERSION} \
+                                                       -f /pip-packages"
+            fi
+          fi
+
+        # install packages
+        inst=$($topdir/qa/setup_packages.py -i $i -u $pip_packages --cuda ${CUDA_VERSION})
+        constraints_file=$($topdir/qa/setup_packages.py -c -u $pip_packages --cuda ${CUDA_VERSION})
+        echo "Constraints file: ${constraints_file}"
+        cat ${constraints_file}
+        if [ -n "$inst" ]; then
+            for pkg in ${inst}
+            do
+                install_pip_pkg "pip install $pkg -f /pip-packages ${link_indices_string} ${extra_indices_string} -c ${constraints_file}"
+            done
+
+            # If we just installed tensorflow, we need to reinstall DALI TF plugin
+            if [[ "$inst" == *tensorflow* ]]; then
+                # The package name can be nvidia-dali-tf-plugin,  nvidia-dali-tf-plugin-weekly or nvidia-dali-tf-plugin-nightly
+                # Different DALI can be installed as a dependency of nvidia-dali so uninstall it too
+                pip uninstall -y `pip list | grep nvidia-dali-tf-plugin | cut -d " " -f1` || true
+                # don't reinstall DALI wheen in conda as we use conda package
+                if [ -z "${CONDA_PREFIX}" ]; then
+                    pip uninstall -y `pip list | grep nvidia-dali | cut -d " " -f1` || true
+                    pip install /opt/dali/nvidia_dali*.whl;
+                fi
+                pip install /opt/dali/nvidia_dali_tf_plugin*.tar.gz --no-build-isolation;
+            fi
+            # if we are using any cuda or nvidia-tensorflow wheels (nvidia-npp, nvidia-nvjpeg or nvidia-cufft)
+            # unset LD_LIBRARY_PATH to not used cuda from /usr/local/ but from wheels
+            # however avoid removing compat from the path
+            if [[ "$inst" == *nvidia-n* ]] || [[ "$inst" == *nvidia-c* ]] || [[ "$inst" == *nvidia-t* ]]; then
+                TAIL=${LD_LIBRARY_PATH#*compat}
+                LD_LIBRARY_PATH=${LD_LIBRARY_PATH/$TAIL/}
+                export LD_LIBRARY_PATH=${LD_LIBRARY_PATH##*:}
+            fi
+        fi
+        export OLD_TF_LD_LIBRARY_PATH=${LD_LIBRARY_PATH}
+        if [[ "$inst" == *tensorflow* ]]; then
+            # Only update LD_LIBRARY_PATH for TensorFlow 2.1 which doesn't define cuSolver library path in its rpath
+            TF_VERSION=$(${python_binary:-python} -c "import tensorflow as tf; print(tf.__version__)")
+            if [[ "${TF_VERSION}" == 2.21* ]]; then
+                # Use path returned by pip show pip and append nvidia/cusolver/lib/ to it
+                PIP_PATH=$(${python_binary:-python} -m pip show pip | awk -F': ' '/Location: /{print $2}')
+                export LD_LIBRARY_PATH="${PIP_PATH}/nvidia/cusolver/lib:${LD_LIBRARY_PATH}"
+            fi
+        fi
+        # test code
+        # Run test_body in subshell, the exit on error is turned off in current shell,
+        # but it will be present in subshell (thanks to wrapper).
+        # We can intercept first error that happens. test_body_wrapper cannot be used with
+        # any conditional as it will turn on "exit on error" behaviour
+        set +e
+        test_body_wrapper
+        RV=$?
+        set -e
+        export LD_LIBRARY_PATH=${OLD_TF_LD_LIBRARY_PATH}
+        if [ -n "$DALI_ENABLE_SANITIZERS" ]; then
+            process_sanitizers_logs
+        fi
+        # restore the original LD_LIBRARY_PATH
+        export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
+        if [ $RV -gt 0 ]; then
+            # if sanitizers are enabled don't capture core
+            if [ -z "$DALI_ENABLE_SANITIZERS" ]; then
+                mkdir -p $topdir/core_artifacts
+                cp core* $topdir/core_artifacts || true
+            fi
+            exit ${RV}
+        fi
+        # remove packages
+        remove=$($topdir/qa/setup_packages.py -r -u $pip_packages --cuda ${CUDA_VERSION})
+        if [ -n "$remove" ]; then
+           pip uninstall -y $remove
+        fi
+        ${epilog[variant]}
+    done
+done

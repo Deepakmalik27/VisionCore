@@ -1,0 +1,394 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+import os
+
+import numpy as np
+from nose2.tools import params, cartesian_params
+from nose_utils import assert_raises
+from PIL import Image
+import torch
+import torchvision.transforms.v2 as transforms
+
+from nvidia.dali.experimental.torchvision import Compose, Grayscale, ColorJitter, RandomGrayscale
+from nvidia.dali.experimental.torchvision.v2.functional import to_grayscale, rgb_to_grayscale
+
+
+def verify_non_one_off(t1: torch.Tensor, t2: torch.Tensor):
+
+    if t1.dtype == torch.uint8:
+        t1 = t1.to(torch.int16)
+        t2 = t2.to(torch.int16)
+
+    diff = (t1 - t2).abs()
+    more_than_one_mask = diff > 1
+
+    return more_than_one_mask.sum().item() == 0
+
+
+dali_extra = os.environ["DALI_EXTRA_PATH"]
+jpeg = os.path.join(dali_extra, "db", "single", "jpeg")
+jpeg_113 = os.path.join(jpeg, "113")
+test_files = [
+    os.path.join(jpeg_113, f)
+    for f in ["snail-4291306_1280.jpg", "snail-4345504_1280.jpg", "snail-4368154_1280.jpg"]
+]
+
+
+def loop_images_test(t, td, num_output_channels=1):
+    for fn in test_files:
+        img = Image.open(fn)
+
+        out_tv = transforms.functional.pil_to_tensor(t(img))
+        out_dali_tv = transforms.functional.pil_to_tensor(td(img))
+        out_dali_fn = transforms.functional.pil_to_tensor(
+            to_grayscale(img, num_output_channels=num_output_channels)
+        )
+        out_dali_fn1 = transforms.functional.pil_to_tensor(
+            rgb_to_grayscale(img, num_output_channels=num_output_channels)
+        )
+
+        assert verify_non_one_off(out_tv, out_dali_tv), f"Images differ {fn}"
+        assert verify_non_one_off(out_tv, out_dali_fn), f"Images differ {fn}"
+        assert verify_non_one_off(out_tv, out_dali_fn1), f"Images differ {fn}"
+
+
+@cartesian_params((1, 3), ("cpu", "gpu"))
+def test_grayscale(output_channels, device):
+    td = Compose([Grayscale(num_output_channels=output_channels, device=device)])
+    t = transforms.Compose([transforms.Grayscale(num_output_channels=output_channels)])
+
+    loop_images_test(t, td, num_output_channels=output_channels)
+
+
+@params("cpu", "gpu")
+def test_randomgrayscale(device):
+    td = Compose([RandomGrayscale(p=1.0, device=device)])
+    t = transforms.RandomGrayscale(p=1.0)
+
+    for fn in test_files:
+        img = Image.open(fn)
+        out_tv = transforms.functional.pil_to_tensor(t(img))
+        out_dali_tv = transforms.functional.pil_to_tensor(td(img))
+        assert verify_non_one_off(out_tv, out_dali_tv), f"Images differ {fn}"
+
+    td = Compose([RandomGrayscale(p=0, device=device)])
+    t = transforms.RandomGrayscale(p=0)
+
+    for fn in test_files:
+        img = Image.open(fn)
+        out_tv = transforms.functional.pil_to_tensor(t(img))
+        out_dali_tv = transforms.functional.pil_to_tensor(td(img))
+        assert verify_non_one_off(out_tv, out_dali_tv), f"Images differ {fn}"
+
+
+@params(-0.1, 2.0, [0.0, 0.8])
+def test_invalid_randomgrayscale_probability(p):
+    with assert_raises(ValueError):
+        Compose([RandomGrayscale(p=p)])
+
+
+@params(2, 4)
+def test_invalid_channel_count_grayscale(output_channels):
+    img = Image.open(test_files[0])
+
+    with assert_raises(ValueError):
+        # Torchvision raises the exception when executing kernel,
+        # we need to raise it from the constructor
+        td = Compose([Grayscale(num_output_channels=output_channels)])
+        _ = transforms.functional.pil_to_tensor(td(img))
+
+
+def make_tensor_inputs():
+    # Single CHW tensor and batched NCHW tensor
+    img = torch.rand(3, 64, 64)
+    batch = torch.rand(4, 3, 64, 64)
+    return (img, batch)
+
+
+@cartesian_params(
+    (
+        # brightness, contrast, saturation, hue
+        (0.0, 0.0, 0.0, 0.0),
+        (0.2, 0.0, 0.0, 0.0),
+        (0.0, 0.3, 0.0, 0.0),
+        (0.0, 0.0, 0.4, 0.0),
+        (0.0, 0.0, 0.0, 0.1),
+        (0.5, 0.5, 0.5, 0.1),
+        ((0.5, 1.5), (0.5, 1.5), (0.5, 1.5), (-0.1, 0.1)),
+    ),
+    ("cpu", "gpu"),
+)
+def test_colorjitter_images(cj_params, device):
+    brightness, contrast, saturation, hue = cj_params
+
+    cj = Compose(
+        [
+            ColorJitter(
+                brightness=brightness,
+                contrast=contrast,
+                saturation=saturation,
+                hue=hue,
+                device=device,
+            )
+        ]
+    )
+
+    for fn in test_files:
+        img = Image.open(fn)
+        _ = cj(img)
+
+
+# Mirrors the hue-only path of ref_color_twist in dali/test/python/operator_1/test_color_twist.py.
+# It is duplicated rather than imported because that module lives in another test directory with
+# no package init, and nothing in this tree imports across those directories today.
+_rgb2yiq = np.array([[0.299, 0.587, 0.114], [0.596, -0.274, -0.321], [0.211, -0.523, 0.311]])
+_yiq2rgb = np.linalg.inv(_rgb2yiq)
+
+
+def yiq_hue_rotate(img: np.ndarray, degrees: float) -> np.ndarray:
+    """Rotate hue by `degrees` in YIQ, the way fn.color_twist defines it."""
+    angle = math.radians(degrees)
+    s, c = math.sin(angle), math.cos(angle)
+    hmat = np.array([[1, 0, 0], [0, c, s], [0, -s, c]])
+    m = np.matmul(_yiq2rgb, np.matmul(hmat, _rgb2yiq))
+    pixels = img.reshape([-1, img.shape[-1]]).astype(np.float64)
+    pixels = np.matmul(pixels, m.transpose())
+    return np.clip(np.round(pixels.reshape(img.shape)), 0, 255).astype(np.uint8)
+
+
+def median_hue_shift(before: Image.Image, after: Image.Image) -> float:
+    """Median hue rotation from `before` to `after`, in degrees, over the colorful pixels."""
+    hue_before, saturation, _ = before.convert("HSV").split()
+    hue_after, _, _ = after.convert("HSV").split()
+    to_degrees = 360.0 / 256.0
+    hue_before = np.asarray(hue_before, dtype=np.float64) * to_degrees
+    hue_after = np.asarray(hue_after, dtype=np.float64) * to_degrees
+    # hue is meaningless for near-gray pixels
+    colorful = np.asarray(saturation) > 32
+    assert colorful.any(), "image has no colorful pixels to measure hue on"
+    shift = (hue_after - hue_before + 180.0) % 360.0 - 180.0
+    return float(np.median(shift[colorful]))
+
+
+def hue_error(actual: float, expected: float) -> float:
+    """Absolute difference between two hue rotations, taking the shorter way around."""
+    return abs((actual - expected + 180.0) % 360.0 - 180.0)
+
+
+@cartesian_params((0.05, 0.1, -0.1, 0.25, -0.25, 0.5, -0.5), ("cpu", "gpu"))
+def test_colorjitter_hue_rotation(hue, device):
+    # torchvision expresses hue as a fraction of a full turn, fn.color_twist takes degrees.
+    # DALI rotates linearly in YIQ, which drifts from torchvision's HSV shift in proportion
+    # to the angle, so the tolerance scales too. The comparison is circular because hue=+-0.5
+    # lands on +-180, where implementations that agree closely can report opposite signs.
+    requested = abs(hue) * 360.0
+    # Deliberately loose. test_colorjitter_hue_matches_yiq_reference pins the unit conversion
+    # exactly, so this only has to catch a gross unit error. 0.35 was the measured worst case
+    # and left no margin: at hue=-0.1 the drift is 12.66 degrees against a 12.60 bound. Errors
+    # here move in steps of 360/256 degrees, the PIL HSV hue quantum, so the bound needs more
+    # than one step of slack. 0.45 leaves over 3 degrees everywhere and still catches a 1.5x
+    # unit error.
+    tol = max(4.0, 0.45 * requested)
+    cj = Compose([ColorJitter(hue=(hue, hue), device=device)])
+
+    for fn in test_files:
+        img = Image.open(fn).convert("RGB")
+        expected = median_hue_shift(img, transforms.functional.adjust_hue(img, hue))
+        actual = median_hue_shift(img, cj(img))
+        assert hue_error(actual, expected) < tol, (
+            f"hue={hue} rotated by {actual:.2f} degrees, torchvision rotates by "
+            f"{expected:.2f} degrees: {fn}"
+        )
+
+
+@cartesian_params((0.05, 0.1, -0.1, 0.25, -0.25, 0.5, -0.5), ("cpu", "gpu"))
+def test_colorjitter_hue_matches_yiq_reference(hue, device):
+    # This is what pins the unit conversion. fn.color_twist rotates hue by the number of degrees
+    # it is handed, so ColorJitter(hue=h) has to match a rotation of h*360 degrees in YIQ.
+    # Measuring against DALI's own model takes the YIQ-vs-HSV drift out of the comparison, which
+    # is what forced the loose bound in the test above, and leaves a per-pixel check instead.
+    cj = Compose([ColorJitter(hue=(hue, hue), device=device)])
+
+    for fn in test_files:
+        img = Image.open(fn).convert("RGB")
+        expected = yiq_hue_rotate(np.asarray(img), hue * 360.0)
+        actual = np.asarray(cj(img).convert("RGB"))
+        # The bound test_color_twist.py uses for this operator with uint8 output.
+        assert np.allclose(actual, expected, 1 / 512, 1), (
+            f"hue={hue} on {fn}: max abs difference "
+            f"{np.abs(actual.astype(np.int32) - expected.astype(np.int32)).max()}"
+        )
+
+
+@params("cpu", "gpu")
+def test_colorjitter_hue_range_is_converted(device):
+    # hue=(h, h) short-circuits in _get_BrightnessContrastSaturationHue and passes a scalar.
+    # A genuine range takes the fn.random.uniform branch, which is the one that consumes the
+    # converted range, and is what ColorJitter(hue=0.1) expands to. Both endpoints must be
+    # converted, so the sampled rotation has to land inside [36, 72] degrees.
+    lo, hi = 0.1, 0.2
+    cj = Compose([ColorJitter(hue=(lo, hi), device=device)])
+    tol = max(4.0, 0.45 * hi * 360.0)
+
+    for fn in test_files:
+        img = Image.open(fn).convert("RGB")
+        actual = median_hue_shift(img, cj(img))
+        assert lo * 360.0 - tol <= actual <= hi * 360.0 + tol, (
+            f"hue range ({lo}, {hi}) should rotate within "
+            f"[{lo * 360.0:.0f}, {hi * 360.0:.0f}] degrees, measured {actual:.2f}: {fn}"
+        )
+
+
+"""
+TODO (https://github.com/NVIDIA/DALI/issues/DALI-4656):
+DALI ColorJitter does not currently work on CHW layout
+@params(
+    # brightness, contrast, saturation, hue
+    (0.0, 0.0, 0.0, 0.0),
+    (0.2, 0.0, 0.0, 0.0),
+    (0.0, 0.3, 0.0, 0.0),
+    (0.0, 0.0, 0.4, 0.0),
+    (0.0, 0.0, 0.0, 0.1),
+    (0.5, 0.5, 0.5, 0.1),
+    ((0.5, 1.5), (0.5, 1.5), (0.5, 1.5), (-0.1, 0.1)),
+)
+def test_colorjitter_tensor(brightness, contrast, saturation, hue):
+    img, batch = make_tensor_inputs()
+
+    cj = Compose( [ColorJitter(
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        hue=hue,)]
+    )
+
+    cj_batched = Compose( [ColorJitter(
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        hue=hue,)],
+        batch_size = 4
+    )
+
+    _ = cj(img)
+    _ = cj_batched(batch)
+"""
+
+
+@params(
+    # invalid brightness / contrast / saturation (negative or bad ranges)
+    (-0.1, 0.0, 0.0, 0.0),
+    ((1.5, 0.5), 0.0, 0.0, 0.0),
+    (0.0, -0.2, 0.0, 0.0),
+    (0.0, 0.0, -0.3, 0.0),
+    # invalid hue beyond allowed range [-0.5, 0.5]
+    (0.0, 0.0, 0.0, 0.6),
+    (0.0, 0.0, 0.0, (-1.0, 0.2)),
+)
+def test_colorjitter_invalid_params_match_errors(brightness, contrast, saturation, hue):
+    img, _ = make_tensor_inputs()
+
+    with assert_raises(ValueError):
+        cj_my = Compose(
+            [
+                ColorJitter(
+                    brightness=brightness,
+                    contrast=contrast,
+                    saturation=saturation,
+                    hue=hue,
+                )
+            ]
+        )
+        _ = cj_my(img)
+
+
+@params("cpu", "gpu")
+def test_colorjitter_no_jitter(device):
+    cj = Compose(
+        [ColorJitter(brightness=0.0, contrast=0.0, saturation=0.0, hue=0.0, device=device)]
+    )
+    for fn in test_files:
+        img = Image.open(fn)
+        out = cj(img)
+        out_tensor = transforms.functional.pil_to_tensor(out)
+        ref_tensor = transforms.functional.pil_to_tensor(img)
+        assert verify_non_one_off(
+            out_tensor, ref_tensor
+        ), f"No-jitter output differs from input: {fn}"
+
+
+def test_colorjitter_default_constructor():
+    cj = Compose([ColorJitter()])
+    img = Image.open(test_files[0])
+    out = cj(img)
+    assert isinstance(out, Image.Image)
+
+
+"""
+# TODO: grayscale does not work for CHW layout
+
+@cartesian_params((1, 3), ("cpu", "gpu"))
+def test_grayscale_tensor(output_channels, device):
+    td = Compose([Grayscale(num_output_channels=output_channels, device=device)])
+
+    img_chw = torch.randint(0, 256, (3, 64, 64), dtype=torch.uint8)
+    out = td(img_chw)
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == (output_channels, 64, 64), (
+        f"Expected ({output_channels}, 64, 64), got {out.shape}"
+    )
+
+    batch = torch.randint(0, 256, (4, 3, 64, 64), dtype=torch.uint8)
+    out_batch = td(batch)
+    assert isinstance(out_batch, torch.Tensor)
+    assert out_batch.shape == (4, output_channels, 64, 64), (
+        f"Expected (4, {output_channels}, 64, 64), got {out_batch.shape}"
+    )
+"""
+
+
+@params("cpu", "gpu")
+def test_grayscale_single_channel_input(device):
+
+    img = Image.open(test_files[0]).convert("L")
+
+    td_1ch = Compose([Grayscale(num_output_channels=1, device=device)])
+    out_1ch = td_1ch(img)
+    assert isinstance(out_1ch, Image.Image)
+    assert out_1ch.mode == "L"
+
+    td_3ch = Compose([Grayscale(num_output_channels=3, device=device)])
+    out_3ch = td_3ch(img)
+    assert isinstance(out_3ch, Image.Image)
+    assert out_3ch.mode == "RGB"
+
+
+@params("cpu", "gpu")
+def test_grayscale_functional_3channels(device):
+    for fn in test_files:
+        img = Image.open(fn)
+
+        out = to_grayscale(img, num_output_channels=3, device=device)
+        out_tensor = transforms.functional.pil_to_tensor(out)
+        assert out_tensor.shape[0] == 3, f"Expected 3 channels, got {out_tensor.shape[0]}"
+
+        out2 = rgb_to_grayscale(img, num_output_channels=3, device=device)
+        out_tensor2 = transforms.functional.pil_to_tensor(out2)
+        assert out_tensor2.shape[0] == 3, f"Expected 3 channels, got {out_tensor2.shape[0]}"
+
+        assert verify_non_one_off(
+            out_tensor, out_tensor2
+        ), f"to_grayscale and rgb_to_grayscale differ: {fn}"

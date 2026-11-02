@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+interface:
+  display_name: "RTVI BYOM Porting"
+  short_description: "Port and validate custom VLMs in VSS RT-VLM"
+  default_prompt: "Use $rtvi-byom-porting to integrate a custom VLM into VSS RT-VLM and validate its quality and performance gates."

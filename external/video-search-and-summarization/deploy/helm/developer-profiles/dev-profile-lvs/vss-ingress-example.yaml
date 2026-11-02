@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Manual equivalent of what this chart's templates/vss-ingress.yaml renders, for a
+# cluster where you apply the Ingress yourself. Regenerate after changing routes:
+#
+#   helm template <RELEASE_NAME> ./dev-profile-lvs --set global.externalHost=<HOST> \
+#     --set global.useReleaseNamePrefix=true --show-only templates/vss-ingress.yaml
+#
+# Mounts come from the canonical route table in deploy/helm/services/common; keep
+# them in step with it and with the Docker edge (haproxy.cfg.template).
+#
+# Routes forwarded as-is. The prefix-stripping ones are in
+# vss-ingress-example-rewrites.yaml — apply both.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: <RELEASE_NAME>-vss-ingress
+  namespace: <NAMESPACE>
+spec:
+  ingressClassName: haproxy
+  rules:
+  - host: vss.<EXTERNAL_HOST>.nip.io
+    http:
+      paths:
+      - path: /api/chat
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent-ui
+            port:
+              number: 3000
+      - path: /api/agent
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent-ui
+            port:
+              number: 3000
+      - path: /api/vss-chat
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent-ui
+            port:
+              number: 3000
+      - path: /api/proxy
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent-ui
+            port:
+              number: 3000
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent
+            port:
+              number: 8000
+      - path: /chat
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent
+            port:
+              number: 8000
+      - path: /websocket
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent
+            port:
+              number: 8000
+      - path: /static
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent
+            port:
+              number: 8000
+      - path: /docs
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent
+            port:
+              number: 8000
+      - path: /redoc
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent
+            port:
+              number: 8000
+      - path: /generate
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent
+            port:
+              number: 8000
+      - path: /openapi.json
+        pathType: Exact
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent
+            port:
+              number: 8000
+      - path: /vst
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-vios-ingress
+            port:
+              number: 30888
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: <RELEASE_NAME>-vss-agent-ui
+            port:
+              number: 3000

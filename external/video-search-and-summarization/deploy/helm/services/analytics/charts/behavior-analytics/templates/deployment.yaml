@@ -1,0 +1,210 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vss-behavior-analytics.fullname" . }}
+  labels:
+    {{- include "vss-behavior-analytics.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vss-behavior-analytics
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "vss-behavior-analytics.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: vss-behavior-analytics
+  template:
+    metadata:
+      labels:
+        {{- include "vss-behavior-analytics.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: vss-behavior-analytics
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $g := .Values.global | default dict }}
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- else if index $g "imagePullSecrets" }}
+      imagePullSecrets:
+        {{- toYaml (index $g "imagePullSecrets") | nindent 8 }}
+      {{- end }}
+      {{- $calibApiUrl := .Values.resourceFiles.calibration.apiUrl }}
+      {{- if or .Values.waitForKafka.enabled .Values.downloadResourcesFromNgc (and .Values.resourceFiles.calibration.enabled $calibApiUrl) }}
+      initContainers:
+        {{- if .Values.waitForKafka.enabled }}
+        - name: wait-for-kafka
+          image: {{ .Values.waitForKafka.image | default "confluentinc/cp-kafka:8.4.0" }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              BOOTSTRAP="{{ required "waitForKafka.host must be set" .Values.waitForKafka.host }}:{{ .Values.waitForKafka.port | default 9092 }}"
+              TOPIC="{{ .Values.waitForKafka.topic }}"
+              MAX_ATTEMPTS={{ .Values.waitForKafka.maxAttempts | default 120 }}
+              SLEEP={{ .Values.waitForKafka.sleepSeconds | default 5 }}
+              n=0
+              echo "[wait-for-kafka] waiting for broker ${BOOTSTRAP}..."
+              until kafka-topics --bootstrap-server "${BOOTSTRAP}" --list >/dev/null 2>&1; do
+                n=$((n+1))
+                if [ "$n" -ge "$MAX_ATTEMPTS" ]; then
+                  echo "[wait-for-kafka] broker not ready after ${MAX_ATTEMPTS} attempts, giving up"
+                  exit 1
+                fi
+                echo "[wait-for-kafka] broker not ready, retrying (${n}/${MAX_ATTEMPTS})..."
+                sleep "$SLEEP"
+              done
+              {{- if .Values.waitForKafka.topic }}
+              n=0
+              echo "[wait-for-kafka] broker ready, waiting for topic ${TOPIC}..."
+              until kafka-topics --bootstrap-server "${BOOTSTRAP}" --list 2>/dev/null | grep -qx "${TOPIC}"; do
+                n=$((n+1))
+                if [ "$n" -ge "$MAX_ATTEMPTS" ]; then
+                  echo "[wait-for-kafka] topic ${TOPIC} not ready after ${MAX_ATTEMPTS} attempts, giving up"
+                  exit 1
+                fi
+                echo "[wait-for-kafka] topic ${TOPIC} not yet created, retrying (${n}/${MAX_ATTEMPTS})..."
+                sleep "$SLEEP"
+              done
+              echo "[wait-for-kafka] topic ${TOPIC} exists, waiting 5s for broker to stabilize..."
+              sleep 5
+              {{- else }}
+              echo "[wait-for-kafka] broker ready, proceeding."
+              {{- end }}
+        {{- end }}
+        {{- if .Values.downloadResourcesFromNgc }}
+        - name: wait-for-resources
+          image: "{{ .Values.ngcDownload.image.repository }}:{{ .Values.ngcDownload.image.tag }}"
+          imagePullPolicy: {{ .Values.ngcDownload.image.pullPolicy | default "IfNotPresent" }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              RESOURCES_ROOT="/resources-data"
+              TIMEOUT={{ .Values.downloadResourcesFromNgcWaitSeconds | default 300 }}
+              ELAPSED=0
+              while true; do
+                READY=true
+                {{- range .Values.ngcResourcesToDownload }}
+                if [ ! -e "${RESOURCES_ROOT}/{{ .destPath }}" ]; then
+                  READY=false
+                fi
+                {{- end }}
+                if [ "${READY}" = "true" ]; then
+                  break
+                fi
+                if [ ${ELAPSED} -ge ${TIMEOUT} ]; then
+                  echo "[ERROR] Timeout waiting for NGC resource files (${TIMEOUT}s)"
+                  exit 1
+                fi
+                echo "[INFO] Waiting for resource files... (${ELAPSED}s / ${TIMEOUT}s)"
+                sleep 10
+                ELAPSED=$((ELAPSED + 10))
+              done
+              echo "[INFO] Resource files present, proceeding."
+          volumeMounts:
+            - name: vss-behavior-analytics-resources
+              mountPath: /resources-data
+        {{- end }}
+        {{- if and .Values.enabled .Values.resourceFiles.calibration.enabled .Values.resourceFiles.calibration.apiUrl }}
+        # Fetches calibration.json from the video-analytics API, retrying
+        # until it returns real data, then validates it before the main
+        # container starts.
+        - name: fetch-calibration
+          image: {{ include "vss-behavior-analytics.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: CALIBRATION_API_URL
+              value: {{ $calibApiUrl | quote }}
+            - name: CALIBRATION_OUTPUT_PATH
+              value: /resources-data/calibration.json
+            - name: CALIBRATION_WAIT_TIMEOUT
+              value: {{ .Values.resourceFiles.calibration.fetchTimeoutSeconds | default 300 | quote }}
+            - name: CALIBRATION_POLL_INTERVAL
+              value: {{ .Values.resourceFiles.calibration.fetchPollSeconds | default 10 | quote }}
+          command:
+            - python3
+            - /scripts/fetch-calibration.py
+          volumeMounts:
+            - name: vss-behavior-analytics-resources
+              mountPath: /resources-data
+            - name: fetch-calibration-script
+              mountPath: /scripts
+              readOnly: true
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: vss-behavior-analytics
+          image: {{ include "vss-behavior-analytics.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            {{- toYaml (required "vss-behavior-analytics.command must be set when enabled" .Values.command) | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.port }}
+              protocol: TCP
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: vss-behavior-analytics-config
+              mountPath: /resources/vss-behavior-analytics-config.json
+              subPath: vss-behavior-analytics-config.json
+              readOnly: true
+            {{- if .Values.resourceFiles.calibration.enabled }}
+            - name: vss-behavior-analytics-resources
+              mountPath: {{ .Values.resourceFiles.calibration.mountPath }}
+              subPath: calibration.json
+              readOnly: true
+            {{- end }}
+            {{- if .Values.resourceFiles.roadNetwork.enabled }}
+            - name: vss-behavior-analytics-resources
+              mountPath: {{ .Values.resourceFiles.roadNetwork.mountPath }}
+              subPath: road-network.json
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: vss-behavior-analytics-config
+          configMap:
+            name: {{ include "vss-behavior-analytics.fullname" . }}-config
+        {{- if or .Values.resourceFiles.calibration.enabled .Values.resourceFiles.roadNetwork.enabled }}
+        - name: vss-behavior-analytics-resources
+          {{- if and .Values.resourceFiles.calibration.enabled $calibApiUrl }}
+          emptyDir: {}
+          {{- else if .Values.downloadResourcesFromNgc }}
+          persistentVolumeClaim:
+            claimName: {{ include "vss-behavior-analytics.fullname" . }}-resources
+          {{- else }}
+          configMap:
+            name: {{ include "vss-behavior-analytics.fullname" . }}-resources
+          {{- end }}
+        {{- end }}
+        {{- if and .Values.enabled .Values.resourceFiles.calibration.enabled .Values.resourceFiles.calibration.apiUrl }}
+        - name: fetch-calibration-script
+          configMap:
+            name: {{ include "vss-behavior-analytics.fullname" . }}-fetch-calibration
+        {{- end }}
+{{- end }}

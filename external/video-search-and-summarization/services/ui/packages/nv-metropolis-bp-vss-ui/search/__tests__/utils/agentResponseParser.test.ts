@@ -1,0 +1,393 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+import {
+  extractSearchResultsFromAgentResponse,
+  normalizeSearchResultMediaUrls,
+} from '../../lib-src/utils/agentResponseParser';
+
+describe('extractSearchResultsFromAgentResponse', () => {
+  const validData = {
+    data: [
+      {
+        video_name: 'clip1.mp4',
+        similarity: 0.95,
+        screenshot_url: 'http://example.com/thumb1.jpg',
+        description: 'Person walking',
+        start_time: '2024-01-15T09:00:00',
+        end_time: '2024-01-15T09:05:00',
+        sensor_id: 'sensor-1',
+        object_ids: ['obj-1', 'obj-2'],
+      },
+    ],
+  };
+
+  describe('null/invalid input', () => {
+    it('returns null for empty string', () => {
+      expect(extractSearchResultsFromAgentResponse('')).toBeNull();
+    });
+
+    it('returns null for null input', () => {
+      expect(extractSearchResultsFromAgentResponse(null as any)).toBeNull();
+    });
+
+    it('returns null for undefined input', () => {
+      expect(extractSearchResultsFromAgentResponse(undefined as any)).toBeNull();
+    });
+
+    it('returns null for non-string input', () => {
+      expect(extractSearchResultsFromAgentResponse(123 as any)).toBeNull();
+    });
+
+    it('returns null for text with no JSON', () => {
+      expect(extractSearchResultsFromAgentResponse('just some plain text')).toBeNull();
+    });
+  });
+
+  describe('JSON in markdown code block', () => {
+    it('extracts from ```json block', () => {
+      const text = `Here are the results:\n\`\`\`json\n${JSON.stringify(validData)}\n\`\`\`\nEnd of results.`;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('clip1.mp4');
+      expect(result![0].similarity).toBe(0.95);
+      expect(result![0].object_ids).toEqual(['obj-1', 'obj-2']);
+    });
+
+    it('extracts from ``` block without json tag', () => {
+      const text = `Results:\n\`\`\`\n${JSON.stringify(validData)}\n\`\`\``;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('clip1.mp4');
+    });
+
+    it('returns null when code block has invalid JSON and first brace in text is also invalid', () => {
+      const text = '```json\n{invalid json}\n```\nNo valid JSON here';
+      expect(extractSearchResultsFromAgentResponse(text)).toBeNull();
+    });
+
+    it('falls back to brace search when code block JSON has no data array', () => {
+      // When code block contains JSON without data array, fallback brace search
+      // finds the first {...} in the text (the code block one), so it still returns null
+      const text = `\`\`\`json\n{"message":"hello"}\n\`\`\`\nSome text`;
+      expect(extractSearchResultsFromAgentResponse(text)).toBeNull();
+    });
+
+    it('parses valid JSON with data array from code block', () => {
+      const text = `\`\`\`json\n${JSON.stringify(validData)}\n\`\`\``;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('clip1.mp4');
+    });
+  });
+
+  describe('VSS UI artifacts', () => {
+    it('prefers the versioned search artifact over unrelated JSON prose', () => {
+      const artifact = {
+        version: '1.0',
+        kind: 'vss.search.results',
+        payload: validData,
+      };
+      const text = `Diagnostic {"status":"ok"}\n<vss-ui-artifact>${JSON.stringify(artifact)}</vss-ui-artifact>`;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('clip1.mp4');
+    });
+
+    it('ignores artifacts for another VSS surface', () => {
+      const artifact = {
+        version: '1.0',
+        kind: 'vss.alert.incidents',
+        payload: { incidents: [] },
+      };
+      expect(
+        extractSearchResultsFromAgentResponse(
+          `<vss-ui-artifact>${JSON.stringify(artifact)}</vss-ui-artifact>`,
+        ),
+      ).toBeNull();
+    });
+  });
+
+  describe('reasoning before the result payload', () => {
+    const resultBlock = `\`\`\`json\n${JSON.stringify(validData)}\n\`\`\``;
+
+    it('ignores fenced JSON inside <agent-think> and reads the later result block', () => {
+      const text = [
+        '<agent-think>',
+        '<agent-think-step title="Plan">',
+        '```json\n{"tool":"search","args":{"query":"forklifts"}}\n```',
+        '</agent-think-step>',
+        '</agent-think>',
+        'Here are the results:',
+        resultBlock,
+      ].join('\n');
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('clip1.mp4');
+    });
+
+    it('ignores malformed JSON inside <agent-think>', () => {
+      const text = `<agent-think>Calling {"query": "forklift", oops</agent-think>\n${resultBlock}`;
+      expect(extractSearchResultsFromAgentResponse(text)).toHaveLength(1);
+    });
+
+    it('does not take a data array from reasoning as the answer', () => {
+      const reasoning = JSON.stringify({ data: [{ video_name: 'draft.mp4' }] });
+      const text = `<agent-think>${reasoning}</agent-think>\nNo matches found.`;
+      expect(extractSearchResultsFromAgentResponse(text)).toBeNull();
+    });
+
+    it('scans past a non-result fenced block outside reasoning', () => {
+      const text = `\`\`\`json\n{"message":"hello"}\n\`\`\`\n${resultBlock}`;
+      expect(extractSearchResultsFromAgentResponse(text)).toHaveLength(1);
+    });
+
+    it('scans past a non-result raw object outside reasoning', () => {
+      const text = `Status {"status":"ok"} then ${JSON.stringify(validData)}`;
+      expect(extractSearchResultsFromAgentResponse(text)).toHaveLength(1);
+    });
+
+    it('finds the payload after a malformed raw object', () => {
+      const text = `Draft {"query": oops ${JSON.stringify(validData)}`;
+      expect(extractSearchResultsFromAgentResponse(text)).toHaveLength(1);
+    });
+
+    it('finds the payload after an unmatched quote in prose', () => {
+      const text = `Draft "unfinished ${JSON.stringify(validData)}`;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('clip1.mp4');
+    });
+
+    it('finds the payload after a quoted brace in prose', () => {
+      const text = `The query contains "{". Results: ${JSON.stringify(validData)}`;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('clip1.mp4');
+    });
+
+    it('does not treat a nested data array as the top-level payload', () => {
+      const text = JSON.stringify({ wrapper: validData });
+      expect(extractSearchResultsFromAgentResponse(text)).toBeNull();
+    });
+
+    it('rejects a data array whose items are not records', () => {
+      expect(extractSearchResultsFromAgentResponse('{"data":[1,2]}')).toBeNull();
+    });
+  });
+
+  describe('JSON in plain text (brace matching)', () => {
+    it('extracts from raw JSON object in text', () => {
+      const text = `Here are your results: ${JSON.stringify(validData)} Done.`;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].sensor_id).toBe('sensor-1');
+    });
+
+    it('handles JSON with nested braces', () => {
+      const nestedData = {
+        data: [
+          {
+            video_name: 'test.mp4',
+            similarity: 0.8,
+            screenshot_url: '',
+            description: 'nested {braces} test',
+            start_time: '',
+            end_time: '',
+            sensor_id: '',
+            object_ids: [],
+          },
+        ],
+      };
+      const text = `Result: ${JSON.stringify(nestedData)}`;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('test.mp4');
+    });
+
+    it('handles unbalanced braces inside JSON strings', () => {
+      const data = { data: [{ video_name: 'brace.mp4', description: 'opens { but never closes' }] };
+      const result = extractSearchResultsFromAgentResponse(`Result: ${JSON.stringify(data)}`);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('brace.mp4');
+    });
+  });
+
+  describe('missing/invalid data field', () => {
+    it('returns null when JSON has no data array', () => {
+      const text = JSON.stringify({ results: [{ video_name: 'test.mp4' }] });
+      expect(extractSearchResultsFromAgentResponse(text)).toBeNull();
+    });
+
+    it('returns null when data is not an array', () => {
+      const text = JSON.stringify({ data: 'not-an-array' });
+      expect(extractSearchResultsFromAgentResponse(text)).toBeNull();
+    });
+
+    it('returns null when no closing brace found', () => {
+      expect(extractSearchResultsFromAgentResponse('prefix { unclosed')).toBeNull();
+    });
+
+    it('still finds the payload after a long unmatched-brace prefix', () => {
+      const text = `${'{'.repeat(20_000)} ${JSON.stringify(validData)}`;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0].video_name).toBe('clip1.mp4');
+    });
+  });
+
+  describe('data transformation and defaults', () => {
+    it('applies default values for missing fields', () => {
+      const text = JSON.stringify({ data: [{}] });
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toHaveLength(1);
+      expect(result![0]).toEqual({
+        video_name: '',
+        similarity: 0,
+        screenshot_url: '',
+        description: '',
+        start_time: '',
+        end_time: '',
+        sensor_id: '',
+        object_ids: [],
+      });
+    });
+
+    it('preserves non-array object_ids as empty array', () => {
+      const text = JSON.stringify({ data: [{ object_ids: 'not-array' }] });
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result![0].object_ids).toEqual([]);
+    });
+
+    it('transforms multiple items', () => {
+      const multiData = {
+        data: [
+          { video_name: 'a.mp4', similarity: 0.9 },
+          { video_name: 'b.mp4', similarity: 0.7 },
+          { video_name: 'c.mp4', similarity: 0.5 },
+        ],
+      };
+      const result = extractSearchResultsFromAgentResponse(JSON.stringify(multiData));
+      expect(result).toHaveLength(3);
+      expect(result!.map((r) => r.video_name)).toEqual(['a.mp4', 'b.mp4', 'c.mp4']);
+    });
+
+    it('handles empty data array', () => {
+      const text = JSON.stringify({ data: [] });
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('critic_result pass-through', () => {
+    it('preserves critic_result when present in data items', () => {
+      const dataWithCritique = {
+        data: [
+          {
+            video_name: 'clip1.mp4',
+            similarity: 0.95,
+            critic_result: {
+              result: 'confirmed',
+              criteria_met: { 'has players': true, 'is outdoor': false },
+            },
+          },
+        ],
+      };
+      const result = extractSearchResultsFromAgentResponse(JSON.stringify(dataWithCritique));
+      expect(result).toHaveLength(1);
+      expect(result![0].critic_result).toEqual({
+        result: 'confirmed',
+        criteria_met: { 'has players': true, 'is outdoor': false },
+      });
+    });
+
+    it('sets critic_result to undefined when not present', () => {
+      const text = JSON.stringify({ data: [{ video_name: 'no-critique.mp4' }] });
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result![0].critic_result).toBeUndefined();
+    });
+
+    it('sets critic_result to undefined when the CLI sends null for an unevaluated hit', () => {
+      const text = JSON.stringify({
+        data: [
+          {
+            video_name: 'evaluated.mp4',
+            critic_result: { result: 'confirmed', criteria_met: { 'subject:forklift': true } },
+          },
+          { video_name: 'unevaluated.mp4', critic_result: null },
+        ],
+      });
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result![0].critic_result).toEqual({
+        result: 'confirmed',
+        criteria_met: { 'subject:forklift': true },
+      });
+      expect(result![1].critic_result).toBeUndefined();
+    });
+
+    it('handles all critic result types (confirmed, rejected, unverified)', () => {
+      const data = {
+        data: [
+          { video_name: 'a.mp4', critic_result: { result: 'confirmed', criteria_met: {} } },
+          { video_name: 'b.mp4', critic_result: { result: 'rejected', criteria_met: {} } },
+          { video_name: 'c.mp4', critic_result: { result: 'unverified', criteria_met: {} } },
+        ],
+      };
+      const result = extractSearchResultsFromAgentResponse(JSON.stringify(data));
+      expect(result).toHaveLength(3);
+      expect(result![0].critic_result!.result).toBe('confirmed');
+      expect(result![1].critic_result!.result).toBe('rejected');
+      expect(result![2].critic_result!.result).toBe('unverified');
+    });
+
+    it('preserves critic_result from JSON in markdown code block', () => {
+      const data = {
+        data: [
+          {
+            video_name: 'md-clip.mp4',
+            similarity: 0.88,
+            critic_result: { result: 'rejected', criteria_met: { 'face visible': false } },
+          },
+        ],
+      };
+      const text = `Results:\n\`\`\`json\n${JSON.stringify(data)}\n\`\`\``;
+      const result = extractSearchResultsFromAgentResponse(text);
+      expect(result![0].critic_result).toEqual({
+        result: 'rejected',
+        criteria_met: { 'face visible': false },
+      });
+    });
+  });
+});
+
+describe('normalizeSearchResultMediaUrls', () => {
+  const result = {
+    video_name: 'clip1.mp4',
+    similarity: 0.95,
+    screenshot_url:
+      'http://127.0.0.1:7777/vst/api/v1/replay/stream/sensor-1/picture?startTime=2025-01-01T00%3A00%3A10Z',
+    description: 'Person walking',
+    start_time: '2025-01-01T00:00:10Z',
+    end_time: '2025-01-01T00:00:20Z',
+    sensor_id: 'sensor-1',
+    object_ids: [],
+  };
+
+  it('rebases a harness-local thumbnail onto the browser-facing VST origin', () => {
+    expect(
+      normalizeSearchResultMediaUrls(
+        [result],
+        'https://vss.example:443/vst/api',
+      )[0].screenshot_url,
+    ).toBe(
+      'https://vss.example/vst/api/v1/replay/stream/sensor-1/picture?startTime=2025-01-01T00%3A00%3A10Z',
+    );
+  });
+
+  it('leaves non-VST media URLs and results without a public VST origin unchanged', () => {
+    const nonVstResult = { ...result, screenshot_url: 'https://images.example/thumb.jpg' };
+    expect(normalizeSearchResultMediaUrls([nonVstResult], 'https://vss.example/vst/api')[0]).toBe(
+      nonVstResult,
+    );
+    expect(normalizeSearchResultMediaUrls([result], undefined)[0]).toBe(result);
+  });
+});

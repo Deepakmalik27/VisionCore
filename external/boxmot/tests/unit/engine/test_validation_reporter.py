@@ -1,0 +1,217 @@
+"""Tests for validation and tuning result presentation."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+from rich.panel import Panel
+
+from boxmot.engine.eval import results as eval_results
+from boxmot.engine.tracking.timing import derive_timing_breakdown
+from boxmot.engine.ui.core.ui import capture_renderable
+from boxmot.engine.ui.reporters import validation
+
+
+def _metrics(**overrides: float | int) -> dict[str, float | int]:
+    metrics: dict[str, float | int] = {
+        "HOTA": 70.0,
+        "MOTA": 80.0,
+        "IDF1": 90.0,
+        "AssA": 75.0,
+        "AssRe": 85.0,
+        "IDSW": 2,
+        "IDs": 10,
+    }
+    metrics.update(overrides)
+    return metrics
+
+
+def test_validation_reporter_uses_canonical_metric_columns() -> None:
+    assert validation.CORE_SUMMARY_COLUMNS is eval_results.CORE_SUMMARY_COLUMNS
+    assert validation.SUMMARY_COLUMNS is eval_results.SUMMARY_COLUMNS
+    assert validation.SUMMARY_INT_COLUMNS is eval_results.SUMMARY_INT_COLUMNS
+
+
+def test_render_validation_cli_report_formats_comparison_deltas_and_colors() -> None:
+    report = validation.render_validation_cli_report(
+        _metrics(HOTA=72.0, MOTA=78.0, IDSW=1),
+        compare_raw=_metrics(),
+        compare_label="Δ vs baseline",
+        colorize=True,
+    )
+
+    assert "Δ vs baseline" in report
+    assert "\033[32m(+2.00)\033[0m" in report
+    assert "\033[31m(-2.00)\033[0m" in report
+    assert "\033[32m(-1)\033[0m" in report
+
+
+def test_render_validation_cli_report_appends_timing_snapshot() -> None:
+    report = validation.render_validation_cli_report(
+        _metrics(),
+        timings={
+            "frames": 2,
+            "totals_ms": {"det": 10.0, "track": 4.0, "total": 20.0},
+        },
+        include_sequences=False,
+        include_timings=True,
+        colorize=False,
+    )
+
+    assert "TIMING SUMMARY" in report
+    assert "Frames" in report
+    assert "2" in report
+
+
+def test_build_validation_cli_renderable_includes_comparison_and_timing() -> None:
+    renderable = validation.build_validation_cli_renderable(
+        _metrics(HOTA=72.0),
+        compare_raw=_metrics(),
+        compare_label="Δ vs baseline",
+        timings={
+            "frames": 2,
+            "totals_ms": {"det": 10.0, "track": 4.0, "total": 20.0},
+            "avg_ms": {"det": 5.0, "track": 2.0, "total": 10.0},
+            "fps": 100.0,
+        },
+        include_timings=True,
+    )
+
+    rendered = capture_renderable(renderable, width=160)
+    assert "COMBINED (results)" in rendered
+    assert "Δ vs baseline" in rendered
+    assert "(+2.00)" in rendered
+    assert "Stage" in rendered
+    assert "Frames" in rendered
+
+
+@pytest.mark.parametrize("rich", (False, True))
+@pytest.mark.parametrize("postprocess_ms", (None, 0.0, 50.0))
+def test_validation_timing_reports_optional_offline_postprocessing(rich: bool, postprocess_ms: float | None) -> None:
+    """Smoothing/linking costs stay separate from tracking and incidental overhead."""
+    totals = {"track": 100.0, "total": 100.0 + (postprocess_ms or 0.0)}
+    if postprocess_ms is not None:
+        totals["postprocess"] = postprocess_ms
+    timings = {
+        "frames": 10,
+        "totals_ms": totals,
+        "avg_ms": {key: value / 10 for key, value in totals.items()},
+        "fps": 10000 / totals["total"],
+        "metadata": {"detector_from_cache": True, "reid_from_cache": True},
+    }
+    options = {"timings": timings, "include_timings": True, "include_sequences": False}
+    if rich:
+        report = capture_renderable(validation.build_validation_cli_renderable(_metrics(), **options), width=160)
+    else:
+        report = validation.render_validation_cli_report(_metrics(), colorize=False, **options)
+
+    assert ("Offline postprocess" in report) is (postprocess_ms is not None)
+    assert "Other (I/O, etc)" not in report
+    if postprocess_ms is not None:
+        row = next(line for line in report.splitlines() if "Offline postprocess" in line)
+        assert f"{postprocess_ms:.1f}" in row
+        assert f"{postprocess_ms / 10:.2f}" in row
+        assert report.index("Tracker total") < report.index("Offline postprocess") < report.index("Overall total")
+    if postprocess_ms:
+        overall = next(line for line in report.splitlines() if "Overall total" in line)
+        assert "150.0" in overall
+        assert "15.00" in overall
+
+
+def test_validation_timing_snapshot_retains_offline_cost_and_derives_missing_total() -> None:
+    snapshot = {"frames": 10, "totals_ms": {"track": 100.0, "postprocess": 50.0}}
+    stats = validation.timing_stats_from_snapshot(snapshot)
+    assert stats is not None
+    restored = stats.to_summary_dict()
+    assert restored["totals_ms"]["postprocess"] == 50.0
+    assert restored["avg_ms"]["postprocess"] == 5.0
+    assert restored["totals_ms"]["total"] == 150.0
+    breakdown = derive_timing_breakdown(stats.totals, stats.frames)
+    assert breakdown["tracker_total"] == 100.0
+    assert breakdown["postprocess_total"] == 50.0
+    assert breakdown["total_total"] == 150.0
+    assert breakdown["overhead_total"] == 0.0
+
+
+@pytest.mark.parametrize("width", (40, 60, 75, 120))
+@pytest.mark.parametrize("compare", (False, True))
+def test_validation_panel_preserves_metrics_and_timing_when_resized(width: int, compare: bool) -> None:
+    """A narrow final panel must retain every digit, including comparison deltas."""
+    metrics = _metrics(HOTA=74.62, MOTA=89.83, IDF1=89.48, AssA=74.27, AssRe=78.46, IDSW=807, IDs=1707)
+    renderable = validation.build_validation_cli_renderable(
+        {"pedestrian": metrics},
+        compare_raw={"pedestrian": _metrics()} if compare else None,
+        compare_label="Δ vs baseline",
+        timings={
+            "frames": 4464,
+            "totals_ms": {"track": 13154867.2, "total": 13154867.2},
+            "avg_ms": {"track": 2946.88, "total": 2946.88},
+            "fps": 0.3,
+        },
+        include_timings=True,
+    )
+
+    rendered = capture_renderable(Panel(renderable, padding=(0, 1)), width=width)
+
+    for metric, value in metrics.items():
+        assert metric in rendered
+        expected = str(value) if metric in {"IDSW", "IDs"} else f"{value:.2f}"
+        assert expected in rendered
+    for expected in ("Total (ms)", "Avg (ms)", "FPS", "13154867.2", "2946.88"):
+        assert expected in rendered
+    assert "…" not in rendered
+    if compare:
+        for delta in ("(+4.62)", "(+9.83)", "(-0.52)", "(-0.73)", "(-6.54)", "(+805)", "(+1697)"):
+            assert delta in rendered
+        assert "Δ vs baseline" in rendered
+
+
+def test_supports_ansi_color_honors_terminal_and_environment() -> None:
+    tty = SimpleNamespace(isatty=lambda: True)
+    non_tty = SimpleNamespace(isatty=lambda: False)
+
+    assert validation.supports_ansi_color(tty, environ={}) is True
+    assert validation.supports_ansi_color(non_tty, environ={}) is False
+    assert validation.supports_ansi_color(tty, environ={"NO_COLOR": "1"}) is False
+    assert validation.supports_ansi_color(tty, environ={"TERM": "dumb"}) is False
+
+
+@pytest.mark.parametrize("rich", (False, True))
+def test_3d_tracking_report_identifies_volumetric_metrics_without_optional_ap(rich: bool) -> None:
+    options = {"args": SimpleNamespace(eval_3d=True, eval_ap=False)}
+    if rich:
+        rendered = capture_renderable(validation.build_validation_cli_renderable(_metrics(), **options), width=160)
+    else:
+        rendered = validation.render_validation_cli_report(_metrics(), colorize=False, **options)
+
+    assert "3D tracking — volumetric IoU" in rendered
+    assert "HOTA" in rendered and "MOTA" in rendered and "IDF1" in rendered
+    assert "AP40" not in rendered
+    assert "Easy" not in rendered and "Moderate" not in rendered and "Hard" not in rendered
+    assert "2D tracking" not in rendered
+
+
+@pytest.mark.parametrize("rich", (False, True))
+def test_optional_ap_report_keeps_difficulties_and_projected_2d_separate_from_main_3d(rich: bool) -> None:
+    options = {
+        "args": SimpleNamespace(eval_3d=True, eval_ap=True),
+        "detection_metrics": {
+            geometry: {"car": {"easy": 96.0, "moderate": 84.0, "hard": None}} for geometry in ("2d", "3d")
+        },
+        "tracking_2d_metrics": {"car": _metrics(HOTA=43.0, MOTA=54.0, IDF1=65.0)},
+    }
+    if rich:
+        rendered = capture_renderable(
+            validation.build_validation_cli_renderable({"car": _metrics(HOTA=71.0)}, **options), width=160
+        )
+    else:
+        rendered = validation.render_validation_cli_report({"car": _metrics(HOTA=71.0)}, colorize=False, **options)
+
+    assert "AP40" in rendered
+    assert "Easy" in rendered and "Moderate" in rendered and "Hard" in rendered
+    main_heading = rendered.index("3D tracking — volumetric IoU")
+    projected_heading = rendered.index("2D tracking")
+    assert main_heading < projected_heading
+    assert "71.00" in rendered[main_heading:projected_heading]
+    assert "43.00" in rendered[projected_heading:]

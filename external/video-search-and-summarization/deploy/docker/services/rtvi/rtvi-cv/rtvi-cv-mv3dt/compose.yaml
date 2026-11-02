@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  # Runs once and exits: fetches calibration from the video-analytics API,
+  # validates it, and writes the per-camera camInfo files plus the pub/sub
+  # topology to the named volumes below. Enable with:
+  #   docker compose --profile dynamic-config up
+  #
+  # NOT yet consumed: `perception` does not mount these volumes and does not
+  # wait for this service, so enabling the profile generates the configs but the
+  # pipeline still runs on the static committed ones. Wiring that up means
+  # mounting both volumes into `perception`, adding
+  # `depends_on: {mv3dt-config-init: {condition: service_completed_successfully}}`,
+  # and pointing the DeepStream start script at the generated files. That is a
+  # separate change: it makes the calibration API a hard startup dependency for
+  # every compose user, which is why Helm keeps the equivalent
+  # standaloneWarehouse.mv3dt.dynamicCameraConfig disabled by default too.
+  # The image coordinate is declared here so the release-set tooling can resolve
+  # it; the profile keeps the default stack byte-identical to before.
+  mv3dt-config-init:
+    profiles: ["dynamic-config"]
+    image: ${VSS_RT_CV_MV3DT_CONFIG_INIT_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/vss-rt-cv-mv3dt-config-init}:${VSS_RT_CV_MV3DT_CONFIG_INIT_TAG:-develop-latest}
+    container_name: vss-rtvi-cv-mv3dt-config-init
+    restart: "no"
+    networks:
+      default:
+        aliases:
+          - vss-rtvi-cv-mv3dt-config-init
+    environment:
+      CALIBRATION_API_URL: ${CALIBRATION_API_URL:-http://vss-video-analytics-api:8081/config/calibration}
+      CALIBRATION_WAIT_TIMEOUT: ${CALIBRATION_WAIT_TIMEOUT:-3600}
+      CAM_INFO_OUTPUT_DIR: /tmp/camInfo
+      PUB_SUB_OUTPUT_DIR: /tmp/generated
+      MQTT_HOST: ${MQTT_HOST:-mosquitto}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+    volumes:
+      - mv3dt-caminfo:/tmp/camInfo
+      - mv3dt-generated:/tmp/generated
+
+  perception:
+    image: ${VSS_RT_CV_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/vss-rt-cv}:${VSS_RT_CV_TAG:-develop-latest}
+    runtime: nvidia
+    container_name: vss-rtvi-cv-mv3dt
+    ports:
+      - ${RTVI_CV_MV3DT_HOST_PORT:-9000}:${RTVI_CV_MV3DT_PORT:-9000}
+    networks:
+      default:
+        aliases:
+          - vss-rtvi-cv-mv3dt
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 2
+      resources:
+        reservations:
+          devices:
+          - capabilities: [gpu]
+            device_ids: ["${RT_CV_DEVICE_ID:-0}"]
+    environment:
+      STREAM_TYPE: ${STREAM_TYPE:-kafka}
+      DEEPSTREAM_ENABLE_SENSOR_ID_EXTRACTION: "0"
+      GST_ENABLE_CUSTOM_PARSER_MODIFICATIONS: 1
+      OTEL_SERVICE_NAME: "rtvi-cv-mv3dt"
+      OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-true}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-otlp}
+
+  measurement-fusion:
+    image: ${VSS_RT_CV_MV3DT_BEV_FUSION_IMAGE:-${VSS_CONTAINER_REGISTRY:-ghcr.io/nvidia-ai-blueprints/vss}/vss-rt-cv-mv3dt-bev-fusion}:${VSS_RT_CV_MV3DT_BEV_FUSION_TAG:-develop-latest}
+    container_name: vss-rtvi-cv-bev-fusion
+    restart: always
+    environment:
+      BROKER_TYPE: ${STREAM_TYPE:-kafka}
+      KAFKA_BOOTSTRAP: "kafka:29092"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      RAW_TOPIC: "mdx-raw"
+      FUSED_TOPIC: "mdx-bev"
+      SENSOR_TIMEOUT_MS: "100"
+      MAX_EXPECTED_SENSORS: ${NUM_STREAMS:-4}
+      BUFFER_DURATION_S: "2.0"
+      FUSION_METHOD: ${FUSION_METHOD:-rays}
+      VISIBILITY_MIN: ${VISIBILITY_MIN:-0.3}
+      MAX_DIST: ${MAX_DIST:-30}
+      TEMPORAL_FILTER: ${TEMPORAL_FILTER:-1}
+      PIXEL_SIGMA: ${PIXEL_SIGMA:-3.0}
+      ACCEL_SIGMA: ${ACCEL_SIGMA:-3.0}
+      # "auto" measures it from overlapping views; "off" or metres to pin it.
+      FOOT_OFFSET: ${FOOT_OFFSET:-auto}
+      # Views of one id further apart than this are different people. 0 disables.
+      CONFLICT_RADIUS: ${CONFLICT_RADIUS:-2.0}
+      # Buckets of publish delay to let a backward pass run. 0 is causal.
+      SMOOTH_LAG: ${SMOOTH_LAG:-0}
+      # Reject a fused step implying more than this, m/s. 0 disables.
+      MAX_SPEED: ${MAX_SPEED:-10}
+      REACQUIRE: ${REACQUIRE:-10}
+      # On re-acquisition publish a new id instead of leaping the old one.
+      # 0 keeps the id and accepts the jump.
+      SPLIT_ON_REACQUIRE: ${SPLIT_ON_REACQUIRE:-1}
+      CALIBRATION_PATH: /calibration/calibration.json
+    volumes:
+      # Camera geometry. closest refuses to start without it and rays
+      # fuses worse; the baselines ignore it. Same file the perception and analytics
+      # containers are given, so all three agree on the camera set.
+      - $VSS_APPS_DIR/industry-profiles/warehouse-operations/warehouse-mv3dt-app/calibration/sample-data/$SAMPLE_VIDEO_DATASET/calibration.json:/calibration/calibration.json:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,sys; sys.exit(0 if os.path.isfile('/tmp/fusion_ready') else 1)"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  mv3dt-caminfo:
+  mv3dt-generated:

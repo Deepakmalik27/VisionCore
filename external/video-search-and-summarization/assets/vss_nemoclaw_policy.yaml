@@ -1,0 +1,471 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# VSS NemoClaw preset — applied with `nemoclaw <sandbox> policy-add --from-file`.
+# Merges into the live sandbox policy instead of replacing it, so the base
+# OpenShell filesystem / landlock / process rules stay intact.
+
+preset:
+  name: vss
+  description: "VSS network access (NVIDIA endpoints, OpenClaw infra, VSS backend, optional channels)"
+
+network_policies:
+  claude_code:
+    name: claude_code
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: statsig.anthropic.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: sentry.io
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: platform.claude.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/v1/oauth/**" }
+          - allow: { method: POST, path: "/v1/oauth/**" }
+    # OpenShell enforces on the kernel-trusted /proc/<pid>/exe. A global npm
+    # install resolves to the package launcher rather than the bin/claude shim,
+    # and the CLI may surface as the Node runtime instead.
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/claude }
+      - { path: /tmp/npm-global/bin/claude }
+      - { path: /tmp/npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe }
+      - { path: /home/linuxbrew/.linuxbrew/bin/claude }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }
+
+  github:
+    name: github
+    endpoints:
+      - host: github.com
+        port: 443
+        access: full
+      - host: api.github.com
+        port: 443
+        access: full
+    # The sandbox base image apt-installs git but not gh.
+    binaries:
+      - { path: /usr/bin/git }
+
+  # Named clawhub_assets, not clawhub: presets merge into the live policy by
+  # policy name and override on collision, so reusing `clawhub` would replace
+  # the base policy's clawhub.ai entry (which carries allow_encoded_slash for
+  # @scope%2Fname package paths) instead of adding to it.
+  clawhub_assets:
+    name: clawhub_assets
+    endpoints:
+      - host: registry.clawhub.ai
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: cdn.clawhub.ai
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+
+  telegram:
+    name: telegram
+    endpoints:
+      - host: api.telegram.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/bot*/**" }
+          - allow: { method: POST, path: "/bot*/**" }
+    binaries:
+      - { path: /usr/local/bin/node }
+
+  discord:
+    name: discord
+    endpoints:
+      - host: discord.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      - host: gateway.discord.gg
+        port: 443
+        access: full
+      - host: cdn.discordapp.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/node }
+
+  pypi:
+    name: pypi
+    endpoints:
+      - host: pypi.org
+        port: 443
+        access: full
+      - host: files.pythonhosted.org
+        port: 443
+        access: full
+    # uv resolves and downloads in-process rather than shelling out to pip, so
+    # its own path has to be listed here or every wheel fetch from
+    # files.pythonhosted.org fails with `tunnel error: unsuccessful`. See
+    # vss-cli-build below for why uv lands under /tmp/.local/bin.
+    binaries:
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python3.13 }
+      - { path: /usr/bin/pip }
+      - { path: /usr/bin/pip3 }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/node }
+      - { path: /tmp/.local/bin/uv }
+      - { path: /tmp/.local/bin/uvx }
+      - { path: /usr/local/bin/uv }
+      - { path: /root/.local/bin/uv }
+      - { path: /sandbox/.local/bin/uv }
+
+  slack:
+    name: slack
+    endpoints:
+      - host: slack.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+    binaries:
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python3.13 }
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/node }
+
+  vss-backend:
+    name: vss-backend-readwrite
+    # Keep this scoped to Docker bridge CIDRs used by supported OpenShell /
+    # NemoClaw drivers. Do not use the full 172.16.0.0/12 private range.
+    # These four are the fallback for a hand-applied policy, which has nothing
+    # to detect from. Section 3.2 of `deploy_nemoclaw.ipynb` replaces every
+    # allowed_ips list below with the subnets the sandbox container is actually
+    # attached to (`orchestrator_mcp_helper.sandbox_host_cidrs`), and keeps
+    # these when the sandbox or Docker cannot be inspected.
+    endpoints:
+      - host: host.openshell.internal
+        port: 8000
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 30888
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 5601
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 9200
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 8081
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 9080
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 9988
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 18789
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      # HAProxy single-origin ingress (HAPROXY_HOST_PORT, default 7777). Every
+      # other entry here is one backend's own host port; this one fronts them
+      # all behind a host-header allowlist, and it is the only origin a
+      # `vss-build-vision-ai` build publishes — `vss configure` records the
+      # ingress-routed URLs, not the loopback ports.
+      - host: host.openshell.internal
+        port: 7777
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      # Agent UI (3000), Auto-Calibration UI (5000), Phoenix (6006), VST MCP (8001),
+      # Auto-Calibration MS (8010), RT-Embed (8017), RT-VLM (8018), Kafka (9092),
+      # VA-MCP (9901), NvStreamer UI (31000), LVS REST (38111), LVS MCP (38112).
+      - host: host.openshell.internal
+        port: 3000
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 5000
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 6006
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 8001
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 8010
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 8017
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 8018
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 9092
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 9901
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 31000
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 38111
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+      - host: host.openshell.internal
+        port: 38112
+        access: full
+        allowed_ips:
+          - 172.17.0.0/16
+          - 172.18.0.0/16
+          - 172.19.0.0/16
+          - 172.20.0.0/16
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python3.13 }
+
+  # Kubernetes developer profiles publish nothing on host.openshell.internal:
+  # every HTTP surface sits behind one path-based Ingress on the node running
+  # the controller, so the Ingress host has to be named here. The host below is
+  # a placeholder under RFC 2606 `.invalid`, so an unfilled entry resolves
+  # nowhere and allowlists nothing. Section 3.2 of `deploy_nemoclaw.ipynb`
+  # rewrites it from that notebook's VSS_PUBLIC_URL when applying the policy,
+  # taking the port from the same origin (80 for a plain-HTTP Ingress, 443 with
+  # ingress.tls).
+  vss-k8s-ingress:
+    name: vss-k8s-ingress
+    endpoints:
+      - host: vss-ingress.unset.invalid
+        port: 80
+        access: full
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python3.13 }
+      - { path: /usr/local/bin/node }
+
+  # Host-CLI skills run `uv run --project libs/vss vss`.
+  # Pair with the `pypi` policy: uv comes from PyPI, not the astral.sh
+  # script (its release assets are not listed).
+  #
+  # Extra indexes from services/agent/pyproject.toml: uv reads every declared
+  # index. pytorch-cpu is for --extra agent; ngc-data-platform is omitted
+  # (NVIDIA-internal, only nvdataset).
+  #
+  # Use `--python /usr/bin/python3.13`. A uv-managed interpreter under
+  # ~/.local/share/uv/python/ is not listed; OpenShell enforces /proc/<pid>/exe.
+  vss-cli-build:
+    name: vss-cli-build
+    endpoints:
+      - host: pypi.nvidia.com
+        port: 443
+        access: full
+      - host: download.pytorch.org
+        port: 443
+        access: full
+    # uv is a standalone binary; its path is enforced, not the shell's. The
+    # agent installs it itself per TOOLS.md "VSS CLI checkout"
+    # (`pip install --user --break-system-packages uv`, PEP 668), which lands
+    # at /tmp/.local/bin/uv under the sandbox PYTHONUSERBASE; the other uv
+    # paths are fallbacks. pip is /usr/bin/pip3; a venv python symlinks
+    # to /usr/bin/python3.13.
+    binaries:
+      - { path: /tmp/.local/bin/uv }
+      - { path: /tmp/.local/bin/uvx }
+      - { path: /usr/local/bin/uv }
+      - { path: /root/.local/bin/uv }
+      - { path: /sandbox/.local/bin/uv }
+      - { path: /home/sandbox/.local/bin/uv }
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python3.13 }
+      - { path: /usr/bin/pip }
+      - { path: /usr/bin/pip3 }
+      - { path: /usr/bin/curl }
+
+  # NGC, for the operation skills' sample-data and release-fixture bootstraps
+  # (`ngc registry resource download-version nvidia/vss-developer/dev-profile-sample-data`).
+  # The harness images install the CLI (../.openclaw/Dockerfile,
+  # ../.hermes/Dockerfile), so the binary is present either way — without these
+  # endpoints it is present and unusable, failing with
+  # `CONNECT tunnel failed, response 403`.
+  #
+  # Three hosts, because a download is three hops and omitting any one of them
+  # fails later than it looks:
+  #   authn.nvidia.com      exchanges NGC_CLI_API_KEY for a bearer token
+  #                         (/token?service=ngc&scope=group/ngc:<org>)
+  #   api.ngc.nvidia.com    the v2 API: resource metadata and the file listing
+  #   xfiles.ngc.nvidia.com the bytes — api.ngc.nvidia.com 302s every file to a
+  #                         signed URL on this host, so metadata succeeds and
+  #                         the transfer dies without it
+  #
+  # `access: full`, not `protocol: rest` with path rules: the signed redirect
+  # carries Expires/Signature/Key-Pair-Id query parameters, so no stable path
+  # allowlist describes it.
+  ngc:
+    name: ngc
+    endpoints:
+      - host: authn.nvidia.com
+        port: 443
+        access: full
+      - host: api.ngc.nvidia.com
+        port: 443
+        access: full
+      - host: xfiles.ngc.nvidia.com
+        port: 443
+        access: full
+    # The CLI is a bundled binary at the real path the image installs it to;
+    # OpenShell enforces /proc/<pid>/exe, so the /usr/local/bin/ngc symlink
+    # resolves here rather than matching on its own. `curl`/`wget` are listed
+    # for the documented manual `api.ngc.nvidia.com/v2/...` fetches that skip
+    # the CLI entirely.
+    binaries:
+      - { path: /usr/local/lib/ngc-cli/ngc }
+      - { path: /usr/local/bin/ngc }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }

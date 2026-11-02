@@ -1,0 +1,79 @@
+name: Bug report
+description: Create a report to help us improve
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the bug
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: To Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: To Reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add any other context about the problem here.
+      placeholder: Additional context
+  - type: textarea
+    id: public-api-output
+    attributes:
+      label: Public API output (optional)
+      description:
+        If you can, paste what the public API returns for the affected
+        device, see [Check the public API first](https://github.com/uilibs/uiprotect#check-the-public-api).
+        Remove MAC addresses, IP addresses and serial numbers first, and never include your API key.
+      render: json
+  - type: input
+    id: protect-version
+    attributes:
+      label: UniFi Protect version and affected device model
+      description: Leave out the model if no device is involved.
+      placeholder: "Example: Protect 7.3.70, G6 Pro Entry"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: uiprotect version
+      description: Run `pip show uiprotect`. In Home Assistant, download the diagnostics (Settings > Devices & services > UniFi Protect > ⋮ > Download diagnostics) and look under `integration_manifest` > `requirements`.
+      placeholder: Version
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Platform where the bug was found.
+      placeholder: "Example: Home Assistant OS 16.2 / Ubuntu 24.04"
+    validations:
+      required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow our
+        [Code of Conduct](https://github.com/uilibs/uiprotect/blob/main/.github/CODE_OF_CONDUCT.md).
+      options:
+        - label: I agree to follow this project's Code of Conduct.
+          required: true
+  - type: checkboxes
+    id: no-duplicate
+    attributes:
+      label: No Duplicate
+      description: Please check [existing issues](https://github.com/uilibs/uiprotect/issues) to avoid duplicates.
+      options:
+        - label: I have checked existing issues to avoid duplicates.
+          required: true
+  - type: markdown
+    attributes:
+      value: 👋 Have a great day and thank you for the bug report!

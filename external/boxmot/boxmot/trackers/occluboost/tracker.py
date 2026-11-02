@@ -1,0 +1,853 @@
+# Mikel Broström 🔥 BoxMOT 🧾 AGPL-3.0 license
+"""OccluBoost tracker.
+
+A hybrid tracker that combines:
+
+* BoostTrack's identity-friendly multi-cue association (IoU + Mahalanobis +
+  shape similarity, optional ReID) and DLO/DUO confidence boosting — this is
+  what gives strong IDF1 / AssA.
+* A BotSort/StrongSort-inspired ReID-only **recovery pass** that re-attaches
+  unmatched high-confidence detections to recently lost tracks when the
+  appearance similarity is high. This lifts MOTA without inducing the ID
+  switches an IoU-only ByteTrack second pass introduces.
+* A BotSort-style **track confirmation state**: new tracks born from
+  medium-confidence detections must accumulate ``confirm_hits`` consecutive
+  matches before being emitted (detections above ``instant_confirm_thresh``
+  skip the wait). Tentative tracks expire quickly via ``tentative_max_age``,
+  cutting ghost IDs and FP from one-frame flickers.
+* A safe **appearance-gated low-confidence pass** that recovers low-confidence
+  detections only for already-confirmed tracks (``is_activated=True``) with
+  strict IoU + appearance gates.
+* Tuned defaults (longer ``max_age``) that favour identity retention.
+* Optional Oriented Bounding Box (OBB) support, dispatched via a separate
+  OBB-only update path that mirrors the AABB flow but uses oriented IoU
+  and a 9-column output schema. DLO/DUO boosting uses oriented geometry;
+  first-pass OBB matching combines geometry and optional appearance.
+  Abnormal-motion suppression is limited to AABB updates.
+"""
+
+from __future__ import annotations
+
+from dataclasses import fields
+from typing import Optional
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+from typing_extensions import Unpack
+
+from boxmot.reid.protocols import AppearanceEncoder
+from boxmot.reid.specs import ReIDConfig
+from boxmot.trackers.boosttrack.config import BoostTrackConfig
+from boxmot.trackers.boosttrack.track import KalmanBoxTracker
+from boxmot.trackers.boosttrack.tracker import BoostTrack
+from boxmot.trackers.common.appearance import (
+    confidence_aware_alpha,
+    resolve_batch_embeddings,
+)
+from boxmot.trackers.common.association.boost import associate
+from boxmot.trackers.common.association.iou import AssociationFunction
+from boxmot.trackers.common.association.matching import fuse_iou, fuse_score, solve_assignment
+from boxmot.trackers.common.constructor import BoxTrackerOptions, validate_runtime_options
+from boxmot.trackers.common.motion.kalman_filters.config import KalmanConfig
+from boxmot.trackers.common.tracking.track import TrackState, sync_track_meta
+from boxmot.trackers.occluboost.config import OccluBoostConfig
+
+
+class OccluBoost(BoostTrack):
+    """Track AABB or OBB detections with confidence boosting and appearance recovery."""
+
+    supports_variable_dt = True
+
+    accepts_embeddings = True
+
+    def __init__(
+        self,
+        config: OccluBoostConfig | None = None,
+        *,
+        kalman: KalmanConfig | None = None,
+        reid: ReIDConfig | AppearanceEncoder | None = None,
+        **kwargs: Unpack[BoxTrackerOptions],
+    ) -> None:
+        """Configure recovery, track confirmation, and occlusion-aware motion updates.
+
+        AABB and OBB paths share detection, matching, and lifetime thresholds.
+        Abnormal-motion suppression and lambda_emb_multiplier affect AABB tracking.
+
+        Args:
+            config: Immutable algorithm settings. None selects OccluBoostConfig defaults.
+            kalman: Immutable filter noise, timing, and supported behavior settings.
+                None preserves tracker defaults.
+            reid: Immutable encoder configuration or a canonical appearance encoder.
+                Missing embeddings are generated lazily; None selects the default encoder.
+            **kwargs: Runtime ``per_class``, ``is_obb``, ``class_ids``, ``class_names``,
+                ``mask_guidance``, and ``edgetam`` settings.
+        """
+        config = OccluBoostConfig.resolve(config)
+        validate_runtime_options(kwargs)
+        self.config = config
+        super().__init__(
+            config=BoostTrackConfig(**{field.name: getattr(config, field.name) for field in fields(BoostTrackConfig)}),
+            kalman=kalman,
+            reid=reid,
+            **kwargs,
+        )
+        self.config = config
+        if config.use_cmc and config.cmc_method == "sof":
+            from boxmot.trackers.common.motion.cmc.registry import create_cmc, sof_options
+
+            self.cmc = create_cmc("sof", **sof_options(config))
+        self.recovery_appearance_thresh = config.recovery_appearance_thresh
+        self.recovery_iou_thresh = self._geometry_similarity_threshold(config.recovery_iou_thresh)
+        self.recovery_max_age = config.recovery_max_age
+        self.feat_alpha = config.feat_alpha
+        self.track_low_thresh = config.track_low_thresh
+        self.second_iou_thresh = self._geometry_similarity_threshold(config.second_iou_thresh)
+        self.second_appearance_thresh = config.second_appearance_thresh
+        self.second_pass_max_age = config.second_pass_max_age
+        self.second_pass_min_hits = config.second_pass_min_hits
+        self.use_second_pass = config.use_second_pass
+        # ``new_track_thresh`` decouples new-track creation from the matching
+        # det_thresh. Detections in [det_thresh, new_track_thresh) help update
+        # existing tracks but do not spawn new ones.
+        self.new_track_thresh = max(config.new_track_thresh, 0.0)
+        # ---- BotSort-style track confirmation ----
+        # Tracks created from low/medium-confidence detections start tentative
+        # and are only emitted (and persisted past ``tentative_max_age`` frames)
+        # once they accumulate ``confirm_hits`` consecutive matched updates.
+        # Detections with confidence >= ``instant_confirm_thresh`` skip the
+        # tentative state entirely so high-quality first detections still emit
+        # immediately (preserves IDF1).
+        self.confirm_hits = max(int(config.confirm_hits), 1)
+        self.instant_confirm_thresh = config.instant_confirm_thresh
+        self.tentative_max_age = max(int(config.tentative_max_age), 0)
+        # ---- Duplicate-track suppression ----
+        # IoU threshold above which two co-existing tracks are considered
+        # duplicates; the younger one (lower ``age``) is dropped.
+        self.duplicate_iou_thresh = config.duplicate_iou_thresh
+        self.lambda_emb_multiplier = float(config.lambda_emb_multiplier)
+
+    def _track_detections(
+        self,
+        dets: np.ndarray,
+        img: np.ndarray,
+        embs: Optional[np.ndarray] = None,
+        masks: np.ndarray = None,
+    ) -> np.ndarray:
+        if self.is_obb:
+            return self._update_obb(dets, img, embs)
+
+        det_dtype = dets.dtype
+        batch = self._make_detection_batch(dets, embs=embs, copy=False)
+        dets = batch.as_indexed_detections(dtype=det_dtype)
+        self.frame_count += 1
+
+        trks_np = self._predict_track_rows(img, dets)
+        mh_dist_matrix = (
+            self.get_mh_dist_matrix(dets)
+            if self.use_duo_boost or (self.use_dlo_boost and self.use_rich_s)
+            else None
+        )
+
+        # Capture original detection confidences before any boosting so the
+        # ByteTrack-style second pass can recover the genuinely low-conf set.
+        orig_confs = batch.confs.copy()
+
+        if self.use_dlo_boost:
+            dets = self.dlo_confidence_boost(dets, tracker_rows=trks_np, motion_distances=mh_dist_matrix)
+        if self.use_duo_boost:
+            dets = self.duo_confidence_boost(dets, motion_distances=mh_dist_matrix)
+
+        boosted_confs = self.detection_layout.confidences(dets)
+        keep_mask = boosted_confs >= self.det_thresh
+        if mh_dist_matrix is not None and mh_dist_matrix.size:
+            mh_dist_matrix = mh_dist_matrix[keep_mask]
+        second_mask = (
+            ((~keep_mask) & (orig_confs >= self.track_low_thresh) & (orig_confs < self.det_thresh))
+            if self.use_second_pass
+            else np.zeros_like(keep_mask, dtype=bool)
+        )
+
+        high_batch = batch.select(keep_mask).with_confs(boosted_confs[keep_mask])
+        second_batch = batch.select(second_mask).with_confs(boosted_confs[second_mask])
+        dets = high_batch.as_indexed_detections(dtype=det_dtype)
+        if mh_dist_matrix is None:
+            mh_dist_matrix = self.get_mh_dist_matrix(dets)
+        dets_second = second_batch.as_indexed_detections(dtype=det_dtype)
+        scores = high_batch.confs
+        dets_embs = resolve_batch_embeddings(
+            high_batch,
+            enabled=self.use_embeddings,
+            placeholder_value=1.0,
+        )
+        dets_embs_second = resolve_batch_embeddings(
+            second_batch,
+            enabled=self.use_embeddings,
+            placeholder_value=1.0,
+        )
+
+        if self.use_embeddings and len(self.trackers) > 0 and dets_embs.shape[0] > 0:
+            tracker_embs = np.array([trk.get_emb() for trk in self.trackers])
+            emb_cost = dets_embs.reshape(dets_embs.shape[0], -1) @ tracker_embs.reshape(tracker_embs.shape[0], -1).T
+        else:
+            emb_cost = None
+
+        geometry_similarity = self.asso_func(high_batch.boxes, trks_np[:, :4])
+        if self.config.fuse_detection_score:
+            geometry_similarity = 1.0 - fuse_score((1.0 - geometry_similarity).T, high_batch.confs).T
+        if emb_cost is not None and self.config.fuse_iou:
+            emb_cost = 1.0 - fuse_iou(1.0 - emb_cost, high_batch.boxes, trks_np[:, :4])
+
+        matched, unmatched_dets, unmatched_trks, _ = associate(
+            dets,
+            trks_np,
+            self.iou_threshold,
+            mahalanobis_distance=mh_dist_matrix,
+            track_confidence=trks_np[:, -1:],
+            detection_confidence=scores,
+            emb_cost=emb_cost,
+            lambda_iou=self.lambda_iou,
+            lambda_mhd=self.lambda_mhd,
+            lambda_shape=self.lambda_shape,
+            s_sim_corr=self.s_sim_corr,
+            lambda_emb_multiplier=self.lambda_emb_multiplier,
+            appearance_thresh=self.appearance_thresh,
+            appearance_iou_fraction=self.appearance_iou_fraction,
+            geometry_matrix=geometry_similarity,
+            gate_before_assignment=self._asso_func_base_name == "centroid",
+            geometry_conditioner=lambda similarity: self._condition_similarity(
+                similarity, self.trackers, high_batch.boxes, threshold=self.iou_threshold
+            ),
+            cost_conditioner=(
+                lambda costs: self._fuse_first_motion(costs, self.trackers, high_batch.boxes)
+            ) if self.config.motion_fusion != "off" else None,
+        )
+
+        dets_alpha = confidence_aware_alpha(
+            self.detection_layout.confidences(dets),
+            self.det_thresh,
+            base_alpha=self.alpha_fixed_emb,
+        )
+
+        self._ams_multi_update([self.trackers[index] for index in matched[:, 1]], dets[matched[:, 0]])
+        for m in matched:
+            if self.use_embeddings:
+                self.trackers[m[1]].update_emb(dets_embs[m[0]], alpha=dets_alpha[m[0]])
+            self._maybe_activate(self.trackers[m[1]])
+
+        # ---- ReID-only recovery pass ----
+        if self.use_embeddings and len(unmatched_trks) > 0 and len(unmatched_dets) > 0:
+            elig = [
+                int(t)
+                for t in unmatched_trks
+                if self.trackers[int(t)].time_since_update <= self.recovery_max_age
+                and self.trackers[int(t)].get_emb() is not None
+            ]
+            if elig:
+                u_det_idx = [int(d) for d in unmatched_dets]
+                trk_e = np.stack([self.trackers[t].get_emb() for t in elig], axis=0)
+                trk_e = trk_e.reshape(len(elig), -1)
+                det_e = dets_embs[u_det_idx].reshape(len(u_det_idx), -1)
+                sim = det_e @ trk_e.T
+
+                trks_pos = trks_np[elig]
+                ious = self.asso_func(high_batch.boxes[u_det_idx], trks_pos[:, :4])
+                guided_ious = self._condition_similarity(
+                    ious,
+                    [self.trackers[t] for t in elig],
+                    high_batch.boxes[u_det_idx],
+                    threshold=self.recovery_iou_thresh,
+                )
+                gated = sim + (guided_ious - ious)
+                ious = guided_ious
+                gated[ious < self.recovery_iou_thresh] = -1.0
+                gated[~self.association_eligibility(high_batch.boxes[u_det_idx], trks_pos[:, :4])] = -1.0
+                gated[sim < self.recovery_appearance_thresh] = -1.0
+
+                if (gated > 0).any():
+                    row_ind, col_ind = linear_sum_assignment(-gated)
+                    matched_dets_set = set()
+                    matched_tracks_set = set()
+                    accepted = [(u_det_idx[r], elig[c]) for r, c in zip(row_ind, col_ind) if gated[r, c] > 0]
+                    self._ams_multi_update(
+                        [self.trackers[t] for _, t in accepted],
+                        dets[[d for d, _ in accepted]],
+                    )
+                    for det_global, trk_global in accepted:
+                        matched_dets_set.add(det_global)
+                        matched_tracks_set.add(trk_global)
+                        self.trackers[trk_global].update_emb(dets_embs[det_global], alpha=self.feat_alpha)
+                        self._maybe_activate(self.trackers[trk_global])
+                    if matched_dets_set:
+                        unmatched_dets = np.array(
+                            [d for d in unmatched_dets if int(d) not in matched_dets_set],
+                            dtype=int,
+                        )
+                        unmatched_trks = np.array(
+                            [t for t in unmatched_trks if int(t) not in matched_tracks_set],
+                            dtype=int,
+                        )
+
+        # ---- ByteTrack-style appearance-gated second pass on low-conf dets ----
+        if self.use_second_pass and len(unmatched_trks) > 0 and dets_second.shape[0] > 0:
+            elig_sec = [
+                int(t)
+                for t in unmatched_trks
+                if self.trackers[int(t)].time_since_update <= self.second_pass_max_age
+                and self.trackers[int(t)].hit_streak >= self.second_pass_min_hits
+                and getattr(self.trackers[int(t)], "is_activated", True)
+            ]
+            if elig_sec:
+                trks_pos = trks_np[elig_sec]
+                ious2 = self.asso_func(second_batch.boxes, trks_pos[:, :4])
+                ious2 = self._condition_similarity(
+                    ious2,
+                    [self.trackers[t] for t in elig_sec],
+                    second_batch.boxes,
+                    threshold=self.second_iou_thresh,
+                )
+
+                eligible = (ious2 >= self.second_iou_thresh) & self.association_eligibility(
+                    second_batch.boxes, trks_pos[:, :4]
+                )
+                cost = 1.0 - ious2
+                cost[~eligible] = 1.0
+
+                if (
+                    self.use_embeddings
+                    and dets_embs_second.shape[0] > 0
+                    and self.trackers[elig_sec[0]].get_emb() is not None
+                ):
+                    trk_e = np.stack([self.trackers[t].get_emb() for t in elig_sec], axis=0).reshape(len(elig_sec), -1)
+                    det_e = dets_embs_second.reshape(dets_embs_second.shape[0], -1)
+                    sim2 = det_e @ trk_e.T
+                    eligible &= sim2 >= self.second_appearance_thresh
+                    cost[sim2 < self.second_appearance_thresh] = 1.0
+
+                centroid = self._asso_func_base_name == "centroid"
+                has_candidates = eligible.any() if centroid else (cost < 1.0).any()
+                if has_candidates:
+                    if centroid:
+                        pairs = solve_assignment(np.where(eligible, cost, np.inf), cost_limit=1.0)
+                        row_ind, col_ind = pairs.T
+                    else:
+                        row_ind, col_ind = linear_sum_assignment(cost)
+                    used = set()
+                    accepted = []
+                    for r, c in zip(row_ind, col_ind):
+                        accepted_cost = eligible[r, c] if centroid else cost[r, c] < 1.0
+                        if not accepted_cost:
+                            continue
+                        trk_global = elig_sec[c]
+                        if trk_global in used:
+                            continue
+                        used.add(trk_global)
+                        accepted.append((r, trk_global))
+                    self._ams_multi_update(
+                        [self.trackers[t] for _, t in accepted],
+                        dets_second[[r for r, _ in accepted]],
+                    )
+                    for r, trk_global in accepted:
+                        if self.use_embeddings and dets_embs_second.shape[0] > 0:
+                            self.trackers[trk_global].update_emb(dets_embs_second[r], alpha=self.feat_alpha)
+                        self._maybe_activate(self.trackers[trk_global])
+
+        for i in unmatched_dets:
+            if dets[i, 4] >= self.new_track_thresh:
+                det_emb = dets_embs[i] if self.use_embeddings else None
+                new_trk = KalmanBoxTracker(
+                    dets[i, :],
+                    max_obs=self.max_obs,
+                    emb=det_emb,
+                    adaptive_kf=self.kalman_config.adaptive_kf,
+                    id_allocator=self.id_allocator,
+                    noise_config=self.kalman_noise_config,
+                    kalman_type=self.kalman_config.type,
+                    track_confidence_decay=self.config.track_confidence_decay,
+                    track_confidence_warmup=self.config.track_confidence_warmup,
+                )
+                # Tentative until confirmed; high-conf detections skip the
+                # confirmation period so first-frame appearances still emit.
+                new_trk.is_activated = bool(dets[i, 4] >= self.instant_confirm_thresh or self.confirm_hits <= 1)
+                self.trackers.append(new_trk)
+
+        eligible_tracks = self._emitted_tracks()
+        emitted_now = list(zip(eligible_tracks, self._track_boxes(eligible_tracks), strict=True))
+
+        # ---- Duplicate-track suppression on emitted tracks ----
+        # When two tracks predict to nearly the same box, BotSort kills the
+        # younger one. Without this step OccluBoost can emit pairs of tracks on
+        # a single object after a recovery/2nd-pass pickup, hurting MOTA (FP)
+        # and IDSW. We only consider currently-emitted tracks so we never
+        # delete a legitimate occluded track that just happens to overlap a
+        # visible one in *prediction* space.
+        if len(emitted_now) > 1 and 0.0 < self.duplicate_iou_thresh < 1.0:
+            emitted_now = self._suppress_duplicate_emissions(emitted_now)
+
+        self.active_tracks = [trk for trk, _ in emitted_now]
+
+        # Lifecycle: confirmed tracks live up to ``max_age`` frames; tentative
+        # tracks are dropped after ``tentative_max_age`` to prevent ghost IDs
+        # from spurious detections, mirroring BotSort's ``unconfirmed`` pool.
+        self.trackers = [
+            trk
+            for trk in self.trackers
+            if trk.time_since_update <= self.max_age
+            and (getattr(trk, "is_activated", True) or trk.time_since_update <= self.tentative_max_age)
+        ]
+
+        boxes = np.asarray([box for _, box in emitted_now]) if emitted_now else self._track_boxes([])
+        outputs = self.format_outputs(self.active_tracks, dtype=np.float32, boxes=boxes)
+        return self.filter_outputs(outputs)
+
+    def _emitted_tracks(self) -> list[KalmanBoxTracker]:
+        """Select visible confirmed identities before decoding output geometry."""
+        warmup = self.frame_count <= self.min_hits
+        return [
+            trk for trk in self.trackers
+            if trk.time_since_update < 1
+            and getattr(trk, "is_activated", True)
+            and (trk.hit_streak >= self.min_hits or warmup)
+        ]
+
+    def _maybe_activate(self, trk: KalmanBoxTracker) -> None:
+        """Promote a tentative track to activated once it accumulates enough
+        consecutive matched updates."""
+        if not getattr(trk, "is_activated", True) and trk.hit_streak >= self.confirm_hits:
+            trk.is_activated = True
+            sync_track_meta(trk)
+
+    @staticmethod
+    def _xyxy_to_cxcywh(box: np.ndarray) -> np.ndarray:
+        """Convert ``[x1, y1, x2, y2]`` to ``[cx, cy, w, h]``."""
+        x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        w = max(x2 - x1, 1e-6)
+        h = max(y2 - y1, 1e-6)
+        return np.array([x1 + 0.5 * w, y1 + 0.5 * h, w, h], dtype=float)
+
+    def _compute_ams_alpha(self, trk: KalmanBoxTracker, det_box: np.ndarray) -> float:
+        """Compute the OccluTrack abnormal-motion suppression coefficient.
+
+        Builds a per-track buffer of past observed ``[cx, cy, w, h]`` boxes
+        (lazily attached to the tracker as ``_ams_obs_buf``). Compares the
+        current speed magnitude (centre and aspect/scale separately) against
+        the running mean of the previous speeds in the buffer. If either
+        relative spike exceeds ``kalman.ams.threshold`` the corresponding pair of
+        gain scalars is replaced with ``kalman.ams.alpha0``; the returned value is
+        the mean of the four ``α_x, α_y, α_w, α_h`` per the paper.
+        """
+        if not self.kalman_config.ams.enabled or self.kalman_config.ams.alpha0 >= 1.0:
+            return 1.0
+        # OBB tracks use a different state layout (theta channel); skip AMS
+        # to avoid mixing rectangular/oriented box semantics.
+        if getattr(trk.kf, "_is_obb", False):
+            return 1.0
+
+        cur = self._xyxy_to_cxcywh(det_box[:4])
+        buf = getattr(trk, "_ams_obs_buf", None)
+        if buf is None:
+            from collections import deque
+
+            buf = deque(maxlen=self.kalman_config.ams.buffer_size)
+            trk._ams_obs_buf = buf
+
+        # Need at least 2 prior observations to estimate the mean speed.
+        if len(buf) < 2:
+            buf.append(cur)
+            return 1.0
+
+        prev = buf[-1]
+        cur_v = cur - prev  # [vx, vy, vw, vh]
+
+        # Mean speed over the (N-1) previous transitions in the buffer.
+        observations = np.asarray(buf, dtype=float)
+        diffs = np.diff(observations, axis=0)
+        mean_v = diffs.mean(axis=0)
+
+        eps = 1e-6
+        cur_c_mag = float(np.linalg.norm(cur_v[:2]))
+        mean_c_mag = float(np.linalg.norm(mean_v[:2]))
+        cur_a_mag = float(np.linalg.norm(cur_v[2:]))
+        mean_a_mag = float(np.linalg.norm(mean_v[2:]))
+
+        # Relative spikes: how much faster is the current speed than the
+        # running mean, normalised by the running mean magnitude.
+        d_c = max(0.0, cur_c_mag - mean_c_mag) / max(mean_c_mag, eps)
+        d_a = max(0.0, cur_a_mag - mean_a_mag) / max(mean_a_mag, eps)
+
+        alpha_c = 1.0 if d_c <= self.kalman_config.ams.threshold else self.kalman_config.ams.alpha0
+        alpha_a = 1.0 if d_a <= self.kalman_config.ams.threshold else self.kalman_config.ams.alpha0
+        alpha = 0.5 * (alpha_c + alpha_a)
+
+        # Physical sanity: partial occlusion specifically *shrinks* the bbox
+        # (the occluder hides part of the body). Only suppress when the new
+        # box area is meaningfully smaller than the running mean area;
+        # otherwise the speed spike is more likely legitimate fast motion or
+        # the track re-emerging from full occlusion at its true scale.
+        cur_area = float(cur[2] * cur[3])
+        mean_area = float(np.mean(observations[:, 2:].prod(axis=1)))
+        if cur_area >= mean_area * self.kalman_config.ams.shrink_ratio:
+            alpha = 1.0
+
+        buf.append(cur)
+        return float(alpha)
+
+    def _ams_update(self, trk: KalmanBoxTracker, det: np.ndarray) -> None:
+        """Drop-in replacement for ``KalmanBoxTracker.update`` that also
+        applies the OccluTrack abnormal-motion suppression coefficient to the
+        Kalman gain.
+
+        Mirrors :meth:`KalmanBoxTracker.update` exactly except for passing
+        ``alpha`` to the underlying KF, so all bookkeeping (hit_streak,
+        history_observations, conf/cls/det_ind) stays consistent across the
+        first pass, ReID-only recovery, and the low-confidence second pass.
+        """
+        alpha = self._compute_ams_alpha(trk, det[:4])
+        trk.time_since_update = 0
+        trk.hit_streak += 1
+        trk.motion_model.update_filter(trk.kf, trk.motion_model.to_measurement(det[:5], column=False), alpha=alpha)
+        trk.conf = float(det[4])
+        trk.cls = int(det[5])
+        trk.det_ind = int(det[6])
+        trk._append_current_history()
+        sync_track_meta(trk, TrackState.TRACKED)
+
+    def _ams_multi_update(self, tracks: list[KalmanBoxTracker], detections: np.ndarray) -> None:
+        """Batch one association stage while retaining each track's AMS and history.
+
+        OBB observations retain track-level equivalent-form alignment. Their
+        gain remains unsuppressed, as in the scalar OBB update.
+        """
+        if not tracks:
+            return
+        if len(tracks) == 1:
+            if tracks[0].is_obb:
+                self._ams_update_obb(tracks[0], detections[0])
+            else:
+                self._ams_update(tracks[0], detections[0])
+            return
+        alphas = [self._compute_ams_alpha(track, det[:4]) for track, det in zip(tracks, detections)]
+        measurements = [track._prepare_update(det) for track, det in zip(tracks, detections)]
+        tracks[0].motion_model.update_filters([track.kf for track in tracks], measurements, alpha=alphas)
+        for track, measurement in zip(tracks, measurements):
+            track._finish_update(measurement)
+
+    def _suppress_duplicate_emissions(
+        self, emitted: list[tuple[KalmanBoxTracker, np.ndarray]]
+    ) -> list[tuple[KalmanBoxTracker, np.ndarray]]:
+        """Drop duplicate emissions when two tracks predict to overlapping
+        boxes. The younger track (smaller ``age``) is dropped *and* removed
+        from ``self.trackers`` so it does not persist as a ghost.
+
+        Mirrors BotSort's ``remove_duplicate_stracks``; uses ``age`` as the
+        survival tiebreaker to favour the older identity.
+        """
+        if self.is_obb:
+            # ``e[1]`` is ``[cx, cy, w, h, angle]`` in OBB mode; use oriented IoU.
+            boxes = np.stack([e[1][:5] for e in emitted], axis=0)
+            ious = AssociationFunction.iou_batch_obb(boxes, boxes)
+        else:
+            boxes = np.stack([e[1][:4] for e in emitted], axis=0)
+            ious = AssociationFunction.iou_batch(boxes, boxes)
+        drop = set()
+        rows, columns = np.nonzero(np.triu(ious >= self.duplicate_iou_thresh, k=1))
+        current_row = -1
+        skip_row = False
+        for i, j in zip(rows, columns, strict=True):
+            if i != current_row:
+                current_row = i
+                skip_row = i in drop
+            # The original traversal finishes a row even if that row's track
+            # loses an earlier comparison. Preserve that ordered policy.
+            if skip_row or j in drop:
+                continue
+            age_i = emitted[i][0].age
+            age_j = emitted[j][0].age
+            drop.add(j if age_i >= age_j else i)
+        if not drop:
+            return emitted
+        # Also remove the dropped (younger) tracks from ``self.trackers`` so
+        # they cannot spawn future emissions or absorb future detections.
+        drop_ids = {emitted[k][0].id for k in drop}
+        self.trackers = [trk for trk in self.trackers if trk.id not in drop_ids]
+        return [e for k, e in enumerate(emitted) if k not in drop]
+
+    # ------------------------------------------------------------------
+    # OBB code path
+    # ------------------------------------------------------------------
+
+    def _ams_update_obb(self, trk: KalmanBoxTracker, det: np.ndarray) -> None:
+        """OBB analogue of :meth:`_ams_update`.
+
+        ``det`` is ``[cx, cy, w, h, angle, conf, cls, det_ind]``. AMS itself
+        is skipped for OBB tracks (the speed-spike heuristic assumes a
+        rectangular box; :meth:`_compute_ams_alpha` already returns ``1.0``
+        for OBB KFs), so we just route the update through the OBB-aware KF
+        and keep the same bookkeeping as :meth:`_ams_update`.
+        """
+        # The track-level update performs equivalent-form alignment before
+        # correcting the filter and records the resulting post-update state.
+        trk.update(det)
+
+    def _update_obb(
+        self,
+        dets: np.ndarray,
+        img: np.ndarray,
+        embs: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """OBB-only update mirroring the AABB flow.
+
+        Differences vs the AABB path:
+        * Detections use the 7-col layout ``(cx, cy, w, h, angle, conf, cls)``;
+          ``self.detection_layout.with_detection_indices`` appends ``det_ind``.
+        * Camera-motion compensation, DLO, and DUO use native OBB geometry.
+        * Association uses the selected oriented geometry, optionally fused
+          with a ReID cosine-similarity term BoTSORT-style.
+        * Outputs follow the OBB schema
+          ``[cx, cy, w, h, angle, id, conf, cls, det_ind]`` (9 cols).
+        """
+        det_dtype = dets.dtype
+        batch = self._make_detection_batch(dets, embs=embs, copy=False)
+        dets = batch.as_indexed_detections(dtype=det_dtype)
+        self.frame_count += 1
+
+        tracker_rows = self._predict_track_rows(img, dets)
+        trks_xywha = tracker_rows[:, :5]
+        motion_distances = (
+            self.get_mh_dist_matrix(dets)
+            if self.use_duo_boost or (self.use_dlo_boost and self.use_rich_s)
+            else None
+        )
+
+        # Confidence-based detection split (high / low for second pass).
+        # Preserve the detector scores so ByteTrack recovery remains a true
+        # low-confidence pass even when an OBB boost promotes a row.
+        orig_confs = batch.confs.copy()
+        if self.use_dlo_boost:
+            dets = self.dlo_confidence_boost_obb(
+                dets, threshold=self.det_thresh, tracker_rows=tracker_rows, motion_distances=motion_distances
+            )
+        if self.use_duo_boost:
+            dets = self.duo_confidence_boost_obb(dets, threshold=self.det_thresh, motion_distances=motion_distances)
+        boosted_confs = self.detection_layout.confidences(dets)
+        batch = batch.with_confs(boosted_confs)
+        keep_mask = boosted_confs >= self.det_thresh
+        second_mask = (
+            ((~keep_mask) & (orig_confs >= self.track_low_thresh) & (orig_confs < self.det_thresh))
+            if self.use_second_pass
+            else np.zeros_like(keep_mask, dtype=bool)
+        )
+
+        high_batch = batch.select(keep_mask)
+        second_batch = batch.select(second_mask)
+        dets = high_batch.as_indexed_detections(dtype=det_dtype)
+        dets_second = second_batch.as_indexed_detections(dtype=det_dtype)
+        dets_embs = resolve_batch_embeddings(
+            high_batch,
+            enabled=self.use_embeddings,
+            placeholder_value=1.0,
+        )
+        dets_embs_second = resolve_batch_embeddings(
+            second_batch,
+            enabled=self.use_embeddings,
+            placeholder_value=1.0,
+        )
+
+        # First-pass association: oriented IoU (+ optional ReID fusion)
+        n_dets = dets.shape[0]
+        n_trks = trks_xywha.shape[0]
+        if n_dets == 0 or n_trks == 0:
+            matched = np.empty((0, 2), dtype=int)
+            unmatched_dets = np.arange(n_dets, dtype=int)
+            unmatched_trks = np.arange(n_trks, dtype=int)
+        else:
+            iou = self.asso_func(high_batch.boxes, trks_xywha)
+            eligible = self.association_eligibility(high_batch.boxes, trks_xywha)
+            cost = 1.0 - iou
+            if self.config.fuse_detection_score:
+                cost = fuse_score(cost.T, high_batch.confs).T
+            cost[iou < self.iou_threshold] = 1e6
+
+            if self.use_embeddings and dets_embs.shape[0] > 0 and self.trackers[0].get_emb() is not None:
+                tracker_embs = np.stack([trk.get_emb() for trk in self.trackers], axis=0).reshape(n_trks, -1)
+                emb_sim = dets_embs.reshape(n_dets, -1) @ tracker_embs.T
+                if self.config.fuse_iou:
+                    emb_sim = 1.0 - fuse_iou(1.0 - emb_sim, high_batch.boxes, trks_xywha, is_obb=True)
+                # BoTSORT-style fusion: subtract a scaled appearance term.
+                lambda_emb = float(getattr(self, "lambda_iou", 0.5)) + 0.5
+                cost = cost - lambda_emb * emb_sim
+                # Re-apply IoU gate so good appearance can't bypass geometry.
+                cost[iou < self.iou_threshold] = 1e6
+
+            centroid = self._asso_func_base_name == "centroid"
+            if self.config.motion_fusion != "off":
+                cost = np.where((iou >= self.iou_threshold) & eligible, cost, np.inf)
+                cost = self._fuse_first_motion(cost, self.trackers, high_batch.boxes)
+            if centroid or self.config.motion_fusion != "off":
+                cost = np.where(eligible, cost, np.inf)
+                row_ind, col_ind = solve_assignment(cost).T
+            else:
+                cost[~eligible] = 1e6
+                row_ind, col_ind = linear_sum_assignment(cost)
+            matched_pairs = []
+            matched_d, matched_t = set(), set()
+            for r, c in zip(row_ind, col_ind):
+                if not np.isfinite(cost[r, c]) or (not centroid and cost[r, c] >= 1e5):
+                    continue
+                matched_pairs.append([r, c])
+                matched_d.add(r)
+                matched_t.add(c)
+            matched = np.array(matched_pairs, dtype=int) if matched_pairs else np.empty((0, 2), dtype=int)
+            unmatched_dets = np.array([i for i in range(n_dets) if i not in matched_d], dtype=int)
+            unmatched_trks = np.array([i for i in range(n_trks) if i not in matched_t], dtype=int)
+
+        # Apply matched updates
+        self._ams_multi_update([self.trackers[index] for index in matched[:, 1]], dets[matched[:, 0]])
+        dets_alpha = confidence_aware_alpha(high_batch.confs, self.det_thresh, base_alpha=self.alpha_fixed_emb)
+        for m in matched:
+            if self.use_embeddings:
+                self.trackers[m[1]].update_emb(dets_embs[m[0]], alpha=float(dets_alpha[m[0]]))
+            self._maybe_activate(self.trackers[m[1]])
+
+        # ---- ReID-only recovery pass ----
+        if self.use_embeddings and len(unmatched_trks) > 0 and len(unmatched_dets) > 0:
+            elig = [
+                int(t)
+                for t in unmatched_trks
+                if self.trackers[int(t)].time_since_update <= self.recovery_max_age
+                and self.trackers[int(t)].get_emb() is not None
+            ]
+            if elig:
+                u_det_idx = [int(d) for d in unmatched_dets]
+                trk_e = np.stack([self.trackers[t].get_emb() for t in elig], axis=0).reshape(len(elig), -1)
+                det_e = dets_embs[u_det_idx].reshape(len(u_det_idx), -1)
+                sim = det_e @ trk_e.T
+
+                trks_pos = trks_xywha[elig]
+                ious = self.asso_func(high_batch.boxes[u_det_idx], trks_pos)
+
+                gated = sim.copy()
+                gated[ious < self.recovery_iou_thresh] = -1.0
+                gated[~self.association_eligibility(high_batch.boxes[u_det_idx], trks_pos)] = -1.0
+                gated[sim < self.recovery_appearance_thresh] = -1.0
+
+                if (gated > 0).any():
+                    row_ind, col_ind = linear_sum_assignment(-gated)
+                    matched_dets_set = set()
+                    matched_tracks_set = set()
+                    accepted = [(u_det_idx[r], elig[c]) for r, c in zip(row_ind, col_ind) if gated[r, c] > 0]
+                    self._ams_multi_update(
+                        [self.trackers[t] for _, t in accepted],
+                        dets[[d for d, _ in accepted]],
+                    )
+                    for det_global, trk_global in accepted:
+                        matched_dets_set.add(det_global)
+                        matched_tracks_set.add(trk_global)
+                        self.trackers[trk_global].update_emb(dets_embs[det_global], alpha=self.feat_alpha)
+                        self._maybe_activate(self.trackers[trk_global])
+                    if matched_dets_set:
+                        unmatched_dets = np.array(
+                            [d for d in unmatched_dets if int(d) not in matched_dets_set],
+                            dtype=int,
+                        )
+                        unmatched_trks = np.array(
+                            [t for t in unmatched_trks if int(t) not in matched_tracks_set],
+                            dtype=int,
+                        )
+
+        # ---- Appearance-gated low-confidence second pass ----
+        if self.use_second_pass and len(unmatched_trks) > 0 and dets_second.shape[0] > 0:
+            elig_sec = [
+                int(t)
+                for t in unmatched_trks
+                if self.trackers[int(t)].time_since_update <= self.second_pass_max_age
+                and self.trackers[int(t)].hit_streak >= self.second_pass_min_hits
+                and getattr(self.trackers[int(t)], "is_activated", True)
+            ]
+            if elig_sec:
+                trks_pos = trks_xywha[elig_sec]
+                ious2 = self.asso_func(second_batch.boxes, trks_pos)
+                eligible = (ious2 >= self.second_iou_thresh) & self.association_eligibility(
+                    second_batch.boxes, trks_pos
+                )
+                cost2 = 1.0 - ious2
+                cost2[~eligible] = 1.0
+
+                if (
+                    self.use_embeddings
+                    and dets_embs_second.shape[0] > 0
+                    and self.trackers[elig_sec[0]].get_emb() is not None
+                ):
+                    trk_e = np.stack([self.trackers[t].get_emb() for t in elig_sec], axis=0).reshape(len(elig_sec), -1)
+                    det_e = dets_embs_second.reshape(dets_embs_second.shape[0], -1)
+                    sim2 = det_e @ trk_e.T
+                    eligible &= sim2 >= self.second_appearance_thresh
+                    cost2[sim2 < self.second_appearance_thresh] = 1.0
+
+                centroid = self._asso_func_base_name == "centroid"
+                has_candidates = eligible.any() if centroid else (cost2 < 1.0).any()
+                if has_candidates:
+                    if centroid:
+                        pairs = solve_assignment(np.where(eligible, cost2, np.inf), cost_limit=1.0)
+                        row_ind, col_ind = pairs.T
+                    else:
+                        row_ind, col_ind = linear_sum_assignment(cost2)
+                    used = set()
+                    accepted = []
+                    for r, c in zip(row_ind, col_ind):
+                        accepted_cost = eligible[r, c] if centroid else cost2[r, c] < 1.0
+                        if not accepted_cost:
+                            continue
+                        trk_global = elig_sec[c]
+                        if trk_global in used:
+                            continue
+                        used.add(trk_global)
+                        accepted.append((r, trk_global))
+                    self._ams_multi_update(
+                        [self.trackers[t] for _, t in accepted],
+                        dets_second[[r for r, _ in accepted]],
+                    )
+                    for r, trk_global in accepted:
+                        if self.use_embeddings and dets_embs_second.shape[0] > 0:
+                            self.trackers[trk_global].update_emb(dets_embs_second[r], alpha=self.feat_alpha)
+                        self._maybe_activate(self.trackers[trk_global])
+
+        # ---- New tracks for remaining unmatched high-conf detections ----
+        for i in unmatched_dets:
+            det_conf = self.detection_layout.confidences(dets)[i]
+            if det_conf >= self.new_track_thresh:
+                det_emb = dets_embs[i] if self.use_embeddings else None
+                new_trk = KalmanBoxTracker(
+                    dets[i, :],
+                    max_obs=self.max_obs,
+                    emb=det_emb,
+                    is_obb=True,
+                    adaptive_kf=self.kalman_config.adaptive_kf,
+                    id_allocator=self.id_allocator,
+                    noise_config=self.kalman_noise_config,
+                    kalman_type=self.kalman_config.type,
+                    track_confidence_decay=self.config.track_confidence_decay,
+                    track_confidence_warmup=self.config.track_confidence_warmup,
+                )
+                new_trk.is_activated = bool(det_conf >= self.instant_confirm_thresh or self.confirm_hits <= 1)
+                self.trackers.append(new_trk)
+
+        # ---- Build outputs ----
+        eligible_tracks = self._emitted_tracks()
+        emitted_now = list(zip(eligible_tracks, self._track_boxes(eligible_tracks), strict=True))
+
+        if len(emitted_now) > 1 and 0.0 < self.duplicate_iou_thresh < 1.0:
+            emitted_now = self._suppress_duplicate_emissions(emitted_now)
+
+        self.active_tracks = [trk for trk, _ in emitted_now]
+
+        # Lifecycle
+        self.trackers = [
+            trk
+            for trk in self.trackers
+            if trk.time_since_update <= self.max_age
+            and (getattr(trk, "is_activated", True) or trk.time_since_update <= self.tentative_max_age)
+        ]
+
+        boxes = np.asarray([box for _, box in emitted_now]) if emitted_now else self._track_boxes([])
+        outputs = self.format_outputs(self.active_tracks, dtype=np.float32, boxes=boxes)
+        return self.filter_outputs(outputs)

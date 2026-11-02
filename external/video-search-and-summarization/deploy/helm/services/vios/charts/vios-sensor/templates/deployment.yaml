@@ -1,0 +1,210 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vss-vios-sensor.fullname" . }}
+  labels:
+    app.kubernetes.io/name: vss-vios-sensor
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vss-vios-sensor
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vss-vios-sensor
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- $notifCm := include "vss-vios-sensor.notificationConfigMapName" . }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if $notifCm }}
+        checksum/vios-notification: {{ .Release.Revision | quote }}
+        {{- end }}
+    spec:
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if (.Values.waitForRedis | default dict).enabled }}
+      {{- $pfx := default false (coalesce .Values.useReleaseNamePrefix (index (.Values.global | default dict) "useReleaseNamePrefix")) }}
+      {{- $redisH := ternary (printf "%s-redis" .Release.Name) "redis" $pfx }}
+      initContainers:
+        # Compose parity with the wait-for-redis service. VST builds its
+        # notification manager at startup and does not retry.
+        - name: wait-for-redis
+          image: "{{ (.Values.waitForRedis.image | default dict).repository | default "busybox" }}:{{ (.Values.waitForRedis.image | default dict).tag | default "1.38.0" }}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              host={{ .Values.waitForRedis.host | default $redisH | quote }}
+              port={{ .Values.waitForRedis.port | default 6379 | quote }}
+              timeout={{ .Values.waitForRedis.timeoutSeconds | default 120 }}
+              i=0
+              until nc -z "${host}" "${port}"; do
+                i=$((i + 2))
+                if [ "${i}" -ge "${timeout}" ]; then
+                  echo "timed out waiting for redis at ${host}:${port}" >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+              echo "redis ${host}:${port} is up"
+      {{- end }}
+      containers:
+        - name: vss-vios-sensor
+          image: {{ include "vss-vios-sensor.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          env:
+            {{- toYaml .Values.env | nindent 12 }}
+            - name: CENTRALIZE_DB_HOSTADDR
+              value: {{ (.Values.centralizedDbHost | default (include "vss-vios-sensor.postgresFullname" .)) | quote }}
+            - name: CENTRALIZE_DB_PORT
+              value: {{ (.Values.centralizedDbPort | default "5432") | quote }}
+            {{- if .Values.centralizedDbPassword }}
+            - name: CENTRALIZE_DB_PASSWORD
+              value: {{ .Values.centralizedDbPassword | quote }}
+            {{- else }}
+            - name: CENTRALIZE_DB_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "vss-vios-sensor.postgresCmName" . }}
+                  key: CENTRALIZE_DB_PASSWORD
+            {{- end }}
+            {{- /* VIOS-only SDRC toggle. global.vios.useSdrc (default false =
+                   direct). `dig` respects an explicit false, unlike `default`.
+                   The binary reads VST_USE_SDRC to choose whether sensor-MS
+                   publishes camera_proxy events for SDR (true) or registers the
+                   RTSP proxy itself (false).
+                   VST_ENABLE_NOTIFICATION is INDEPENDENT of SDRC: it defaults to
+                   useSdrc but can be set on its own via global.vios.enableNotification,
+                   matching docker's ${VST_ENABLE_NOTIFICATION:-${VST_USE_SDRC:-false}}. */}}
+            {{- $g := .Values.global | default dict }}
+            {{- $useSdrc := dig "vios" "useSdrc" false $g }}
+            {{- $enableNotif := dig "vios" "enableNotification" $useSdrc $g }}
+            {{- /* STREAM_PROCESSOR_MODULE_ENDPOINT follows VST_USE_SDRC, mirroring
+                   docker-compose: SDRC -> sdr-controller:10000 (WDM/Envoy listener),
+                   direct -> vss-vios-streamprocessing:30001 (streamprocessing service).
+                   An explicit .Values.streamProcessorEndpoint still overrides both. */}}
+            {{- $streamProcessorService := default "sdrc" .Values.streamProcessorService }}
+            {{- $sdrcName := ternary "sdrc-controller" $streamProcessorService (eq $streamProcessorService "sdrc") }}
+            {{- $sdrcEndpoint := printf "http://%s:10000" (include "vss-vios-sensor.peerHost" (dict "root" . "short" $sdrcName "peer" "sdrc")) }}
+            {{- $spEndpoint := printf "http://%s:30001" (include "vss-vios-sensor.peerHost" (dict "root" . "short" "vss-vios-streamprocessing" "peer" "streamprocessing")) }}
+            {{- $streamProcessorModuleEndpoint := .Values.streamProcessorEndpoint | default (ternary $sdrcEndpoint $spEndpoint $useSdrc) }}
+            - name: STREAM_PROCESSOR_MODULE_ENDPOINT
+              value: {{ $streamProcessorModuleEndpoint | quote }}
+            {{- /* Docker parity: sensor-ms sets RTSP_SERVER_MODULE_ENDPOINT to the
+                   same value as STREAM_PROCESSOR_MODULE_ENDPOINT (see
+                   deploy/docker/services/vios/initiator/docker-compose.yaml). */}}
+            - name: RTSP_SERVER_MODULE_ENDPOINT
+              value: {{ $streamProcessorModuleEndpoint | quote }}
+            - name: VST_INGRESS_ENDPOINT
+              value: {{ include "vss-vios-sensor.vstIngressEndpointUrl" . | quote }}
+            - name: VST_USE_SDRC
+              value: {{ $useSdrc | quote }}
+            - name: VST_ENABLE_NOTIFICATION
+              value: {{ $enableNotif | quote }}
+          volumeMounts:
+            - name: configs
+              mountPath: /home/vst/vst_release/configs
+              readOnly: true
+            - name: vst-data
+              mountPath: /home/vst/vst_release/vst_data
+            - name: vst-video
+              mountPath: /home/vst/vst_release/vst_video
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: configs
+          {{- if $notifCm }}
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "vss-vios-sensor.fullname" . }}-configs
+              - configMap:
+                  name: {{ $notifCm }}
+          {{- else }}
+          configMap:
+            name: {{ include "vss-vios-sensor.fullname" . }}-configs
+          {{- end }}
+        - name: vst-data
+          {{- if and (index .Values "persistence") .Values.persistence.vstData.enabled }}
+          persistentVolumeClaim:
+            {{- $g := .Values.global | default dict }}
+            {{- if .Values.persistence.vstData.existingClaim }}
+            claimName: {{ .Values.persistence.vstData.existingClaim }}
+            {{- else if and (hasKey $g "createSharedVstPvcs") (not (index $g "createSharedVstPvcs")) }}
+            claimName: {{ printf "%s-vst-data" (include "vss-vios-sensor.fullname" .) }}
+            {{- else }}
+            claimName: {{ printf "%s-vst-data" (include "vss-vios-sensor.streamprocessingSharedPvcBase" .) }}
+            {{- end }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: vst-video
+          {{- if and (index .Values "persistence") .Values.persistence.vstVideo.enabled }}
+          persistentVolumeClaim:
+            {{- $g := .Values.global | default dict }}
+            {{- if .Values.persistence.vstVideo.existingClaim }}
+            claimName: {{ .Values.persistence.vstVideo.existingClaim }}
+            {{- else if and (hasKey $g "createSharedVstPvcs") (not (index $g "createSharedVstPvcs")) }}
+            claimName: {{ printf "%s-vst-video" (include "vss-vios-sensor.fullname" .) }}
+            {{- else }}
+            claimName: {{ printf "%s-vst-video" (include "vss-vios-sensor.streamprocessingSharedPvcBase" .) }}
+            {{- end }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

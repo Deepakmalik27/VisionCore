@@ -1,0 +1,309 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""VSSSearch — facade for direct (non-HTTP) callers.
+
+All three primitives (embed_search, attribute_search, search) are
+implemented and constructed lazily on first use. Query decomposition is
+NAT-owned and must run before `.search()` receives its input.
+
+Lifecycle: build via one of the class methods and use as an async context
+manager (or call ``aclose()``) so lazily-built primitives release their backend clients cleanly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import TYPE_CHECKING
+from typing import Any
+
+from ._internal.time_measure import collect_timings
+from .models.attribute_search import AttributeSearchInput
+from .models.attribute_search import AttributeSearchOutput
+from .models.embed_search import EmbedSearchInput
+from .models.embed_search import EmbedSearchOutput
+from .models.search import SearchInput
+from .models.search import SearchOutput
+from .models.search import SearchTimings
+from .models.tag_search import TagSearchInput
+from .models.tag_search import TagSearchOutput
+from .primitives.attribute_search import AttributeSearch
+from .primitives.embed_search import EmbedSearch
+from .primitives.search import Search
+from .primitives.tag_search import TagSearch
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from .critic import CriticAgent
+    from .critic import VideoInfo
+    from .events import SearchEvent
+    from .runtime import SearchRuntime
+
+logger = logging.getLogger(__name__)
+
+
+class VSSSearch:
+    """One-stop facade for direct (non-HTTP) callers — host skills, notebooks, evals.
+
+    Build from a SearchRuntime; call .embed_search / .attribute_search /
+    .tag_search / .search. Use as an async context manager so resources close cleanly:
+
+        async with VSSSearch.from_runtime(runtime) as vss:
+            out = await vss.embed_search(query="red car", source_type="rtsp")
+
+    Note on `.search()`: direct callers pass already-prepared SearchInput
+    fields. The facade never builds or invokes model clients for decomposition.
+    """
+
+    def __init__(self, runtime: SearchRuntime, *, critic: CriticAgent | None = None) -> None:
+        self._rt = runtime
+        self._critic = critic
+        self._embed: EmbedSearch | None = None
+        self._attribute: AttributeSearch | None = None
+        self._tag: TagSearch | None = None
+        self._search: Search | None = None
+
+    @property
+    def runtime(self) -> SearchRuntime:
+        """Resolved runtime used by this facade (read-only).
+
+        Host entry points use this to perform deployment-aware preflights before
+        dispatching a primitive.  Returning the frozen dataclass preserves the
+        facade's no-mutable-runtime invariant.
+        """
+        return self._rt
+
+    # ------------------------------------------------------------------ Builders
+
+    @classmethod
+    def from_runtime(cls, rt: SearchRuntime, *, critic: CriticAgent | None = None) -> VSSSearch:
+        return cls(rt, critic=critic)
+
+    # ------------------------------------------------ Convenience primitive-only
+
+    @staticmethod
+    def embed_only(rt: SearchRuntime) -> EmbedSearch:
+        """Build just an EmbedSearch (e.g. for embed-only workflows that don't
+        do not need the RTVI-CV endpoint)."""
+        return EmbedSearch.from_runtime(rt)
+
+    @staticmethod
+    def attribute_only(rt: SearchRuntime) -> AttributeSearch:
+        """Build just an AttributeSearch."""
+        return AttributeSearch.from_runtime(rt)
+
+    @staticmethod
+    def tag_only(rt: SearchRuntime) -> TagSearch:
+        """Build just a TagSearch."""
+        return TagSearch.from_runtime(rt)
+
+    # -------------------------------------------------------------- Primitives
+
+    async def embed_search(self, **kw: Any) -> EmbedSearchOutput:
+        if self._embed is None:
+            self._embed = EmbedSearch.from_runtime(self._rt)
+        return await self._embed.run(EmbedSearchInput(**kw))
+
+    async def attribute_search(self, **kw: Any) -> AttributeSearchOutput:
+        if self._attribute is None:
+            self._attribute = AttributeSearch.from_runtime(self._rt)
+        return await self._attribute.run(AttributeSearchInput(**kw))
+
+    async def tag_search(self, **kw: Any) -> TagSearchOutput:
+        if self._tag is None:
+            self._tag = TagSearch.from_runtime(self._rt)
+        return await self._tag.run(TagSearchInput(**kw))
+
+    def _build_search(self) -> Search:
+        """Lazy-build the Search primitive."""
+        return Search.from_runtime(self._rt)
+
+    async def search(self, **kw: Any) -> SearchOutput:
+        if self._search is None:
+            self._search = self._build_search()
+        inp = SearchInput(**kw)
+
+        # Collect around retrieval AND verification: the critic is often the
+        # larger share of a search, so timing only retrieval would explain the
+        # smaller half of the wall clock.
+        started = time.perf_counter()
+        with collect_timings() as stages:
+            output = await self._search.run(inp)
+            output = await self._verify_results(output, inp)
+
+        output.timings = SearchTimings(
+            stages={
+                label: {metric: round(value, 6) for metric, value in entry.items()} for label, entry in stages.items()
+            },
+            total_s=round(time.perf_counter() - started, 6),
+        )
+        return output
+
+    async def _verify_results(self, output: SearchOutput, inp: SearchInput) -> SearchOutput:
+        """Best-effort critic pass over retrieved intervals.
+
+        Search never depends on verification succeeding. Missing dependencies,
+        invalid media bounds, a critic run that raises, or the evaluation cap
+        leave the affected hits without a ``critic_result``. A per-hit media or
+        VLM failure is an evaluated ``unverified`` verdict instead.
+        """
+        if self._critic is None or not output.data:
+            return output
+
+        query = self._critic_query(inp)
+        if not query:
+            return output
+
+        from .critic import CriticAgentInput
+        from .critic import CriticAgentResult
+        from .models.search import SearchVerification
+
+        candidate_indices, videos = self._critic_candidates(output, inp)
+        if not videos:
+            return output
+
+        extra_messages: list[str] = []
+
+        try:
+            critic_output = await self._critic.run(CriticAgentInput(query=query, videos=videos))
+        except Exception:
+            logger.warning("Search-result verification failed; returning retrieval hits as unverified", exc_info=True)
+            return output.model_copy(
+                update={
+                    "search_messages": [
+                        *output.search_messages,
+                        "Visual verification failed; retrieval results remain unverified.",
+                    ]
+                }
+            )
+
+        verified_results = list(output.data)
+        for index, verdict in zip(candidate_indices, critic_output.video_results, strict=False):
+            verified_results[index] = verified_results[index].model_copy(
+                update={
+                    "critic_result": SearchVerification(
+                        result=verdict.result.value,
+                        criteria_met=verdict.criteria_met or {},
+                    )
+                }
+            )
+        # `evaluation_count` can truncate the critic run below the candidate
+        # count (`vss search run --critic-eval-count`); the hits it did not
+        # evaluate carry no `critic_result`. Surface that rather than silently
+        # dropping them.
+        if len(critic_output.video_results) < len(candidate_indices):
+            extra_messages.append(
+                f"Visual verification evaluated {len(critic_output.video_results)} of "
+                f"{len(candidate_indices)} retrieved hits; the rest remain unverified."
+            )
+
+        # The critic degrades a failed candidate to `unverified` instead of
+        # raising, so a deployment whose VLM answers /v1/models but fails every
+        # completion returns output identical to one with no VLM at all. Say
+        # which it was: silence here means no critic ran.
+        if critic_output.video_results and all(
+            verdict.result == CriticAgentResult.UNVERIFIED for verdict in critic_output.video_results
+        ):
+            extra_messages.append(
+                "Visual verification ran but produced no verdict for any evaluated hit; "
+                "check the configured RT-VLM service."
+            )
+
+        update: dict[str, Any] = {"data": verified_results}
+        if extra_messages:
+            update["search_messages"] = [*output.search_messages, *extra_messages]
+        return output.model_copy(update=update)
+
+    @staticmethod
+    def _critic_query(inp: SearchInput) -> str:
+        """The user's visual intent: the original wording, else the query plus any attributes it omits."""
+        if inp.original_query and inp.original_query.strip():
+            return inp.original_query.strip()
+        query = inp.query.strip()
+        attributes = [attribute.strip() for attribute in inp.attributes if attribute.strip()]
+        missing_attributes = [attribute for attribute in attributes if attribute.casefold() not in query.casefold()]
+        if not missing_attributes:
+            return query
+        suffix = ", ".join(missing_attributes)
+        return f"{query}; required visual attributes: {suffix}" if query else suffix
+
+    @staticmethod
+    def _critic_candidates(output: SearchOutput, inp: SearchInput) -> tuple[list[int], list[VideoInfo]]:
+        """Indices and critic inputs for the hits whose interval can be verified."""
+        from pydantic import ValidationError
+
+        from .critic import VideoInfo
+
+        candidate_indices: list[int] = []
+        videos: list[VideoInfo] = []
+        for index, result in enumerate(output.data):
+            if not result.sensor_id:
+                continue
+            try:
+                video = VideoInfo.model_validate(
+                    {
+                        "sensor_id": result.sensor_id,
+                        "start_timestamp": result.start_time,
+                        "end_timestamp": result.end_time,
+                        # Only file sources are indexed on the synthetic epoch the
+                        # critic rebases; live bounds must be taken literally.
+                        "source_type": inp.source_type,
+                    }
+                )
+            except ValidationError:
+                logger.warning("Search result %d has invalid verification bounds; leaving it unverified", index)
+                continue
+            candidate_indices.append(index)
+            videos.append(video)
+        return candidate_indices, videos
+
+    def search_stream(self, **kw: Any) -> AsyncIterator[SearchEvent]:
+        if self._search is None:
+            self._search = self._build_search()
+        return self._verified_search_stream(SearchInput(**kw))
+
+    async def _verified_search_stream(self, inp: SearchInput) -> AsyncIterator[SearchEvent]:
+        """Preserve streaming progress and verify only the terminal output."""
+        from .events import FinalResultEvent
+
+        assert self._search is not None
+        async for event in self._search.stream(inp):
+            if isinstance(event, FinalResultEvent):
+                yield event.model_copy(update={"output": await self._verify_results(event.output, inp)})
+            else:
+                yield event
+
+    # ---------------------------------------------------------------- Lifecycle
+
+    async def aclose(self) -> None:
+        """Close every lazily-built search primitive."""
+        coros: list[Any] = []
+        for p in (self._embed, self._attribute, self._tag, self._search):
+            if p is not None:
+                coros.append(p.aclose())
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
+        self._embed = None
+        self._attribute = None
+        self._tag = None
+        self._search = None
+
+    async def __aenter__(self) -> VSSSearch:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()

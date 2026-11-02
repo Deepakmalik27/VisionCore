@@ -1,0 +1,1052 @@
+---
+title: "Alert Verification"
+description: ""
+position: 3
+---
+Two approaches for leveraging VLMs to generate alerts are showcased as part of the agent workflows:
+
+- **Alert Verification**: The VLM analyzes video snippets corresponding to alerts generated upstream for verification; original alerts are generated through a combination of object detection/tracking and behavior analytics microservices that process video streams in real time. This approach invokes the VLM more sporadically and hence has lower GPU requirements, but depends on an upstream entity to generate "candidate" alerts for verification.
+
+- **Real-Time Alerts**: The VLM continuously processes segments from a video source (for example, a camera) at periodic intervals based on a user-defined chunk duration. This approach leverages the generalizability of VLMs to trigger alerts for a broad set of cases (VLM fine-tuning or prompt tuning may be needed). However, it has higher GPU requirements due to more frequent VLM usage.
+
+This section addresses the Alert Verification workflow; see [Real-Time Alerts](/vision-agent/agent-workflows/real-time-alerts) for the other approach.
+
+**Use Cases for Alert Verification**
+
+- PPE compliance verification (hard hats, safety vests)
+- Restricted area monitoring
+- Asset presence/absence detection
+- Custom object detection scenarios
+
+**Estimated Deployment Time:** 15-20 minutes
+
+The following diagram illustrates the alert verification workflow architecture:
+
+![Vision Agent with Alert Verification Architecture](./assets/images/agent-workflows/profile-alerts-verification-arch.png)
+
+**Key Features of the Alert Verification Agent:**
+
+- RTVI CV for real-time object detection using Grounding DINO (open-vocabulary detection)
+- Behavior Analytics for rule-based and configurable alert generation from detection results
+- Alert Verification for VLM-based alert clip review to reduce false positives
+- Alert storage for querying and reporting
+- Report Generation
+
+## What's being deployed
+
+- **NVStreamer:** Video streaming service for dataset video playback, thereby replicating live cameras in a real-world deployment
+- **Video IO & Storage (VIOS):** Video ingestion (of NVStreamer video streams) supporting live streaming, recording, and playback features used by the agent
+- **RTVI CV:** Real-Time Video Intelligence CV Microservice for object detection that processes VIOS live streams to output metadata to Kafka
+- **Behavior Analytics:** Processes metadata from RTVI CV to generate alerts
+- **Alert Verification:** Verification of alert video using VLM
+- **RTVI VLM:** [Real-Time VLM Microservice](/system-components/vision-microservices/real-time-vlm) for vision-language model inference used by Alert Verification
+- **ELK:** Elasticsearch, Logstash, and Kibana stack for log storage and analysis
+- **VSS Agent:** Agent service that uses a configured LLM endpoint to route requests and orchestrate tool calls to VSS microservices and model endpoints (LLM/VLM NIMs) to answer questions and generate outputs
+- **Nemotron LLM (NIM):** LLM inference service used for reasoning, tool selection, and response generation
+- **Phoenix:** Observability and telemetry service for agent workflow monitoring
+
+This list describes the stock profile used by the manual Compose deployment.
+Build Vision AI customizes that profile for the requested capabilities. With
+the default NemoClaw harness, or with no harness, it does not deploy the
+in-stack VSS Agent or Phoenix. It also omits the Agent's local LLM unless
+another selected service needs it. Ask for the in-stack VSS Agent if you plan
+to use the Agent REST API or the manual Agent UI workflow below.
+
+## Prerequisites
+
+Before you begin, ensure all of the prerequisites are met. See [Prerequisites](/getting-started/prerequisites) for more details.
+
+<Note>
+For instructions on downloading sample data and the deployment package, see [Download Sample Data and Deployment Package](/getting-started/quickstart#configure-ngc-access) in the Quickstart guide.
+
+If you have already completed those steps for another agent workflow, skip to [Step 1: Deploy the Agent](/vision-agent/agent-workflows/alert-verification#step-1-deploy-the-agent) in the Deploy section below.
+</Note>
+
+## Deploy
+
+### Step 1: Deploy the Agent
+
+<Note>
+- Set the NGC CLI API key and authenticate Docker to `nvcr.io` before running the deploy commands. See [Verify Your NGC Access](/getting-started/prerequisites#verify-your-ngc-access).
+- Refer to [Configure the LLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-llm) and [Configure the VLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-vlm) for all LLM and VLM (local and remote) configuration options.
+  For RTVI-VLM configuration options, see [Real-Time VLM](/system-components/vision-microservices/real-time-vlm).
+- For advanced settings and Agent Customization, edit the profile `user-overrides.env`.
+</Note>
+
+```bash
+# Set NGC CLI API key
+export NGC_CLI_API_KEY='your_ngc_api_key'
+
+# Authenticate Docker for gated NIM and other nvcr.io images. The managed VSS
+# images on ghcr.io are public and do not require a registry login.
+printf '%s' "$NGC_CLI_API_KEY" | \
+  docker login nvcr.io --username '$oauthtoken' --password-stdin
+```
+
+See [Configuration](/system-components/configuration) for common variables,
+valid values, defaults, and env-file precedence. The complete profile-specific
+template is
+`deploy/docker/developer-profiles/dev-profile-alerts/overrides.env`.
+
+From the repository checkout root, enter the Compose deployment directory:
+
+```bash
+cd deploy/docker
+```
+
+`overrides.env` is the checked-in template. Copy it to any
+filename matching `*-overrides.env` before selecting a layout. Files matching
+that pattern are ignored by Git so local settings and credentials are not
+committed. The commands below use `user-overrides.env` as a concrete example;
+if you choose another name, use it consistently in every `--env-file` argument.
+Repeat the copy only when you want to discard prior layout changes:
+
+```bash
+PROFILE=alerts
+cp "developer-profiles/dev-profile-${PROFILE}/overrides.env" \
+  "developer-profiles/dev-profile-${PROFILE}/user-overrides.env"
+```
+
+Before starting Compose, complete the host settings and select one hardware
+layout below in `deploy/docker/developer-profiles/dev-profile-alerts/user-overrides.env`.
+
+**Environment-variable overrides:** In `deploy/docker/developer-profiles/dev-profile-alerts/user-overrides.env`, update existing values in place; add a variable only when it is absent. `COMPOSE_PROFILES` is derived from values above it, so appending duplicate model-mode or model-slug variables can select the wrong services.
+
+**Host-path and service-address overrides (all hardware profiles):**
+
+- `VSS_APPS_DIR`: Absolute path to this repository's `deploy/docker` directory.
+- `VSS_DATA_DIR`: Absolute writable host directory for downloaded models, videos, and service data.
+- `HOST_IP`: IP address or hostname that clients use to reach services on this VSS host. Set it to an address reachable by the intended clients.
+- `EXTERNAL_IP`: Address VSS puts in externally reachable service URLs. It defaults to `${HOST_IP}`; on a cloud host or when clients connect from outside the host network, set it to the instance's public address or external hostname.
+
+<Note>
+The default deployed model is Cosmos3 Nano Reasoner with BF16 precision.
+You can change this model by selecting an option from the following table and
+setting `VLM_NAME` to the Name value and `RTVI_VLM_MODEL_PATH` to the Path value
+in `deploy/docker/developer-profiles/dev-profile-alerts/user-overrides.env`.
+</Note>
+
+<a id="alert-verification-available-vlm-models"></a>
+
+#### Available VLM Models
+
+| Model | Name | Path |
+| --- | --- | --- |
+| CR3 Nano BF16 | `nim_nvidia_cosmos3-nano-reasoner_bf16-final` | `ngc:nim/nvidia/cosmos3-nano-reasoner:bf16-final` |
+| CR3 Nano FP8 | `nim_nvidia_cosmos3-nano-reasoner_modelopt-fp8-final_format_fix` | `ngc:nim/nvidia/cosmos3-nano-reasoner:modelopt-fp8-final_format_fix` |
+| CR3 Nano NVFP4 | `nim_nvidia_cosmos3-nano-reasoner_modelopt-nvfp4-full-quantize-final_format_fix` | `ngc:nim/nvidia/cosmos3-nano-reasoner:modelopt-nvfp4-full-quantize-final_format_fix` |
+| CR3 Super BF16 | `nim_nvidia_cosmos3-super-reasoner_bf16-final` | `ngc:nim/nvidia/cosmos3-super-reasoner:bf16-final` |
+| CR3 Super FP8 | `nim_nvidia_cosmos3-super-reasoner_modelopt-fp8-final_format_fix` | `ngc:nim/nvidia/cosmos3-super-reasoner:modelopt-fp8-final_format_fix` |
+| CR3 Super NVFP4 | `nim_nvidia_cosmos3-super-reasoner_modelopt-nvfp4-full-quantize-final_format_fix` | `ngc:nim/nvidia/cosmos3-super-reasoner:modelopt-nvfp4-full-quantize-final_format_fix` |
+
+<Note>
+Super models have only been tested on RTX PRO 6000 and H100 with a single GPU dedicated to the VLM.
+
+NVFP4 models only work on Blackwell platforms.
+</Note>
+
+#### Enable Efficient Video Sampling
+
+You can enable Efficient Video Sampling (EVS++) to prune redundant video tokens and reduce VLM inference latency. Add the following settings to `deploy/docker/developer-profiles/dev-profile-alerts/user-overrides.env` before
+starting the profile:
+
+```ini
+VIA_EVS_SESSION=true
+VLM_VIDEO_PRUNING_RATE=0.5
+VLLM_EVS_SIMILARITY_THRESHOLD=0.015
+```
+
+In testing with a warehouse dataset and the Cosmos 3 Super Reasoner FP8 VLM on RTX PRO 6000, this
+configuration reduced VLM latency by approximately 20% with an approximately
+1% decrease in accuracy.
+
+<Note>
+`VLLM_EVS_SIMILARITY_THRESHOLD` can be tuned for the characteristics of the
+input streams to improve the accuracy/latency tradeoff. For
+compatibility details and additional configuration options, see
+[Efficient Video Sampling (EVS and EVS++)](/system-components/vision-microservices/real-time-vlm#efficient-video-sampling-evs-and-evs).
+</Note>
+
+#### Enable Real-Time Alerts Alongside Alert Verification
+
+Real-time alerts can run at the same time as alert verification in the same
+profile. To enable both workflows, update the following options in the profile's
+`user-overrides.env` copy used by the deployment commands on this page before
+starting the profile. Add an option only when it is absent:
+
+```ini
+RTVI_VLM_KAFKA_ENABLED=true
+RTVI_VLM_MESSAGE_BUS=kafka
+RTVI_VLM_MESSAGE_BUS_TOPIC=mdx-vlm-captions
+RTVI_VLM_KAFKA_INCIDENT_TOPIC=mdx-vlm-incidents
+ENABLE_MESSAGES_FOR_CHAT_COMPLETIONS=false
+```
+
+Enabling real-time alerts alongside alert verification reduces the total number
+of streams supported per GPU due to the additional processing load.
+
+For this combined setup, use the REST API instructions in
+[Real-Time Alerts](/vision-agent/agent-workflows/real-time-alerts) to create and modify rules.
+The `vss-manage-alerts` skill still refuses real-time rule management in
+verification mode (`MODE=2d_cv`); its agent-based workflow requires VLM real-time mode.
+
+#### Configure Required Deployment Values
+
+Set these required placeholder values in the existing assignments:
+
+```ini
+VSS_APPS_DIR=/absolute/path/to/video-search-and-summarization/deploy/docker
+VSS_DATA_DIR=/absolute/path/to/vss-apps-data
+HOST_IP=<reachable-host-ip-or-name>
+```
+
+**Prepare host data directories before starting Compose.** Export
+`VSS_DATA_DIR` and `VSS_APPS_DIR` with the same absolute paths set above, then
+run this block. The guards stop before `mkdir` or `chmod` if either value is
+absent or is not absolute:
+
+```bash
+: "${VSS_DATA_DIR:?Export VSS_DATA_DIR with the value from user-overrides.env}"
+: "${VSS_APPS_DIR:?Export VSS_APPS_DIR with the value from user-overrides.env}"
+case "$VSS_DATA_DIR" in
+  /*) ;;
+  *) echo "VSS_DATA_DIR must be an absolute path" >&2; exit 1 ;;
+esac
+case "$VSS_APPS_DIR" in
+  /*) ;;
+  *) echo "VSS_APPS_DIR must be an absolute path" >&2; exit 1 ;;
+esac
+mkdir -p \
+  "$VSS_DATA_DIR/data_log/analytics_cache" \
+  "$VSS_DATA_DIR/data_log/calibration_toolkit" \
+  "$VSS_DATA_DIR/data_log/elastic/data" \
+  "$VSS_DATA_DIR/data_log/elastic/logs" \
+  "$VSS_DATA_DIR/data_log/kafka" \
+  "$VSS_DATA_DIR/data_log/nvstreamer/vst_data" \
+  "$VSS_DATA_DIR/data_log/redis/data" \
+  "$VSS_DATA_DIR/data_log/redis/log" \
+  "$VSS_DATA_DIR/data_log/vss_video_analytics_api" \
+  "$VSS_DATA_DIR/data_log/vst/clip_storage" \
+  "$VSS_DATA_DIR/agent_eval/dataset" \
+  "$VSS_DATA_DIR/agent_eval/results" \
+  "$VSS_DATA_DIR/models" \
+  "$VSS_DATA_DIR/videos/dev-profile-alerts"
+mkdir -p "$VSS_APPS_DIR/engines/gdino" "$VSS_APPS_DIR/engines/rtdetr-its"
+chmod -R a+rwx "$VSS_APPS_DIR/engines"
+chmod -R a+rwx \
+  "$VSS_DATA_DIR/data_log" \
+  "$VSS_DATA_DIR/agent_eval" \
+  "$VSS_DATA_DIR/models" \
+  "$VSS_DATA_DIR/videos"
+```
+
+#### Direct Docker Compose Overrides
+
+Add this common alert-verification block to
+`developer-profiles/dev-profile-alerts/user-overrides.env` before adding the
+hardware-specific values from the tabs below:
+
+```ini
+MODE=2d_cv
+ALERT_AGENT_ALWAYS_ON=false
+COMPOSE_PROFILES=${COMPOSE_PROFILES_CV}
+```
+
+**Default container image tag**
+
+`containers.env` uses `VSS_CONTAINER_TAG` as the default tag for all images.
+Export the tag selected for this documentation branch before choosing a hardware
+layout:
+
+```bash
+export VSS_CONTAINER_TAG="${VSS_DOCS_IMAGE_TAG:-develop-latest}"
+```
+
+Any service-specific image tag or tag suffix shown inside a hardware tab
+supersedes or augments this common default. Use the SBSA settings shown in the
+GB300 and DGX Spark tabs when deploying on those platforms.
+
+
+<Tabs>
+<Tab title="H100">
+<Tabs>
+<Tab title="Shared GPU">
+
+```ini
+HARDWARE_PROFILE=H100
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.4
+```
+</Tab>
+<Tab title="Dedicated GPU">
+
+```ini
+HARDWARE_PROFILE=H100
+MODE=2d_cv
+LLM_DEVICE_ID=1
+VLM_DEVICE_ID=2 # Any non-shared GPU; differ from LLM_DEVICE_ID when the LLM is local
+RT_VLM_DEVICE_ID=2 # Must match VLM_DEVICE_ID
+LLM_MODE=local
+VLM_MODE=local
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=H100
+MODE=2d_cv
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=H100
+MODE=2d_cv
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=H100
+MODE=2d_cv
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="GB300">
+<Tabs>
+<Tab title="Default">
+
+```ini
+HARDWARE_PROFILE=GB300
+MODE=2d_cv
+LLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_CV_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VSS_RT_CV_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.2
+RTVI_VLLM_ATTENTION_BACKEND=TRITON_ATTN
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=GB300
+MODE=2d_cv
+RT_CV_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VSS_RT_CV_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.2
+RTVI_VLLM_ATTENTION_BACKEND=TRITON_ATTN
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=GB300
+MODE=2d_cv
+LLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_CV_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VSS_RT_CV_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=GB300
+MODE=2d_cv
+RT_CV_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the GB300 GPU ID reported by nvidia-smi.
+VSS_RT_CV_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="RTXPRO6000BW">
+<Tabs>
+<Tab title="Shared GPU">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+MODE=2d_cv
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.4
+```
+</Tab>
+<Tab title="Dedicated GPU">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+MODE=2d_cv
+LLM_DEVICE_ID=1
+VLM_DEVICE_ID=2 # Any non-shared GPU; differ from LLM_DEVICE_ID when the LLM is local
+RT_VLM_DEVICE_ID=2 # Must match VLM_DEVICE_ID
+LLM_MODE=local
+VLM_MODE=local
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+MODE=2d_cv
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+MODE=2d_cv
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=RTXPRO6000BW
+MODE=2d_cv
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="RTXPRO4500BW">
+
+<Tabs>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=RTXPRO4500BW
+MODE=2d_cv
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.8
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="L40S">
+<Tabs>
+<Tab title="Dedicated GPU">
+
+```ini
+HARDWARE_PROFILE=L40S
+MODE=2d_cv
+LLM_DEVICE_ID=1
+VLM_DEVICE_ID=2 # Any non-shared GPU; differ from LLM_DEVICE_ID when the LLM is local
+RT_VLM_DEVICE_ID=2 # Must match VLM_DEVICE_ID
+LLM_MODE=local
+VLM_MODE=local
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.8
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=L40S
+MODE=2d_cv
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.8
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=L40S
+MODE=2d_cv
+LLM_MODE=local
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=L40S
+MODE=2d_cv
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="DGX-SPARK">
+<Tabs>
+<Tab title="Remote LLM">
+See [Configure the LLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-llm) for remote LLM endpoint options.
+
+```ini
+HARDWARE_PROFILE=DGX-SPARK
+MODE=2d_cv
+RT_CV_DEVICE_ID=0
+VLM_DEVICE_ID=0
+RT_VLM_DEVICE_ID=0
+VSS_RT_CV_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+VSS_RT_VLM_TAG=${VSS_DOCS_SBSA_IMAGE_TAG:-develop-latest-sbsa}
+PERCEPTION_DOCKERFILE_PREFIX=EDGE-
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.35
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="IGX-THOR">
+<Tabs>
+<Tab title="Remote LLM">
+See [Configure the LLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-llm) for remote LLM endpoint options.
+
+```ini
+HARDWARE_PROFILE=IGX-THOR
+MODE=2d_cv
+RT_CV_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+VLM_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+PERCEPTION_DOCKERFILE_PREFIX=EDGE-
+VLM_AS_VERIFIER_CONFIG_FILE_PREFIX=EDGE-LOCAL-VLM-
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.35
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="AGX-THOR">
+<Tabs>
+<Tab title="Remote LLM">
+See [Configure the LLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-llm) for remote LLM endpoint options.
+
+```ini
+HARDWARE_PROFILE=AGX-THOR
+MODE=2d_cv
+RT_CV_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+VLM_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+RT_VLM_DEVICE_ID=0 # Adjust to the Thor GPU ID reported by nvidia-smi.
+PERCEPTION_DOCKERFILE_PREFIX=EDGE-
+VLM_AS_VERIFIER_CONFIG_FILE_PREFIX=EDGE-LOCAL-VLM-
+RTVI_VLLM_GPU_MEMORY_UTILIZATION=0.35
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+```
+</Tab>
+</Tabs>
+</Tab>
+<Tab title="OTHER">
+See [Local LLM and VLM deployments on OTHER hardware](/appendix/faq) and
+[Local RTVI-VLM deployments on OTHER hardware](/appendix/faq)
+for known limitations and configuration constraints.
+
+<Tabs>
+<Tab title="Shared GPU">
+
+```ini
+HARDWARE_PROFILE=OTHER
+MODE=2d_cv
+LLM_ENV_FILE=/path/to/llm.env
+VLM_ENV_FILE=/path/to/vlm.env
+```
+</Tab>
+<Tab title="Dedicated GPU">
+
+```ini
+HARDWARE_PROFILE=OTHER
+MODE=2d_cv
+LLM_DEVICE_ID=1
+VLM_DEVICE_ID=2 # Any non-shared GPU; differ from LLM_DEVICE_ID when the LLM is local
+RT_VLM_DEVICE_ID=2 # Must match VLM_DEVICE_ID
+LLM_MODE=local
+VLM_MODE=local
+LLM_ENV_FILE=/path/to/llm.env
+VLM_ENV_FILE=/path/to/vlm.env
+```
+</Tab>
+<Tab title="Remote LLM">
+
+```ini
+HARDWARE_PROFILE=OTHER
+MODE=2d_cv
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_ENV_FILE=/path/to/vlm.env
+```
+</Tab>
+<Tab title="Remote VLM">
+
+```ini
+HARDWARE_PROFILE=OTHER
+MODE=2d_cv
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+LLM_ENV_FILE=/path/to/llm.env
+```
+</Tab>
+<Tab title="Remote LLM + VLM">
+
+```ini
+HARDWARE_PROFILE=OTHER
+MODE=2d_cv
+LLM_MODE=remote
+LLM_NAME_SLUG=none
+LLM_BASE_URL=https://<llm-endpoint-without-v1>
+LLM_NAME=<llm-model-id-from-v1-models>
+LLM_MODEL_TYPE=<nim-or-openai>
+VLM_MODE=remote
+VLM_NAME_SLUG=none
+VLM_BASE_URL=https://<vlm-endpoint-without-v1>
+VLM_NAME=<vlm-model-id-from-v1-models>
+VLM_MODEL_TYPE=<nim-or-openai-or-vllm>
+VLM_PORT=30082
+RTVI_VLM_ENDPOINT=https://<vlm-endpoint-without-v1>/v1
+RTVI_VLM_MODEL_TO_USE=openai-compat
+RTVI_VLM_MODEL_PATH=none
+```
+</Tab>
+</Tabs>
+</Tab>
+</Tabs>
+
+After replacing every placeholder in the selected layout, from `deploy/docker`
+validate the resolved configuration, then start the profile:
+
+```bash
+PROFILE=alerts
+docker compose -f compose.yml \
+  --env-file containers.env \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/.env" \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/user-overrides.env" \
+  config --quiet
+
+docker compose -f compose.yml \
+  --env-file containers.env \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/.env" \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/user-overrides.env" \
+  up --detach --pull always --force-recreate --build
+```
+
+On the first bring-up, Docker Compose pulls the required containers from the
+configured GHCR and NGC registries and builds five support images locally:
+Elasticsearch, its initializer, the Kafka topic
+initializer, the broker health checker, and the alerts Kibana initializer.
+Those builds pull base images from Docker Hub and `docker.elastic.co`; the
+Kafka support-image builds also download `jq` from GitHub. Allow outbound access
+and disk space for both pulls and local builds. Depending on your network
+speed, this may take a few minutes.
+
+**This deployment uses the following defaults:**
+
+
+- LLM model: nvidia/nemotron-3.5-lightning-30b-a3b
+- VLM model: cosmos-reason3 (served via RTVI VLM container)
+
+<Note>
+When using a remote VLM of model-type `nim` (not `openai`), see [How does a remote `nim` VLM access videos?](/appendix/faq#how-does-a-remote-nim-vlm-access-videos) for access requirements.
+</Note>
+
+Once the deployment is complete, check that all the containers are running and healthy:
+
+```bash
+docker ps
+```
+
+Once all the containers are running, you can access the [Agent UI](/system-components/user-interface) at `http://<HOST_IP>:7777/`.
+
+#### Deploy with Agent Skills
+
+As an alternative to running the deployment command manually, you can use VSS
+Agent Skills from a coding agent such as Claude Code, Codex, or NemoClaw.
+First, install the [`vss-build-vision-ai`](/vision-agent/build-vision-ai-skill) skill as described in [Agent Skills](/vision-agent/agent-skills) and make it
+accessible to your coding agent. The host must meet the same deployment requirements listed above (supported GPU/hardware for that profile)
+and must meet the [Prerequisites](/getting-started/prerequisites).
+
+The `vss-build-vision-ai` skill composes the stack from the capabilities you name and selects the `<platform>` and `<mode>` to match your system, as detailed in [Development Profile GPU Requirements](/getting-started/prerequisites#development-profile-gpu-requirements).
+Refer to the requirements table for valid platform and mode combinations compatible with your hardware.
+
+**Deploy prompt structure**
+
+The remaining steps on this page use the in-stack Agent UI, so request the
+in-stack VSS Agent explicitly when you deploy with Build Vision AI.
+
+```text title="Deploy prompt structure"
+Deploy the VSS alerts verification profile with the in-stack VSS Agent so I can use the Agent UI workflow.
+```
+
+Name an image tag in the prompt to run a release's images instead of the
+`containers.env` default. See
+[Container image tag](/vision-agent/build-vision-ai-skill#container-image-tag).
+
+```text title="Deploy prompt with a release image tag"
+Deploy the VSS alerts verification profile with the in-stack VSS Agent and image tag ${VSS_DOCS_IMAGE_TAG:-develop-latest}.
+```
+
+For edge platforms, ask the `vss-build-vision-ai` skill to use a remote LLM when possible.
+Local LLM/VLM sharing on the edge GPU is supported, but a remote LLM is recommended for better response time.
+See [VSS Agent Customization - Configure LLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-llm) for remote LLM endpoint options.
+
+**Recommended edge deployment prompts**
+
+```text title="Recommended edge deployment prompts"
+Deploy the VSS alerts verification profile on this DGX-SPARK machine with a remote LLM and the in-stack VSS Agent.
+Deploy the VSS alerts verification profile on this IGX-THOR machine with a remote LLM and the in-stack VSS Agent.
+Deploy the VSS alerts verification profile on this AGX-THOR machine with a remote LLM and the in-stack VSS Agent.
+```
+
+The `vss-build-vision-ai` skill uses Cosmos3 Nano Reasoner BF16 as the default VLM. You can ask the agent
+which VLM models are available during the deployment process, or request a different model
+directly in your deployment prompt:
+
+```text title="VLM model prompts"
+Which VLM models are available for the alerts profile?
+Deploy the VSS alerts verification profile with the Cosmos3 Super Reasoner FP8 VLM and the in-stack VSS Agent.
+```
+
+The agent sets `VLM_NAME` and `RTVI_VLM_MODEL_PATH` in the generated
+`_builds/<name>/override.env` to the model you request. The same options and
+hardware constraints listed in
+[Available VLM Models](#alert-verification-available-vlm-models) apply.
+
+If you would like to modify the workflow to work with other videos or use cases, you can update the following files:
+
+* `deploy/docker/developer-profiles/dev-profile-alerts/vlm-as-verifier/configs/alert_type_config.json`
+
+  * Modify the "output_category" and "user" fields here. "output_category" modifies the category type that shows up in the agent UI. "user" is the user prompt that is sent to the VLM for verification of each alert clip.
+
+* `deploy/docker/developer-profiles/dev-profile-alerts/deepstream/configs/config_triton_nvinferserver_gdino.txt`
+
+  * Update the "type_name" field under "postprocess" to change the objects that are detected by Grounding DINO. By default this is "person" with a threshold of 0.5. This can be modified to support multiple classes by using " . " as a delimiter.
+
+* `deploy/docker/developer-profiles/dev-profile-alerts/vss-behavior-analytics/configs/vss-behavior-analytics-config.json`
+
+  * Update the "value" field under `"name": "fovCountViolationIncidentObjectType"` to change the objects that Behavior Analytics creates alerts for.
+
+* Custom response-parser directory *(optional; user-created)*
+
+  * The repository does not ship or mount a parser directory. Create a host directory, add the read-only `/app/parsers` volume described in [Pluggable Response Parser](/system-components/analytics-microservices/alerts-microservice#pluggable-response-parser), and place a Python module exposing a parser class with a `parse(self, raw_response: str) -> dict` method in it. Then set `vlm.response_parser` in `config.yml` to its dotted path and recreate Alert Bridge. Use this to replace the built-in YES/NO verification parsing with classification, analytics, or enrichment outputs.
+
+#### Scale Alert processing across CPU cores
+
+A single Alerts Microservice process uses about one CPU core. Running the pipeline in several processes adds CPU capacity, and it helps when that process is consistently near one core while Kafka consumer lag keeps growing. A process below one core is limited by offered traffic or by a downstream service, and gains nothing from additional processes.
+
+Edit the profile's Alerts Microservice configuration and redeploy:
+
+```text
+deploy/docker/developer-profiles/dev-profile-alerts/vlm-as-verifier/configs/config.yml
+```
+
+This setting is not available through `user-overrides.env`. A conservative four-process configuration that keeps the profile's instance-wide VLM and VIOS load unchanged:
+
+```yaml
+alert_agent:
+  pipeline_mode: event_loop
+  processes: 4
+  startup_timeout_seconds: 60
+  async_dispatch_max_in_flight: 4
+  async_io:
+    max_vlm_concurrent: 1
+    max_vst_concurrent: 2
+
+persistence:
+  enabled: true
+```
+
+Every per-process limit is multiplied by the process count, which is why the three limits above are divided by four from the one-process profile values of 16, 4, and 8. `max_vlm_concurrent` caps what each process offers the VLM backend and does not raise the backend's throughput. When the VLM is the limiting service, capacity comes from the VLM side, for example more replicas behind the same endpoint.
+
+Before raising the process count, confirm the following:
+
+- `pipeline_mode` is `event_loop` and `persistence.enabled` is `true`. Both are the profile defaults.
+- Every Alert input topic has at least as many partitions as the process count, counted per topic. The profile creates eight partitions per topic, so one instance can run four processes as shipped. When several Alerts Microservice instances share the consumer group, for example as replicas on Kubernetes, the bound applies to `instances × processes`.
+- At least as many active streams as processes. The Behavior Analytics pipeline keys every message of one stream by `sensorId`, so a stream lands on one partition and one process, and work is spread across processes at stream granularity. Fewer streams than processes leaves processes without work, and more streams spread the load more evenly.
+- The host has about one CPU core per process, plus capacity for the parent and API processes. Each process also holds its own Kafka consumers, HTTP connection pools to the VLM and VIOS backends, Elasticsearch clients, and memory, so connection, file-descriptor, and memory use grow with the process count.
+- The VLM and VIOS backends can serve `processes × max_vlm_concurrent` and `processes × max_vst_concurrent` requests concurrently.
+
+Startup refuses a combination the deployment cannot honor and names the reason. `/health` returns HTTP 503 until every process holds a Kafka assignment. Allow for `startup_timeout_seconds` before the instance reports ready.
+
+For pipeline modes, startup validation, throughput monitoring, and rollback, see [Scaling and Performance Tuning](/system-components/analytics-microservices/alerts-microservice#scaling-and-performance-tuning) in the Alerts Microservice guide.
+
+### Step 2: Add a video stream
+
+Add an RTSP stream by clicking the **+ Add RTSP** button on the **Video Management** tab in the agent UI. If you do not have an RTSP stream, you can use [NVStreamer](/system-components/middleware/video-io-storage-vios/nv-streamer) at `http://<HOST_IP>:31000` to upload a video file and create an RTSP stream.
+
+For this profile, use the `sample-warehouse-ladder.mp4` stream.
+
+<Note>
+By default, this profile only supports up to one stream being processed at a time.
+
+This can be increased by setting `NUM_SENSORS` in
+`deploy/docker/developer-profiles/dev-profile-alerts/user-overrides.env` before
+deployment. On RTX PRO 6000, up to 4 streams at 30 FPS have been tested to
+work.
+
+On edge platforms like DGX Spark, IGX Thor, and AGX Thor, up to 1 stream at 30 FPS has been tested to work due to GPU requirements.
+
+RTVI CV supports input streams at up to 30 FPS by default. On dGPU systems,
+`interval=0` in the `[primary-gie]` group runs inference on every frame. On edge
+systems, the deployment sets `interval=1`, which runs inference on every other
+frame. This inference load limits how many streams a single GPU can process in
+parallel.
+
+Increasing RTVI CV stream capacity also increases the potential alert load.
+Verify that RTVI VLM can keep up with the resulting alerts and monitor
+end-to-end alert latency. Depending on stream count and stream content, RTVI CV may generate alerts faster than the RTVI VLM container can verify them, causing the verification backlog and latency to increase drastically. On single-GPU systems, including edge devices, the additional RTVI VLM load can also saturate shared GPU resources and reduce RTVI CV processing FPS.
+
+To reduce the perception workload and run more streams on one GPU, use one or
+more of the following options:
+
+- Supply lower-FPS input streams such as 10 FPS streams.
+- Use RT-DETR instead of the default Grounding DINO model. RT-DETR is lighter
+  weight, but supports only the classes in `deploy/docker/developer-profiles/dev-profile-alerts/deepstream/configs/rtdetr-960x544-labels.txt`.
+
+  To do so, set `MODEL_NAME_2D=RTDETR` in `deploy/docker/developer-profiles/dev-profile-alerts/user-overrides.env` before deployment.
+- Increase `interval` in the `[primary-gie]` group of
+  `deploy/docker/developer-profiles/dev-profile-alerts/deepstream/configs/run_config-api-rtdetr-protobuf.txt`.
+  An interval of `1` runs inference on every other frame; `2` runs inference on
+  every third frame. The tracker continues to track objects between inference
+  frames.
+
+  Note that on edge systems, `deploy/docker/services/rtvi/rtvi-cv/ds-start.sh` overrides the DeepStream configuration and sets `interval=1` during startup. To use another value, modify the edge-platform `interval` assignment in that script as well.
+</Note>
+
+### Step 3: Verify pipeline components
+
+Open the Kibana UI at `http://<HOST_IP>:7777/kibana/app/home#/` and navigate to the Discover tab.
+
+Verify the following data indices are populated. It may take a few minutes for data to start appearing after adding the stream:
+
+- `mdx-raw-*` - Raw detection data
+- `mdx-incidents-*` - Generated incidents
+- `mdx-vlm-incidents-*` - VLM-verified alerts
+
+If the indices do not show data, check the following items:
+
+- Ensure that the Perception service is running and processing the stream. View the container logs with `docker logs -f vss-rtvi-cv` and confirm that the engine files are built and the added stream is being processed. Common causes of failure include model download errors during startup and insufficient GPU memory.
+- Confirm that the labels emitted by the Perception model match the labels that Behavior Analytics expects. Behavior Analytics processes only the object type specified by the `fovCountViolationIncidentObjectType` field in `deploy/docker/developer-profiles/dev-profile-alerts/vss-behavior-analytics/configs/vss-behavior-analytics-config.json`.
+
+### Step 4: View alerts in the Agent UI
+
+Launch the Agent UI at `http://<HOST_IP>:7777/`.
+
+List streams to verify connectivity, then use the **Alerts** tab to list alerts. Select the verified alerts option to view VLM-verified alerts. To see the alerts, go to [Agent UI](/system-components/user-interface) > [Alerts Tab](/system-components/user-interface#1-alerts-tab) > [View Alerts](/system-components/user-interface#view-alerts).
+
+![Alerts table](./assets/images/agent-workflows/alert-verification-alerts.png)
+
+You can then click on a video thumbnail to play the video and view the alert. When the bounding box overlay is enabled, playback includes bounding boxes over objects of interest. This overlay is off by default; to enable it, set `vst_config.add_overlay: true` on the alert verification service and `NEXT_PUBLIC_ALERTS_TAB_MEDIA_WITH_OBJECTS_BBOX=true` for the Agent UI.
+
+![Video Playback with Bounding Boxes](./assets/images/agent-workflows/alert-verification-bbox.png)
+
+### Step 5: Generate a Report for the Alert
+
+You can use the chat interface to request creation of a report for the generated alerts. The report is currently generated in markdown format and displayed in the VSS UI.
+
+As a first step, identify the alert ID for which the report needs to be generated. Use the chat interface to retrieve the ID by listing recent alerts by count, or expand any alert in the **Alerts** tab to display the **Id** field along with associated metadata.
+
+Now, use the ID to request generation of the report while also specifying the associated sensor, as shown in the sample image below.
+
+![Report Generation](./assets/images/agent-workflows/report-gen.png)
+
+### Step 6: Teardown the Agent
+
+To tear down the agent, run the following command:
+
+```bash
+cd deploy/docker
+PROFILE=alerts
+docker compose -f compose.yml \
+  --env-file containers.env \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/.env" \
+  --env-file "developer-profiles/dev-profile-${PROFILE}/user-overrides.env" \
+  down -v --remove-orphans
+```
+
+This command stops the manually deployed alert-verification containers and
+removes their Compose volumes.
+
+## Service Endpoints
+
+The following endpoints apply to the stock manual Compose deployment. Build
+Vision AI reports the endpoints available in the deployment it creates; use
+that deployment summary instead of assuming every endpoint below is present.
+
+| Service | URL |
+| --- | --- |
+| VSS UI | `http://<HOST_IP>:7777` |
+| Kibana UI | `http://<HOST_IP>:7777/kibana/app/home#/` |
+| NVStreamer UI | `http://<HOST_IP>:31000/#/dashboard` |
+| VST UI | `http://<HOST_IP>:30888/vst/#/dashboard` |
+| Phoenix UI | `http://<HOST_IP>:7777/phoenix/projects` |
+| Jaeger UI | `http://<HOST_IP>:16686` |
+
+The Jaeger UI is present only when the `jaeger` Compose profile is enabled; see [OpenTelemetry Tracing](/system-components/analytics-microservices/alerts-microservice#opentelemetry-tracing) in the Alerts Microservice page.
+
+## Next Steps
+
+Once you've familiarized yourself with the alert verification workflow, you can explore:
+
+- Modifying the alert prompt in the Alerts Microservice configuration.
+- Adjusting rate limit settings to control alert verification frequency.
+- Configuring G-DINO prompting and class thresholds for custom detection scenarios.
+
+### Known Issues
+
+* Some VLM inaccuracies might be observed depending on the model and configuration used with the RTVI VLM container.
+
+* Video snippets generated for alerts may be short (for example, only a couple of seconds) depending on behavior analytics processing of the specific video, which could impact VLM accuracy. To address this issue, modify the *fovCountViolationIncidentThreshold* setting to the desired minimum alert clip duration in *deploy/docker/developer-profiles/dev-profile-alerts/vss-behavior-analytics/configs/vss-behavior-analytics-config.json*.
+
+* Video playback duration for verified alerts may not exactly match the alert timestamps.
+
+* Report generation may produce inaccurate results.
+
+* If perception crashes and restarts, streams are not automatically re-added and alerts will not be generated.
+
+* For remote VLM and LLM deployments, the alert verification timeout may need to be increased from the default value of 5 seconds. See [Alert Verification VLM Configuration Options](/system-components/analytics-microservices/alerts-microservice#vlm-configuration) for specific details.
+
+* VLM verdict verification can fail in the UI even when VLM requests are processed successfully. Alert Bridge response parsing accepts only raw verdicts such as `A/B` or `Yes/No` before serializing them to `confirmed` or `rejected`. As a result, a semantically valid `rejected` verdict from Cosmos Reason can fail schema validation and be persisted as `verification-failed`.
+
+* The VST UI is externally accessible on both port 30000 and 30888 because both ports are exposed on the host network. For security hardening, consider using a firewall to allowlist only the required VST ingress port.
+
+* Spurious records in the `mdx-vlm-incidents-1970-01-01` index may be generated by RTVI VLM. Workaround: add this near the top of the Logstash `filter { }` block in `deploy/docker/services/infra/elk/logstash/pipelines/kafka/mdx-logstash.conf`:
+
+  ```text
+  # Drop internal RT-VLM activity-detector noise before indexing.
+  if [analyticsModule][id] == "vlm-activity-detector" and [analyticsModule][info][streamType] == "file" {
+    drop { }
+  }
+  ```
+
+  If `streamType` is unavailable, use the following fallback:
+
+  ```text
+  if [analyticsModule][id] == "vlm-activity-detector" and [category] == "vlm-alert" {
+    drop { }
+  }
+  ```

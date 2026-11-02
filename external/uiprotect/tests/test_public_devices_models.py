@@ -1,0 +1,1560 @@
+"""Dedicated public device models (PublicCamera/Light/Sensor/Chime) and WS routing."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
+from unittest.mock import Mock
+
+import pytest
+
+from tests.conftest import set_no_debug
+from uiprotect.api import RTSPSStreams
+from uiprotect.data import (
+    NVR,
+    AlarmHubInput,
+    AlarmHubInputContactType,
+    AlarmHubInputStatus,
+    Fob,
+    LinkStation,
+    NvrArmMode,
+    NvrArmModeStatus,
+    OnOffState,
+    ProtectDeviceIdentity,
+    PublicBridge,
+    PublicCamera,
+    PublicChime,
+    PublicDeviceModel,
+    PublicDoorbellMessage,
+    PublicDoorbellSettings,
+    PublicLcdMessage,
+    PublicLight,
+    PublicLiveview,
+    PublicNVR,
+    PublicSensor,
+    PublicSensorFeatureCapability,
+    PublicSensorFeatureFlags,
+    PublicSirenStatus,
+    PublicViewer,
+    Relay,
+    SensorFeatureCapability,
+    Siren,
+    Speaker,
+)
+from uiprotect.data.public_bootstrap import PublicBootstrap
+from uiprotect.data.types import (
+    ChannelQuality,
+    DoorbellMessageType,
+    EventType,
+    ModelType,
+    SensorAlarmType,
+    SensorScheduleMode,
+    SmartDetectObjectType,
+    ThreadNetworkRole,
+    ThreadNetworkStatus,
+)
+from uiprotect.exceptions import BadRequest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+CAMERA_PAYLOAD: dict[str, Any] = {
+    "id": "cam1",
+    "modelKey": "camera",
+    "state": "CONNECTED",
+    "name": "Front Door",
+    "mac": "AABBCCDDEEFF",
+    "isMicEnabled": True,
+    "osdSettings": {
+        "isNameEnabled": True,
+        "isDateEnabled": True,
+        "isLogoEnabled": False,
+        "isDebugEnabled": False,
+        "overlayLocation": "topLeft",
+    },
+    "ledSettings": {"isEnabled": True, "welcomeLed": None, "floodLed": None},
+    "lcdMessage": {},
+    "micVolume": 100,
+    "activePatrolSlot": None,
+    "videoMode": "default",
+    "hdrType": "auto",
+    "featureFlags": {
+        "supportFullHdSnapshot": False,
+        "hasHdr": True,
+        "hasMic": True,
+        "hasLedStatus": True,
+        "hasSpeaker": False,
+        "videoModes": ["default"],
+        "smartDetectTypes": ["person"],
+        "smartDetectAudioTypes": ["alrmSmoke"],
+    },
+    "smartDetectSettings": {"objectTypes": ["person"], "audioTypes": ["alrmSmoke"]},
+    "hasPackageCamera": False,
+}
+
+LIGHT_PAYLOAD: dict[str, Any] = {
+    "id": "light1",
+    "modelKey": "light",
+    "state": "CONNECTED",
+    "name": "Garage Light",
+    "mac": "AABBCCDDEE01",
+    "lightModeSettings": {"mode": "motion", "enableAt": "dark"},
+    "lightDeviceSettings": {
+        "isIndicatorEnabled": True,
+        "pirDuration": 15000,
+        "pirSensitivity": 80,
+        "ledLevel": 3,
+    },
+    "isDark": True,
+    "isLightOn": False,
+    "isLightForceEnabled": False,
+    "lastMotion": None,
+    "isPirMotionDetected": False,
+    "camera": "cam1",
+}
+
+SENSOR_PAYLOAD: dict[str, Any] = {
+    "id": "sensor1",
+    "modelKey": "sensor",
+    "state": "CONNECTED",
+    "name": "Kitchen Sensor",
+    "mac": "AABBCCDDEE02",
+    "mountType": "door",
+    "batteryStatus": {"percentage": 90, "isLow": False},
+    "stats": {
+        "light": {"value": 12.0, "status": "neutral"},
+        "humidity": {"value": None, "status": "unknown"},
+        "temperature": {"value": 22.5, "status": "neutral"},
+    },
+    "lightSettings": {
+        "isEnabled": True,
+        "margin": 1,
+        "lowThreshold": 1.0,
+        "highThreshold": 100.0,
+    },
+    "humiditySettings": {
+        "isEnabled": False,
+        "margin": 1,
+        "lowThreshold": None,
+        "highThreshold": None,
+    },
+    "temperatureSettings": {
+        "isEnabled": False,
+        "margin": 1,
+        "lowThreshold": None,
+        "highThreshold": None,
+    },
+    "isOpened": False,
+    "openStatusChangedAt": None,
+    "isMotionDetected": False,
+    "motionDetectedAt": None,
+    "motionSettings": {
+        "isEnabled": True,
+        "sensitivity": 50,
+        "sensitivityWhenArmed": 80,
+    },
+    "alarmTriggeredAt": None,
+    "alarmSettings": {"isEnabled": False},
+    "leakDetectedAt": None,
+    "externalLeakDetectedAt": None,
+    "leakSettings": {"isInternalEnabled": False, "isExternalEnabled": False},
+    "tamperingDetectedAt": None,
+    "wirelessConnectionState": {
+        "signalState": {"signalQuality": 80, "signalStrength": -50},
+        "batteryStatus": {"percentage": 90, "isLow": False},
+        "bridge": "bridge1",
+    },
+    "scheduleMode": "when_armed",
+    "glassBreakSettings": {
+        "isEnabled": True,
+        "sensitivity": 60,
+        "sensitivityWhenArmed": 90,
+    },
+    "armProfileIds": ["profile1"],
+    "hasCustomSensitivityWhenArmed": True,
+    "featureFlags": {
+        "temperature": {"channelCount": 1},
+        "humidity": {"channelCount": 1},
+        "light": {"channelCount": 1},
+        "motion": {"channelCount": 1},
+        "open": {"channelCount": 1},
+        "tamper": {"channelCount": 1},
+    },
+}
+
+CHIME_PAYLOAD: dict[str, Any] = {
+    "id": "chime1",
+    "modelKey": "chime",
+    "state": "CONNECTED",
+    "name": "Hallway Chime",
+    "mac": "AABBCCDDEE03",
+    "cameraIds": ["cam1", "cam2"],
+    "ringSettings": [
+        {
+            "cameraId": "cam1",
+            "repeatTimes": 2,
+            "ringtoneId": "rt1",
+            "volume": 75,
+        }
+    ],
+}
+
+FOB_PAYLOAD: dict[str, Any] = {
+    "id": "fob1",
+    "modelKey": "fob",
+    "state": "CONNECTED",
+    "name": "Front Fob",
+    "mac": "AABBCCDDEE04",
+    "awayState": "ONLINE",
+    "buttonLabels": "securityActions",
+    "featureFlags": {"buttons": ["arm", "disarm"]},
+    "wirelessConnectionState": {
+        "signalState": {"signalQuality": None, "signalStrength": None},
+        "batteryStatus": {"percentage": None, "isLow": False},
+        "bridge": None,
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("cls", "payload", "field_count"),
+    [
+        (PublicCamera, CAMERA_PAYLOAD, 19),
+        (PublicLight, LIGHT_PAYLOAD, 15),
+        (PublicSensor, SENSOR_PAYLOAD, 30),
+        (PublicChime, CHIME_PAYLOAD, 9),
+    ],
+)
+def test_public_model_field_set(
+    cls: type, payload: dict[str, Any], field_count: int
+) -> None:
+    """Each public model exposes exactly its spec field count and parses its payload."""
+    assert len(cls.model_fields) == field_count
+    obj = cls.from_unifi_dict(api=Mock(), **dict(payload))
+    assert obj.name == payload["name"]
+
+
+@pytest.mark.parametrize(
+    ("cls", "payload"),
+    [
+        (PublicCamera, CAMERA_PAYLOAD),
+        (PublicLight, LIGHT_PAYLOAD),
+        (PublicSensor, SENSOR_PAYLOAD),
+        (PublicChime, CHIME_PAYLOAD),
+    ],
+)
+def test_public_model_name_nullable(cls: type, payload: dict[str, Any]) -> None:
+    """``name`` is present-but-nullable: a ``null`` wire value parses to ``None``."""
+    data = dict(payload)
+    data["name"] = None
+    obj = cls.from_unifi_dict(api=Mock(), **data)
+    assert obj.name is None
+
+
+@pytest.mark.parametrize(
+    ("cls", "payload"),
+    [
+        (PublicCamera, CAMERA_PAYLOAD),
+        (PublicLight, LIGHT_PAYLOAD),
+        (PublicSensor, SENSOR_PAYLOAD),
+        (PublicChime, CHIME_PAYLOAD),
+    ],
+)
+def test_public_device_model_shared_base(cls: type, payload: dict[str, Any]) -> None:
+    """Dedicated public devices share ``PublicDeviceModel`` and type ``mac`` / ``state``."""
+    assert issubclass(cls, PublicDeviceModel)
+    assert PublicDeviceModel.model_fields.keys() >= {"mac", "state"}
+    obj: PublicDeviceModel = cls.from_unifi_dict(api=Mock(), **dict(payload))
+    assert obj.mac == payload["mac"]
+    assert obj.state.value == payload["state"]
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [Siren, Relay, Fob, Speaker, LinkStation, PublicBridge, PublicViewer],
+)
+def test_mac_state_devices_share_base(cls: type[PublicDeviceModel]) -> None:
+    """Every mac/state-carrying public device subclasses ``PublicDeviceModel``."""
+    assert issubclass(cls, PublicDeviceModel)
+    assert cls.model_fields.keys() >= {"mac", "state"}
+
+
+def test_reparented_viewer_is_public_device_model() -> None:
+    """A constructed viewer satisfies the generic ``isinstance`` dispatch guard."""
+    obj = PublicViewer.from_unifi_dict(
+        api=Mock(),
+        id="viewer-1",
+        modelKey="viewer",
+        state="CONNECTED",
+        name="Viewer 1",
+        mac="AABBCCDDEE01",
+        liveview="lv-1",
+        streamLimit=16,
+    )
+    assert isinstance(obj, PublicDeviceModel)
+    assert obj.mac == "AABBCCDDEE01"
+    assert obj.state.value == "CONNECTED"
+
+
+def test_public_camera_drops_private_only_fields() -> None:
+    """A private-only key on the payload is not modeled and not stored."""
+    assert "recording_settings" not in PublicCamera.model_fields
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(), **{**CAMERA_PAYLOAD, "recordingSettings": {"mode": "always"}}
+    )
+    assert not hasattr(obj, "recording_settings")
+
+
+@pytest.mark.parametrize(
+    ("has_package_camera", "expected"),
+    [
+        (False, [ChannelQuality.HIGH, ChannelQuality.MEDIUM, ChannelQuality.LOW]),
+        (
+            True,
+            [
+                ChannelQuality.HIGH,
+                ChannelQuality.MEDIUM,
+                ChannelQuality.LOW,
+                ChannelQuality.PACKAGE,
+            ],
+        ),
+    ],
+)
+def test_public_camera_hardware_stream_qualities(
+    has_package_camera: bool, expected: list[ChannelQuality]
+) -> None:
+    """Hardware qualities are high/medium/low plus package only when supported."""
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(), **{**CAMERA_PAYLOAD, "hasPackageCamera": has_package_camera}
+    )
+    assert obj.hardware_stream_qualities() == expected
+
+
+@pytest.mark.parametrize(
+    ("smart_detect_types", "smart_detect_audio_types", "smart_type", "expected"),
+    [
+        (["person"], [], SmartDetectObjectType.PERSON, True),
+        (["person"], [], SmartDetectObjectType.VEHICLE, False),
+        ([], ["alrmCmonx"], SmartDetectObjectType.CMONX, True),
+        ([], ["alrmSmoke"], SmartDetectObjectType.CMONX, False),
+        ([], ["alrmBurglar"], SmartDetectObjectType.BURGLAR, True),
+        ([], ["alrmSmoke"], SmartDetectObjectType.BURGLAR, False),
+        ([], ["alrmSmoke"], SmartDetectObjectType.PERSON, False),
+        (["alrmSmoke"], [], SmartDetectObjectType.SMOKE, False),
+    ],
+)
+def test_public_camera_can_detect(
+    smart_detect_types: list[str],
+    smart_detect_audio_types: list[str],
+    smart_type: SmartDetectObjectType,
+    expected: bool,
+) -> None:
+    """Object types match the object list, audio types the audio list via ``audio_type``."""
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(),
+        **{
+            **CAMERA_PAYLOAD,
+            "featureFlags": {
+                **CAMERA_PAYLOAD["featureFlags"],
+                "smartDetectTypes": smart_detect_types,
+                "smartDetectAudioTypes": smart_detect_audio_types,
+            },
+        },
+    )
+    assert obj.can_detect(smart_type) is expected
+
+
+def test_public_camera_unknown_smart_detect_type_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runtime-generated smart detect type (e.g. ``linecrossing_basic``) is dropped, not fatal."""
+    payload = {
+        **CAMERA_PAYLOAD,
+        "featureFlags": {
+            **CAMERA_PAYLOAD["featureFlags"],
+            "smartDetectTypes": ["person", "linecrossing_basic"],
+            "smartDetectAudioTypes": ["alrmSmoke", "linecrossing_audio"],
+            "videoModes": ["default", "linecrossing_video"],
+        },
+        "smartDetectSettings": {
+            "objectTypes": ["person", "linecrossing_basic"],
+            "audioTypes": ["alrmSmoke", "linecrossing_audio"],
+        },
+    }
+    obj = PublicCamera.from_unifi_dict(api=Mock(), **payload)
+    assert obj.feature_flags.smart_detect_types == [SmartDetectObjectType.PERSON]
+    assert obj.smart_detect_settings.object_types == [SmartDetectObjectType.PERSON]
+    assert "linecrossing_basic" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("object_types", "audio_types", "prop", "expected"),
+    [
+        (["person"], [], "is_person_detection_on", True),
+        ([], [], "is_person_detection_on", False),
+        (["vehicle"], [], "is_vehicle_detection_on", True),
+        (["face"], [], "is_face_detection_on", True),
+        (["licensePlate"], [], "is_license_plate_detection_on", True),
+        (["package"], [], "is_package_detection_on", True),
+        ([], [], "is_package_detection_on", False),
+        (["animal"], [], "is_animal_detection_on", True),
+        ([], ["alrmSmoke"], "is_smoke_detection_on", True),
+        ([], [], "is_smoke_detection_on", False),
+        ([], ["alrmCmonx"], "is_co_detection_on", True),
+        ([], ["alrmSiren"], "is_siren_detection_on", True),
+        ([], ["alrmBabyCry"], "is_baby_cry_detection_on", True),
+        ([], ["alrmSpeak"], "is_speaking_detection_on", True),
+        ([], ["alrmBark"], "is_bark_detection_on", True),
+        ([], ["alrmBurglar"], "is_car_alarm_detection_on", True),
+        ([], ["alrmCarHorn"], "is_car_horn_detection_on", True),
+        ([], ["alrmGlassBreak"], "is_glass_break_detection_on", True),
+        ([], ["alrmSmoke"], "is_siren_detection_on", False),
+    ],
+)
+def test_public_camera_detection_on_properties(
+    object_types: list[str],
+    audio_types: list[str],
+    prop: str,
+    expected: bool,
+) -> None:
+    """``is_*_detection_on`` are membership tests over the smart-detect settings."""
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(),
+        **{
+            **CAMERA_PAYLOAD,
+            "smartDetectSettings": {
+                "objectTypes": object_types,
+                "audioTypes": audio_types,
+            },
+        },
+    )
+    assert getattr(obj, prop) is expected
+
+
+@pytest.mark.parametrize(
+    ("object_types", "audio_types", "smart_type", "expected"),
+    [
+        (["person"], [], SmartDetectObjectType.PERSON, True),
+        (["person"], [], SmartDetectObjectType.VEHICLE, False),
+        (["car"], [], SmartDetectObjectType.CAR, True),
+        ([], ["alrmSmoke"], SmartDetectObjectType.SMOKE, True),
+        ([], ["alrmSmoke"], SmartDetectObjectType.CMONX, False),
+        ([], ["alrmSmoke"], SmartDetectObjectType.PERSON, False),
+        (["alrmSmoke"], [], SmartDetectObjectType.SMOKE, False),
+    ],
+)
+def test_public_camera_is_detection_on(
+    object_types: list[str],
+    audio_types: list[str],
+    smart_type: SmartDetectObjectType,
+    expected: bool,
+) -> None:
+    """Object types match ``object_types``, audio types ``audio_types`` via ``audio_type``."""
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(),
+        **{
+            **CAMERA_PAYLOAD,
+            "smartDetectSettings": {
+                "objectTypes": object_types,
+                "audioTypes": audio_types,
+            },
+        },
+    )
+    assert obj.is_detection_on(smart_type) is expected
+
+
+@pytest.mark.parametrize(
+    ("smart_type", "prop"),
+    [
+        (SmartDetectObjectType.PERSON, "is_person_detection_on"),
+        (SmartDetectObjectType.VEHICLE, "is_vehicle_detection_on"),
+        (SmartDetectObjectType.FACE, "is_face_detection_on"),
+        (SmartDetectObjectType.LICENSE_PLATE, "is_license_plate_detection_on"),
+        (SmartDetectObjectType.PACKAGE, "is_package_detection_on"),
+        (SmartDetectObjectType.ANIMAL, "is_animal_detection_on"),
+        (SmartDetectObjectType.SMOKE, "is_smoke_detection_on"),
+        (SmartDetectObjectType.CMONX, "is_co_detection_on"),
+        (SmartDetectObjectType.SIREN, "is_siren_detection_on"),
+        (SmartDetectObjectType.BABY_CRY, "is_baby_cry_detection_on"),
+        (SmartDetectObjectType.SPEAK, "is_speaking_detection_on"),
+        (SmartDetectObjectType.BARK, "is_bark_detection_on"),
+        (SmartDetectObjectType.BURGLAR, "is_car_alarm_detection_on"),
+        (SmartDetectObjectType.CAR_HORN, "is_car_horn_detection_on"),
+        (SmartDetectObjectType.GLASS_BREAK, "is_glass_break_detection_on"),
+    ],
+)
+@pytest.mark.parametrize("enabled", [True, False])
+def test_public_camera_is_detection_on_matches_properties(
+    smart_type: SmartDetectObjectType, prop: str, enabled: bool
+) -> None:
+    """``is_detection_on`` agrees with every ``is_*_detection_on`` property."""
+    audio_type = smart_type.audio_type
+    object_types = [] if audio_type is not None or not enabled else [smart_type.value]
+    audio_types = [audio_type.value] if audio_type is not None and enabled else []
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(),
+        **{
+            **CAMERA_PAYLOAD,
+            "smartDetectSettings": {
+                "objectTypes": object_types,
+                "audioTypes": audio_types,
+            },
+        },
+    )
+    assert obj.is_detection_on(smart_type) is getattr(obj, prop) is enabled
+
+
+@pytest.mark.parametrize(
+    ("video_modes", "expected"),
+    [(["default"], False), (["default", "highFps"], True)],
+)
+def test_public_camera_feature_flags_has_highfps(
+    video_modes: list[str], expected: bool
+) -> None:
+    """``has_highfps`` tracks ``highFps`` membership in ``video_modes``."""
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(),
+        **{
+            **CAMERA_PAYLOAD,
+            "featureFlags": {
+                **CAMERA_PAYLOAD["featureFlags"],
+                "videoModes": video_modes,
+            },
+        },
+    )
+    assert obj.feature_flags.has_highfps is expected
+
+
+@pytest.mark.parametrize(
+    ("video_mode", "expected"),
+    [("default", False), ("highFps", True)],
+)
+def test_public_camera_is_high_fps_enabled(video_mode: str, expected: bool) -> None:
+    """``is_high_fps_enabled`` tracks the ``highFps`` video mode."""
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(), **{**CAMERA_PAYLOAD, "videoMode": video_mode}
+    )
+    assert obj.is_high_fps_enabled is expected
+
+
+@pytest.mark.parametrize(
+    ("hdr_type", "expected"),
+    [("auto", "auto"), ("on", "always"), ("off", "off")],
+)
+def test_public_camera_hdr_mode_display(hdr_type: str, expected: str) -> None:
+    """``hdr_mode_display`` inverts the public HDR enum to the interface labels."""
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(), **{**CAMERA_PAYLOAD, "hdrType": hdr_type}
+    )
+    assert obj.hdr_mode_display == expected
+
+
+@pytest.mark.parametrize(
+    ("lcd_message", "expected"),
+    [
+        (None, None),
+        ({}, None),
+        ({"text": "Hello"}, "Hello"),
+        ({"type": "LEAVE_PACKAGE_AT_DOOR"}, "LEAVE PACKAGE AT DOOR"),
+        ({"type": "DO_NOT_DISTURB"}, "DO NOT DISTURB"),
+        ({"type": "CUSTOM_MESSAGE", "text": "Hello"}, "Hello"),
+        ({"type": "CUSTOM_MESSAGE"}, ""),
+        ({"type": "IMAGE", "text": "img1"}, "IMAGE"),
+    ],
+)
+def test_public_camera_lcd_message_text(
+    lcd_message: dict[str, Any] | None, expected: str | None
+) -> None:
+    """``lcd_message_text`` is the text the doorbell LCD shows."""
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(), **{**CAMERA_PAYLOAD, "lcdMessage": lcd_message}
+    )
+    assert obj.lcd_message_text == expected
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize("text", [_MISSING, "", "Hi"])
+@pytest.mark.parametrize("message_type", [*DoorbellMessageType, None])
+def test_public_camera_lcd_message_text_all_types(
+    message_type: DoorbellMessageType | None, text: object
+) -> None:
+    """``lcd_message_text`` shows custom text, else the type's display text."""
+    lcd_message: dict[str, Any] = {}
+    if message_type is not None:
+        lcd_message["type"] = message_type.value
+    if text is not _MISSING:
+        lcd_message["text"] = text
+    obj = PublicCamera.from_unifi_dict(
+        api=Mock(), **{**CAMERA_PAYLOAD, "lcdMessage": lcd_message}
+    )
+    if message_type is None:
+        expected = None if text is _MISSING else text
+    elif message_type is DoorbellMessageType.CUSTOM_MESSAGE:
+        expected = "" if text is _MISSING else text
+    else:
+        expected = message_type.value.replace("_", " ")
+    assert obj.lcd_message_text == expected
+
+
+@pytest.mark.parametrize(
+    ("custom_messages", "expected_custom"),
+    [([], []), (["Hello", "Back soon"], ["Hello", "Back soon"])],
+)
+def test_public_doorbell_settings_all_messages(
+    custom_messages: list[str], expected_custom: list[str]
+) -> None:
+    """``all_messages`` lists the built-in messages, then the custom ones."""
+    settings = PublicDoorbellSettings.from_unifi_dict(customMessages=custom_messages)
+    assert settings.all_messages == [
+        PublicDoorbellMessage(
+            DoorbellMessageType.LEAVE_PACKAGE_AT_DOOR, "LEAVE PACKAGE AT DOOR"
+        ),
+        PublicDoorbellMessage(DoorbellMessageType.DO_NOT_DISTURB, "DO NOT DISTURB"),
+        *(
+            PublicDoorbellMessage(DoorbellMessageType.CUSTOM_MESSAGE, text)
+            for text in expected_custom
+        ),
+    ]
+
+
+def test_public_doorbell_settings_all_messages_matches_private() -> None:
+    """``all_messages`` mirrors the private ``NVR.update_all_messages``."""
+    nvr = Mock(doorbell_settings=Mock(custom_messages=["Hello", "Back soon"]))
+    NVR.update_all_messages(nvr)
+    settings = PublicDoorbellSettings.from_unifi_dict(
+        customMessages=["Hello", "Back soon"]
+    )
+    assert [(m.type, m.text) for m in settings.all_messages] == [
+        (m.type, m.text) for m in nvr.doorbell_settings.all_messages
+    ]
+
+
+def test_public_sensor_sub_models_typed() -> None:
+    """Sensor leaf payloads parse into the dedicated read-shape sub-models."""
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **dict(SENSOR_PAYLOAD))
+    assert sensor.battery_status.percentage == 90
+    assert sensor.stats.temperature.value == 22.5
+    assert sensor.stats.humidity.value is None
+    assert sensor.leak_settings.is_internal_enabled is False
+    assert sensor.schedule_mode is SensorScheduleMode.WHEN_ARMED
+    assert sensor.glass_break_settings.is_enabled is True
+    assert sensor.glass_break_settings.sensitivity_when_armed == 90
+    assert sensor.motion_settings.sensitivity_when_armed == 80
+    assert sensor.arm_profile_ids == ["profile1"]
+    assert sensor.has_custom_sensitivity_when_armed is True
+
+
+def test_public_device_identity_optional_and_round_trips() -> None:
+    """``type`` / ``guid`` map to ``device_type`` / ``device_guid`` and round-trip."""
+    data = dict(SENSOR_PAYLOAD)
+    data["type"] = "Example-Model"
+    data["guid"] = "00000000-0000-0000-0000-000000000000"
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **data)
+    assert sensor.device_type == "Example-Model"
+    assert sensor.device_guid == "00000000-0000-0000-0000-000000000000"
+    # ``model`` (the modelKey enum) is untouched by the new fields.
+    assert sensor.model is ModelType.SENSOR
+    dumped = sensor.unifi_dict()
+    assert dumped["type"] == "Example-Model"
+    assert dumped["guid"] == "00000000-0000-0000-0000-000000000000"
+
+
+def test_sensor_feature_capability_enum_matches_flag_fields() -> None:
+    """``supports`` does ``getattr`` by enum value, so the names must stay in lockstep."""
+    assert {c.value for c in SensorFeatureCapability} == set(
+        PublicSensorFeatureFlags.model_fields
+    )
+
+
+def test_public_sensor_feature_flags_capabilities() -> None:
+    """``featureFlags`` parses into the capability map and the presence helpers."""
+    data = dict(SENSOR_PAYLOAD)
+    data["featureFlags"] = {
+        "temperature": {"channelCount": 1},
+        "humidity": {"channelCount": 1},
+        "light": {"channelCount": 1},
+        "waterLeak": {"channelCount": 2},
+        # A present capability that omits ``channelCount`` must not raise.
+        "motion": {},
+    }
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **data)
+    assert sensor.feature_flags.water_leak.channel_count == 2
+    assert sensor.feature_flags.motion.channel_count == 0
+    assert sensor.supports(SensorFeatureCapability.TEMPERATURE) is True
+    assert sensor.supports(SensorFeatureCapability.WATER_LEAK) is True
+    assert sensor.supports(SensorFeatureCapability.MOTION) is True
+    # An absent capability key means "not supported".
+    assert sensor.supports(SensorFeatureCapability.SMOKE) is False
+    assert sensor.supported_alarm_types == frozenset()
+    assert sensor.supported_event_types == frozenset()
+
+
+def test_public_sensor_smoke_flag_implies_alarm_and_event_types() -> None:
+    """``smoke`` implies the smoke/CO alarm types and the smoke/CO events."""
+    data = dict(SENSOR_PAYLOAD)
+    data["featureFlags"] = {"smoke": {"channelCount": 1}, "tamper": {}}
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **data)
+    assert sensor.supported_alarm_types == {SensorAlarmType.SMOKE, SensorAlarmType.CO}
+    assert sensor.supported_event_types == {
+        EventType.SENSOR_ALARM,
+        EventType.SENSOR_SMOKE_TEST,
+        EventType.SENSOR_SMOKE_BATTERY_LOW,
+        EventType.SENSOR_SMOKE_NEEDS_CLEANING,
+        EventType.SENSOR_SMOKE_FAULT,
+        EventType.SENSOR_CO_FAULT,
+        EventType.SENSOR_SMOKE_END_OF_LIFE,
+    }
+    assert isinstance(sensor.supported_alarm_types, frozenset)
+    assert isinstance(sensor.supported_event_types, frozenset)
+
+
+def test_public_sensor_supported_types_follow_feature_flag_changes() -> None:
+    """The supported types track ``feature_flags`` replaced after construction."""
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **dict(SENSOR_PAYLOAD))
+    assert sensor.supported_alarm_types == frozenset()
+    sensor.feature_flags = PublicSensorFeatureFlags(
+        smoke=PublicSensorFeatureCapability()
+    )
+    assert SensorAlarmType.CO in sensor.supported_alarm_types
+    assert EventType.SENSOR_CO_FAULT in sensor.supported_event_types
+    sensor.feature_flags = PublicSensorFeatureFlags()
+    assert sensor.supported_alarm_types == frozenset()
+    assert sensor.supported_event_types == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("internal", "external", "expected"),
+    [(None, None, False), (1, None, True), (None, 1, True), (1, 1, True)],
+)
+def test_public_sensor_is_leak_detected_aggregates_channels(
+    internal: int | None, external: int | None, expected: bool
+) -> None:
+    """``is_leak_detected`` is the OR of the internal and external leak channels."""
+    data = dict(SENSOR_PAYLOAD)
+    data["leakDetectedAt"] = internal
+    data["externalLeakDetectedAt"] = external
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **data)
+    assert sensor.is_leak_detected is expected
+
+
+@pytest.mark.parametrize(("at", "expected"), [(None, False), (123, True)])
+def test_public_sensor_is_tampering_detected(at: int | None, expected: bool) -> None:
+    sensor = PublicSensor.from_unifi_dict(
+        api=Mock(), **{**SENSOR_PAYLOAD, "tamperingDetectedAt": at}
+    )
+    assert sensor.is_tampering_detected is expected
+
+
+@pytest.mark.parametrize(
+    ("mount_type", "temp_en", "leak_en", "contact_en"),
+    [
+        ("door", True, False, True),
+        ("leak", False, True, False),
+        ("none", True, False, False),
+    ],
+)
+def test_public_sensor_enabled_properties_respect_mount_type(
+    mount_type: str, temp_en: bool, leak_en: bool, contact_en: bool
+) -> None:
+    """Environmental metrics are suppressed on leak mounts; leak only on leak mounts."""
+    data = dict(SENSOR_PAYLOAD)
+    data["mountType"] = mount_type
+    for key in (
+        "temperatureSettings",
+        "humiditySettings",
+        "lightSettings",
+        "motionSettings",
+        "alarmSettings",
+    ):
+        data[key] = {"isEnabled": True}
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **data)
+    # The five environmental/alarm metrics share the same gate (enabled unless
+    # leak-mounted), so they all track ``temp_en``.
+    assert sensor.is_temperature_sensor_enabled is temp_en
+    assert sensor.is_humidity_sensor_enabled is temp_en
+    assert sensor.is_light_sensor_enabled is temp_en
+    assert sensor.is_motion_sensor_enabled is temp_en
+    assert sensor.is_alarm_sensor_enabled is temp_en
+    assert sensor.is_leak_sensor_enabled is leak_en
+    assert sensor.is_contact_sensor_enabled is contact_en
+
+
+@pytest.mark.parametrize(
+    ("mount_type", "water_leak", "internal", "external", "expected"),
+    [
+        ("leak", False, False, False, True),
+        ("none", True, True, False, True),
+        ("none", True, False, True, True),
+        ("none", True, False, False, False),
+        ("none", False, True, True, False),
+        ("door", False, False, False, False),
+    ],
+)
+def test_public_sensor_is_leak_detection_enabled(
+    mount_type: str,
+    water_leak: bool,
+    internal: bool,
+    external: bool,
+    expected: bool,
+) -> None:
+    """Leak detection is on for leak mounts or water_leak sensors with a channel on."""
+    data = dict(SENSOR_PAYLOAD)
+    data["mountType"] = mount_type
+    data["featureFlags"] = {"waterLeak": {"channelCount": 2}} if water_leak else {}
+    data["leakSettings"] = {
+        "isInternalEnabled": internal,
+        "isExternalEnabled": external,
+    }
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **data)
+    assert sensor.is_leak_detection_enabled is expected
+
+
+def test_public_sensor_identity_fields_default_when_absent() -> None:
+    """``type`` / ``guid`` are optional on the wire and default to ``None``."""
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **dict(SENSOR_PAYLOAD))
+    assert sensor.device_type is None
+    assert sensor.device_guid is None
+
+
+@pytest.mark.parametrize("debug", [True, False])
+@pytest.mark.parametrize("absent", [True, False], ids=["absent", "null"])
+def test_public_sensor_missing_feature_flags_is_empty_map(
+    debug: bool, absent: bool
+) -> None:
+    """An absent or ``null`` ``featureFlags`` parses as an empty capability map."""
+    if not debug:
+        set_no_debug()
+    data = dict(SENSOR_PAYLOAD)
+    if absent:
+        del data["featureFlags"]
+    else:
+        data["featureFlags"] = None
+    sensor = PublicSensor.from_unifi_dict(api=Mock(), **data)
+    assert sensor.feature_flags.model_dump() == PublicSensorFeatureFlags().model_dump()
+    assert not any(sensor.supports(c) for c in SensorFeatureCapability)
+    assert sensor.supported_alarm_types == frozenset()
+    assert sensor.supported_event_types == frozenset()
+    assert sensor.unifi_dict()["id"] == SENSOR_PAYLOAD["id"]
+
+
+def test_public_nvr_device_identity_round_trips() -> None:
+    """``type`` / ``guid`` map onto the NVR and round-trip; absent → ``None``."""
+    nvr = PublicNVR.from_unifi_dict(
+        api=Mock(),
+        id="nvr1",
+        modelKey="nvr",
+        type="Example-Model",
+        guid="00000000-0000-0000-0000-000000000000",
+    )
+    assert nvr.device_type == "Example-Model"
+    assert nvr.device_guid == "00000000-0000-0000-0000-000000000000"
+    dumped = nvr.unifi_dict()
+    assert dumped["type"] == "Example-Model"
+    assert dumped["guid"] == "00000000-0000-0000-0000-000000000000"
+
+    bare = PublicNVR.from_unifi_dict(api=Mock(), id="nvr1", modelKey="nvr")
+    assert bare.device_type is None
+    assert bare.device_guid is None
+
+
+@pytest.mark.parametrize(
+    ("cls", "payload"),
+    [
+        (PublicCamera, CAMERA_PAYLOAD),
+        (PublicLight, LIGHT_PAYLOAD),
+        (PublicSensor, SENSOR_PAYLOAD),
+        (PublicChime, CHIME_PAYLOAD),
+    ],
+)
+def test_public_type_aliases_device_type(cls: type, payload: dict[str, Any]) -> None:
+    """``type`` mirrors ``device_type`` (the private tree's ``type`` field)."""
+    data = dict(payload)
+    data["type"] = "Example-Model"
+    obj = cls.from_unifi_dict(api=Mock(), **data)
+    assert obj.type == "Example-Model"
+    assert obj.type == obj.device_type
+
+    bare = cls.from_unifi_dict(api=Mock(), **dict(payload))
+    assert bare.type is None
+
+
+@pytest.mark.parametrize(
+    ("name", "device_type", "expected"),
+    [
+        ("Front Door", "Example-Model", "Front Door"),
+        (None, "Example-Model", "Example-Model"),
+        (None, None, ""),
+    ],
+)
+def test_public_display_name_fallback(
+    name: str | None, device_type: str | None, expected: str
+) -> None:
+    """``display_name`` falls back ``name -> type -> ""`` like the private tree."""
+    nvr = PublicNVR.from_unifi_dict(
+        api=Mock(), id="nvr1", modelKey="nvr", name=name, type=device_type
+    )
+    assert nvr.display_name == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("CONNECTED", True),
+        ("CONNECTING", False),
+        ("DISCONNECTED", False),
+        # Unknown to this library, coerced to ``DeviceState.UNKNOWN``.
+        ("REBOOTING", False),
+    ],
+)
+def test_public_is_reachable_tracks_state(state: str, expected: bool) -> None:
+    """``is_reachable`` is ``state is CONNECTED`` for a regular public device."""
+    camera = PublicCamera.from_unifi_dict(
+        api=Mock(), **{**CAMERA_PAYLOAD, "state": state}
+    )
+    assert camera.is_reachable is expected
+
+
+@pytest.mark.parametrize("state", ["CONNECTED", "DISCONNECTED", "CONNECTING"])
+@pytest.mark.parametrize("away_state", ["ONLINE", "DEVICE_LOST"])
+def test_fob_is_reachable_ignores_state(state: str, away_state: str) -> None:
+    """A fob stays reachable whatever ``state`` / ``away_state`` report."""
+    fob = Fob.from_unifi_dict(
+        api=Mock(), **{**FOB_PAYLOAD, "state": state, "awayState": away_state}
+    )
+    assert fob.is_reachable is True
+
+
+@pytest.mark.parametrize(
+    ("cls", "payload"),
+    [
+        (PublicCamera, CAMERA_PAYLOAD),
+        (PublicLight, LIGHT_PAYLOAD),
+        (PublicSensor, SENSOR_PAYLOAD),
+        (PublicChime, CHIME_PAYLOAD),
+    ],
+)
+def test_public_model_name_from_console(cls: type, payload: dict[str, Any]) -> None:
+    """``model_name`` is the console-reported ``type``, else ``None``."""
+    obj = cls.from_unifi_dict(api=Mock(), **{**payload, "type": "Example-Model"})
+    assert obj.model_name == "Example-Model"
+
+    bare = cls.from_unifi_dict(api=Mock(), **dict(payload))
+    assert bare.model_name is None
+
+
+def test_fob_model_name_falls_back_to_class_name() -> None:
+    """A fob names itself when the console does not report a ``type``."""
+    fob = Fob.from_unifi_dict(api=Mock(), **dict(FOB_PAYLOAD))
+    assert fob.device_type is None
+    assert fob.model_name == "Key Fob"
+
+    reported = Fob.from_unifi_dict(api=Mock(), **{**FOB_PAYLOAD, "type": "UFP-Fob"})
+    assert reported.model_name == "UFP-Fob"
+
+
+FOB_7_3_KEYS: dict[str, Any] = {
+    "featureFlags": {"buttons": ["arm", "disarm"], "hasKeypad": True},
+    "armControlSettings": {
+        "enabled": True,
+        "armProfileId": "profile1",
+        "nightProfileId": None,
+    },
+    "keypadSettings": {"beepEnabled": False, "beepVolume": 40},
+}
+
+LINK_STATION_PAYLOAD: dict[str, Any] = {
+    "id": "ls1",
+    "modelKey": "linkstation",
+    "state": "CONNECTED",
+    "name": "Garage Link",
+    "mac": "AABBCCDDEE05",
+    "isAlarmHub": False,
+    "ledSettings": {"isEnabled": True},
+    "lastEvent": None,
+    "alarmHub": None,
+}
+
+THREAD_NETWORK: dict[str, Any] = {
+    "status": "ready",
+    "role": "leader",
+    "networkName": "ProtectThread",
+    "channel": 15,
+    "panId": "1a2b",
+    "extendedPanId": "0011223344556677",
+    "joinedDeviceCount": 3,
+    "errorReason": None,
+    "lastUpdatedAt": 1700000000000,
+}
+
+
+@pytest.mark.parametrize("debug", [True, False])
+@pytest.mark.parametrize("firmware", ["7.3", "7.2"])
+def test_fob_7_3_settings(debug: bool, firmware: str) -> None:
+    """7.3 fob settings and ``hasKeypad`` parse and round-trip; 7.2 leaves ``None``."""
+    if not debug:
+        set_no_debug()
+    extra = FOB_7_3_KEYS if firmware == "7.3" else {}
+    fob = Fob.from_unifi_dict(api=Mock(), **deepcopy({**FOB_PAYLOAD, **extra}))
+    if firmware == "7.2":
+        assert fob.feature_flags.has_keypad is None
+        assert fob.arm_control_settings is None
+        assert fob.keypad_settings is None
+        return
+    assert fob.feature_flags.has_keypad is True
+    assert fob.arm_control_settings is not None
+    assert fob.arm_control_settings.enabled is True
+    assert fob.arm_control_settings.arm_profile_id == "profile1"
+    assert fob.arm_control_settings.night_profile_id is None
+    assert fob.keypad_settings is not None
+    assert fob.keypad_settings.beep_enabled is False
+    assert fob.keypad_settings.beep_volume == 40
+    data = fob.unifi_dict()
+    for key, value in FOB_7_3_KEYS.items():
+        assert data[key] == value
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"isAlarmHub": True}, "Alarm Hub"),
+        ({"isAlarmHub": False}, "Link Station"),
+        ({"isAlarmHub": True, "type": None}, "Alarm Hub"),
+        ({"isAlarmHub": True, "type": "UP-AlarmHub"}, "UP-AlarmHub"),
+        ({"isAlarmHub": False, "type": "UP-LinkStation"}, "UP-LinkStation"),
+    ],
+    ids=["alarm-hub", "link-station", "null-type", "alarm-hub-type", "type"],
+)
+def test_link_station_model_name(extra: dict[str, Any], expected: str) -> None:
+    """``model_name`` falls back by role when the console reports no ``type``."""
+    ls = LinkStation.from_unifi_dict(
+        api=Mock(), **deepcopy({**LINK_STATION_PAYLOAD, **extra})
+    )
+    assert ls.model_name == expected
+
+
+@pytest.mark.parametrize("debug", [True, False])
+@pytest.mark.parametrize(
+    "thread_state",
+    [None, {"network": None}, {"network": THREAD_NETWORK}],
+    ids=["7.2", "no-thread-radio", "7.3"],
+)
+def test_link_station_thread_state(
+    debug: bool, thread_state: dict[str, Any] | None
+) -> None:
+    """``threadState`` parses and round-trips; absent on 7.2 leaves ``None``."""
+    if not debug:
+        set_no_debug()
+    data = deepcopy(LINK_STATION_PAYLOAD)
+    if thread_state is not None:
+        data["threadState"] = deepcopy(thread_state)
+    ls = LinkStation.from_unifi_dict(api=Mock(), **data)
+    if thread_state is None:
+        assert ls.thread_state is None
+        return
+    assert ls.thread_state is not None
+    assert ls.unifi_dict()["threadState"] == thread_state
+    network = ls.thread_state.network
+    if thread_state["network"] is None:
+        assert network is None
+        return
+    assert network is not None
+    assert network.status is ThreadNetworkStatus.READY
+    assert network.role is ThreadNetworkRole.LEADER
+    assert network.network_name == "ProtectThread"
+    assert network.channel == 15
+    assert network.pan_id == "1a2b"
+    assert network.extended_pan_id == "0011223344556677"
+    assert network.joined_device_count == 3
+    assert network.error_reason is None
+    assert network.last_updated_at_dt == datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC)
+
+
+def test_link_station_thread_network_unknown_values() -> None:
+    """Unknown Thread status/role coerce to ``UNKNOWN``; null role stays ``None``."""
+    network = {**THREAD_NETWORK, "status": "degraded", "role": "sleepy"}
+    ls = LinkStation.from_unifi_dict(
+        api=Mock(),
+        **deepcopy({**LINK_STATION_PAYLOAD, "threadState": {"network": network}}),
+    )
+    assert ls.thread_state is not None
+    assert ls.thread_state.network is not None
+    assert ls.thread_state.network.status is ThreadNetworkStatus.UNKNOWN
+    assert ls.thread_state.network.role is ThreadNetworkRole.UNKNOWN
+
+    network = {**THREAD_NETWORK, "status": "error", "role": None}
+    ls = LinkStation.from_unifi_dict(
+        api=Mock(),
+        **deepcopy({**LINK_STATION_PAYLOAD, "threadState": {"network": network}}),
+    )
+    assert ls.thread_state is not None
+    assert ls.thread_state.network is not None
+    assert ls.thread_state.network.status is ThreadNetworkStatus.ERROR
+    assert ls.thread_state.network.role is None
+
+
+@pytest.mark.asyncio
+async def test_shared_identity_protocol_spans_both_trees(
+    nvr_obj: Any, camera_obj: Any
+) -> None:
+    """One ``ProtectDeviceIdentity`` variable accepts either tree without ``cast()``."""
+    if camera_obj is None:
+        pytest.skip("No camera_obj found")
+
+    public_nvr = PublicNVR.from_unifi_dict(
+        api=Mock(), id="nvr1", modelKey="nvr", name="Console", type="UNVR"
+    )
+    public_camera = PublicCamera.from_unifi_dict(api=Mock(), **dict(CAMERA_PAYLOAD))
+
+    def identity_line(device: ProtectDeviceIdentity) -> str:
+        return f"{device.display_name} ({device.type}) [{device.mac}] {device.id}"
+
+    for device in (nvr_obj, camera_obj, public_nvr, public_camera):
+        assert isinstance(device, ProtectDeviceIdentity)
+        assert identity_line(device)
+
+    assert public_nvr.display_name == "Console"
+    assert public_nvr.type == "UNVR"
+
+
+@pytest.mark.parametrize(
+    ("model_type", "payload", "cls", "store_attr"),
+    [
+        (ModelType.CAMERA, CAMERA_PAYLOAD, PublicCamera, "cameras"),
+        (ModelType.LIGHT, LIGHT_PAYLOAD, PublicLight, "lights"),
+        (ModelType.SENSOR, SENSOR_PAYLOAD, PublicSensor, "sensors"),
+        (ModelType.CHIME, CHIME_PAYLOAD, PublicChime, "chimes"),
+    ],
+)
+def test_ws_add_update_remove_routes_to_public_model(
+    model_type: ModelType,
+    payload: dict[str, Any],
+    cls: type,
+    store_attr: str,
+) -> None:
+    """WS add/update/remove caches the dedicated public model, not the private one."""
+    pb = PublicBootstrap()
+    api = Mock()
+
+    mt, new, _old = pb.process_devices_ws_message(
+        api, {"type": "add", "item": dict(payload)}
+    )
+    assert mt is model_type
+    assert isinstance(new, cls)
+    store = getattr(pb, store_attr)
+    assert isinstance(store[payload["id"]], cls)
+
+    # update diff that omits ``name`` must preserve it.
+    mt, merged, _old = pb.process_devices_ws_message(
+        api,
+        {
+            "type": "update",
+            "item": {"id": payload["id"], "modelKey": payload["modelKey"], "mac": "X"},
+        },
+    )
+    assert isinstance(merged, cls)
+    assert merged.name == payload["name"]
+    assert merged.mac == "X"
+
+    pb.process_devices_ws_message(
+        api,
+        {
+            "type": "remove",
+            "item": {"id": payload["id"], "modelKey": payload["modelKey"]},
+        },
+    )
+    assert payload["id"] not in getattr(pb, store_attr)
+
+
+def test_get_device_mac_resolves_public_devices() -> None:
+    """Routing the four types via factory slots keeps them mac-resolvable."""
+    pb = PublicBootstrap()
+    pb.process_devices_ws_message(Mock(), {"type": "add", "item": dict(SENSOR_PAYLOAD)})
+    assert pb.get_device_mac("sensor1") == "AABBCCDDEE02"
+
+
+def _bootstrap_with_devices() -> PublicBootstrap:
+    pb = PublicBootstrap()
+    for payload in (CAMERA_PAYLOAD, SENSOR_PAYLOAD, CHIME_PAYLOAD):
+        pb.process_devices_ws_message(Mock(), {"type": "add", "item": dict(payload)})
+    return pb
+
+
+@pytest.mark.parametrize(
+    "mac", ["AABBCCDDEE02", "aabbccddee02", "aa:bb:cc:dd:ee:02", "AA-BB-CC-DD-EE-02"]
+)
+def test_get_device_from_mac_normalizes_formats(mac: str) -> None:
+    """A mac in any common format resolves to the cached device."""
+    pb = _bootstrap_with_devices()
+    device = pb.get_device_from_mac(mac)
+    assert device is pb.sensors["sensor1"]
+    assert pb.get_device_from_mac(mac, ModelType.SENSOR) is device
+
+
+def test_get_device_from_mac_model_type_limits_search() -> None:
+    """A mac from another store is not found when model_type is given."""
+    pb = _bootstrap_with_devices()
+    assert pb.get_device_from_mac(CHIME_PAYLOAD["mac"], ModelType.SENSOR) is None
+    assert (
+        pb.get_device_from_mac(CHIME_PAYLOAD["mac"], ModelType.CHIME)
+        is pb.chimes[CHIME_PAYLOAD["id"]]
+    )
+
+
+def test_get_device_from_mac_covers_dedicated_slot_stores() -> None:
+    """Bridges and viewers resolve by mac, with or without model_type."""
+    pb = PublicBootstrap()
+    bridge = PublicBridge.model_construct(id="b1", mac="AABBCCDDEE10")
+    viewer = PublicViewer.model_construct(id="v1", mac="AABBCCDDEE11")
+    pb.bridges[bridge.id] = bridge
+    pb.viewers[viewer.id] = viewer
+    assert pb.get_device_from_mac("aa:bb:cc:dd:ee:10") is bridge
+    assert pb.get_device_from_mac("aa:bb:cc:dd:ee:11", ModelType.VIEWPORT) is viewer
+    assert pb.get_device_from_mac("aa:bb:cc:dd:ee:10", ModelType.VIEWPORT) is None
+
+
+@pytest.mark.parametrize(
+    ("mac", "model_type"),
+    [
+        ("00:11:22:33:44:55", None),
+        ("00:11:22:33:44:55", ModelType.CAMERA),
+        (SENSOR_PAYLOAD["mac"], ModelType.NVR),
+        (SENSOR_PAYLOAD["mac"], ModelType.LIVEVIEW),
+    ],
+)
+def test_get_device_from_mac_returns_none(
+    mac: str, model_type: ModelType | None
+) -> None:
+    """An unknown mac, unsupported type or mac-less store returns None."""
+    pb = _bootstrap_with_devices()
+    pb.liveviews["lv1"] = PublicLiveview.model_construct(id="lv1")
+    assert pb.get_device_from_mac(mac, model_type) is None
+
+
+@pytest.mark.parametrize("cls", [PublicCamera, PublicLight, PublicSensor, PublicChime])
+@pytest.mark.asyncio()
+async def test_public_model_api_update_blocked(cls: type) -> None:
+    """The generic mutation path is blocked in favor of the public helpers."""
+    obj = cls.model_construct()
+    with pytest.raises(BadRequest):
+        await obj._api_update({})
+
+
+def _seed_camera(pb: PublicBootstrap, state: str) -> None:
+    pb.process_devices_ws_message(
+        Mock(), {"type": "add", "item": {**CAMERA_PAYLOAD, "state": state}}
+    )
+
+
+def test_camera_connect_schedules_rtsps_refresh_keeping_cache() -> None:
+    """A camera transitioning to CONNECTED schedules a refresh, keeping its streams."""
+    pb = PublicBootstrap()
+    api = Mock()
+    _seed_camera(pb, "CONNECTING")
+    streams = RTSPSStreams(high="rtsps://example.com/high")
+    pb.cameras["cam1"].rtsps_streams = streams
+
+    pb.process_devices_ws_message(
+        api,
+        {
+            "type": "update",
+            "item": {"id": "cam1", "modelKey": "camera", "state": "CONNECTED"},
+        },
+    )
+
+    # The field is never emptied — the old URLs stay until the background
+    # refresh overwrites them in place.
+    assert pb.cameras["cam1"].rtsps_streams is streams
+    api._schedule_rtsps_refresh.assert_called_once_with("cam1")
+
+
+def test_camera_connect_schedules_rtsps_prime_when_streamless() -> None:
+    """A streamless camera coming online schedules a prime, not just a refresh."""
+    pb = PublicBootstrap()
+    api = Mock()
+    _seed_camera(pb, "DISCONNECTED")
+    assert pb.cameras["cam1"].rtsps_streams is None
+
+    pb.process_devices_ws_message(
+        api,
+        {
+            "type": "update",
+            "item": {"id": "cam1", "modelKey": "camera", "state": "CONNECTED"},
+        },
+    )
+
+    api._schedule_rtsps_refresh.assert_called_once_with("cam1")
+
+
+def test_camera_steady_connected_update_keeps_cached_rtsps_streams() -> None:
+    """An update on an already-connected camera leaves the RTSPS field intact."""
+    pb = PublicBootstrap()
+    api = Mock()
+    _seed_camera(pb, "CONNECTED")
+    streams = RTSPSStreams(high="rtsps://example.com/high")
+    pb.cameras["cam1"].rtsps_streams = streams
+
+    pb.process_devices_ws_message(
+        api,
+        {
+            "type": "update",
+            "item": {"id": "cam1", "modelKey": "camera", "name": "Renamed"},
+        },
+    )
+
+    assert pb.cameras["cam1"].rtsps_streams is streams
+    api._schedule_rtsps_refresh.assert_not_called()
+
+
+def test_camera_remove_cancels_pending_rtsps_refresh() -> None:
+    """A camera-remove WS frame drops the camera and cancels any pending refresh."""
+    pb = PublicBootstrap()
+    api = Mock()
+    _seed_camera(pb, "CONNECTED")
+    pb.cameras["cam1"].rtsps_streams = RTSPSStreams(high="rtsps://example.com/high")
+
+    pb.process_devices_ws_message(
+        api,
+        {"type": "remove", "item": {"id": "cam1", "modelKey": "camera"}},
+    )
+
+    # The streams ride with the removed camera object.
+    assert "cam1" not in pb.cameras
+    api._cancel_rtsps_refresh.assert_called_once_with("cam1")
+
+
+def test_non_camera_remove_leaves_camera_rtsps_untouched() -> None:
+    """A non-camera remove frame does not cancel a camera's refresh or streams."""
+    pb = PublicBootstrap()
+    api = Mock()
+    _seed_camera(pb, "CONNECTED")
+    streams = RTSPSStreams(high="rtsps://example.com/high")
+    pb.cameras["cam1"].rtsps_streams = streams
+    pb.process_devices_ws_message(
+        api, {"type": "add", "item": {**LIGHT_PAYLOAD, "state": "CONNECTED"}}
+    )
+
+    pb.process_devices_ws_message(
+        api,
+        {"type": "remove", "item": {"id": "light1", "modelKey": "light"}},
+    )
+
+    assert pb.cameras["cam1"].rtsps_streams is streams
+    api._cancel_rtsps_refresh.assert_not_called()
+
+
+def test_non_camera_connect_leaves_camera_rtsps_untouched() -> None:
+    """A non-camera device reaching CONNECTED does not schedule a camera refresh."""
+    pb = PublicBootstrap()
+    api = Mock()
+    _seed_camera(pb, "CONNECTED")
+    streams = RTSPSStreams(high="rtsps://example.com/high")
+    pb.cameras["cam1"].rtsps_streams = streams
+    pb.process_devices_ws_message(
+        api, {"type": "add", "item": {**LIGHT_PAYLOAD, "state": "CONNECTING"}}
+    )
+
+    pb.process_devices_ws_message(
+        api,
+        {
+            "type": "update",
+            "item": {"id": "light1", "modelKey": "light", "state": "CONNECTED"},
+        },
+    )
+
+    assert pb.cameras["cam1"].rtsps_streams is streams
+    api._schedule_rtsps_refresh.assert_not_called()
+
+
+EPOCH_MS = 1_700_000_000_123
+EPOCH_DT = datetime(2023, 11, 14, 22, 13, 20, 123000, tzinfo=UTC)
+
+
+def _light_with(last_motion: int | None) -> PublicLight:
+    return PublicLight.from_unifi_dict(
+        api=Mock(), **{**LIGHT_PAYLOAD, "lastMotion": last_motion}
+    )
+
+
+def _sensor_with(wire_key: str, value: int | None) -> PublicSensor:
+    return PublicSensor.from_unifi_dict(
+        api=Mock(), **{**SENSOR_PAYLOAD, wire_key: value}
+    )
+
+
+@pytest.mark.parametrize(
+    ("build", "prop"),
+    [
+        (lambda v: PublicLcdMessage(reset_at=v), "reset_at_dt"),
+        (_light_with, "last_motion_dt"),
+        (
+            lambda v: _sensor_with("openStatusChangedAt", v),
+            "open_status_changed_at_dt",
+        ),
+        (lambda v: _sensor_with("motionDetectedAt", v), "motion_detected_at_dt"),
+        (lambda v: _sensor_with("alarmTriggeredAt", v), "alarm_triggered_at_dt"),
+        (lambda v: _sensor_with("leakDetectedAt", v), "leak_detected_at_dt"),
+        (
+            lambda v: _sensor_with("externalLeakDetectedAt", v),
+            "external_leak_detected_at_dt",
+        ),
+        (
+            lambda v: _sensor_with("tamperingDetectedAt", v),
+            "tampering_detected_at_dt",
+        ),
+        (
+            lambda v: PublicSirenStatus(is_active=True, activated_at=v, duration=5000),
+            "activated_at_dt",
+        ),
+        (
+            lambda v: AlarmHubInput(
+                enable=OnOffState.ON,
+                type=AlarmHubInputContactType.NO,
+                status=AlarmHubInputStatus.NORMAL,
+                last_triggered_at=v,
+            ),
+            "last_triggered_at_dt",
+        ),
+        (
+            lambda v: NvrArmMode(status=NvrArmModeStatus.ARMED, armed_at=v),
+            "armed_at_dt",
+        ),
+        (
+            lambda v: NvrArmMode(status=NvrArmModeStatus.ARMING, will_be_armed_at=v),
+            "will_be_armed_at_dt",
+        ),
+        (
+            lambda v: NvrArmMode(status=NvrArmModeStatus.BREACH, breach_detected_at=v),
+            "breach_detected_at_dt",
+        ),
+    ],
+)
+def test_public_epoch_ms_datetime_accessors(
+    build: Callable[[int | None], Any], prop: str
+) -> None:
+    """Convert epoch-ms fields to UTC datetimes and preserve ``None``."""
+    assert getattr(build(EPOCH_MS), prop) == EPOCH_DT
+    assert getattr(build(None), prop) is None
+
+
+def test_public_siren_turn_off_at_matches_activated_at_dt() -> None:
+    """``turn_off_at`` is ``activated_at_dt`` plus the run duration."""
+    # ``duration`` is milliseconds on the status object (the play request takes
+    # seconds), so a 5000 ms run ends five seconds after activation.
+    status = PublicSirenStatus(is_active=True, activated_at=EPOCH_MS, duration=5000)
+    assert status.turn_off_at == EPOCH_DT + timedelta(seconds=5)
+
+
+SIREN_PAYLOAD: dict[str, Any] = {
+    "id": "siren1",
+    "modelKey": "siren",
+    "state": "CONNECTED",
+    "name": "Hallway Siren",
+    "mac": "AABBCCDDEE03",
+    "volume": 80,
+    "ledSettings": {"isEnabled": True},
+    "sirenStatus": {"isActive": False, "activatedAt": None, "duration": None},
+    "connectionType": "lora",
+}
+
+RELAY_PAYLOAD: dict[str, Any] = {
+    "id": "relay1",
+    "modelKey": "relay",
+    "state": "CONNECTED",
+    "name": "Gate Relay",
+    "mac": "AABBCCDDEE04",
+    "ledSettings": {"isEnabled": True},
+    "outputs": [],
+    "inputs": [],
+}
+
+
+@pytest.mark.parametrize(
+    ("cls", "payload", "fallback", "reported"),
+    [
+        (Relay, RELAY_PAYLOAD, "Relay", "USL-Relay-EU"),
+        (Siren, SIREN_PAYLOAD, "Siren", "UP-Siren-PoE"),
+    ],
+)
+def test_model_name_falls_back_to_class_name(
+    cls: type, payload: dict[str, Any], fallback: str, reported: str
+) -> None:
+    """Relay and siren name themselves when ``type`` is absent or null."""
+    bare = cls.from_unifi_dict(api=Mock(), **dict(payload))
+    assert bare.device_type is None
+    assert bare.model_name == fallback
+
+    null = cls.from_unifi_dict(api=Mock(), **{**payload, "type": None})
+    assert null.model_name == fallback
+
+    typed = cls.from_unifi_dict(api=Mock(), **{**payload, "type": reported})
+    assert typed.model_name == reported
+
+
+def test_siren_add_arms_expiry_announcement() -> None:
+    """A siren add frame arms the timer that announces its run ending."""
+    pb = PublicBootstrap()
+    api = Mock()
+
+    pb.process_devices_ws_message(api, {"type": "add", "item": dict(SIREN_PAYLOAD)})
+
+    api._schedule_siren_off.assert_called_once_with("siren1")
+    api._cancel_siren_off.assert_not_called()
+
+
+def test_siren_update_rearms_expiry_announcement() -> None:
+    """Every siren update re-derives the deadline from the merged status."""
+    pb = PublicBootstrap()
+    api = Mock()
+    pb.process_devices_ws_message(api, {"type": "add", "item": dict(SIREN_PAYLOAD)})
+    api.reset_mock()
+
+    pb.process_devices_ws_message(
+        api,
+        {
+            "type": "update",
+            "item": {
+                "id": "siren1",
+                "modelKey": "siren",
+                "sirenStatus": {
+                    "isActive": True,
+                    "activatedAt": 1_700_000_000_000,
+                    "duration": 5000,
+                },
+            },
+        },
+    )
+
+    api._schedule_siren_off.assert_called_once_with("siren1")
+
+
+def test_siren_remove_drops_expiry_announcement() -> None:
+    """A removed siren takes its pending expiry timer with it."""
+    pb = PublicBootstrap()
+    api = Mock()
+    pb.process_devices_ws_message(api, {"type": "add", "item": dict(SIREN_PAYLOAD)})
+    api.reset_mock()
+
+    pb.process_devices_ws_message(
+        api, {"type": "remove", "item": {"id": "siren1", "modelKey": "siren"}}
+    )
+
+    assert "siren1" not in pb.sirens
+    api._cancel_siren_off.assert_called_once_with("siren1")
+    api._schedule_siren_off.assert_not_called()
+
+
+def test_non_siren_frame_leaves_expiry_announcement_alone() -> None:
+    """Frames for other device types never touch the siren timers."""
+    pb = PublicBootstrap()
+    api = Mock()
+
+    pb.process_devices_ws_message(api, {"type": "add", "item": dict(LIGHT_PAYLOAD)})
+    pb.process_devices_ws_message(
+        api, {"type": "remove", "item": {"id": "light1", "modelKey": "light"}}
+    )
+
+    api._schedule_siren_off.assert_not_called()
+    api._cancel_siren_off.assert_not_called()

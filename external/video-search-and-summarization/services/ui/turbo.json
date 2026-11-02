@@ -1,0 +1,42 @@
+{
+  "$schema": "https://v2-11-10.turborepo.dev/schema.json",
+  "globalDependencies": [],
+  "cacheDir": ".turbo/cache",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**", "lib/**", "!node_modules/**"]
+    },
+    "bundle": {
+      "dependsOn": ["build"]
+    },
+    "build:lib": {
+      "outputs": ["lib/**"]
+    },
+    "dev": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/eslint.config.mjs"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": ["coverage/**"]
+    },
+    "clean": {
+      "cache": false
+    },
+    "list": {
+      "cache": false
+    },
+    "start": {
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

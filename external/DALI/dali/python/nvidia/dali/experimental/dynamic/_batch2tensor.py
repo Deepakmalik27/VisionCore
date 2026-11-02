@@ -1,0 +1,118 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+from . import _device, _invocation, _op_builder
+from ._batch import Batch, Tensor, as_batch, batch
+from ._call_site import mark_transparent, resolve_callsite_frame
+from ._nvtx import NVTXRange
+from .capture._invariant import unwrap_invariant, unwrap_invariant_args
+
+
+def is_uniform(shape):
+    return all(x == shape[0] for x in shape[1:])
+
+
+class BatchToTensor:
+    """This is an internal pseudo-operator, not to be used directly.
+
+    This operator is used when calling ``tensor`` or ``as_tensor`` with a ``Batch`` argument.
+    Unlike any other operator, it takes a ``Batch`` and returns a single ``Tensor``.
+    This operator is special in that, unlike any other, it takes a Batch and returns a
+    single Tensor. It needs to be an usable as an operator so we can benefit from the
+    ``Invocation`` object and correctly apply ``EvalModes`` policies.
+    Only a minimal required subset of ``Operator`` interface is implemented.
+    """
+
+    _nvtx_construct_invocation = NVTXRange("__call__: construct Invocation", category="op_builder")
+
+    @mark_transparent
+    @NVTXRange("__call__: Batch2Tensor", category="op_builder")
+    def __call__(
+        self,
+        batch,
+        *,
+        pad=False,
+        force_copy=False,
+        dtype=None,
+        layout=None,
+        batch_size=None,
+        device=None,
+    ):
+        batch, device = unwrap_invariant_args(batch, device)
+        if not isinstance(batch, Batch):
+            batch = _op_builder._to_batch(batch, batch_size)
+        with BatchToTensor._nvtx_construct_invocation:
+            invocation = _invocation.Invocation(
+                self,
+                None,
+                inputs=[batch],
+                args={
+                    "pad": pad,
+                    "force_copy": force_copy,
+                    "device": device,
+                    "dtype": dtype,
+                    "layout": layout,
+                },
+                is_batch=False,
+                batch_size=None,
+                previous_invocation=None,
+                caller_frame=resolve_callsite_frame(depth_hint=2),
+            )
+        invocation.apply_eval_policy(_op_builder.is_external(batch))
+        return Tensor(invocation_result=invocation[0])
+
+    def _infer_output_devices(self, input, device, **_):
+        return (_device.device(device) or input.device,)
+
+    def _run(self, ctx, input_batch, *, pad, force_copy, dtype, layout, device, **_):
+        with ctx:
+            if input_batch._storage and input_batch._storage.is_dense_tensor():
+                return Tensor(
+                    input_batch._storage.as_tensor(),
+                    dtype=dtype,
+                    layout=layout,
+                    device=device,
+                    copy=force_copy,
+                )._storage
+
+            input_batch = as_batch(input_batch, dtype=dtype, device=device).evaluate()
+            shape = input_batch.shape
+            if input_batch._storage.is_dense_tensor():
+                t = input_batch._storage.as_tensor()
+            elif is_uniform(shape):
+                t = batch(input_batch).evaluate()._storage.as_tensor()
+            else:
+                if not pad:
+                    raise ValueError(
+                        "The batch has a non-uniform shape. "
+                        "To convert it to a tensor, `pad` argument must be ``True``"
+                    )
+                from . import pad as _pad
+
+                t = _pad(input_batch).evaluate()._storage.as_tensor()
+
+            if layout:
+                t.set_layout(unwrap_invariant(layout))
+            return t
+
+
+_batch_to_tensor_instance = BatchToTensor()
+
+
+@mark_transparent
+def batch_to_tensor(batch, *, pad=False, force_copy=False, device=None, dtype=None, layout=None):
+    return _batch_to_tensor_instance(
+        batch, pad=pad, force_copy=force_copy, device=device, dtype=dtype, layout=layout
+    )

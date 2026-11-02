@@ -1,0 +1,59 @@
+# Modes Overview
+
+The engine exposes one command group. Domain components remain usable on their
+own and pipelines contain no source, output, persistence, retry, or display
+logic.
+
+| Mode | Purpose | Required input |
+| --- | --- | --- |
+| [`install`](install.md) | Install missing optional dependencies into the current Python environment | `--extra` or `--requirement` |
+| `track` | Track a source or replay saved TrackR-CNN predictions | `--source` plus component selectors, or `--detections`, `--images`, and `--instances` |
+| `materialize` | Publish keyed perception or derive a timestamped frame-loss dataset | experiment, or `--time-variant` with dataset, sequence, and `--build` |
+| `eval` | Evaluate a perception build or saved sensor inputs | experiment, dataset plus `--build`, or sensor dataset plus `--tracker eagermot` |
+| `tune` | Optimize tracker parameters from a build or saved sensor inputs | experiment, dataset plus `--build`, or sensor dataset plus `--tracker eagermot` |
+| `research` | Score proposed tracker changes against a build | experiment plus `--build` |
+| `train-reid` | Train a reusable appearance backbone | ReID dataset/config |
+| `eval-reid` | Evaluate query/gallery retrieval | checkpoint and ReID dataset |
+| `compare-reid` | Compare checkpoints across ReID datasets | checkpoints and targets |
+| `export` | Export a ReID backbone | checkpoint and formats |
+| `build` | Compile native tracker libraries | tracker selector/toolchain |
+
+## Live tracking
+
+```bash
+boxmot track \
+  --source video.mp4 \
+  --detector yolov8n \
+  --reid osnet_x0_25_msmt17 \
+  --tracker botsort \
+  --save
+```
+
+The engine creates canonical RGB `Frame` values, runs a `TrackingPipeline`, and
+sends each `(frame, result)` pair to configured sinks.
+
+## Reproducible benchmark workflow
+
+Perception runs once during materialization. Eval and tune can perform that
+deterministic step automatically; research consumes an explicit build:
+
+```bash
+boxmot eval --experiment mot17/ablation-yolox-lmbn.yaml
+boxmot tune --experiment mot17/ablation-yolox-lmbn.yaml
+boxmot research --experiment mot17/ablation-yolox-lmbn.yaml --build BUILD_ID
+```
+
+These workflows never select a latest build. They verify source, split,
+taxonomy, geometry, and component fingerprints before replay.
+
+See [Materialize](materialize.md), [Evaluate](eval.md), [Tune](tune.md), and
+[Research](research.md).
+
+Use [`materialize --time-variant`](time-variant.md) to compare timing modes under
+reproducible frame loss without rerunning perception.
+
+## Python composition
+
+Python callers use factories and canonical structures directly. See the
+[Python API](../python/index.md) for detector, segmentor, appearance encoder,
+tracker, and pipeline examples.

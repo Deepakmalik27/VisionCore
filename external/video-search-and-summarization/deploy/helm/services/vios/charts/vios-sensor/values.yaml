@@ -1,0 +1,168 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+enabled: false
+global: {}
+image:
+  repository: ghcr.io/nvidia-ai-blueprints/vss/vss-vios-sensor
+  tag: "develop-latest"
+  pullPolicy: IfNotPresent
+replicas: 1
+service:
+  port: 30000
+  type: ClusterIP
+# Compose parity: entrypoint, healthcheck, env and volumes (configs, vst_data, vst_video)
+command: ["/bin/bash", "-c"]
+args: ["exec /home/vst/vst_release/launch_vst"]
+# Compose healthcheck: CMD-SHELL bash -ec 'exec 3<>/dev/tcp/127.0.0.1/30000' → tcpSocket on service port
+livenessProbe:
+  tcpSocket:
+    port: 30000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 20
+readinessProbe:
+  tcpSocket:
+    port: 30000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 20
+streamProcessorEndpoint: ""   # override if needed; else derived from streamProcessorService
+# Release-name prefix of each derived peer's Service, when it differs from
+# global.useReleaseNamePrefix. The peers are rendered by other subcharts
+# (vss-vios-streamprocessing; infra's sdrc), whose local useReleaseNamePrefix
+# this chart cannot read -- so a mixed-prefix install states it here, e.g.
+#   peerUseReleaseNamePrefix: { streamprocessing: false }
+# for global true with vss-vios-streamprocessing.useReleaseNamePrefix: false.
+# Unset keys follow global.useReleaseNamePrefix; an explicit false is honoured.
+peerUseReleaseNamePrefix: {}
+streamProcessorService: "sdrc"
+vstIngressEndpoint: ""        # Full URL with scheme. Defaults to the public ingress when externalHost is set; otherwise the in-cluster ingress.
+# Redis: used in notification_config.json message_broker.redis_server_env_var. Default "" means <Release.Name>-redis:6379.
+redisServerAddress: ""
+# Kafka and MQTT use notification_config.json placeholders; video metadata and cloud storage remain in vst_config.json. Empty = release-based or Compose default.
+kafkaServerAddress: ""
+# Search-profile webhook targets. Empty values derive the in-cluster Service
+# names and honor global.useReleaseNamePrefix.
+rtviCvServerAddress: ""
+rtviEmbedServerAddress: ""
+# RT-VLM webhook target (__RTVI_VLM_ADDRESS__). Empty = vss-rtvi-vlm:8000, or
+# <Release.Name>-vss-rtvi-vlm:8000 when global.useReleaseNamePrefix is true.
+rtviVlmServerAddress: ""
+elasticsearchServerAddress: ""
+# Optional complete notification_config.json. Empty uses the chart default;
+# global.vios.notificationConfig provides one shared inline config to sensor and streamprocessing.
+# global.vios.sensorNotificationConfigMapName (falling back to
+# global.vios.notificationConfigMapName) overlays a parent-chart ConfigMap key
+# notification_config.json (Search loads configs/vios/notification_config.json this way).
+# Logical name only; when useReleaseNamePrefix is true the release is prepended.
+# Set notificationConfig on this subchart to skip the overlay and use this JSON instead.
+notificationConfig: ""
+notificationConfigMapName: ""
+# message_broker fields in notification_config.json. Empty = chart default (redis/mdx-raw).
+messageBrokerConsumer: ""
+messageBrokerTopicConsumer: ""
+messageBrokerMetadataTopic: ""
+videoMetadataServerUrl: ""
+maxDevicesSupported: ""
+videoMetadataIndexPattern: ""
+cloudStorageEndpoint: ""
+mqttBrokerAddress: ""
+# Comma-separated static TURN URLs (username:password@host:port). Empty = STUN only,
+# so WebRTC playback fails off-network/behind NAT.
+turnServerUrl: ""
+# Centralized DB: host matches vss-vios-postgres Service (same rules as global.useReleaseNamePrefix). Password from that chart's *-postgres-cm unless overridden.
+# Override when using external DB: centralizedDbHost, centralizedDbPort, centralizedDbPassword.
+# centralizedDbHost: ""
+# centralizedDbPort: "5432"
+# centralizedDbPassword: ""   # leave empty to use postgres-cm; set for external DB
+env:
+  - name: HOST_IP
+    value: "0.0.0.0"
+  - name: ADAPTOR
+    value: vst_rtsp
+  # Optional credential override for mms-type adaptors (milestone_onvif,
+  # milestone_soap), mirroring ADAPTOR_IP/USER/PASSWORD/PORT in the compose
+  # deployments. A non-empty value wins over the matching field in
+  # adaptor_config.json; leave empty to let that file be authoritative.
+  # ADAPTOR_PASSWORD is a secret: prefer overriding it from a Secret via
+  # --set or a values file rather than committing a value here.
+  - name: ADAPTOR_IP
+    value: ""
+  - name: ADAPTOR_USER
+    value: ""
+  - name: ADAPTOR_PASSWORD
+    value: ""
+  - name: ADAPTOR_PORT
+    value: ""
+  - name: NEED_RECORDING
+    value: "false"
+  - name: NEED_RTSPSERVER
+    value: "false"
+  - name: NEED_STORAGE
+    value: "false"
+  - name: NEED_STREAM_MONITORING
+    value: "true"
+  - name: HTTP_PORT
+    value: "30000"
+  - name: CENTRALIZE_DB_NAME
+    value: nvcentralizedb
+  - name: CENTRALIZE_DB_USERNAME
+    value: vst
+  # STREAM_PROCESSOR_MODULE_ENDPOINT is set by the template from streamProcessorEndpoint
+
+# Persistence: compose mounts VST_DATA_PATH, VST_VIDEO_STORAGE_PATH. Optional PVCs for vst-data, vst-video.
+# To share with vss-vios-streamprocessing, set existingClaim to the same claim name (defaults: <Helm release>-vst-data / -vst-video). Single-node: ReadWriteOnce is enough.
+persistence:
+  vstData:
+    enabled: false
+    create: true
+    existingClaim: ""
+    size: 10Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+  vstVideo:
+    enabled: false
+    create: true
+    existingClaim: ""
+    size: 20Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+# Run as root (match compose user: "0:0") so the app can write to vst_data/vst_video (SQLite, recordings). Override if your image expects non-root.
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  fsGroup: 0
+
+# Request 1 GPU for HW encode/decode (NVIDIA device plugin). Set to {} to run without GPU (software path).
+# resources:
+#   limits:
+#     nvidia.com/gpu: 1
+#   requests:
+#     nvidia.com/gpu: 1
+nodeSelector: {}
+tolerations: []
+
+# Compose parity with the wait-for-redis service in the warehouse profiles.
+waitForRedis:
+  enabled: true
+  host: ""
+  port: 6379
+  timeoutSeconds: 120
+  image:
+    repository: busybox
+    tag: "1.38.0"

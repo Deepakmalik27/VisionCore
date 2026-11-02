@@ -1,0 +1,218 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- if .Values.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vss-vios-nvstreamer.fullname" . }}
+  labels:
+    app.kubernetes.io/name: vss-vios-nvstreamer
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vss-vios-nvstreamer
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vss-vios-nvstreamer
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        {{- /* The rendered ConfigMap, not the raw config files: values such as
+               maxDevicesSupported change the rendered JSON only, and the configs
+               are subPath-mounted, so nothing else rolls the pod (same as
+               vios-sensor and vios-streamprocessing). */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $seed := .Values.ngcVideoSeed | default dict }}
+      {{- if $seed.enabled }}
+      initContainers:
+        - name: prepare-streamer-videos
+          {{- if $seed.fromExistingClaim }}
+          image: "busybox:1.38.0"
+          {{- else }}
+          image: "{{ $seed.image.repository }}:{{ $seed.image.tag }}"
+          imagePullPolicy: {{ $seed.image.pullPolicy | default "IfNotPresent" }}
+          env:
+            - name: NGC_CLI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $seed.apiKeySecretName | default "ngc-api" }}
+                  key: {{ $seed.apiKeySecretKey | default "NGC_CLI_API_KEY" }}
+          {{- end }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              DEST=/streamer-videos
+              DATASET={{ $seed.dataset | default ((.Values.global | default dict).sampleVideoDataset | default "") | quote }}
+              if [ -n "$(find "${DEST}" -name '*.mp4' -print -quit 2>/dev/null)" ]; then
+                echo "[prepare-streamer-videos] videos already present, skipping"
+                exit 0
+              fi
+              {{- if $seed.fromExistingClaim }}
+              SRC=/ngc-bundle/vss-warehouse-app-data/videos
+              # The rtvi-cv NGC job extracts into this claim in parallel on a fresh
+              # install. Wait for its .ngc-extracted marker, not just the videos
+              # directory, which tar creates before the files are fully written.
+              MARKER=/ngc-bundle/vss-warehouse-app-data/.ngc-extracted
+              WAIT={{ $seed.waitSeconds | default 3600 }}
+              i=0
+              while [ ! -f "${MARKER}" ] && [ "${i}" -lt "${WAIT}" ]; do
+                [ $((i % 30)) -eq 0 ] && echo "[prepare-streamer-videos] waiting for the NGC bundle (${i}s)"
+                sleep 5; i=$((i + 5))
+              done
+              if [ ! -f "${MARKER}" ]; then
+                echo "[prepare-streamer-videos] ${MARKER} still missing after ${WAIT}s; check the NGC app-data job" >&2
+                exit 1
+              fi
+              {{- end }}
+              {{- if not $seed.fromExistingClaim }}
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq && apt-get install -y -qq wget unzip > /dev/null
+              cd /tmp
+              wget -q https://ngc.nvidia.com/downloads/ngccli_linux.zip -O ngccli_linux.zip
+              unzip -q ngccli_linux.zip && chmod +x ngc-cli/ngc
+              export PATH="/tmp/ngc-cli:$PATH"
+              rm -rf /tmp/ngc-dl && mkdir -p /tmp/ngc-dl
+              ngc registry resource download-version {{ required "ngcVideoSeed.resourceVersion is required when fromExistingClaim is unset" $seed.resourceVersion | quote }} \
+                --dest /tmp/ngc-dl --org {{ $seed.org | default "nvidia" | quote }}
+              TAR="$(find /tmp/ngc-dl -name '*.tar.gz' -type f | head -1)"
+              if [ -z "${TAR}" ]; then
+                echo "[prepare-streamer-videos] no tarball in the NGC download" >&2
+                exit 1
+              fi
+              mkdir -p /tmp/ngc-x && tar -xzf "${TAR}" -C /tmp/ngc-x
+              SRC=/tmp/ngc-x/vss-warehouse-app-data/videos
+              {{- end }}
+              if [ -n "${DATASET}" ]; then
+                SRC="${SRC}/${DATASET}"
+              fi
+              if [ ! -d "${SRC}" ]; then
+                echo "[prepare-streamer-videos] dataset directory ${SRC} not found" >&2
+                ls -1 "$(dirname "${SRC}")" 2>/dev/null || true
+                exit 1
+              fi
+              echo "[prepare-streamer-videos] copying videos from ${SRC}"
+              find "${SRC}" -name '*.mp4' -exec cp -a {} "${DEST}/" \;
+              chmod -R a+rwX "${DEST}" || true
+              echo "[prepare-streamer-videos] $(find "${DEST}" -name '*.mp4' | wc -l) video(s) staged"
+          volumeMounts:
+            - name: streamer-videos
+              mountPath: /streamer-videos
+            {{- if $seed.fromExistingClaim }}
+            - name: ngc-bundle
+              mountPath: /ngc-bundle
+              readOnly: true
+            {{- end }}
+      {{- end }}
+      containers:
+        - name: vss-vios-nvstreamer
+          image: {{ include "vss-vios-nvstreamer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "-c", "if [ \"$$NVSTREAMER_INSTALL_ADDITIONAL_PACKAGES\" = \"true\" ]; then /home/vst/vst_release/tools/user_additional_install.sh; fi && /home/vst/vst_release/tools/configure_nvstreamer_ui.sh && exec /home/vst/vst_release/launch_vst"]
+          env:
+            - name: ADAPTOR
+              value: {{ .Values.env.ADAPTOR | quote }}
+            - name: HTTP_PORT
+              value: {{ .Values.env.HTTP_PORT | quote }}
+            - name: NVSTREAMER_UI_BASE_PATH
+              value: {{ .Values.env.NVSTREAMER_UI_BASE_PATH | quote }}
+            - name: NVSTREAMER_INSTALL_ADDITIONAL_PACKAGES
+              value: {{ .Values.env.NVSTREAMER_INSTALL_ADDITIONAL_PACKAGES | quote }}
+            - name: VST_APT_MIRROR
+              value: {{ .Values.env.VST_APT_MIRROR | default "" | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+            {{- $rtspBasePort := .Values.rtsp.basePort | default 31554 }}
+            {{- $rtspInstanceCount := .Values.rtsp.instanceCount | default 8 }}
+            {{- range $i := until (int $rtspInstanceCount) }}
+            {{- $rtspPort := add (int $rtspBasePort) $i }}
+            - name: rtsp-{{ $rtspPort }}
+              containerPort: {{ $rtspPort }}
+            {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /home/vst/vst_release/configs/vst_config.json
+              subPath: vst_config.json
+            - name: config
+              mountPath: /home/vst/vst_release/configs/notification_config.json
+              subPath: notification_config.json
+            - name: config
+              mountPath: /home/vst/vst_release/configs/vst_storage.json
+              subPath: vst_storage.json
+            - name: streamer-videos
+              mountPath: /home/vst/vst_release/streamer_videos
+            - name: vst-data
+              mountPath: /home/vst/vst_release/vst_data
+            - name: user-install-script
+              mountPath: /home/vst/vst_release/tools/user_additional_install.sh
+              subPath: user_additional_install.sh
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "vss-vios-nvstreamer.fullname" . }}-config
+        - name: user-install-script
+          configMap:
+            name: {{ include "vss-vios-nvstreamer.fullname" . }}-user-install-script
+            defaultMode: 493
+        - name: streamer-videos
+          {{- $sv := (.Values.persistence | default dict).streamerVideos | default dict }}
+          {{- if $sv.hostPath }}
+          hostPath:
+            path: {{ $sv.hostPath }}
+            type: {{ $sv.hostPathType | default "DirectoryOrCreate" }}
+          {{- else if $sv.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $sv.existingClaim | default (include "vss-vios-nvstreamer.sharedVstClaimStreamerVideos" .) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: vst-data
+          emptyDir: {}
+        {{- if (.Values.ngcVideoSeed | default dict).enabled }}
+        {{- if .Values.ngcVideoSeed.fromExistingClaim }}
+        - name: ngc-bundle
+          persistentVolumeClaim:
+            claimName: {{ .Values.ngcVideoSeed.fromExistingClaim }}
+            readOnly: true
+        {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

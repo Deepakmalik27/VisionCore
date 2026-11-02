@@ -1,0 +1,57 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import List
+import nvidia.dali.experimental.dynamic as ndd
+
+from nvidia.dali._typing import TensorLike
+from nvidia.dali.experimental.dynamic._device import DeviceLike
+
+from ..operator import adjust_input, get_HWC_from_layout_dynamic
+from ..centercrop import CenterCrop
+
+
+@adjust_input
+def center_crop(
+    inpt: TensorLike | ndd.Batch,
+    output_size: int | List[int],
+    device: DeviceLike = "cpu",
+) -> ndd.Tensor | ndd.Batch:
+    """
+    Please refer to the ``CenterCrop`` operator for more details.
+    """
+    CenterCrop.verify_args(size=output_size)
+
+    crop_h, crop_w = CenterCrop.adjust_size(output_size)
+
+    in_h, in_w, _ = get_HWC_from_layout_dynamic(inpt)
+
+    # torchvision: crop_top = int(round((H - crop_H) / 2.0)) — banker's rounding. If the crop is
+    # larger than the input, torchvision first pads (crop_H - H) // 2 on top, so the anchor
+    # is -((-N) // 2).
+    N_h, N_w = in_h - crop_h, in_w - crop_w
+    anchor_y = -((-N_h) // 2) if N_h < 0 else int(round(N_h / 2.0))
+    anchor_x = -((-N_w) // 2) if N_w < 0 else int(round(N_w / 2.0))
+    crop_pos_y = anchor_y / N_h if N_h else 0.0
+    crop_pos_x = anchor_x / N_w if N_w else 0.0
+
+    return ndd.crop(
+        inpt,
+        device=device,
+        crop=(crop_h, crop_w),
+        crop_pos_x=crop_pos_x,
+        crop_pos_y=crop_pos_y,
+        out_of_bounds_policy="pad",
+        fill_values=0,
+    )

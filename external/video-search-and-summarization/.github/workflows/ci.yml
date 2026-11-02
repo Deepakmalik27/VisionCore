@@ -1,0 +1,1699 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+"on":
+  push:
+    branches:
+      - main
+      - develop
+      - "pull-request/[0-9]+"
+
+concurrency:
+  # Preserve every delivery run on develop/main. Synthetic PR mirror branches
+  # still cancel stale runs after a newer PR revision arrives.
+  group: >-
+    ${{ github.workflow }}-${{
+      startsWith(github.ref_name, 'pull-request/') && github.ref || github.run_id
+    }}
+  cancel-in-progress: ${{ startsWith(github.ref_name, 'pull-request/') }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The source artifact intentionally excludes .git. The Python package
+  # derives its version from VCS metadata, so provide a deterministic
+  # CI-only version for artifact-based jobs.
+  SETUPTOOLS_SCM_PRETEND_VERSION: 0.0.0+${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 0: Package source once for jobs that do not need git history
+  # ---------------------------------------------------------------------------
+  prepare-source:
+    name: Prepare source artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build-behavior-analytics: ${{ steps.managed-image-changes.outputs.behavior }}
+      build-video-analytics-api: ${{ steps.managed-image-changes.outputs.video }}
+      current-behavior-analytics-image: ${{ steps.current-images.outputs.behavior }}
+      current-video-analytics-api-image: ${{ steps.current-images.outputs.video }}
+      sdr-mw-l-changed: ${{ steps.managed-image-changes.outputs.sdr-mw-l }}
+      vss-configurator-changed: ${{ steps.managed-image-changes.outputs.vss-configurator }}
+      vss-rt-config-adaptor-changed: ${{ steps.managed-image-changes.outputs.vss-rt-config-adaptor }}
+      vss-rt-embed-changed: ${{ steps.managed-image-changes.outputs.vss-rt-embed }}
+      vss-rt-vlm-changed: ${{ steps.managed-image-changes.outputs.vss-rt-vlm }}
+      unit-test-workflow-changed: ${{ steps.changed-paths.outputs.unit-test-workflow-changed }}
+      trigger-from-src-change: ${{ steps.changed-paths.outputs.trigger-from-src-change }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # GitLab Master rejects regular blobs > 5 MiB. Scoped to services/,
+      # libs/, tools/ (mirror-sync). LFS pointers are small in git and pass.
+      - name: Files >5 MiB under services/ libs/ tools/ must be Git LFS
+        run: bash .github/scripts/check_large_files_lfs.sh --all
+
+      # One diff resolution answering several path questions. A second step
+      # would have to re-resolve the same base, which is how the two gates
+      # drifted apart last time.
+      - name: Detect changed paths
+        id: changed-paths
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, ".github/scripts")
+          from detect_changed_images import (
+              changed_paths,
+              paths_changed_under,
+              resolve_diff_base,
+          )
+
+          # Folders that warrant a downstream acceptance run on their own.
+          # Image sources are absent by design: a container source change is
+          # already picked up by the per-image source_path check, and
+          # containers this repo does not build cannot invalidate a deployed
+          # artifact from a source edit alone.
+          DOWNSTREAM_TRIGGER_PATHS = ["deploy"]
+
+          repo = Path.cwd()
+          ref_name = os.environ["REF_NAME"]
+          # Direct pushes use their event range. PR mirror branches use the
+          # merge-base with develop so all changes in the PR are considered.
+          base_branch = ref_name if ref_name in {"main", "develop"} else "develop"
+          base, reason = resolve_diff_base(
+              repo,
+              os.environ["EVENT_NAME"],
+              ref_name,
+              os.environ.get("BEFORE_SHA", ""),
+              base_branch,
+          )
+          paths = changed_paths(repo, base) if base else None
+          if base and paths is None:
+              reason += "; diff failed; running downstream acceptance"
+
+          unit_test_workflow_changed = paths is None or ".github/workflows/ci.yml" in paths
+          trigger_from_src = any(
+              paths_changed_under(paths, folder)
+              for folder in DOWNSTREAM_TRIGGER_PATHS
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(
+                  "unit-test-workflow-changed="
+                  f"{str(unit_test_workflow_changed).lower()}\n"
+              )
+              output.write(
+                  f"trigger-from-src-change={str(trigger_from_src).lower()}\n"
+              )
+          print(f"Unit-test workflow changed: {unit_test_workflow_changed} ({reason})")
+          print(f"Downstream trigger from source: {trigger_from_src} ({reason})")
+          PY
+
+      - name: Detect managed image changes
+        id: managed-image-changes
+        run: |
+          python3 .github/scripts/detect_changed_images.py \
+            --event-name "${{ github.event_name }}" \
+            --ref-name "${{ github.ref_name }}" \
+            --before "${{ github.event.before }}" \
+            --base-branch develop > analytics-detection.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          entries = json.load(open("analytics-detection.json"))["matrix"]["include"]
+          names = {entry["name"] for entry in entries}
+          inventory = json.loads(Path("deploy/docker/container-inventory.json").read_text())
+          outputs = {
+              entry["name"]: entry["name"]
+              for entry in inventory["images"]
+              if entry.get("strategy") == "build" and entry.get("ghcr_build")
+          }
+          outputs.update({
+              # Backward-compatible aliases used by the existing analytics jobs.
+              "behavior": "vss-behavior-analytics",
+              "video": "vss-video-analytics-api",
+          })
+          for output, image in outputs.items():
+              print(f"{output}={str(image in names).lower()}")
+          PY
+
+      - name: Resolve current analytics images
+        id: current-images
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, ".github/scripts")
+          from check_container_tag_source import find_image_refs, resolve_compose_vars
+
+          def current(compose_path: str, image_name: str) -> str:
+              refs = find_image_refs(Path(compose_path), image_name)
+              if len(refs) != 1:
+                  raise RuntimeError(f"{image_name}: expected one Compose image, found {len(refs)}")
+              resolved, missing = resolve_compose_vars(refs[0], {})
+              if missing:
+                  raise RuntimeError(f"{image_name}: unresolved variables: {', '.join(missing)}")
+              return resolved
+
+          print("behavior=" + current(
+              "deploy/docker/services/analytics/behavior-analytics/compose.yml",
+              "vss-behavior-analytics",
+          ))
+          print("video=" + current(
+              "deploy/docker/services/analytics/video-analytics-api/compose.yml",
+              "vss-video-analytics-api",
+          ))
+          PY
+
+      - name: Fetch required LFS source notices
+        run: |
+          git lfs pull \
+            --include='services/vios/LICENSE.3rdparty' \
+            --exclude=''
+          if head -c 64 services/vios/LICENSE.3rdparty | grep -q '^version https://git-lfs'; then
+            echo "::error::git lfs pull did not materialize services/vios/LICENSE.3rdparty"
+            exit 1
+          fi
+
+      - name: Package tracked source
+        run: |
+          # actions/checkout above runs with lfs:false, but `git archive` applies
+          # checkout-side conversion (ident, then smudge/process), so it fetches
+          # the repo's entire ~989 MB of LFS payload on every run. 414 MB of that
+          # is services/vios. Skip those binaries via lfs.fetchexclude.
+          #
+          # fetchexclude is a path filter: matching files stay LFS pointers even
+          # when already pulled. LICENSE.3rdparty lives under services/vios, so
+          # archive would pack the pointer. Pull the notices above, then replace
+          # that one tar member after archive. Scoped to this command with -c,
+          # so analytics fixtures are still smudged normally.
+          git -c lfs.fetchexclude='services/vios/**' \
+            archive --format=tar --prefix=repo/ -o source.tar HEAD
+          license_member='repo/services/vios/LICENSE.3rdparty'
+          tar --delete -f source.tar "$license_member"
+          mkdir -p .archive-license/repo/services/vios
+          cp services/vios/LICENSE.3rdparty .archive-license/repo/services/vios/LICENSE.3rdparty
+          tar --append -C .archive-license -f source.tar "$license_member"
+          rm -rf .archive-license
+          gzip -n source.tar
+          git ls-files > tracked-files.txt
+          ls -lh source.tar.gz
+
+      # Assert the notice and exclusion did what we think. Without this a silent
+      # change in git-lfs behaviour either stops saving anything, or starts
+      # stripping fixtures the analytics integration jobs depend on.
+      - name: Verify LFS exclusion boundaries
+        run: |
+          # Must be a regular file, not a symlink: git archive stores a symlink's
+          # target text, so libaws-c-auth.so (mode 120000, content
+          # "libaws-c-auth.so.1.0.0") would never match the pointer signature and
+          # would fail this step for every run. All 126 vios LFS pointers are
+          # regular files; this is the resolved target of that symlink.
+          vios='repo/services/vios/prebuilts/aarch64/aws/libaws-c-auth.so.1.0.0'
+          license='repo/services/vios/LICENSE.3rdparty'
+          keep='repo/services/analytics/behavior-analytics/tests/integration/expected_output/smart_city/mdx-behavior-data.json'
+          if ! tar -xzOf source.tar.gz "$vios" | head -c 64 | grep -q '^version https://git-lfs'; then
+            echo "::error::$vios is not an LFS pointer; lfs.fetchexclude is not taking effect"
+            exit 1
+          fi
+          if tar -xzOf source.tar.gz "$license" | head -c 64 | grep -q '^version https://git-lfs'; then
+            echo "::error::$license is an LFS pointer; the required license notices are missing"
+            exit 1
+          fi
+          if ! tar -xzOf source.tar.gz "$license" | cmp -s - services/vios/LICENSE.3rdparty; then
+            echo "::error::$license does not match the materialized license notices"
+            exit 1
+          fi
+          if tar -xzOf source.tar.gz "$keep" | head -c 64 | grep -q '^version https://git-lfs'; then
+            echo "::error::$keep is a pointer; the exclusion over-matched and analytics fixtures would break"
+            exit 1
+          fi
+          echo "vios payloads excluded, required license and analytics fixtures smudged"
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: source-${{ github.sha }}
+          path: |
+            source.tar.gz
+            tracked-files.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Python lint (ruff check + ruff format + yamllint)
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (Python)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: services/agent
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          mkdir -p .ci
+          mv .source-artifact/tracked-files.txt .ci/tracked-files.txt
+          rm -rf .source-artifact
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.6.2"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev pkg-config
+
+      - name: Install dev dependencies
+        run: uv sync --group dev --frozen
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format
+        run: uv run ruff format --check .
+
+      # Run from repo root so the tracked-file manifest sees YAML files
+      # outside services/agent (the job's default working-directory).
+      # yamllint is GPL-3.0-or-later, so we run it ephemerally via `uvx`
+      # rather than declaring it as a project dep — that way it never
+      # appears in services/agent/uv.lock and never lands in any
+      # installed project venv.
+      - name: yamllint
+        working-directory: ${{ github.workspace }}
+        run: |
+          YAML_FILES=$(grep -E '^(\.github/.*\.ya?ml|\.pre-commit-config\.yaml|services/.*\.ya?ml)$' .ci/tracked-files.txt || true)
+          if [ -z "$YAML_FILES" ]; then
+            echo "No YAML files to lint."
+            exit 0
+          fi
+          uvx yamllint \
+            -d "{extends: default, rules: {line-length: {max: 200}, document-start: disable, indentation: {spaces: 2, indent-sequences: consistent}}}" \
+            $YAML_FILES
+
+  codec-installer-test:
+    name: Validate codec artifacts
+    needs: prepare-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Validate codec installers
+        run: |
+          EMBED_INSTALLER=services/rtvi/rt-embed/src/scripts/install_codecs_nonroot.sh
+          VLM_INSTALLER=services/rtvi/rt-vlm/src/scripts/install_codecs_nonroot.sh
+          bash -n "$EMBED_INSTALLER"
+          bash -n "$VLM_INSTALLER"
+          cmp "$EMBED_INSTALLER" "$VLM_INSTALLER"
+          CODEC_VALIDATE_ONLY=true bash "$EMBED_INSTALLER"
+          CODEC_VALIDATE_ONLY=true CODEC_DEB_ARCH=arm64 bash "$EMBED_INSTALLER"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Python type checking (mypy)
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: Type Check (mypy)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: services/agent
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          mkdir -p .ci
+          mv .source-artifact/tracked-files.txt .ci/tracked-files.txt
+          rm -rf .source-artifact
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.6.2"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev pkg-config
+
+      - name: Install dev dependencies
+        run: uv sync --group dev --extra agent --extra cli --frozen
+
+      - name: mypy
+        run: uv run mypy packages/vss_agents/src/vss_agents
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Python tests (pytest + coverage)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (pytest)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: services/agent
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          mkdir -p .ci
+          mv .source-artifact/tracked-files.txt .ci/tracked-files.txt
+          rm -rf .source-artifact
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.6.2"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev pkg-config
+
+      - name: Install dev dependencies
+        run: uv sync --group dev --extra agent --extra cli --frozen
+
+      - name: pytest
+        timeout-minutes: 10
+        run: |
+          uv run pytest \
+            --cov=packages/vss_agents/src \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            -m "not slow and not integration"
+
+      - name: Video summarization contracts
+        working-directory: ${{ github.workspace }}
+        run: |
+          uv run --project services/agent --with requests pytest \
+            .github/skill-eval/tests/test_generic_judge_trajectory_guidance.py \
+            .github/skill-eval/tests/test_lvs_deployment_config.py \
+            .github/skill-eval/tests/test_vss_summarize_eval_contract.py \
+            .github/skill-eval/tests/test_vss_summarize_model_selection.py \
+            deploy/docker/scripts/tests/test_orchestrator_mcp_helper.py \
+            deploy/docker/scripts/tests/test_pin_docker_version.py \
+            deploy/docker/scripts/tests/test_run_setup_notebook.py \
+            deploy/docker/scripts/tests/test_dashboard_relay.py \
+            deploy/docker/scripts/tests/test_dashboard_forward_watchdog.py \
+            .openclaw/tests/test_runtime_instructions.py \
+            skills/vss-build-vision-ai/scripts/tests/test_sync_skills.py \
+            skills/vss-build-vision-ai/scripts/tests/test_stage_vss_src.py \
+            skills/vss-build-vision-ai/scripts/tests/test_apply_onboard_config.py \
+            skills/vss-build-vision-ai/scripts/tests/test_container_tag_override.py \
+            skills/vss-build-vision-ai/scripts/tests/test_script_help.py \
+            skills/vss-build-vision-ai/scripts/tests/test_check_credentials_gate.py \
+            skills/benchmarking/benchmark-video-search/scripts/tests/test_search_eval_flows.py \
+            skills/benchmarking/vss-benchmark-vlm-qa/scripts/tests/test_benchmark_vlm_qa.py \
+            -q
+
+      - name: Skill eval harness contracts
+        working-directory: ${{ github.workspace }}
+        env:
+          SKILL_EVAL_EXPECTED_PYTHON_VERSION: "3.12"
+        run: |
+          uvx --python 3.12 --from "pytest==9.1.1" pytest \
+            .github/skill-eval/tests/test_adapter_agent_timeout.py \
+            .github/skill-eval/tests/test_vss_search_archive_adapter.py \
+            .github/skill-eval/tests/test_eval_env_forwarding.py \
+            .github/skill-eval/tests/test_leg_timing.py \
+            .github/skill-eval/tests/test_leg_report.py \
+            .github/skill-eval/tests/test_local_nim.py \
+            .github/skill-eval/tests/test_model_config.py \
+            .github/skill-eval/tests/test_nv_claude_code.py \
+            .github/skill-eval/tests/test_nv_codex.py \
+            .github/skill-eval/tests/test_nemoclaw.py \
+            .github/skill-eval/tests/test_vss_ask_video_adapter.py \
+            .github/skill-eval/tests/test_vss_manage_alerts_adapter.py \
+            .github/skill-eval/tests/test_python_runtime_contract.py \
+            .github/skill-eval/tests/test_plan_matrix.py \
+            .github/skill-eval/tests/test_skills_eval_agent_protocol.py \
+            .github/skill-eval/envs/tests/test_cancellation_recovery.py \
+            .github/skill-eval/envs/tests/test_step_gate.py \
+            .github/skill-eval/tests/test_generic_judge_trajectory_guidance.py \
+            .github/skill-eval/envs/tests/test_registered_node.py::LocalNimCredentialDelivery \
+            .github/skill-eval/envs/tests/test_registered_node.py::PreparationRetries \
+            .github/skill-eval/envs/tests/test_registered_node.py::NemoClawNamespaceClaim \
+            .github/skill-eval/tests/test_run_leg.py::HarborCommand \
+            .github/skill-eval/tests/test_run_leg.py::SparkSelection \
+            .github/skill-eval/tests/test_run_leg.py::SetupOnlySelection \
+            .github/skill-eval/tests/test_run_leg.py::SparkReachability \
+            .github/skill-eval/tests/test_run_leg.py::PhaseBudgets \
+            .github/skill-eval/tests/test_run_leg.py::HarborEnvironment \
+            .github/skill-eval/tests/test_run_leg.py::RunCommand \
+            .github/skill-eval/tests/test_run_leg.py::ProcessGroupShutdown \
+            .github/skill-eval/tests/test_run_leg.py::RunInvocations \
+            .github/skill-eval/tests/test_run_leg.py::GatewayAllocation \
+            .github/skill-eval/tests/test_run_leg.py::TheHeartbeatNamesTheRightPhase \
+            .github/skill-eval/tests/test_run_leg.py::InstrumentationNeverChangesTheVerdict \
+            -q
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: coverage-report
+          path: services/agent/coverage.xml
+
+  # ---------------------------------------------------------------------------
+  # Job 4: NAT-free base distribution (lib + vss CLI) build and tests.
+  # Installs only the base `nvidia-vss` dependencies + the cli-dev tool group, so this
+  # lane proves the host CLI surface never grows a NAT/torch dependency.
+  # ---------------------------------------------------------------------------
+  vss-cli-test:
+    name: Test (vss-cli)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        # The library is its own workspace: NAT-free, with its own lock.
+        working-directory: libs/vss
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.6.2"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Build and test NAT-free base distribution
+        run: |
+          uv sync --frozen
+          uv run --no-sync mypy \
+            core/src/vss_core/_foundation \
+            core/src/vss_core/search_core \
+            core/src/vss_core/vlm \
+            core/src/vss_core/vios \
+            cli/src/vss_cli
+          uv run --no-sync pytest core/tests/unit_test cli/tests/unit_test -W error::RuntimeWarning -W error::ResourceWarning \
+            --cov=core/src --cov=cli/src --cov-fail-under=80 --cov-report=xml:coverage-lib.xml -m "not slow and not integration"
+          uv run --no-sync python ../../.github/osrb/test_osrb_scan.py
+          uv run --no-sync python ../../.github/osrb/test_osrb_summary.py
+          rm -rf dist
+          uv build --package nvidia-vss-core
+          uv build --package nvidia-vss-cli
+
+      - name: Smoke-test built wheel in a clean environment
+        run: |
+          rm -rf .wheel-smoke
+          uv venv --python 3.13 .wheel-smoke
+          set -- dist/nvidia_vss_core-*.whl
+          test "$#" -eq 1 && test -f "$1"
+          core_whl="$1"
+          set -- dist/nvidia_vss_cli-*.whl
+          test "$#" -eq 1 && test -f "$1"
+          cli_whl="$1"
+          uv pip install --python .wheel-smoke/bin/python --no-cache "$core_whl" "$cli_whl"
+          uv pip check --python .wheel-smoke/bin/python
+          .wheel-smoke/bin/python - <<'PY'
+          import importlib.util
+          from importlib import metadata
+
+          import vss_core
+          import vss_cli
+          import vss_core.search_core.critic
+          import vss_core.search_core
+          import vss_core.vlm
+          import vss_core.vios
+
+          installed = {dist.metadata["Name"].lower() for dist in metadata.distributions()}
+          assert "nvidia-vss-core" in installed
+          assert "nvidia-vss-cli" in installed
+          assert installed.isdisjoint({"coverage", "mypy", "pytest", "ruff"})
+          # The base (core + cli) install must never pull the NAT/torch stack
+          # nor the agent distribution.
+          assert installed.isdisjoint({"nvidia-nat", "nvidia-nat-core", "torch", "langchain-core", "nvidia-vss-agents"})
+          assert importlib.util.find_spec("nat") is None
+          assert importlib.util.find_spec("torch") is None
+          assert importlib.util.find_spec("vss_agents") is None
+          assert importlib.util.find_spec("vss_core.critic") is None and vss_core.search_core is not None and vss_core.search_core.critic is not None
+          assert vss_core.vlm is not None and vss_core.vios is not None
+          PY
+          .wheel-smoke/bin/vss --help >/dev/null
+
+      - name: Upload lib coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: vss-cli-coverage-report
+          path: libs/vss/coverage-lib.xml
+
+  # ---------------------------------------------------------------------------
+  # Job 5a: Behavior analytics unit tests
+  # ---------------------------------------------------------------------------
+  behavior-analytics-test:
+    name: Test (behavior analytics)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    if: needs.prepare-source.outputs.build-behavior-analytics == 'true' || needs.prepare-source.outputs.unit-test-workflow-changed == 'true'
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: services/analytics/behavior-analytics
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip pipenv
+          pipenv install --dev
+
+      - name: Run unit tests
+        run: |
+          mkdir -p test/coverage
+          pipenv run coverage run --source=src/mdx/analytics/core -m pytest tests/unit/ -v --junitxml=test/coverage/test-results.xml
+          pipenv run coverage xml -o coverage.xml
+          pipenv run coverage report
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: behavior-analytics-test-reports
+          path: |
+            services/analytics/behavior-analytics/test/coverage/
+            services/analytics/behavior-analytics/coverage.xml
+
+  # ---------------------------------------------------------------------------
+  # Job 5b: Video analytics API unit tests
+  # ---------------------------------------------------------------------------
+  video-analytics-api-test:
+    name: Test (video analytics API)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    if: needs.prepare-source.outputs.build-video-analytics-api == 'true' || needs.prepare-source.outputs.unit-test-workflow-changed == 'true'
+    timeout-minutes: 30
+    env:
+      NPM_CONFIG_AUDIT: "false"
+      NPM_CONFIG_FUND: "false"
+    defaults:
+      run:
+        working-directory: services/analytics/video-analytics-api
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22.22.3"
+
+      - name: Install and link dependencies
+        run: |
+          cd src/web-api-core && npm install && cd ../..
+          cd src/app && npm install --save ../web-api-core && npm install && cd ../..
+          cd test && npm install --save ../src/web-api-core && npm install --save ../src/app && npm install
+
+      - name: Run unit tests
+        run: cd test && npm run ci
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: video-analytics-api-test-reports
+          path: services/analytics/video-analytics-api/test/coverage/
+
+  # ---------------------------------------------------------------------------
+  # Job 5c: SDRC unit tests
+  # ---------------------------------------------------------------------------
+  sdr-mw-l-test:
+    name: Test (sdr-mw-l)
+    needs: prepare-source
+    if: needs.prepare-source.outputs.sdr-mw-l-changed == 'true' || needs.prepare-source.outputs.unit-test-workflow-changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: services/sdrc
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.11.24"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.10"
+
+      - name: Run unit tests
+        run: |
+          mkdir -p test/coverage
+          uv run --python 3.10 --with pytest --with pytest-cov pytest tests/ -v --tb=short \
+            --junitxml=test/coverage/test-results.xml
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: sdr-mw-l-test-reports
+          path: services/sdrc/test/coverage/
+
+  # ---------------------------------------------------------------------------
+  # Job 5d: VSS configurator unit tests
+  # ---------------------------------------------------------------------------
+  vss-configurator-test:
+    name: Test (vss-configurator)
+    needs: prepare-source
+    if: needs.prepare-source.outputs.vss-configurator-changed == 'true' || needs.prepare-source.outputs.unit-test-workflow-changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: services/configurators/vss-configurator
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.11.24"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Run unit tests
+        run: |
+          mkdir -p test/coverage
+          # spatialai-data-utils pins NumPy 1.26.4, which has no Python 3.13 wheel.
+          # Unit tests mock that package, so install the locked app deps without it.
+          uv export --frozen --group dev --no-emit-project --prune spatialai-data-utils -o /tmp/vss-configurator-test-reqs.txt
+          uv venv --python 3.13
+          uv pip install --python .venv/bin/python -r /tmp/vss-configurator-test-reqs.txt
+          .venv/bin/pytest tests/ -v --tb=short \
+            --junitxml=test/coverage/test-results.xml \
+            --cov=app \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: vss-configurator-test-reports
+          path: |
+            services/configurators/vss-configurator/test/coverage/
+            services/configurators/vss-configurator/coverage.xml
+
+  # ---------------------------------------------------------------------------
+  # Job 5e: VSS RT config adaptor unit tests
+  # ---------------------------------------------------------------------------
+  vss-rt-config-adaptor-test:
+    name: Test (vss-rt-config-adaptor)
+    needs: prepare-source
+    if: needs.prepare-source.outputs.vss-rt-config-adaptor-changed == 'true' || needs.prepare-source.outputs.unit-test-workflow-changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: services/configurators/vss-rt-config-adaptor
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.11.24"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --python 3.13 --frozen --group dev
+
+      - name: Run unit tests
+        run: |
+          mkdir -p test/coverage
+          uv run --python 3.13 pytest tests/ -v --tb=short \
+            --junitxml=test/coverage/test-results.xml \
+            --cov=app \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: vss-rt-config-adaptor-test-reports
+          path: |
+            services/configurators/vss-rt-config-adaptor/test/coverage/
+            services/configurators/vss-rt-config-adaptor/coverage.xml
+
+  # ---------------------------------------------------------------------------
+  # Job 5g: RTVI vLLM-compatible model unit tests
+  #
+  # rt-vlm and rt-embed each carry their own copy of vllm_compatible_model.py.
+  # Its engine-args builders are env parsing that a CPU-only torch can drive,
+  # so this lane needs no GPU and no vLLM. Because vLLM is absent, rt-vlm
+  # selects the CI-safe subset of its mixed test module by the test_in_ci
+  # marker; rt-embed's file is CI-safe throughout and is selected by path.
+  # ---------------------------------------------------------------------------
+  rtvi-vllm-compatible-test:
+    name: Test (rtvi vllm-compatible)
+    needs: prepare-source
+    if: >-
+      needs.prepare-source.outputs.vss-rt-vlm-changed == 'true'
+      || needs.prepare-source.outputs.vss-rt-embed-changed == 'true'
+      || needs.prepare-source.outputs.unit-test-workflow-changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+        with:
+          version: "0.11.24"
+
+      # 3.12 is the interpreter the rt-vlm image ships, so the parsing helpers
+      # are exercised on the same version that runs in production.
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      # The model module imports torch and torchvision at module scope. The
+      # CPU wheel index keeps this near 850 MiB instead of installing the
+      # CUDA runtime, which this lane would never use.
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.12 .venv-rtvi
+          uv pip install --python .venv-rtvi/bin/python \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch \
+            torchvision
+          uv pip install --python .venv-rtvi/bin/python \
+            cloudpickle \
+            filelock \
+            numpy \
+            pillow \
+            pydantic \
+            pytest
+
+      # --noconftest: tests/conftest.py imports prometheus_client,
+      # sse_starlette, requests and sseclient for autouse fixtures that none
+      # of the selected tests need.
+      - name: Run rt-vlm unit tests
+        working-directory: services/rtvi/rt-vlm
+        run: |
+          PYTHONPATH=src "$GITHUB_WORKSPACE/.venv-rtvi/bin/pytest" \
+            -c tests/pytest.ini \
+            --noconftest \
+            -m test_in_ci \
+            tests/model/vllm_compatible/test_input_error_handling.py \
+            tests/rtvi_vlm/test_vlm_thor_runtime.py \
+            tests/test_sbsa_decoder_bridge.py \
+            -v
+
+      - name: Run rt-embed unit tests
+        working-directory: services/rtvi/rt-embed
+        run: |
+          PYTHONPATH=src "$GITHUB_WORKSPACE/.venv-rtvi/bin/pytest" \
+            tests/model/vllm_compatible/test_mm_processor_cache_engine_args.py \
+            -v
+
+  # ---------------------------------------------------------------------------
+  # Job 5f: Behavior analytics Docker Compose integration test
+  # ---------------------------------------------------------------------------
+  behavior-analytics-integration-test:
+    name: Integration (behavior analytics)
+    needs: prepare-source
+    # Same path gate as Test (sdr-mw-l) / configurator jobs: skip the ~150 min
+    # compose suite when this PR did not touch BA sources or ci.yml (license-diff
+    # and similar). Diff-resolution failure still runs it via unit-test-workflow-changed.
+    if: needs.prepare-source.outputs.build-behavior-analytics == 'true' || needs.prepare-source.outputs.unit-test-workflow-changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      COMPOSE_TIMEOUT: "1800"
+      # The integration stack already uses host networking for its builds.
+      # Keep Compose's direct builder: Bake requires a separate entitlement.
+      COMPOSE_BAKE: "false"
+      BUILD_SERVICE_IMAGE: ${{ needs.prepare-source.outputs.build-behavior-analytics }}
+      CURRENT_BEHAVIOR_ANALYTICS_IMAGE: ${{ needs.prepare-source.outputs.current-behavior-analytics-image }}
+    defaults:
+      run:
+        working-directory: services/analytics/behavior-analytics
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22.22.3"
+
+      - name: Log in to NGC for current image reuse
+        if: needs.prepare-source.outputs.build-behavior-analytics != 'true'
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: nvcr.io
+          username: "$oauthtoken"
+          password: ${{ secrets.NGC_CLI_API_KEY }}
+
+      - name: Run warehouse Kafka integration test
+        run: |
+          chmod +x tests/integration/test.sh tests/integration/cleanup.sh tests/integration/generate_env.sh
+          chmod -R 777 tests/integration/docker_compose/apps_data
+          cd tests/integration
+          ./test.sh warehouse_2d kafka prod
+
+  # ---------------------------------------------------------------------------
+  # Job 5d: Video analytics API Docker Compose integration test
+  # ---------------------------------------------------------------------------
+  video-analytics-api-integration-test:
+    name: Integration (video analytics API)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    if: needs.prepare-source.outputs.build-video-analytics-api == 'true' || needs.prepare-source.outputs.unit-test-workflow-changed == 'true'
+    timeout-minutes: 150
+    env:
+      COMPOSE_TIMEOUT: "300"
+      # Match the behavior analytics stack's host-network build policy.
+      COMPOSE_BAKE: "false"
+      BUILD_TIMEOUT: "600"
+      NPM_CONFIG_AUDIT: "false"
+      NPM_CONFIG_FUND: "false"
+      BUILD_SERVICE_IMAGE: ${{ needs.prepare-source.outputs.build-video-analytics-api }}
+      CURRENT_VIDEO_ANALYTICS_API_IMAGE: ${{ needs.prepare-source.outputs.current-video-analytics-api-image }}
+    defaults:
+      run:
+        working-directory: services/analytics/video-analytics-api
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          rm -rf .source-artifact
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22.22.3"
+
+      - name: Log in to NGC for current image reuse
+        if: needs.prepare-source.outputs.build-video-analytics-api != 'true'
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: nvcr.io
+          username: "$oauthtoken"
+          password: ${{ secrets.NGC_CLI_API_KEY }}
+
+      - name: Install integration-test dependencies
+        run: cd test && npm install
+
+      - name: Run integration test
+        run: |
+          chmod +x test/integration-test/test.sh test/integration-test/cleanup.sh test/integration-test/generate_env.sh
+          chmod +x test/integration-test/scripts/run_integration_tests.sh
+          ./test/integration-test/test.sh prod
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Security scanning (detect-secrets)
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security Scan (detect-secrets)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          # The scan compares each changed file with its base commit copy.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Install detect-secrets
+        run: python -m pip install detect-secrets==1.5.0
+
+      - name: Unit-test the secret scan
+        run: python .github/scripts/test_scan_new_secrets.py
+
+      - name: detect-secrets
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: python .github/scripts/scan_new_secrets.py
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Frontend lint + typecheck
+  # ---------------------------------------------------------------------------
+  frontend-lint:
+    name: Lint & Typecheck (UI)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: services/ui
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          mkdir -p .ci
+          mv .source-artifact/tracked-files.txt .ci/tracked-files.txt
+          rm -rf .source-artifact
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version-file: services/ui/.nvmrc
+          cache: "npm"
+          cache-dependency-path: services/ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Frontend build
+  # ---------------------------------------------------------------------------
+  frontend-build:
+    name: Build (UI)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: services/ui
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        working-directory: ${{ github.workspace }}
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          mkdir -p .ci
+          mv .source-artifact/tracked-files.txt .ci/tracked-files.txt
+          rm -rf .source-artifact
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version-file: services/ui/.nvmrc
+          cache: "npm"
+          cache-dependency-path: services/ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Job 7: Copyright header check
+  # ---------------------------------------------------------------------------
+  copyright-headers:
+    name: Copyright Headers
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          mkdir -p .ci
+          mv .source-artifact/tracked-files.txt .ci/tracked-files.txt
+          rm -rf .source-artifact
+
+      - name: Test SPDX header checker
+        run: python3 .github/scripts/test_check_copyright_headers.py
+
+      - name: Check SPDX headers
+        run: python3 .github/scripts/check_copyright_headers.py
+
+  # ---------------------------------------------------------------------------
+  # Job 8: DCO sign-off check
+  # ---------------------------------------------------------------------------
+  dco:
+    name: DCO Sign-off
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Check DCO sign-off
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Only check commits that are authored on this branch — i.e. NOT already
+          # reachable from any long-lived upstream branch (main, develop, release/*,
+          # hotfix/*) or from the PR base branch. This avoids re-checking historical
+          # commits that were inherited via a sync or rebase from another branch and
+          # that pre-date the DCO requirement.
+          #
+          # The base ref matters for STACKED PRs (base = another feature branch):
+          # without it, the walker re-checks the base branch's entire inherited
+          # history and fails on unsigned commits the PR author never touched
+          # (seen on PR #1200: 12 inherited failures, 0 from the PR's own commits).
+          # On `pull-request/<N>` mirror pushes GITHUB_BASE_REF is empty, so resolve
+          # the base from the PR API — same pattern as the license-diff fix (#622).
+          BASE="${GITHUB_BASE_REF:-}"
+          if [ -z "$BASE" ] && [[ "$GITHUB_REF_NAME" =~ ^pull-request/([0-9]+)$ ]]; then
+            BASE=$(gh api "repos/$GITHUB_REPOSITORY/pulls/${BASH_REMATCH[1]}" \
+              --jq .base.ref 2>/dev/null || true)
+          fi
+          BASE="${BASE:-develop}"
+
+          # `actions/checkout` only fetches the checked-out ref. Make sure the refs we
+          # use as exclusion bases exist locally. Failures are tolerated (e.g. a fresh
+          # repo with no release/* branches yet).
+          for ref in "$BASE" main develop; do
+            git rev-parse --verify "origin/$ref" >/dev/null 2>&1 || \
+              git fetch --no-tags --quiet origin \
+                "+refs/heads/$ref:refs/remotes/origin/$ref" 2>/dev/null || true
+          done
+          for pattern in 'release/*' 'hotfix/*' 'dev/*'; do
+            git fetch --no-tags --quiet origin \
+              "+refs/heads/$pattern:refs/remotes/origin/$pattern" 2>/dev/null || true
+          done
+
+          # Build the exclusion set from every long-lived upstream branch we know
+          # about. A commit reachable from any of these is inherited history.
+          # dev/* covers integration / release-prep branches (e.g. dev/3.2.0)
+          # which carry squash-merged history from develop and shouldn't have
+          # each historical commit re-checked.
+          EXCLUDES=()
+          while IFS= read -r ref; do
+            [ -n "$ref" ] && EXCLUDES+=("^$ref")
+          done < <(git for-each-ref --format='%(refname:short)' \
+              refs/remotes/origin/main \
+              refs/remotes/origin/develop \
+              'refs/remotes/origin/release/*' \
+              'refs/remotes/origin/hotfix/*' \
+              'refs/remotes/origin/dev/*' 2>/dev/null)
+
+          # Exclude the PR base branch too (no-op when it is one of the refs
+          # above; load-bearing when the base is a feature branch).
+          git rev-parse --verify "origin/$BASE" >/dev/null 2>&1 && \
+            EXCLUDES+=("^origin/$BASE")
+
+          # --no-merges: skip auto-generated merge commits (e.g. from "Update branch" /
+          # `git merge develop` into a feature branch). They have no Signed-off-by and
+          # are bookkeeping, not authored content. Matches Probot DCO behavior.
+          COMMITS=$(git rev-list --no-merges HEAD "${EXCLUDES[@]}" 2>/dev/null || echo "")
+          if [ -z "$COMMITS" ]; then
+            echo "No new commits to check."
+            exit 0
+          fi
+          echo "Checking $(echo "$COMMITS" | wc -l) commit(s) authored on this branch..."
+          FAILED=0
+          for sha in $COMMITS; do
+            MSG=$(git log -1 --format="%B" "$sha")
+            if ! echo "$MSG" | grep -q "^Signed-off-by:"; then
+              echo "FAIL: Commit $sha missing DCO sign-off"
+              echo "  Subject: $(git log -1 --format='%s' "$sha")"
+              FAILED=1
+            fi
+          done
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "All commits must include a Signed-off-by line."
+            echo "Use: git commit -s -m 'your message'"
+            echo "Or amend: git commit --amend -s --no-edit"
+            exit 1
+          fi
+          echo "OK: All commits have DCO sign-off."
+  folder-structure:
+    name: Check folder structure
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    # Downloading and unpacking the source artifact can consume five minutes.
+    # Allow setup headroom while keeping the validator itself bounded below.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          mkdir -p .ci
+          mv .source-artifact/tracked-files.txt .ci/tracked-files.txt
+          rm -rf .source-artifact
+
+      - name: Validate folder structures
+        timeout-minutes: 5
+        run: python3 .github/scripts/check_folder_structure.py
+
+  # ---------------------------------------------------------------------------
+  # Job 11b: No patent-encumbered media codecs in the agent image (OSRB)
+  # Defense in depth: (1) unit-test the shared scanner, (2) assert the
+  # Dockerfile still strips the codecs and wires the build-time guard so the
+  # protection cannot be silently removed, and (3) scan the ALREADY-PUBLISHED
+  # agent image the blueprint pins (pulled from nvcr.io, resolved the same way
+  # as the container-source check) for any FFmpeg/H.264/H.265 codec library.
+  # No local build, so it can't flake on base-image registry rate limits; the
+  # Dockerfile's build-time guard still enforces this in the publish build.
+  # ---------------------------------------------------------------------------
+  codec-scan:
+    name: No Patented Codecs (agent image)
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    env:
+      NGC_CLI_API_KEY: ${{ secrets.NGC_CLI_API_KEY }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Unit-test the codec scanner
+        run: python3 .github/scripts/test_check_no_patented_codecs.py
+
+      # Cheap, always-runs guard so the protection can't be silently removed
+      # even if the published-image pull below is skipped (e.g. missing NGC key).
+      - name: Assert Dockerfile strips codecs and excludes FFmpeg source
+        run: |
+          DF=services/agent/docker/Dockerfile
+          fail() { echo "ERROR: $1 (see $DF)"; exit 1; }
+          if grep -qE '^[[:space:]]*COPY .*([3]rdparty/ffmpeg|third_party/ffmpeg|verify_ffmpeg_tarball)' "$DF"; then
+            fail "FFmpeg source or its verifier must not be copied into any image stage"
+          fi
+          if grep -qF 'verify_ffmpeg_tarball' "$DF"; then
+            fail "obsolete FFmpeg source verification step remains"
+          fi
+          grep -qF 'opencv_python_headless.libs' "$DF" \
+            || fail "OpenCV/FFmpeg removal step missing"
+          grep -qF 'libav*.so*' "$DF" \
+            || fail "FFmpeg shared-library removal glob missing"
+          grep -qF 'patent-encumbered codec libraries present in image' "$DF" \
+            || fail "build-time codec guard missing"
+          echo "OK: Dockerfile excludes FFmpeg source, removes codecs, and enforces the build-time guard."
+
+      # The committed deploy coordinate may target GHCR or NGC.
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # NGC_CLI_API_KEY lets us pull the published agent image from nvcr.io.
+      - name: Log in to NGC
+        if: ${{ env.NGC_CLI_API_KEY != '' }}
+        run: echo "${NGC_CLI_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      # Scan the ALREADY-PUBLISHED agent image the blueprint pins (resolved from
+      # deploy/docker exactly like the container-source check) via `docker
+      # export`, which flattens the layers so codec files deleted at build time
+      # correctly do not appear. No local build -> no base-image rate-limit flakes.
+      # Gated on NGC_CLI_API_KEY (same as the login above): the pinned image lives
+      # in a private nvcr.io registry, so without the secret (fork PRs, dev boxes)
+      # the docker pull would fail. The always-on unit test + Dockerfile assertion
+      # above, plus the Dockerfile build-time guard in the gated publish build,
+      # keep enforcing the policy when this scan is skipped.
+      # PR mirrors publish only pr-<N>-* candidates; develop-latest is created
+      # after merge, so the committed deploy coordinate is not pullable yet.
+      - name: Scan the deployed agent image for patent-encumbered codecs
+        if: ${{ env.NGC_CLI_API_KEY != '' && !startsWith(github.ref_name, 'pull-request/') }}
+        run: python3 .github/scripts/check_no_patented_codecs.py --from-deploy vss-agent
+
+  # ---------------------------------------------------------------------------
+  # Job 11c: Container coordinates golden test (containers.env SSOT)
+  # Guards the single source of truth for first-party image coordinates:
+  # (1) unit-test the resolver, (2) prove every resolved compose image ref
+  # matches the checked-in golden file, and (3) prove containers.env cannot
+  # drift from the inline compose defaults. Pure Python, no registry access.
+  # ---------------------------------------------------------------------------
+  compose-golden:
+    name: Container Coordinates Golden
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          # Full depth: the version-stamp check below derives the release line
+          # from the nearest v* tag, which a shallow clone cannot reach.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Unit-test static CI and deployment guards
+        run: |
+          python3 .github/scripts/test_agent_config_defaults.py
+          python3 .github/scripts/test_compose_image_golden.py
+          python3 .github/scripts/test_helm_release_channel_policy.py
+          python3 .github/scripts/test_rtvi_vlm_env_docs.py
+          python3 .github/scripts/test_diagnose_sonarqube_failure.py
+
+      - name: Unit-test the release-set tooling
+        run: python3 .github/scripts/test_release_set.py
+
+      - name: Unit-test the build change detection
+        run: |
+          python3 .github/scripts/test_detect_changed_images.py
+          python3 .github/scripts/test_detect_sonarqube_projects.py
+          python3 .github/scripts/test_container_build_plan.py
+
+      - name: Unit-test the version stamp (skills, compose edge, helm edge)
+        run: python3 .github/scripts/test_stamp_versions.py
+
+      # Every stamped version field -- SKILL.md metadata.version, the
+      # containers.env VSS_VERSION line, each ingress chart's vssVersion -- must
+      # equal the release line of the nearest v* tag (.github/version-convention.md).
+      # A hand edit, or a new skill / ingress chart without its field, fails
+      # here with the file list; the fix is `python3 .github/scripts/stamp_versions.py`,
+      # never the number. A PR opened before a new v* tag lands fails until it
+      # is rebased onto develop -- once per line, by design.
+      - name: Stamped version fields agree with the release tag
+        run: python3 .github/scripts/stamp_versions.py --check
+
+      - name: Unit-test the downstream GHCR candidate reporter
+        run: |
+          python3 .github/scripts/test_github_build_run.py
+          python3 .github/scripts/test_prepare_downstream_release_set.py
+          python3 .github/scripts/test_trigger_downstream_pipeline.py
+          python3 .github/scripts/test_advance_ghcr_alias.py
+          python3 .github/scripts/test_cleanup_pr_tags.py
+          python3 .github/scripts/test_cancel_stale_pr_ci.py
+          python3 .github/scripts/test_cancel_downstream_pipeline.py
+          python3 .github/scripts/test_poll_downstream_pipeline.py
+
+      - name: Unit-test the GHCR immutability/provenance guard
+        run: python3 .github/scripts/test_ghcr_image_guard.py
+
+      - name: Verify resolved image refs match the golden file
+        run: python3 .github/scripts/compose_image_golden.py
+
+      - name: Verify profile dependency closure over the container inventory
+        run: python3 .github/scripts/release_set.py closure
+
+
+  # ---------------------------------------------------------------------------
+  # Job 11d: Helm chart render checks
+  # Renders the developer-profile charts and asserts what they emit: the VIOS
+  # sensor's peer endpoints name Services the same render creates (direct,
+  # SDRC and mixed-prefix installs, with mismatches refused), VST config
+  # timeouts and placeholders, the canonical ingress route table, and
+  # vssIngress.annotations on every profile. Uses the Helm preinstalled on the
+  # hosted runner; every profile dependency is a local file:// chart.
+  # ---------------------------------------------------------------------------
+  helm-render:
+    name: Helm Chart Render Checks
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+
+      - name: Build developer-profile chart dependencies
+        run: |
+          helm version --short
+          # Every chart that owns an ingress: the version route
+          # (deploy/tests/test_helm_ingress_version_route.py) is rendered on all of them.
+          for profile in deploy/helm/developer-profiles/*/ deploy/helm/industry-profiles/warehouse-operations/warehouse-{2d,3d,mv3dt}-app/; do
+            helm dependency build "$profile"
+          done
+
+      - name: Render checks
+        run: |
+          uv run --no-project --with pyyaml python deploy/helm/scripts/verify-vios-runtime.py
+          uv run --no-project --with pyyaml python deploy/helm/scripts/verify-ingress-routes.py
+          uvx --with pyyaml pytest -q deploy/tests
+
+  # ---------------------------------------------------------------------------
+  # Job 12: Wait for this commit's separate Build Dev Images workflow
+  # ---------------------------------------------------------------------------
+  # GitHub Actions cannot express `needs` across workflow files. Treat the
+  # successful release-set artifact as the completion signal, then pass that
+  # exact artifact to the downstream trigger job.
+  wait-for-build-dev-images:
+    name: Wait for Build Dev Images
+    needs: prepare-source
+    if: needs.prepare-source.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    outputs:
+      run-downstream: ${{ steps.release-set.outputs.run_downstream }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # Full history: the downstream gate diffs changed paths against the
+      # previous commit. A shallow checkout makes that diff fail, which
+      # fails open and runs downstream for every push -- safe, but it
+      # defeats the gate.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Wait for successful GHCR release set
+        id: release-set
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/prepare_downstream_release_set.py \
+            --attempts 520 \
+            --interval-seconds 15 \
+            --repo-root . \
+            --before "${{ github.event.before }}"
+
+
+  # ---------------------------------------------------------------------------
+  # Job 12: OSRB dispatch wiring
+  # ---------------------------------------------------------------------------
+  # The OSRB Review workflow itself runs on `workflow_run` from the default
+  # branch, so a pull request never executes its own copy. These tests are the
+  # only pre-merge signal on that wiring: they assert the workflow supplies
+  # every variable the downstream helpers require, keeps the private code-ref
+  # choice out of the public repo, and creates the check before anything that
+  # can fail.
+  osrb-dispatch:
+    name: OSRB Dispatch Wiring
+    needs: prepare-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Unit-test the OSRB dispatch boundary
+        run: python3 .github/osrb/test_osrb_dispatch.py
+
+      # The source- and use-side passes need the working tree, so they run
+      # here rather than in the artifact-based package job alongside
+      # test_osrb_scan.py / test_osrb_summary.py.
+      - name: Unit-test the OSRB source and use-side passes
+        run: |
+          python3 .github/osrb/test_osrb_sources.py
+          python3 .github/osrb/test_osrb_usage.py
+
+      # The state pipeline: reads the whole tree and the committed
+      # baseline, so it needs the checkout too.
+      - name: Unit-test the OSRB approved-state comparison
+        run: |
+          python3 .github/osrb/test_osrb_inventory.py
+          python3 .github/osrb/test_osrb_compare.py
+          python3 .github/osrb/test_osrb_seed.py
+          python3 .github/osrb/test_osrb_agent.py
+
+  # ---------------------------------------------------------------------------
+  # Job 13: Trigger downstream pipeline and poll it to completion
+  # ---------------------------------------------------------------------------
+  trigger-downstream-pipeline:
+    name: Trigger Downstream Pipeline
+    # Intentionally NOT depending on `test` (pytest) or `frontend-build`
+    # so they run in parallel with this job - the downstream pipeline is
+    # the long pole (~hours), and the upstream pytest / UI build are
+    # independent of what the downstream pipeline exercises. They still
+    # gate the overall workflow conclusion via GitHub's required checks.
+    needs:
+      - prepare-source
+      - lint
+      - codec-installer-test
+      - typecheck
+      - security
+      - frontend-lint
+      - copyright-headers
+      - dco
+      - folder-structure
+      - wait-for-build-dev-images
+    if: >-
+      !cancelled() &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      !contains(needs.*.result, 'skipped') &&
+      needs.wait-for-build-dev-images.outputs.run-downstream == 'true'
+    runs-on: [self-hosted, downstream-pipeline]
+    # Holds the runner until the downstream pipeline completes. Must be
+    # at least as long as MAX_POLL_DURATION_SECONDS in the poll step
+    # (+ a small safety buffer).
+    timeout-minutes: 310
+    permissions:
+      actions: read
+      contents: read
+      # Needed so the trigger script can resolve the PR's base branch and
+      # the candidate reporter can update the validated-image PR comment.
+      # The workflow runs on `pull-request/<N>` synthetic push refs created
+      # by copy-pr-bot rather than on a `pull_request` event.
+      pull-requests: write
+      issues: write
+    env:
+      DOWNSTREAM_CI_URL: ${{ secrets.DOWNSTREAM_CI_URL }}
+      DOWNSTREAM_CI_TOKEN: ${{ secrets.DOWNSTREAM_CI_TOKEN }}
+      DOWNSTREAM_PROJECT_PATH: ${{ secrets.DOWNSTREAM_PROJECT_PATH }}
+      DOWNSTREAM_REF: main
+      DOWNSTREAM_SUBMODULE_HASH_VARIABLE: VSS_SUBMODULE_HASH
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: source-${{ github.sha }}
+          path: .source-artifact
+
+      - name: Unpack source artifact
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .source-artifact -exec rm -rf {} +
+          tar -xzf .source-artifact/source.tar.gz --strip-components=1
+          mkdir -p .ci
+          mv .source-artifact/tracked-files.txt .ci/tracked-files.txt
+          rm -rf .source-artifact
+
+      - name: Prepare GHCR release-set handoff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/prepare_downstream_release_set.py
+
+      - name: Trigger pipeline
+        id: trigger
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/trigger_downstream_pipeline.py
+
+      - name: Poll pipeline
+        env:
+          DOWNSTREAM_PIPELINE_ID: ${{ steps.trigger.outputs.pipeline_id }}
+          DOWNSTREAM_PROJECT_ID: ${{ steps.trigger.outputs.project_id }}
+          POLL_INTERVAL_SECONDS: "120"
+          MAX_POLL_DURATION_SECONDS: "14400"  # 4 hours
+        run: python3 .github/scripts/poll-downstream-pipeline.py
+
+      - name: Cancel downstream if this GitHub job was cancelled
+        if: cancelled()
+        env:
+          DOWNSTREAM_PIPELINE_ID: ${{ steps.trigger.outputs.pipeline_id }}
+          DOWNSTREAM_PROJECT_ID: ${{ steps.trigger.outputs.project_id }}
+        run: python3 .github/scripts/cancel_downstream_pipeline.py

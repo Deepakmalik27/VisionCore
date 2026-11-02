@@ -1,0 +1,81 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <string>
+#include <jsoncpp/json/json.h>
+#include "device_manager.h"
+
+inline constexpr int PORT_TIMED_WAIT_STATE = 6;
+
+// HTTP and JSON safety constants
+inline constexpr int MAX_JSON_SIZE_BYTES = 1000000;
+inline constexpr int MAX_JSON_DEPTH = 50;
+inline constexpr int MAX_JSON_KEYS = 10000;
+inline constexpr int MAX_JSON_OBJECT_KEYS = 1000;
+inline constexpr int MAX_JSON_ARRAY_ELEMENTS = 10000;
+inline constexpr int MAX_JSON_KEY_LENGTH = 256;
+inline constexpr int MAX_JSON_STRING_LENGTH = 65536;
+inline constexpr int MAX_JSON_STACK_LIMIT = 50;
+
+typedef struct _curlRequestFields
+{
+    std::string m_url;
+    std::string m_method;
+    std::string m_jsonData;
+    int m_timeout;
+    int m_httpErrorCode;
+    std::string m_httpErrorString;
+} CurlRequestFields;
+
+int openProbe();
+int sendProbe(const std::string& inIpAddress = "");
+int sendProbeToSensor(nv_vms::SensorInfo& sensor);
+void closeProbe();
+int stopOnvifDiscovery();
+int getProbeMatch(nv_vms::SensorInfo& sensor);
+bool isCameraOnline(nv_vms::SensorInfo& sensor);
+bool curlGetRequest(const std::string& url, long& http_code);
+// timeout_ms bounds both connection setup and the complete transfer.  The
+// default preserves the historical 10-second behaviour for existing callers.
+bool curlGetRequest(const std::string url, std::string& outData, long timeout_ms = 10000L);
+bool curlGetRequest(const std::string& url, const std::string& username,
+                              const std::string& password, std::string& outData);
+bool curlPostRequest(const std::string& httpUrl, const std::string& username, const std::string& password,
+        const std::string& rest_api, const std::string& params, std::string& response, bool is_digest = false, std::vector<std::string> headers = std::vector<std::string>());
+bool curlPostRequest_2(const std::string& httpUrl, std::vector<std::string> header_list, std::string& response);
+bool curlPostRequest(const std::string url, std::string& outData, const Json::Value& postData);
+bool curlDeleteRequest(const std::string& httpUrl, std::vector<std::string> header_list, std::string& response);
+int checkIfPortAvailable(const int& port, const std::string& proto = "udp");
+bool curlGetRequest(const std::string url, std::string& outData, const std::vector<std::string>& customHeaders);
+bool curlPostRequest(const std::string url, std::string& outData, const Json::Value& postData, const std::vector<std::string>& customHeaders);
+int curlSendRequest(CurlRequestFields& curlFields, std::string& outData);
+bool isTcpPortAvailable(int port);
+bool isRtspServerReachable(const std::string& rtsp_server, bool is_url_provided = true);
+std::string getUrlWithQueryParameters(const std::string& url, const std::map<std::string, std::string, std::less<>>& queryParams);
+
+// HTTP utility functions for safer operations
+bool safeStringEqual(const char* str1, const char* str2);
+bool isValidHttpMethod(const char* method);
+bool isValidContentLength(long long contentLength, long long maxLength, const char* httpMethod = nullptr);
+std::string safeGetString(const char* ptr, const std::string& defaultValue = "", bool sanitize = false);
+
+// JSON safety functions for preventing attacks
+bool isJsonSafe(const std::string& jsonStr, size_t maxDepth = MAX_JSON_DEPTH, size_t maxKeys = MAX_JSON_KEYS);
+Json::CharReaderBuilder createSafeJsonReaderBuilder();
+bool validateJsonStructure(const Json::Value& json, size_t maxDepth = MAX_JSON_DEPTH, size_t currentDepth = 0);

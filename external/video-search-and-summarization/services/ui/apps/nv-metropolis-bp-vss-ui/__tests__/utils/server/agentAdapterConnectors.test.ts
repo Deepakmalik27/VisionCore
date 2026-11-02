@@ -1,0 +1,639 @@
+/** @jest-environment node */
+
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+import type { AgentAdapterConfig } from "../../../utils/server/agentAdapter/config";
+import { ConnectorError } from "../../../utils/server/agentAdapter/connectors/base";
+import { OpenClawConnector } from "../../../utils/server/agentAdapter/connectors/openClaw";
+import { ResponsesConnector } from "../../../utils/server/agentAdapter/connectors/responses";
+import type { WebSocketLike } from "../../../utils/server/agentAdapter/connectors/websocket";
+import { parseCreateRunRequest } from "../../../utils/server/agentAdapter/contract";
+import { AgentAdapterService } from "../../../utils/server/agentAdapter/service";
+
+const config = (
+  overrides: Partial<AgentAdapterConfig> = {}
+): AgentAdapterConfig => ({
+  backendProtocol: "responses",
+  backendUrl: "http://agent.local",
+  backendPath: "/v1/responses",
+  backendToken: "backend-secret",
+  backendModel: "agent",
+  backendSessionField: "user",
+  backendSessionHeader: "X-Agent-Session",
+  backendHeaders: {},
+  requestTimeoutMs: 5_000,
+  runRetentionMs: 60_000,
+  maxRuns: 100,
+  maxEventsPerRun: 1_000,
+  maxEventCharsPerRun: 1_000_000,
+  maxThreadStateChars: 1_000_000,
+  maxRetainedChars: 4_000_000,
+  ...overrides,
+});
+
+const requestWithInstructions = parseCreateRunRequest({
+  thread_id: "thread-1",
+  input: [{ role: "user", content: "Find a clip" }],
+  instructions:
+    'VSS UI request parameters for this turn (JSON):\n{"llm_reasoning":true}',
+});
+
+const sseResponse = (
+  ...events: Array<[string, Record<string, unknown>]>
+): Response =>
+  new Response(
+    events
+      .map(
+        ([type, payload]) =>
+          `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`
+      )
+      .join(""),
+    { headers: { "Content-Type": "text/event-stream" } }
+  );
+
+class FakeOpenClawSocket extends EventTarget implements WebSocketLike {
+  readyState = 0;
+  binaryType: BinaryType = "arraybuffer";
+  readonly sent: Record<string, unknown>[] = [];
+  private sessionKey = "";
+  private runId = "";
+
+  constructor(private readonly imageMode?: "final" | "read") {
+    super();
+    queueMicrotask(() => {
+      this.readyState = 1;
+      this.dispatchEvent(new Event("open"));
+      this.message({
+        type: "event",
+        event: "connect.challenge",
+        payload: { nonce: "nonce", ts: 1 },
+      });
+    });
+  }
+
+  private message(payload: Record<string, unknown>): void {
+    this.dispatchEvent(
+      new MessageEvent("message", { data: JSON.stringify(payload) })
+    );
+  }
+
+  send(data: string): void {
+    const frame = JSON.parse(data) as Record<string, unknown>;
+    this.sent.push(frame);
+    const params = frame.params as Record<string, unknown>;
+    if (frame.method === "connect") {
+      queueMicrotask(() =>
+        this.message({
+          type: "res",
+          id: frame.id,
+          ok: true,
+          payload: {
+            type: "hello-ok",
+            protocol: 4,
+            auth: {
+              role: "operator",
+              scopes: ["operator.read", "operator.write"],
+            },
+            features: {
+              methods: ["chat.send", "chat.abort"],
+              events: ["chat", "session.tool"],
+            },
+          },
+        })
+      );
+    } else if (frame.method === "chat.send") {
+      this.sessionKey = String(params.sessionKey);
+      this.runId = "upstream-run";
+      queueMicrotask(() => {
+        this.message({
+          type: "res",
+          id: frame.id,
+          ok: true,
+          payload: { runId: this.runId, status: "accepted" },
+        });
+        this.message({
+          type: "event",
+          event: "session.tool",
+          payload: {
+            sessionKey: this.sessionKey,
+            runId: this.runId,
+            data:
+              this.imageMode === "read"
+                ? {
+                    id: "tool-1",
+                    name: "tool_call",
+                    phase: "started",
+                    args: {
+                      id: "openclaw:core:read",
+                      args: {
+                        path: "/sandbox/.openclaw/workspace/warehouse_safety_0002_12.5s.jpg",
+                      },
+                    },
+                  }
+                : { id: "tool-1", name: "vss", phase: "started" },
+          },
+        });
+        this.message({
+          type: "event",
+          event: "session.tool",
+          payload: {
+            sessionKey: this.sessionKey,
+            runId: this.runId,
+            data: {
+              id: "tool-1",
+              name: "vss",
+              phase: "completed",
+              result:
+                this.imageMode === "read"
+                  ? '{"result":{"content":[]}}[... 100 more characters truncated; rerun with narrower args if needed]'
+                  : { ok: true },
+            },
+          },
+        });
+        this.message({
+          type: "event",
+          event: "chat",
+          payload: {
+            sessionKey: this.sessionKey,
+            runId: this.runId,
+            state: "delta",
+            deltaText: "Found it",
+          },
+        });
+        this.message({
+          type: "event",
+          event: "chat",
+          payload: {
+            sessionKey: this.sessionKey,
+            runId: this.runId,
+            state: "final",
+            ...(this.imageMode === "final"
+              ? {
+                  message: {
+                    content: [
+                      { type: "text", text: "Found it" },
+                      {
+                        type: "image",
+                        url: `/api/chat/media/outgoing/${encodeURIComponent(
+                          this.sessionKey
+                        )}/797be77f-b6ce-47bd-b4ef-a95fdc2586d9/full`,
+                        alt: "warehouse_safety_0002_12.5s---939218c3-85e1-4221-9fcd-ba731cadfa93.jpg",
+                        mimeType: "image/jpeg",
+                      },
+                    ],
+                  },
+                }
+              : {}),
+          },
+        });
+      });
+    }
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.dispatchEvent(new Event("close"));
+  }
+}
+
+describe("embedded adapter connectors", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  it("normalizes Responses text and tool events while keeping credentials server-side", async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      sseResponse(
+        [
+          "response.output_item.added",
+          {
+            response: { id: "resp_1" },
+            item: {
+              type: "function_call",
+              id: "item-1",
+              call_id: "call-1",
+              name: "search",
+            },
+          },
+        ],
+        [
+          "response.function_call_arguments.delta",
+          { item_id: "item-1", delta: '{"q":"fire"}' },
+        ],
+        [
+          "response.output_item.done",
+          {
+            item: {
+              type: "function_call",
+              id: "item-1",
+              call_id: "call-1",
+              name: "search",
+              status: "completed",
+              arguments: '{"q":"fire"}',
+            },
+          },
+        ],
+        ["response.output_text.delta", { delta: "Found it" }],
+        ["response.completed", { response: { id: "resp_1" } }]
+      )
+    ) as jest.Mock;
+
+    const connector = new ResponsesConnector(config());
+    const events = [];
+    for await (const event of connector.run(
+      requestWithInstructions,
+      "run-1",
+      new AbortController().signal
+    )) {
+      events.push(event);
+    }
+
+    expect(events.map((event) => event.type)).toEqual([
+      "tool.started",
+      "tool.arguments.delta",
+      "tool.completed",
+      "message.delta",
+    ]);
+    const [, options] = (global.fetch as jest.Mock).mock.calls[0];
+    expect((options.headers as Headers).get("Authorization")).toBe(
+      "Bearer backend-secret"
+    );
+    expect((options.headers as Headers).get("X-Agent-Session")).toMatch(
+      /^vss-ui:/
+    );
+    expect(JSON.parse(options.body as string)).toEqual(
+      expect.objectContaining({
+        model: "agent",
+        stream: true,
+        store: true,
+        tools: [
+          expect.objectContaining({
+            name: "vss_ui_publish_artifact",
+            parameters: expect.objectContaining({
+              properties: expect.objectContaining({
+                kind: expect.objectContaining({
+                  enum: expect.arrayContaining(["vss.media.image"]),
+                }),
+              }),
+            }),
+          }),
+        ],
+        instructions: expect.stringContaining(
+          'VSS UI request parameters for this turn (JSON):\n{"llm_reasoning":true}'
+        ),
+      })
+    );
+  });
+
+  it("extracts snapshot artifacts from legacy agent tool payloads", async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      new Response(
+        `intermediate_data: ${JSON.stringify({
+          id: "snapshot-1",
+          name: "snapshot",
+          status: "completed",
+          payload: {
+            kind: "snapshot",
+            media_url: "http://vios:30888/storage/temp/snapshot.jpg",
+            name: "warehouse_safety_0001",
+            at: "2026-09-15T00:00:05Z",
+          },
+        })}\ndata: [DONE]\n`,
+        { headers: { "Content-Type": "text/event-stream" } }
+      )
+    );
+    const service = new AgentAdapterService(
+      config({
+        backendProtocol: "legacy-chat",
+        backendPath: "/chat/completions",
+      })
+    );
+    const { record } = service.createRun(requestWithInstructions);
+
+    for (let attempt = 0; attempt < 20 && !record.terminal; attempt += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    expect(record.terminal).toBe(true);
+    expect(record.eventsAfter(0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "artifact.created",
+          data: expect.objectContaining({
+            kind: "vss.media.image",
+            payload: expect.objectContaining({
+              media_url: "/vst/storage/temp/snapshot.jpg",
+              sensor: "warehouse_safety_0001",
+            }),
+          }),
+        }),
+      ])
+    );
+    expect(service.capabilities()).toEqual(
+      expect.objectContaining({
+        artifact_protocol: expect.objectContaining({
+          kinds: expect.arrayContaining(["vss.media.image"]),
+        }),
+      })
+    );
+  });
+
+  it.each([
+    ["backend_auth_error", true],
+    ["backend_scope_error", true],
+    ["backend_unreachable", false],
+  ])("records rejected credentials when a run fails with %s", async (code, rejected) => {
+    jest
+      .spyOn(OpenClawConnector.prototype, "run")
+      // eslint-disable-next-line require-yield
+      .mockImplementation(async function* () {
+        throw new ConnectorError("gateway failure", code, true);
+      });
+    const service = new AgentAdapterService(
+      config({ backendProtocol: "openclaw-ws", backendUrl: "ws://agent.local", backendPath: "/" })
+    );
+    const { record } = service.createRun(requestWithInstructions);
+
+    for (let attempt = 0; attempt < 20 && !record.terminal; attempt += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    expect(record.terminal).toBe(true);
+    expect(service.credentialsRejected).toBe(rejected);
+  });
+
+  it("marks a failed run undelivered only when the connector knows nothing was sent", async () => {
+    const openClaw = new AgentAdapterService(
+      config({ backendProtocol: "openclaw-ws", backendUrl: "ws://agent.local", backendPath: "/" })
+    );
+    // The OpenClaw socket cannot open, so the gateway never sees the turn.
+    jest.spyOn(OpenClawConnector.prototype, "run").mockRestore();
+    (openClaw as unknown as { connector: OpenClawConnector }).connector = new OpenClawConnector(
+      openClaw.config,
+      () => {
+        throw new Error("connection refused");
+      }
+    );
+    global.fetch = jest.fn().mockRejectedValue(new TypeError("socket hang up"));
+    const responses = new AgentAdapterService(config());
+
+    const failures = [];
+    for (const service of [openClaw, responses]) {
+      const { record } = service.createRun(requestWithInstructions);
+      for (let attempt = 0; attempt < 20 && !record.terminal; attempt += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      failures.push(record.eventsAfter(0).find((event) => event.type === "run.failed")?.data);
+    }
+
+    expect(failures[0]).toEqual({
+      error: expect.objectContaining({ code: "backend_unreachable", delivered: false }),
+    });
+    expect(failures[1]).toEqual({
+      error: expect.objectContaining({ code: "backend_unreachable" }),
+    });
+    expect((failures[1] as { error: object }).error).not.toHaveProperty("delivered");
+  });
+
+  it("uses native OpenClaw chat and tool events with narrow requested scopes", async () => {
+    const socket = new FakeOpenClawSocket();
+    const connector = new OpenClawConnector(
+      config({
+        backendProtocol: "openclaw-ws",
+        backendUrl: "ws://agent.local",
+        backendPath: "/",
+        backendSessionField: undefined,
+        backendSessionHeader: undefined,
+      }),
+      () => socket
+    );
+    const events = [];
+    for await (const event of connector.run(
+      requestWithInstructions,
+      "run-1",
+      new AbortController().signal
+    )) {
+      events.push(event);
+    }
+
+    expect(events.map((event) => event.type)).toEqual([
+      "tool.started",
+      "tool.completed",
+      "message.delta",
+    ]);
+    expect(events[1].data._artifact_source).toEqual({ ok: true });
+    const connect = socket.sent.find((frame) => frame.method === "connect");
+    expect((connect?.params as Record<string, unknown>).scopes).toEqual([
+      "operator.read",
+      "operator.write",
+    ]);
+    const send = socket.sent.find((frame) => frame.method === "chat.send");
+    expect((send?.params as Record<string, unknown>).message).toBe(
+      'VSS UI instructions:\nVSS UI request parameters for this turn (JSON):\n{"llm_reasoning":true}\n\nUser:\nFind a clip'
+    );
+  });
+
+  it("materializes final OpenClaw managed images as private artifact sources", async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ available: true, mediaTicket: "media-ticket" }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(Uint8Array.from([0xff, 0xd8, 0xff]), {
+          headers: {
+            "Content-Type": "image/jpeg",
+            "Content-Length": "3",
+          },
+        })
+      ) as jest.Mock;
+    const connector = new OpenClawConnector(
+      config({
+        backendProtocol: "openclaw-ws",
+        backendUrl: "ws://agent.local/gateway",
+        backendPath: "/",
+        backendSessionField: undefined,
+        backendSessionHeader: undefined,
+      }),
+      () => new FakeOpenClawSocket("final")
+    );
+
+    const events = [];
+    for await (const event of connector.run(
+      requestWithInstructions,
+      "run-1",
+      new AbortController().signal
+    )) {
+      events.push(event);
+    }
+
+    expect(events.map((event) => event.type)).toEqual([
+      "tool.started",
+      "tool.completed",
+      "message.delta",
+      "artifact.source",
+    ]);
+    expect(events[3].data.source).toEqual({
+      type: "image",
+      data: "/9j/",
+      mimeType: "image/jpeg",
+      alt: "warehouse_safety_0002_12.5s---939218c3-85e1-4221-9fcd-ba731cadfa93.jpg",
+    });
+    const metadataUrl = new URL(
+      (global.fetch as jest.Mock).mock.calls[0][0] as URL
+    );
+    expect(metadataUrl.pathname).toBe(
+      "/gateway/__openclaw__/assistant-media"
+    );
+    expect(metadataUrl.searchParams.get("source")).toBe(
+      "/sandbox/.openclaw/workspace/warehouse_safety_0002_12.5s.jpg"
+    );
+    expect(
+      ((global.fetch as jest.Mock).mock.calls[0][1].headers as Headers).get(
+        "Authorization"
+      )
+    ).toBe("Bearer backend-secret");
+  });
+
+  it("recovers image reads when OpenClaw truncates the tool result", async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ available: true, mediaTicket: "media-ticket" }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(Uint8Array.from([0xff, 0xd8, 0xff]), {
+          headers: {
+            "Content-Type": "image/jpeg",
+            "Content-Length": "3",
+          },
+        })
+      ) as jest.Mock;
+    const connector = new OpenClawConnector(
+      config({
+        backendProtocol: "openclaw-ws",
+        backendUrl: "ws://agent.local",
+        backendPath: "/",
+        backendSessionField: undefined,
+        backendSessionHeader: undefined,
+      }),
+      () => new FakeOpenClawSocket("read")
+    );
+
+    const events = [];
+    for await (const event of connector.run(
+      requestWithInstructions,
+      "run-1",
+      new AbortController().signal
+    )) {
+      events.push(event);
+    }
+
+    expect(events.map((event) => event.type)).toEqual([
+      "tool.started",
+      "tool.completed",
+      "artifact.source",
+      "message.delta",
+    ]);
+    expect(events[2].data.source).toEqual({
+      type: "image",
+      data: "/9j/",
+      mimeType: "image/jpeg",
+      alt: "VSS snapshot",
+    });
+  });
+
+  it("cancels managed image recovery with the agent run", async () => {
+    const controller = new AbortController();
+    global.fetch = jest.fn((_url, options) => {
+      const signal = (options as RequestInit).signal as AbortSignal;
+      queueMicrotask(() => controller.abort());
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        });
+      });
+    }) as jest.Mock;
+    const connector = new OpenClawConnector(
+      config({
+        backendProtocol: "openclaw-ws",
+        backendUrl: "ws://agent.local",
+        backendPath: "/",
+        backendSessionField: undefined,
+        backendSessionHeader: undefined,
+        requestTimeoutMs: 900_000,
+      }),
+      () => new FakeOpenClawSocket("final")
+    );
+
+    const events = [];
+    for await (const event of connector.run(
+      requestWithInstructions,
+      "run-1",
+      controller.signal
+    )) {
+      events.push(event);
+    }
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(events.map((event) => event.type)).toEqual([
+      "tool.started",
+      "tool.completed",
+      "message.delta",
+    ]);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues ordinary OpenClaw follow-ups in the same session", async () => {
+    const sockets: FakeOpenClawSocket[] = [];
+    const connector = new OpenClawConnector(
+      config({
+        backendProtocol: "openclaw-ws",
+        backendUrl: "ws://agent.local",
+        backendPath: "/",
+        backendSessionField: undefined,
+        backendSessionHeader: undefined,
+      }),
+      () => {
+        const socket = new FakeOpenClawSocket();
+        sockets.push(socket);
+        return socket;
+      }
+    );
+    const followUp = parseCreateRunRequest({
+      thread_id: "thread-1",
+      input: [{ role: "user", content: "Use the base profile" }],
+    });
+
+    for await (const _event of connector.run(
+      requestWithInstructions,
+      "run-1",
+      new AbortController().signal
+    )) {
+      // Drain the first completed turn.
+    }
+    for await (const _event of connector.run(
+      followUp,
+      "run-2",
+      new AbortController().signal
+    )) {
+      // Drain the normal follow-up turn.
+    }
+
+    const sessionKeys = sockets.map((socket) => {
+      const send = socket.sent.find((frame) => frame.method === "chat.send");
+      return (send?.params as Record<string, unknown>).sessionKey;
+    });
+    expect(sessionKeys).toHaveLength(2);
+    expect(sessionKeys[1]).toBe(sessionKeys[0]);
+  });
+});

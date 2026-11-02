@@ -1,0 +1,294 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+enabled: false
+# alerts | search | standalone-2d | standalone-3d | standalone-mv3dt
+profileMode: alerts
+
+global: {}
+imagePullSecrets:
+  - name: ngc-docker-reg-secret
+scripts:
+  create: false
+  existingConfigMap: ""
+  data: {}
+
+# Managed GHCR channel, shared with the Docker compose coordinate
+# (VSS_RT_CV_IMAGE / VSS_RT_CV_TAG in deploy/docker/containers.env). Override
+# both together via global.container_prefix / global.container_tag.
+#
+# SBSA cannot ride this multiarch manifest (different base image, same
+# linux/arm64 platform) so it is a separate build -- but it shares this GHCR
+# repository under an -sbsa tag suffix. DGX-SPARK deploys therefore override
+# only the tag, leaving `repository` on the managed channel:
+#   tag: "develop-latest-sbsa"
+#
+# Keep `repository:` on the line directly after `image:`. The release-channel
+# policy check (.github/scripts/test_helm_release_channel_policy.py) matches
+# that pair with a regex, and a comment between them makes it silently read the
+# next image block in this file instead.
+image:
+  repository: ghcr.io/nvidia-ai-blueprints/vss/vss-rt-cv
+  tag: "develop-latest"
+  pullPolicy: IfNotPresent
+
+replicas: 1
+statefulSetName: "vss-rtvi-cv"
+workingDir: /opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app
+runtimeClassName: ""
+
+service:
+  port: 9010
+  type: ClusterIP
+httpPort: 9000
+
+# Stream-affinity routing via a HAProxy stick table keyed on an HTTP header.
+# When enabled, the rendered Service carries `haproxy.org/*` annotations
+# that ask a HAProxy Ingress controller to record, on the first request for
+# each hashHeader value, which vss-rtvi-cv pod served it, and to route every
+# later request with the same value to that pod (stick-table, `stick on`).
+# Required for replica count > 1 so the DeepStream pipeline state stays
+# coherent for the lifetime of a stream.
+#
+# The table is per HAProxy process: controller replicas do NOT share entries
+# (the OSS controller has no peers sync), so affinity holds only for traffic
+# entering through one controller replica. Entries idle out after tableExpire
+# of inactivity; each match refreshes the timer, so a live stream never
+# expires. tableSize bounds the number of concurrently tracked streams.
+#
+# IMPORTANT — these annotations are only honored when traffic actually
+# flows through HAProxy Ingress. In the default chart deployment the
+# vss-agent connects to `vss-rtvi-cv:9000` (ClusterIP), so kube-proxy
+# load-balances directly and these annotations are inert. To make them
+# functional you need to (a) install the HAProxy Technologies
+# kubernetes-ingress controller, (b) add an Ingress that routes to this
+# Service, and (c) repoint the agent's RTVI_CV_BASE_URL at the ingress
+# endpoint. This toggle only emits the annotations; it does not create
+# the Ingress.
+streamAffinity:
+  enabled: true
+  hashHeader: x-stream-id
+  # Stick-table sizing: max concurrently tracked streams, and per-entry idle
+  # expiry (refreshed on every match).
+  tableSize: 10k
+  tableExpire: 30m
+# Long-running detection requests take minutes; keep this backend well above the
+# controller default when it is published through an ingress.
+ingressTimeoutServer: "3600s"
+
+streamType: "kafka"
+otelSdkDisabled: "true"
+otelServiceName: "rtvi-cv"
+deepstreamEnableSensorIdExtraction: "1"
+gstEnableCustomParserModifications: "1"
+hfHubOffline: "0"
+transformersOffline: "0"
+
+env:
+  DS_MODEL_FAMILY: "rtdetr-gdino"
+  DS_CONFIG_FILE: ""
+  DS_VISION_ENCODER: "false"
+  DS_TRACKER_REID: "false"
+  DS_SHOW_SENSOR_ID: "false"
+  DS_MODE_FLAG: "1"
+  DS_MESSAGE_RATE: "1"
+  VISION_ENCODER_MODEL: ""
+  VISION_ENCODER_VERSION: ""
+  MODEL_NAME_2D: "GDINO"
+  NUM_SENSORS: "1"
+  STREAM_TYPE: "kafka"
+  HARDWARE_PROFILE: ""
+
+kafka:
+  bootstrapServers: ""
+kafkaBrokerConnStr: ""
+
+# Rare: set true so PVC size comes only from values (may trigger resize). Default false = match existing claim when present.
+forceModelsStorageFromValues: false
+
+modelsVolume: {}
+# When true, ds-start phase 0 downloads ngcModelsToDownload into the models PVC.
+# When false, set DS_MODEL_DOWNLOAD=never on the main container.
+downloadModelsFromNgc: true
+# Retained for operators; wait-for-models init was removed. Prefer startupProbe budgets.
+downloadModelsFromNgcWaitSeconds: 900
+downloadModelsJob:
+  ttlSecondsAfterFinished: null
+# Opaque secret for NGC CLI (ds-start download phase + app-data Job). Not the docker-registry pull secret.
+ngcApiKeySecretName: "ngc-api"
+ngcApiKeySecretKey: "NGC_CLI_API_KEY"
+ngcOrg: "nvidia"
+ngcDownload:
+  storageUid: 1001
+  storageGid: 1001
+  # Unused for model download after Job removal; kept for compatibility / app-data tooling.
+  image:
+    repository: docker.io/library/ubuntu
+    tag: "22.04"
+    pullPolicy: IfNotPresent
+ngcModelsToDownload:
+  []
+
+# NGC *resource* bundle used for warehouse videos, playback, and calibration data.
+# RT-CV models are downloaded separately through ngcModelsToDownload.
+# Download Job unpacks the .tar.gz onto the shared -models PVC under vss-warehouse-app-data/.
+downloadNgcAppData: false
+ngcAppDataResourceVersion: "<vss-warehouse-app-data-resource>"
+# Required with NGC_CLI_API_KEY: registry org for the resource (e.g. nvidia for vss-warehouse).
+ngcAppDataOrg: "nvidia"
+downloadNgcAppDataWaitSeconds: 3600
+downloadNgcAppDataJob:
+  ttlSecondsAfterFinished: null
+
+# Used by warehouse standalone profile modes (metropolis warehouse ds-start.sh paths).
+standaloneWarehouse:
+  # Valid values depend on app profile; warehouse app profiles set kafka.
+  streamType: "none"
+  kafka:
+    rawTopic: mdx-raw
+  dsModeFlag2d: "1"
+  dsModeFlag3d: "5"
+  dsMessageRate: "1"
+  dsTrackerReid: "false"
+  dsShowSensorId: "false"
+  sparse4dDebugTs: "1"
+  networkWidth: "960"
+  networkHeight: "540"
+  hardwareProfile: ""
+  mv3dt:
+    instanceId: "0"
+    batchSize: "4"
+    maxBatchSize: "4"
+    mqttHost: ""
+    mqttServiceName: ""
+    mqttPort: "1883"
+    redisHost: ""
+    redisPort: "6379"
+    deepstreamEnableSensorIdExtraction: "0"
+    fusion:
+      enabled: true
+      image:
+        repository: ghcr.io/nvidia-ai-blueprints/vss/vss-rt-cv-mv3dt-bev-fusion
+        tag: develop-latest
+        pullPolicy: IfNotPresent
+      rawTopic: mdx-raw
+      fusedTopic: mdx-bev
+      sensorTimeoutMs: "100"
+      # Static, like docker-compose (NUM_STREAMS). Defaults to maxBatchSize.
+      # Truly-dynamic sensor count would be an image-side feature, not a Helm wrapper.
+      maxExpectedSensors: "4"
+      bufferDurationS: "2.0"
+      fusionMethod: "rays"
+      visibilityMin: "0.3"
+      # Views further than this from their own camera are dropped before fusing.
+      # Raising it adds distant detections, which are the noisiest.
+      # "0" disables the gate.
+      maxDist: "30"
+      # Filter each fused track over time; stateful, so it can be switched off.
+      # pixelSigma is the box's bottom-edge jitter, accelSigma how hard a tracked
+      # object may accelerate in m/s^2.
+      temporalFilter: "1"
+      pixelSigma: "3.0"
+      accelSigma: "3.0"
+      # "auto" measures it from overlapping views; "off" or metres to pin it.
+      footOffset: "auto"
+      # Views of one id further apart than this are different people. "0" disables.
+      conflictRadius: "2.0"
+      # Buckets of publish delay to let a backward pass run. "0" is causal.
+      smoothLag: "0"
+      # Reject a fused step implying more than this, m/s. "0" disables.
+      maxSpeed: "10"
+      reacquire: "10"
+      # On re-acquisition publish a new id instead of leaping the old one.
+      # "0" keeps the id and accepts the jump.
+      splitOnReacquire: "1"
+      # ConfigMap holding a calibration.json key, mounted for the fusionMethod
+      # values that use camera geometry (rays, closest). Leave empty and the
+      # chart resolves one itself: its own ConfigMap when
+      # files/warehouse-standalone-mv3dt/calibration/calibration.json is
+      # supplied, else an init container fetching from
+      # dynamicCameraConfig.calibrationApiUrl, the same source the perception pod
+      # uses. With none of the three available those methods refuse to start.
+      calibrationConfigMap: ""
+      resources: {}
+    # Appearance-based ReID re-association. When enabled, the tracker config
+    # gains the ReID and ReIDService blocks, the perception app runs with
+    # --tracker-reid, and startup waits for the ReID assets that the
+    # vss-reid-embed chart's staging Job writes onto this chart's models claim.
+    # Enable both sides together: rtvi.vss-reid-embed.enabled must also be true,
+    # and serviceAddress/servicePort must match that chart's Service.
+    reid:
+      enabled: false
+      serviceAddress: "vss-reid-embed"
+      servicePort: "8088"
+      # Directory on the models claim (mounted at /opt/storage) that the
+      # staging Job populates.
+      modelSubDir: reid
+      # CLIP-ReID ONNX the tracker loads, relative to the ReID directory.
+      onnxFileName: reid_model.onnx
+      # DeepStream derives the engine name from the ONNX plus batch/precision.
+      engineFileName: reid_model.onnx_b64_gpu0_fp32.engine
+      extractionInterval: "8"
+      # Hold DeepStream at startup until the ReID assets are staged, which the
+      # vss-reid-embed chart signals with a .reid-models-ready marker. When the
+      # staging Job is enabled the marker must also carry that Job's generation;
+      # a leftover file from an earlier run is not enough. Turn off only when
+      # the models are guaranteed present without that marker.
+      # Explicit false is honoured (the template uses hasKey, not Sprig default).
+      waitForModels: true
+      waitSeconds: 3600
+    # Generate camInfo + pub/sub + tracker cameraModelFilepath map from
+    # calibration.json at pod start (sensor ids/count come from calibration).
+    # DS batch size and fusion MAX_EXPECTED_SENSORS stay value-driven. Off by
+    # default in this reusable subchart (adds a runtime dependency on the
+    # calibration API); enable it in the MV3DT profile. Disabled falls back to
+    # the static caminfo ConfigMap.
+    dynamicCameraConfig:
+      enabled: false
+      calibrationApiUrl: "http://vss-video-analytics-api:8081/config/calibration"
+      waitTimeoutSeconds: 3600
+      configInit:
+        image:
+          repository: ghcr.io/nvidia-ai-blueprints/vss/vss-rt-cv-mv3dt-config-init
+          tag: develop-latest
+          pullPolicy: IfNotPresent
+
+modelsPvc:
+  create: false
+  size: 50Gi
+  storageClass: ""
+# Per-model metadata (onnx filenames, infer dims, etc.) is profile-specific and
+# should be defined in each profile values/template (e.g. dev-profile-search).
+
+persistence:
+  storageClass: ""
+  models:
+    size: 50Gi
+  # /opt/storage holds the models copied out of the models PVC plus the TRT
+  # engines built on first run. On emptyDir every restart rebuilds them.
+  runtimeStorage:
+    enabled: false
+    existingClaim: ""
+    size: 50Gi
+    storageClass: ""
+
+resources:
+  limits:
+    nvidia.com/gpu: 1
+  requests:
+    nvidia.com/gpu: 1
+
+nodeSelector: {}
+tolerations: []

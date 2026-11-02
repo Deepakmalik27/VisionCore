@@ -1,0 +1,260 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+include:
+  - path: ./sdrc/docker-compose.yaml
+
+services:
+  sensor-ms:
+    image: ${VST_SENSOR_IMAGE}
+    user: "0:0"
+    runtime: nvidia
+    entrypoint: ["/bin/bash", "-c", "exec /home/vst/vst_release/launch_vst"]
+    environment:
+      - CONTAINER_NAME=sensor-ms
+      - ADAPTOR=${VST_ADAPTOR}
+      # Optional adaptor credential override. When set (non-empty) these win over the
+      # adaptor_config.json entry; leave blank to use adaptor_config.json. Either source is valid.
+      - ADAPTOR_IP=${ADAPTOR_IP:-}
+      - ADAPTOR_USER=${ADAPTOR_USER:-}
+      - ADAPTOR_PASSWORD=${ADAPTOR_PASSWORD:-}
+      - ADAPTOR_PORT=${ADAPTOR_PORT:-}
+      - NEED_RECORDING=false
+      - NEED_RTSPSERVER=false
+      - VST_USE_SDRC=${VST_USE_SDRC:-false}
+      - VST_ENABLE_NOTIFICATION=${VST_ENABLE_NOTIFICATION:-${VST_USE_SDRC:-false}}
+      - RTSP_SERVER_MODULE_ENDPOINT=${STREAM_PROCESSOR_MODULE_ENDPOINT:-}
+      - NEED_STORAGE=false
+      - NEED_STREAM_MONITORING=true
+      - HTTP_PORT=${SENSOR_HTTP_PORT}
+      - PROMETHEUS_PORT=${SENSOR_PROMETHEUS_PORT}
+      - CENTRALIZE_DB_NAME=${CENTRALIZE_DB_NAME}
+      - CENTRALIZE_DB_USERNAME=${CENTRALIZE_DB_USERNAME}
+      - CENTRALIZE_DB_PASSWORD=${CENTRALIZE_DB_PASSWORD}
+      - CENTRALIZE_DB_PORT=${CENTRALIZE_DB_PORT}
+      - CENTRALIZE_DB_HOSTADDR=${CENTRALIZE_DB_HOSTADDR}
+      - STREAM_PROCESSOR_MODULE_ENDPOINT=${STREAM_PROCESSOR_MODULE_ENDPOINT}
+      - DEEPSTREAM_ENABLE_SENSOR_ID_EXTRACTION=1
+    volumes:
+      - ${VST_CONFIG_PATH}:/home/vst/vst_release/configs
+      - ${VST_DATA_PATH}:/home/vst/vst_release/vst_data
+      - ${VST_VIDEO_STORAGE_PATH}:/home/vst/vst_release/vst_video
+    network_mode: host
+    container_name: sensor-ms
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          bash -ec 'exec 3<>/dev/tcp/127.0.0.1/$${HTTP_PORT}; printf "GET /v1/ready HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3;
+          read -r status <&3; [[ "$${status}" == HTTP/*" 200 "* ]]'
+      timeout: 3s
+      interval: 15s
+      retries: 60
+      start_period: 5s
+    depends_on:
+      redis:
+        condition: service_healthy
+        required: false
+      centralizedb:
+        condition: service_healthy
+      sdr-controller:
+        condition: service_started
+        required: false
+
+  streamprocessing-ms-1:
+    image: ${VST_STREAM_PROCESSOR_IMAGE}
+    user: "0:0"
+    runtime: nvidia
+    network_mode: host
+    container_name: streamprocessing-ms-1
+    entrypoint: ["/bin/bash", "-c", "if [ \"$$VST_INSTALL_ADDITIONAL_PACKAGES\" = \"true\" ]; then /home/vst/vst_release/tools/user_additional_install.sh; fi && exec /home/vst/vst_release/launch_vst"]
+    environment:
+      - VST_APT_MIRROR=${VST_APT_MIRROR:-}
+      - VST_INSTALL_ADDITIONAL_PACKAGES=${VST_INSTALL_ADDITIONAL_PACKAGES}
+      - VST_VIDEO_STORAGE_SIZE_MB=${VST_VIDEO_STORAGE_SIZE_MB:-}
+      - CONTAINER_NAME=streamprocessing-ms-1
+      - VST_APT_CACHE_DIR=/opt/apt-cache
+      # Diagnostic, off by default: keep every DASH segment on disk instead of
+      # pruning to the published window, so a session can be taken apart after
+      # it has gone wrong.  Output grows without bound while it is on, so turn
+      # it on for a session and off again afterwards.
+      - VST_DASH_KEEP_SEGMENTS=${VST_DASH_KEEP_SEGMENTS:-0}
+      - ADAPTOR=${VST_ADAPTOR}
+      - HTTP_PORT=${STREAM_PROCESSOR_HTTP_PORT_1}
+      - PROMETHEUS_PORT=${STREAM_PROCESSOR_PROMETHEUS_PORT_1}
+      - RTSP_SERVER_PORT=${RTSP_SERVER_PORT_1}
+      - CENTRALIZE_DB_NAME=${CENTRALIZE_DB_NAME}
+      - CENTRALIZE_DB_USERNAME=${CENTRALIZE_DB_USERNAME}
+      - CENTRALIZE_DB_PASSWORD=${CENTRALIZE_DB_PASSWORD}
+      - CENTRALIZE_DB_PORT=${CENTRALIZE_DB_PORT}
+      - CENTRALIZE_DB_HOSTADDR=${CENTRALIZE_DB_HOSTADDR}
+      - SENSOR_MODULE_ENDPOINT=${SENSOR_MODULE_ENDPOINT}
+      - VST_INGRESS_ENDPOINT=${VST_INGRESS_ENDPOINT}
+      - ENABLE_AGING_POLICY=true
+      - VST_ENABLE_NOTIFICATION=${VST_ENABLE_NOTIFICATION:-${VST_USE_SDRC:-false}}
+      - DEEPSTREAM_ENABLE_SENSOR_ID_EXTRACTION=1
+    volumes:
+      - ${VST_CONFIG_PATH}:/home/vst/vst_release/configs
+      - vios_apt_cache:/opt/apt-cache:ro
+      # Run the cache-aware host script (same as the init container and the
+      # NVStreamer consumers already do) instead of the image's baked-in copy,
+      # so this consumer installs from the shared cache rather than downloading.
+      - ./scripts/user_additional_install.sh:/home/vst/vst_release/tools/user_additional_install.sh
+      - ${VST_DATA_PATH}:/home/vst/vst_release/vst_data
+      - ${VST_VIDEO_STORAGE_PATH}:/home/vst/vst_release/vst_video
+      - ${CLIP_STORAGE_PATH}:/home/vst/vst_release/streamer_videos
+      - ${VST_TEMP_FILES_PATH}:/home/vst/vst_release/webroot/temp_files
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    deploy:
+      restart_policy:
+        condition: always
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          bash -ec 'exec 3<>/dev/tcp/127.0.0.1/$${HTTP_PORT};
+          printf "GET /v1/ready HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3;
+          read -r status <&3; [[ "$${status}" == HTTP/*" 200 "* ]]'
+      interval: 20s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+    depends_on:
+      vios-apt-cache-init:
+        condition: service_completed_successfully
+      centralizedb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+        required: false
+
+  centralizedb:
+    image: ${POSTGRES_IMAGE}
+    user: "0:0"
+    environment:
+      - POSTGRES_USER=${CENTRALIZE_DB_USERNAME}
+      - POSTGRES_DB=${CENTRALIZE_DB_NAME}
+      - POSTGRES_PASSWORD=${CENTRALIZE_DB_PASSWORD}
+    volumes:
+      - vst_pg_data:/var/lib/postgresql/data
+      - ${VST_CONFIG_PATH}/postgresql.conf:/etc/postgresql/postgresql.conf
+    network_mode: host
+    container_name: centralizedb
+    restart: always
+    command:
+      - "postgres"
+      - "-c"
+      - "config_file=/etc/postgresql/postgresql.conf"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 2s
+
+  vst-ingress:
+    image: ${NGINX_IMAGE}
+    user: "0:0"
+    volumes:
+      - ${VST_CONFIG_PATH}/nginx-${NGINX_MODE:-vst}.conf:/etc/nginx/nginx.conf
+    network_mode: host
+    container_name: vst-ingress
+    restart: always    # Nginx should always restart as it's critical for routing
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          bash -ec 'exec 3<>/dev/tcp/127.0.0.1/30888; printf "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3; read -r status <&3; [[ "$${status}" == HTTP/*" 200 "* ]]'
+          || (test -s /tmp/nginx/nginx.pid && kill -0 "$(cat /tmp/nginx/nginx.pid)" >/dev/null 2>&1 && nginx -t -q)
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 2s
+    depends_on:
+      sensor-ms:
+        condition: service_healthy
+
+  # Redis is the message broker SDR consumes from, and the routing-table
+  # backing store Envoy's Lua filter reads. It's only used in SDRC mode. Profile-
+  # gated to "sdrc" so direct mode skips it entirely. sensor-MS still has
+  # `enable_notification: true` in its vst_config.json, so in direct mode it
+  # will attempt to publish camera_status_change events to a non-existent
+  # broker — the async notification queue logs and drops them, no crash.
+  redis:
+    profiles: ["sdrc"]
+    image: ${REDIS_IMAGE}
+    user: "0:0"
+    restart: always
+    command: redis-server --save 60 1 --loglevel warning
+    network_mode: host
+    container_name: redis-server
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 2s
+
+  # Downloads the runtime media packages once per host into a shared volume so
+  # every VIOS service installs from disk instead of re-fetching ~138MB. Runs to
+  # completion before the services start and is the only writer; services mount
+  # the cache read-only, which is what makes skipping the apt archives lock safe
+  # (see the note in user_additional_install.sh).
+  vios-apt-cache-init:
+    image: ${VST_STREAM_PROCESSOR_IMAGE}
+    container_name: vios-apt-cache-init
+    user: "0:0"
+    network_mode: host
+    environment:
+      # Gate the populate step on the same switch the consumers use, and inject
+      # it here: without this line the variable is unset inside the init
+      # container, the entrypoint check below always takes the else branch, and
+      # the cache is never populated (consumers then each download on their own).
+      - VST_INSTALL_ADDITIONAL_PACKAGES=${VST_INSTALL_ADDITIONAL_PACKAGES}
+      - VST_APT_CACHE_POPULATE=true
+      - VST_APT_CACHE_DIR=/opt/apt-cache
+      - VST_APT_MIRROR=${VST_APT_MIRROR:-}
+    # Best-effort: the `|| echo` keeps the init exit 0 even if the populate
+    # fails, so a transient apt error never blocks the consumers that depend on
+    # it -- they fall back to a normal download (the install script bypasses the
+    # cache on failure). The cache is an optimization, not a hard dependency.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        if [ "$$VST_INSTALL_ADDITIONAL_PACKAGES" = "true" ]; then
+          /home/vst/vst_release/tools/user_additional_install.sh \
+            || echo 'cache populate failed (best-effort); consumers will download'
+        else
+          echo 'additional packages disabled; nothing to cache'
+        fi
+    volumes:
+      - vios_apt_cache:/opt/apt-cache
+      # This compose file lives in docker-compose/, so the shared populate
+      # script is ./scripts/ (NOT ../scripts/ -- that resolves one level too
+      # high to stream-processing/scripts/, which does not exist, and Docker
+      # then bind-mounts an auto-created empty dir onto a file, failing the up).
+      - ./scripts/user_additional_install.sh:/home/vst/vst_release/tools/user_additional_install.sh
+    restart: "no"
+
+volumes:
+  vst_pg_data:
+  vios_apt_cache:
+    name: vios_apt_cache

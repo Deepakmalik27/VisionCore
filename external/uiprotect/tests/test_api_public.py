@@ -1,0 +1,6641 @@
+# mypy: disable-error-code="attr-defined, method-assign"
+"""Tests for the Public Integration API extensions."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, Mock, patch
+
+import aiohttp
+import orjson
+import pytest
+from pydantic import ValidationError
+
+from tests.conftest import set_no_debug
+from uiprotect import anonymize
+from uiprotect import api as api_module
+from uiprotect.api import _UNSET, RTSPSStreams, _UnsetType
+from uiprotect.data import (
+    ArmProfile,
+    DeviceState,
+    Fob,
+    FobAwayState,
+    FobButton,
+    FobButtonLabels,
+    LinkStation,
+    Liveview,
+    NvrArmModeStatus,
+    PublicBootstrap,
+    PublicBridge,
+    PublicCamera,
+    PublicLiveview,
+    PublicLiveviewSlot,
+    PublicLiveviewSlotDict,
+    PublicNVR,
+    PublicSensorFeatureFlags,
+    PublicSpeakerFeatureFlags,
+    PublicSpeakerState,
+    PublicUlpUser,
+    PublicViewer,
+    Relay,
+    RelayInputActionTrigger,
+    RelayInputActionType,
+    RelayOutputRebootState,
+    RelayOutputState,
+    RelayOutputType,
+    SensorFeatureCapability,
+    Siren,
+    SirenConnectionType,
+    Speaker,
+    SpeakerMode,
+    SpeakerStatus,
+    Viewer,
+)
+from uiprotect.data import public_bootstrap as public_bootstrap_module
+from uiprotect.data.convert import MODEL_TO_CLASS, create_from_unifi_dict
+from uiprotect.data.types import (
+    EventType,
+    LiveviewCycleMode,
+    ModelType,
+    SensorScheduleMode,
+    SirenDuration,
+    UlpUserStatus,
+)
+from uiprotect.data.websocket import WSAction
+from uiprotect.devices import DeviceChange, ProtectDeviceChange
+from uiprotect.exceptions import BadRequest, NotAuthorized, NvrError
+from uiprotect.utils import convert_to_datetime
+from uiprotect.websocket import WebsocketState
+
+from .test_public_devices_models import CAMERA_PAYLOAD, SENSOR_PAYLOAD
+
+if TYPE_CHECKING:
+    from uiprotect.api import ProtectApiClient
+    from uiprotect.data.websocket import WSSubscriptionMessage
+
+
+SENSOR_ID = "66d025b301ebc903e80003ea"
+SIREN_ID = "672094f900e26303e800062a"
+RELAY_ID = "66d025b301ebc903e80003eb"
+FOB_ID = "66d025b301ebc903e80003ed"
+SPEAKER_ID = "66d025b301ebc903e80003ee"
+LINK_STATION_ID = "66d025b301ebc903e80003ef"
+ALARM_HUB_ID = "66d025b301ebc903e80003f0"
+PROFILE_ID = "6878d82800155803e45928e0"
+NVR_ID = "66d025b301ebc903e80003ec"
+LIVEVIEW_ID = "d65bb41c14d6aa92bfa4a6d1"
+OWNER_ID = "4c5f03a8c8bd48ad8e066285"
+BRIDGE_ID = "66d025b301ebc903e80003f1"
+VIEWER_ID = "66d025b301ebc903e80003f2"
+
+# Minimal raw payload matching the Public API NVR schema (v7.0 — no armMode).
+_NVR_RAW_BASE: dict[str, Any] = {
+    "id": NVR_ID,
+    "modelKey": "nvr",
+    "name": "Test NVR",
+    "doorbellSettings": {
+        "defaultMessageText": "WELCOME",
+        "defaultMessageResetTimeoutMs": 60000,
+        "customMessages": [],
+        "customImages": [],
+    },
+}
+
+
+def _make_public_nvr(
+    client: ProtectApiClient,
+    arm_mode: dict[str, Any] | None = None,
+) -> PublicNVR:
+    """Build a minimal :class:`PublicNVR` instance for use in tests."""
+    raw = deepcopy(_NVR_RAW_BASE)
+    if arm_mode is not None:
+        raw["armMode"] = arm_mode
+    return PublicNVR.from_unifi_dict(**raw, api=client)
+
+
+def _arm_mode_raw(
+    status: str = "disabled", profile_id: str | None = None
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "armProfileId": profile_id,
+        "armedAt": None,
+        "willBeArmedAt": None,
+        "breachDetectedAt": None,
+        "breachEventCount": 0,
+        "breachTriggerEventId": None,
+        "breachEventId": None,
+    }
+
+
+def _mock_update_public_endpoints(client: ProtectApiClient, **overrides: Any) -> None:
+    """Stub every endpoint ``update_public`` calls. Overrides win over defaults."""
+    defaults: dict[str, Any] = {
+        "get_nvr_public": AsyncMock(return_value=_make_public_nvr(client)),
+        "get_cameras_public": AsyncMock(return_value=[]),
+        "get_lights_public": AsyncMock(return_value=[]),
+        "get_chimes_public": AsyncMock(return_value=[]),
+        "get_sensors_public": AsyncMock(return_value=[]),
+        "get_sirens_public": AsyncMock(return_value=[]),
+        "get_relays_public": AsyncMock(return_value=[]),
+        "get_fobs_public": AsyncMock(return_value=[]),
+        "get_speakers_public": AsyncMock(return_value=[]),
+        "get_link_stations_public": AsyncMock(return_value=[]),
+        "_fetch_liveviews": AsyncMock(return_value=[]),
+        "get_bridges_public": AsyncMock(return_value=[]),
+        "get_viewers_public": AsyncMock(return_value=[]),
+        "get_ulp_users_public": AsyncMock(return_value=[]),
+        "_fetch_arm_profiles": AsyncMock(return_value=[]),
+    }
+    defaults.update(overrides)
+    for name, value in defaults.items():
+        setattr(client, name, value)
+
+
+@pytest.mark.asyncio()
+async def test_get_public_api_camera_snapshot_package(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=b"snap")
+    result = await protect_client.get_public_api_camera_snapshot("cam-1", package=True)
+    assert result == b"snap"
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == "/v1/cameras/cam-1/snapshot"
+    assert kwargs["params"]["channel"] == "package"
+
+
+@pytest.mark.asyncio()
+async def test_get_public_api_camera_snapshot_no_package(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=b"snap")
+    await protect_client.get_public_api_camera_snapshot("cam-1")
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert "channel" not in kwargs["params"]
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicSensor.from_unifi_dict")
+async def test_get_sensors_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=SENSOR_ID), Mock(id="other")]
+    protect_client.api_request_list = AsyncMock(
+        return_value=[{"id": SENSOR_ID}, {"id": "other"}]
+    )
+    result = await protect_client.get_sensors_public()
+    assert len(result) == 2
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/sensors", public_api=True
+    )
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicSensor.from_unifi_dict")
+async def test_get_sensor_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=SENSOR_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SENSOR_ID})
+    await protect_client.get_sensor_public(SENSOR_ID)
+    protect_client.api_request_obj.assert_called_with(
+        url=f"/v1/sensors/{SENSOR_ID}", public_api=True
+    )
+
+
+@pytest.mark.asyncio()
+async def test_update_sensor_public_requires_args(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_sensor_public(SENSOR_ID)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicSensor.from_unifi_dict")
+async def test_update_sensor_public_body(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=SENSOR_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SENSOR_ID})
+    await protect_client.update_sensor_public(
+        SENSOR_ID,
+        name="kitchen",
+        motion_settings={"isEnabled": True, "sensitivity": 80},
+    )
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["method"] == "patch"
+    assert kwargs["json"] == {
+        "name": "kitchen",
+        "motionSettings": {"isEnabled": True, "sensitivity": 80},
+    }
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Siren.from_unifi_dict")
+async def test_get_sirens_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=SIREN_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": SIREN_ID}])
+    await protect_client.get_sirens_public()
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/sirens", public_api=True
+    )
+
+
+@pytest.mark.asyncio()
+async def test_play_siren_public(protect_client: ProtectApiClient) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.play_siren_public(SIREN_ID, duration=10)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/sirens/{SIREN_ID}/play"
+    assert kwargs["method"] == "post"
+    assert kwargs["json"] == {"duration": 10}
+
+
+@pytest.mark.asyncio()
+async def test_play_siren_public_default_duration(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Without explicit duration, the default SirenDuration.FIVE must be sent."""
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.play_siren_public(SIREN_ID)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["json"] == {"duration": 5}
+
+
+@pytest.mark.asyncio()
+async def test_play_siren_public_enum_duration(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Passing a SirenDuration enum value directly should be forwarded as-is."""
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.play_siren_public(SIREN_ID, duration=SirenDuration.TWENTY)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["json"] == {"duration": SirenDuration.TWENTY}
+
+
+@pytest.mark.asyncio()
+async def test_play_siren_public_invalid_duration(
+    protect_client: ProtectApiClient,
+) -> None:
+    """An integer that is not a valid SirenDuration value must raise BadRequest."""
+    with pytest.raises(BadRequest):
+        await protect_client.play_siren_public(SIREN_ID, duration=99)
+
+
+@pytest.mark.asyncio()
+async def test_stop_siren_public(protect_client: ProtectApiClient) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.stop_siren_public(SIREN_ID)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/sirens/{SIREN_ID}/stop"
+    assert kwargs["method"] == "post"
+
+
+@pytest.mark.asyncio()
+async def test_test_siren_sound_public(protect_client: ProtectApiClient) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.test_siren_sound_public(SIREN_ID, volume=70)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/sirens/{SIREN_ID}/test-sound"
+    assert kwargs["json"] == {"volume": 70}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Siren.from_unifi_dict")
+async def test_update_siren_public_led(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=SIREN_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SIREN_ID})
+    await protect_client.update_siren_public(SIREN_ID, volume=80, led_is_enabled=True)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {"volume": 80, "ledSettings": {"isEnabled": True}}
+
+
+@pytest.mark.asyncio()
+async def test_update_siren_public_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_siren_public(SIREN_ID)
+
+
+@pytest.mark.asyncio()
+async def test_activate_relay_output_toggle(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.activate_relay_output_public(RELAY_ID, 0)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/relays/{RELAY_ID}/outputs/0/activate"
+    assert kwargs["json"] is None
+
+
+@pytest.mark.asyncio()
+async def test_activate_relay_output_on_with_pulse(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.activate_relay_output_public(
+        RELAY_ID, 1, state="on", pulse_duration_ms=500
+    )
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["json"] == {"state": "on", "pulseDuration": 500}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Relay.from_unifi_dict")
+async def test_update_relay_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=RELAY_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": RELAY_ID})
+    await protect_client.update_relay_public(
+        RELAY_ID, name="garage", led_is_enabled=False
+    )
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {
+        "name": "garage",
+        "ledSettings": {"isEnabled": False},
+    }
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Fob.from_unifi_dict")
+async def test_get_fobs_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=FOB_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": FOB_ID}])
+    result = await protect_client.get_fobs_public()
+    protect_client.api_request_list.assert_called_with(url="/v1/fobs", public_api=True)
+    assert len(result) == 1
+    assert result[0].id == FOB_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Fob.from_unifi_dict")
+async def test_get_fob_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=FOB_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": FOB_ID})
+    result = await protect_client.get_fob_public(FOB_ID)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/fobs/{FOB_ID}"
+    assert kwargs["public_api"] is True
+    assert result.id == FOB_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Fob.from_unifi_dict")
+async def test_update_fob_public_body(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=FOB_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": FOB_ID})
+    await protect_client.update_fob_public(FOB_ID, name="Front Fob")
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/fobs/{FOB_ID}"
+    assert kwargs["method"] == "patch"
+    assert kwargs["json"] == {"name": "Front Fob"}
+
+
+@pytest.mark.asyncio()
+async def test_update_fob_public_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_fob_public(FOB_ID)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Speaker.from_unifi_dict")
+async def test_get_speakers_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=SPEAKER_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": SPEAKER_ID}])
+    result = await protect_client.get_speakers_public()
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/speakers", public_api=True
+    )
+    assert len(result) == 1
+    assert result[0].id == SPEAKER_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Speaker.from_unifi_dict")
+async def test_get_speaker_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=SPEAKER_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SPEAKER_ID})
+    result = await protect_client.get_speaker_public(SPEAKER_ID)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/speakers/{SPEAKER_ID}"
+    assert kwargs["public_api"] is True
+    assert result.id == SPEAKER_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Speaker.from_unifi_dict")
+async def test_update_speaker_public_body(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=SPEAKER_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SPEAKER_ID})
+    await protect_client.update_speaker_public(
+        SPEAKER_ID,
+        name="Lobby",
+        volume=70,
+        mic_volume=40,
+        is_mic_enabled=False,
+    )
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/speakers/{SPEAKER_ID}"
+    assert kwargs["method"] == "patch"
+    assert kwargs["json"] == {
+        "name": "Lobby",
+        "volume": 70,
+        "micVolume": 40,
+        "isMicEnabled": False,
+    }
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Speaker.from_unifi_dict")
+async def test_update_speaker_public_partial(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=SPEAKER_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SPEAKER_ID})
+    await protect_client.update_speaker_public(SPEAKER_ID, mic_volume=20)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {"micVolume": 20}
+
+
+@pytest.mark.asyncio()
+async def test_update_speaker_public_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_speaker_public(SPEAKER_ID)
+
+
+@pytest.mark.asyncio()
+async def test_test_speaker_sound_public(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.test_speaker_sound_public(SPEAKER_ID, volume=70)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/speakers/{SPEAKER_ID}/test-sound"
+    assert kwargs["method"] == "post"
+    assert kwargs["json"] == {"volume": 70}
+
+
+@pytest.mark.asyncio()
+async def test_test_speaker_sound_public_no_volume(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.test_speaker_sound_public(SPEAKER_ID)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["json"] == {}
+
+
+_LINK_STATION_FIXTURE: dict[str, Any] = {
+    "id": LINK_STATION_ID,
+    "modelKey": "linkstation",
+    "state": "CONNECTED",
+    "name": "Garage Link",
+    "mac": "AA:BB:CC:DD:EE:01",
+    "isAlarmHub": False,
+    "ledSettings": {"isEnabled": True},
+    "lastEvent": None,
+    "alarmHub": None,
+}
+
+_ALARM_HUB_FIXTURE: dict[str, Any] = {
+    "id": ALARM_HUB_ID,
+    "modelKey": "linkstation",
+    "state": "CONNECTED",
+    "name": "Main Hub",
+    "mac": "AA:BB:CC:DD:EE:02",
+    "isAlarmHub": True,
+    "ledSettings": {"isEnabled": True},
+    "lastEvent": 1700000000000,
+    "alarmHub": {
+        "12v": {"state": "on"},
+        "+": "positive-terminal",
+        "-": "negative-terminal",
+        "outputs": [{"id": 0, "state": "off"}],
+    },
+}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.LinkStation.from_unifi_dict")
+async def test_get_link_stations_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=LINK_STATION_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": LINK_STATION_ID}])
+    result = await protect_client.get_link_stations_public()
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/link-stations", public_api=True
+    )
+    assert len(result) == 1
+    assert result[0].id == LINK_STATION_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.LinkStation.from_unifi_dict")
+async def test_get_alarm_hubs_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=ALARM_HUB_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": ALARM_HUB_ID}])
+    result = await protect_client.get_alarm_hubs_public()
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/alarm-hubs", public_api=True
+    )
+    assert len(result) == 1
+    assert result[0].id == ALARM_HUB_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.LinkStation.from_unifi_dict")
+async def test_get_link_station_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=LINK_STATION_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": LINK_STATION_ID})
+    result = await protect_client.get_link_station_public(LINK_STATION_ID)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/link-stations/{LINK_STATION_ID}"
+    assert kwargs["public_api"] is True
+    assert result.id == LINK_STATION_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.LinkStation.from_unifi_dict")
+async def test_get_alarm_hub_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=ALARM_HUB_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": ALARM_HUB_ID})
+    result = await protect_client.get_alarm_hub_public(ALARM_HUB_ID)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/alarm-hubs/{ALARM_HUB_ID}"
+    assert kwargs["public_api"] is True
+    assert result.id == ALARM_HUB_ID
+
+
+def test_link_station_model_from_unifi_dict() -> None:
+    ls = LinkStation.from_unifi_dict(**deepcopy(_LINK_STATION_FIXTURE))
+    assert ls.id == LINK_STATION_ID
+    assert ls.model is ModelType.LINK_STATION
+    assert ls.state is DeviceState.CONNECTED
+    assert ls.name == "Garage Link"
+    assert ls.is_alarm_hub is False
+    assert ls.alarm_hub is None
+    assert ls.last_event is None
+
+
+def test_alarm_hub_model_from_unifi_dict() -> None:
+    ah = LinkStation.from_unifi_dict(**deepcopy(_ALARM_HUB_FIXTURE))
+    assert ah.id == ALARM_HUB_ID
+    assert ah.is_alarm_hub is True
+    assert ah.last_event == convert_to_datetime(1700000000000)
+    assert ah.unifi_dict()["lastEvent"] == 1700000000000
+    assert ah.alarm_hub is not None
+    assert ah.alarm_hub["12v"] == {"state": "on"}
+    assert ah.alarm_hub["+"] == "positive-terminal"
+    assert ah.alarm_hub["-"] == "negative-terminal"
+
+
+def test_link_station_model_modelkey_lowercase() -> None:
+    """Wire ``modelKey`` for both link stations and alarm hubs is literally ``linkstation``."""
+    assert ModelType.LINK_STATION.value == "linkstation"
+    ls = LinkStation.from_unifi_dict(**deepcopy(_LINK_STATION_FIXTURE))
+    assert ls.unifi_dict()["modelKey"] == "linkstation"
+
+
+@pytest.mark.asyncio()
+async def test_update_link_station_public_requires_args(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_link_station_public(LINK_STATION_ID)
+
+
+@pytest.mark.asyncio()
+async def test_update_alarm_hub_public_requires_args(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_alarm_hub_public(ALARM_HUB_ID)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.LinkStation.from_unifi_dict")
+async def test_update_link_station_public_body(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=LINK_STATION_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": LINK_STATION_ID})
+    await protect_client.update_link_station_public(LINK_STATION_ID, name="Garage")
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/link-stations/{LINK_STATION_ID}"
+    assert kwargs["method"] == "patch"
+    assert kwargs["json"] == {"name": "Garage"}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.LinkStation.from_unifi_dict")
+async def test_update_alarm_hub_public_body(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=ALARM_HUB_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": ALARM_HUB_ID})
+    await protect_client.update_alarm_hub_public(ALARM_HUB_ID, name="Main")
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/alarm-hubs/{ALARM_HUB_ID}"
+    assert kwargs["method"] == "patch"
+    assert kwargs["json"] == {"name": "Main"}
+
+
+@pytest.mark.asyncio()
+async def test_trigger_alarm_hub_output_public(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.trigger_alarm_hub_output_public(
+        ALARM_HUB_ID, 0, enable=True, duration=5000
+    )
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/alarm-hubs/{ALARM_HUB_ID}/outputs/0/trigger"
+    assert kwargs["method"] == "post"
+    assert kwargs["public_api"] is True
+    assert kwargs["json"] == {"enable": True, "duration": 5000}
+
+
+@pytest.mark.asyncio()
+async def test_trigger_alarm_hub_output_public_no_body(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.trigger_alarm_hub_output_public(ALARM_HUB_ID, 1)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/alarm-hubs/{ALARM_HUB_ID}/outputs/1/trigger"
+    assert kwargs["json"] is None
+
+
+@pytest.mark.asyncio()
+async def test_trigger_alarm_hub_output_public_with_delay(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.trigger_alarm_hub_output_public(ALARM_HUB_ID, 0, delay=1000)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/alarm-hubs/{ALARM_HUB_ID}/outputs/0/trigger"
+    assert kwargs["method"] == "post"
+    assert kwargs["public_api"] is True
+    assert kwargs["json"] == {"delay": 1000}
+
+
+@pytest.mark.asyncio()
+async def test_trigger_alarm_hub_output_public_rejects_negative_delay(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    with pytest.raises(BadRequest):
+        await protect_client.trigger_alarm_hub_output_public(ALARM_HUB_ID, 0, delay=-1)
+    protect_client.api_request_raw.assert_not_called()
+
+
+@pytest.mark.asyncio()
+async def test_trigger_alarm_hub_output_public_rejects_negative_duration(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    with pytest.raises(BadRequest):
+        await protect_client.trigger_alarm_hub_output_public(
+            ALARM_HUB_ID, 0, duration=-1
+        )
+    protect_client.api_request_raw.assert_not_called()
+
+
+@pytest.mark.asyncio()
+async def test_link_station_set_name_routes_to_link_station_endpoint(
+    protect_client: ProtectApiClient,
+) -> None:
+    ls = LinkStation.from_unifi_dict(
+        **deepcopy(_LINK_STATION_FIXTURE), api=protect_client
+    )
+    protect_client.update_link_station_public = AsyncMock(return_value=ls)
+    protect_client.update_alarm_hub_public = AsyncMock(return_value=ls)
+    await ls.set_name("Renamed")
+    protect_client.update_link_station_public.assert_awaited_once_with(
+        LINK_STATION_ID, name="Renamed"
+    )
+    protect_client.update_alarm_hub_public.assert_not_called()
+
+
+@pytest.mark.asyncio()
+async def test_link_station_set_name_routes_to_alarm_hub_endpoint(
+    protect_client: ProtectApiClient,
+) -> None:
+    ah = LinkStation.from_unifi_dict(**deepcopy(_ALARM_HUB_FIXTURE), api=protect_client)
+    protect_client.update_link_station_public = AsyncMock(return_value=ah)
+    protect_client.update_alarm_hub_public = AsyncMock(return_value=ah)
+    await ah.set_name("Renamed")
+    protect_client.update_alarm_hub_public.assert_awaited_once_with(
+        ALARM_HUB_ID, name="Renamed"
+    )
+    protect_client.update_link_station_public.assert_not_called()
+
+
+@pytest.mark.asyncio()
+async def test_link_station_trigger_output_rejects_non_alarm_hub(
+    protect_client: ProtectApiClient,
+) -> None:
+    ls = LinkStation.from_unifi_dict(
+        **deepcopy(_LINK_STATION_FIXTURE), api=protect_client
+    )
+    protect_client.trigger_alarm_hub_output_public = AsyncMock()
+    with pytest.raises(BadRequest, match="Not an alarm hub"):
+        await ls.trigger_output(0, enable=True)
+    protect_client.trigger_alarm_hub_output_public.assert_not_called()
+
+
+@pytest.mark.asyncio()
+async def test_link_station_trigger_output_delegates_for_alarm_hub(
+    protect_client: ProtectApiClient,
+) -> None:
+    ah = LinkStation.from_unifi_dict(**deepcopy(_ALARM_HUB_FIXTURE), api=protect_client)
+    protect_client.trigger_alarm_hub_output_public = AsyncMock()
+    await ah.trigger_output(0, enable=True, delay=500, duration=2000)
+    protect_client.trigger_alarm_hub_output_public.assert_awaited_once_with(
+        ALARM_HUB_ID, 0, enable=True, delay=500, duration=2000
+    )
+
+
+@pytest.mark.asyncio()
+async def test_link_station_api_update_rejects_generic_mutations(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Generic mutation path must fail loudly for Public API link stations."""
+    ls = LinkStation.from_unifi_dict(
+        **deepcopy(_LINK_STATION_FIXTURE), api=protect_client
+    )
+    with pytest.raises(BadRequest, match="LinkStation mutations"):
+        await ls._api_update({"name": "new"})
+
+
+def test_public_bootstrap_routes_link_station_ws_message(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    mt, new, old = pb.process_devices_ws_message(
+        protect_client,
+        {"type": "add", "item": deepcopy(_LINK_STATION_FIXTURE)},
+    )
+    assert mt is ModelType.LINK_STATION
+    assert new is not None
+    assert old is None
+    assert LINK_STATION_ID in pb.link_stations
+
+    # Partial WS update merges into the existing object.
+    mt, merged, prev = pb.process_devices_ws_message(
+        protect_client,
+        {
+            "type": "update",
+            "item": {
+                "id": LINK_STATION_ID,
+                "modelKey": "linkstation",
+                "name": "patched",
+            },
+        },
+    )
+    assert merged is not None and prev is not None
+    assert pb.link_stations[LINK_STATION_ID].name == "patched"
+    assert pb._warned_merge_failures == set()
+
+
+def test_public_bootstrap_alarm_hubs_property(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    pb.process_devices_ws_message(
+        protect_client,
+        {"type": "add", "item": deepcopy(_LINK_STATION_FIXTURE)},
+    )
+    pb.process_devices_ws_message(
+        protect_client,
+        {"type": "add", "item": deepcopy(_ALARM_HUB_FIXTURE)},
+    )
+    # link_stations carries both; alarm_hubs filters down to the hubs.
+    assert set(pb.link_stations) == {LINK_STATION_ID, ALARM_HUB_ID}
+    assert set(pb.alarm_hubs) == {ALARM_HUB_ID}
+
+
+@pytest.mark.asyncio()
+async def test_send_alarm_webhook(protect_client: ProtectApiClient) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.send_alarm_webhook_public("my-trigger")
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == "/v1/alarm-manager/webhook/my-trigger"
+    assert kwargs["method"] == "post"
+
+
+@pytest.mark.asyncio()
+async def test_send_alarm_webhook_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.send_alarm_webhook_public("")
+
+
+@pytest.mark.asyncio()
+async def test_set_current_arm_profile_updates_cache(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    # Without an arm_mode in the cache the profile_id update is a no-op.
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    await protect_client.set_current_arm_profile_public(PROFILE_ID)
+    # arm_mode is None (no NVR cached) — no crash, no state change.
+    assert pb.arm_mode is None
+
+
+@pytest.mark.asyncio()
+async def test_enable_disable_arm_alarm_tracks_state(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    pb.nvr = _make_public_nvr(protect_client, arm_mode=_arm_mode_raw("disabled"))
+    await protect_client.enable_arm_alarm_public()
+    assert pb.arm_mode.status == NvrArmModeStatus.ARMING
+    await protect_client.disable_arm_alarm_public()
+    assert pb.arm_mode.status == NvrArmModeStatus.DISABLED
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ArmProfile.from_unifi_dict")
+async def test_get_arm_profiles_populates_cache(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=PROFILE_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": PROFILE_ID}])
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    await protect_client.get_arm_profiles_public()
+    assert PROFILE_ID in pb.arm_profiles
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ArmProfile.from_unifi_dict")
+async def test_get_arm_profiles_no_bootstrap(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """Standalone fetch with no bootstrap still returns profiles without applying."""
+    mock_ctor.side_effect = [Mock(id=PROFILE_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": PROFILE_ID}])
+    protect_client._public_bootstrap = None
+
+    profiles = await protect_client.get_arm_profiles_public()
+
+    assert [p.id for p in profiles] == [PROFILE_ID]
+    assert protect_client._public_bootstrap is None
+
+
+@pytest.mark.asyncio()
+async def test_update_arm_profile_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_arm_profile_public(PROFILE_ID)
+
+
+def test_siren_model_from_unifi_dict() -> None:
+    # activatedAt and duration are both Unix-ms on the status object; only the
+    # play request takes seconds.
+    # Use a timestamp safely in the future so is_active stays True throughout the test.
+    activated_at_ms = int((time.time() + 60) * 1000)
+    siren = Siren.from_unifi_dict(
+        id=SIREN_ID,
+        modelKey="siren",
+        state="CONNECTED",
+        name="Front Siren",
+        mac="AA:BB:CC:DD:EE:FF",
+        volume=80,
+        ledSettings={"isEnabled": True},
+        sirenStatus={
+            "isActive": True,
+            "activatedAt": activated_at_ms,
+            "duration": 5000,
+        },
+        connectionType="lora",
+        wirelessConnectionState={
+            "signalState": {"signalQuality": 85, "signalStrength": -45},
+            "batteryStatus": {"percentage": 90, "isLow": False},
+            "bridge": None,
+        },
+    )
+    assert siren.id == SIREN_ID
+    assert siren.model is ModelType.SIREN
+    assert siren.volume == 80
+    assert siren.is_active is True
+
+    # When the timer has expired the siren should appear inactive even if
+    # sirenStatus.isActive is still True (server sends no stop event).
+    expired_at_ms = int((time.time() - 10) * 1000)  # 10 s in the past
+    siren_expired = Siren.from_unifi_dict(
+        id=SIREN_ID,
+        modelKey="siren",
+        state="CONNECTED",
+        name="Front Siren",
+        mac="AA:BB:CC:DD:EE:FF",
+        volume=80,
+        ledSettings={"isEnabled": True},
+        sirenStatus={"isActive": True, "activatedAt": expired_at_ms, "duration": 5000},
+        connectionType="lora",
+        wirelessConnectionState={
+            "signalState": {"signalQuality": 85, "signalStrength": -45},
+            "batteryStatus": {"percentage": 90, "isLow": False},
+            "bridge": None,
+        },
+    )
+    assert siren_expired.is_active is False
+
+    # Manual stop before the timer elapsed: server clears isActive but may
+    # leave activatedAt/duration populated. The clock check would still say
+    # "active"; the server flag must win.
+    future_at_ms = int((time.time() + 60) * 1000)
+    siren_stopped = Siren.from_unifi_dict(
+        id=SIREN_ID,
+        modelKey="siren",
+        state="CONNECTED",
+        name="Front Siren",
+        mac="AA:BB:CC:DD:EE:FF",
+        volume=80,
+        ledSettings={"isEnabled": True},
+        sirenStatus={"isActive": False, "activatedAt": future_at_ms, "duration": 5000},
+        connectionType="lora",
+        wirelessConnectionState={
+            "signalState": {"signalQuality": 85, "signalStrength": -45},
+            "batteryStatus": {"percentage": 90, "isLow": False},
+            "bridge": None,
+        },
+    )
+    assert siren_stopped.is_active is False
+
+
+def test_siren_state_and_connection_type_round_trip() -> None:
+    activated_at_ms = int((time.time() + 60) * 1000)
+    payload: dict[str, Any] = {
+        "id": SIREN_ID,
+        "modelKey": "siren",
+        "state": "CONNECTED",
+        "name": "Front Siren",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "volume": 80,
+        "ledSettings": {"isEnabled": True},
+        "sirenStatus": {
+            "isActive": True,
+            "activatedAt": activated_at_ms,
+            "duration": 5000,
+        },
+        "connectionType": "lora",
+        "wirelessConnectionState": {
+            "signalState": {"signalQuality": 85, "signalStrength": -45},
+            "batteryStatus": {"percentage": 90, "isLow": False},
+            "bridge": None,
+        },
+    }
+    siren = Siren.from_unifi_dict(**payload)
+    assert siren.state is DeviceState.CONNECTED
+    assert siren.connection_type is SirenConnectionType.LORA
+
+    wire = siren.unifi_dict()
+    assert wire["state"] == "CONNECTED"
+    assert wire["connectionType"] == "lora"
+
+
+def test_siren_state_and_connection_type_coerce_unknown() -> None:
+    activated_at_ms = int((time.time() + 60) * 1000)
+    siren = Siren.from_unifi_dict(
+        id=SIREN_ID,
+        modelKey="siren",
+        state="FUTURE_STATE",
+        name="Front Siren",
+        mac="AA:BB:CC:DD:EE:FF",
+        volume=80,
+        ledSettings={"isEnabled": True},
+        sirenStatus={
+            "isActive": True,
+            "activatedAt": activated_at_ms,
+            "duration": 5000,
+        },
+        connectionType="future-radio",
+        wirelessConnectionState={
+            "signalState": {"signalQuality": 85, "signalStrength": -45},
+            "batteryStatus": {"percentage": 90, "isLow": False},
+            "bridge": None,
+        },
+    )
+    assert siren.state is DeviceState.UNKNOWN
+    assert siren.connection_type is SirenConnectionType.UNKNOWN
+
+
+def test_relay_model_from_unifi_dict() -> None:
+    relay = Relay.from_unifi_dict(
+        id=RELAY_ID,
+        modelKey="relay",
+        state="CONNECTED",
+        name="Garage Relay",
+        mac="AA:BB:CC:DD:EE:FF",
+        ledSettings={"isEnabled": True},
+        outputs=[
+            {
+                "id": 0,
+                "name": "Garage Door",
+                "type": "garageDoor",
+                "delay": 0,
+                "pulseDuration": 500,
+                "state": "off",
+                "rebootState": "off",
+            }
+        ],
+        inputs=[
+            {
+                "id": 0,
+                "name": "Trigger A",
+                "state": "off",
+                "actionTrigger": "switchedOn",
+                "actionType": "toggleOutput",
+                "actionOutputId": 0,
+            }
+        ],
+        wirelessConnectionState={
+            "signalState": {"signalQuality": 85, "signalStrength": -45},
+            "batteryStatus": {"percentage": 90, "isLow": False},
+            "bridge": None,
+        },
+    )
+    assert relay.id == RELAY_ID
+    assert relay.model is ModelType.RELAY
+    assert relay.state is DeviceState.CONNECTED
+    out = relay.get_output(0)
+    assert out is not None
+    assert out.name == "Garage Door"
+    assert out.type is RelayOutputType.GARAGE_DOOR
+    assert out.state is RelayOutputState.OFF
+    assert out.reboot_state is RelayOutputRebootState.OFF
+    assert relay.get_output(5) is None
+    inp = relay.inputs[0]
+    assert inp.action_trigger is RelayInputActionTrigger.SWITCHED_ON
+    assert inp.action_type is RelayInputActionType.TOGGLE_OUTPUT
+
+
+def test_fob_model_from_unifi_dict_unreported() -> None:
+    """Null signal/battery parses; state/away/buttons coerce to enums."""
+    fob = Fob.from_unifi_dict(
+        id=FOB_ID,
+        modelKey="fob",
+        state="CONNECTED",
+        name="Front Fob",
+        mac="AA:BB:CC:DD:EE:FF",
+        awayState="ONLINE",
+        buttonLabels="securityActions",
+        featureFlags={"buttons": ["arm", "disarm", "panic", "main"]},
+        wirelessConnectionState={
+            "signalState": {"signalQuality": None, "signalStrength": None},
+            "batteryStatus": {"percentage": None, "isLow": False},
+            "bridge": None,
+        },
+    )
+    assert fob.id == FOB_ID
+    assert fob.model is ModelType.FOB
+    assert fob.state is DeviceState.CONNECTED
+    assert fob.away_state is FobAwayState.ONLINE
+    assert fob.feature_flags.buttons == [
+        FobButton.ARM,
+        FobButton.DISARM,
+        FobButton.PANIC,
+        FobButton.MAIN,
+    ]
+    assert fob.wireless_connection_state.signal_state.signal_quality is None
+    assert fob.wireless_connection_state.signal_state.signal_strength is None
+    assert fob.wireless_connection_state.battery_status.percentage is None
+    assert fob.wireless_connection_state.battery_status.is_low is False
+
+    # Unknown server values (future firmware) coerce to the ``UNKNOWN`` member
+    # rather than raising.
+    fob_unknown = Fob.from_unifi_dict(
+        id=FOB_ID,
+        modelKey="fob",
+        state="REBOOTING",
+        name="Bare Fob",
+        mac="AA:BB:CC:DD:EE:FF",
+        awayState="FORGOTTEN",
+        buttonLabels="securityActions",
+        featureFlags={"buttons": ["teleport"]},
+        wirelessConnectionState={
+            "signalState": {"signalQuality": None, "signalStrength": None},
+            "batteryStatus": {"percentage": None, "isLow": False},
+            "bridge": None,
+        },
+    )
+    assert fob_unknown.state is DeviceState.UNKNOWN
+    assert fob_unknown.away_state is FobAwayState.UNKNOWN
+    assert fob_unknown.feature_flags.buttons == [FobButton.UNKNOWN]
+
+    # ``name`` is nullable on the wire.
+    fob_null_name = Fob.from_unifi_dict(
+        id=FOB_ID,
+        modelKey="fob",
+        state="CONNECTED",
+        name=None,
+        mac="AA:BB:CC:DD:EE:FF",
+        awayState="ONLINE",
+        buttonLabels="securityActions",
+        featureFlags={"buttons": ["arm"]},
+        wirelessConnectionState={
+            "signalState": {"signalQuality": None, "signalStrength": None},
+            "batteryStatus": {"percentage": None, "isLow": False},
+            "bridge": None,
+        },
+    )
+    assert fob_null_name.name is None
+
+
+def test_fob_button_labels_parses_and_round_trips() -> None:
+    """``buttonLabels`` types to ``FobButtonLabels``; unknown styles coerce."""
+    payload: dict[str, Any] = {
+        "id": FOB_ID,
+        "modelKey": "fob",
+        "state": "CONNECTED",
+        "name": "Front Fob",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "awayState": "ONLINE",
+        "buttonLabels": "securityActions",
+        "featureFlags": {"buttons": ["arm"]},
+        "wirelessConnectionState": {
+            "signalState": {"signalQuality": None, "signalStrength": None},
+            "batteryStatus": {"percentage": None, "isLow": False},
+            "bridge": None,
+        },
+    }
+
+    fob = Fob.from_unifi_dict(**payload)
+
+    assert fob.button_labels is FobButtonLabels.SECURITY_ACTIONS
+    assert fob.unifi_dict()["buttonLabels"] == "securityActions"
+
+    unknown = Fob.from_unifi_dict(**{**payload, "buttonLabels": "hieroglyphs"})
+    assert unknown.button_labels is FobButtonLabels.UNKNOWN
+
+    with pytest.raises(ValidationError):
+        Fob.from_unifi_dict(**{k: v for k, v in payload.items() if k != "buttonLabels"})
+
+
+def test_public_bootstrap_applies_fob_add_and_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    add_payload = {
+        "type": "add",
+        "item": {
+            "id": FOB_ID,
+            "modelKey": "fob",
+            "state": "CONNECTED",
+            "name": "Fob",
+            "mac": "AA",
+            "awayState": "ONLINE",
+            "buttonLabels": "securityActions",
+            "featureFlags": {"buttons": ["arm", "disarm"]},
+            "wirelessConnectionState": {
+                "signalState": {"signalQuality": None, "signalStrength": None},
+                "batteryStatus": {"percentage": None, "isLow": False},
+                "bridge": None,
+            },
+        },
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, add_payload)
+    assert mt is ModelType.FOB
+    assert new is not None and new.id == FOB_ID
+    assert old is None
+    assert FOB_ID in pb.fobs
+
+    # Partial update — only the changed field on the wire.
+    update_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": FOB_ID, "modelKey": "fob", "awayState": "DEVICE_LOST"},
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, update_payload)
+    assert old is not None
+    assert new is not None
+    assert new.away_state == "DEVICE_LOST"  # type: ignore[attr-defined]
+    # Other fields preserved from the cached object.
+    assert new.name == "Fob"  # type: ignore[attr-defined]
+
+    # A ``name: null`` partial update must merge, not drop the frame.
+    name_null_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": FOB_ID, "modelKey": "fob", "name": None},
+    }
+    _, new, _ = pb.process_devices_ws_message(protect_client, name_null_payload)
+    assert new is not None and new.name is None  # type: ignore[attr-defined]
+
+
+def _speaker_raw(**overrides: Any) -> dict[str, Any]:
+    raw: dict[str, Any] = {
+        "id": SPEAKER_ID,
+        "modelKey": "speaker",
+        "state": "CONNECTED",
+        "name": "Lobby Speaker",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "volume": 80,
+        "micVolume": 50,
+        "isMicEnabled": True,
+        "speakerState": {"status": "idle", "mode": "listen"},
+        "featureFlags": {"hasMic": True},
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_speaker_model_from_unifi_dict() -> None:
+    raw = _speaker_raw(name=None)
+    speaker = Speaker.from_unifi_dict(**raw)
+    assert speaker.id == SPEAKER_ID
+    assert speaker.model is ModelType.SPEAKER
+    assert speaker.state is DeviceState.CONNECTED
+    assert speaker.name is None
+    assert speaker.mac == "AA:BB:CC:DD:EE:FF"
+    assert speaker.volume == 80
+    assert speaker.mic_volume == 50
+    assert speaker.is_mic_enabled is True
+    assert isinstance(speaker.speaker_state, PublicSpeakerState)
+    assert speaker.speaker_state.status is SpeakerStatus.IDLE
+    assert speaker.speaker_state.mode is SpeakerMode.LISTEN
+    assert isinstance(speaker.feature_flags, PublicSpeakerFeatureFlags)
+    assert speaker.feature_flags.has_mic is True
+
+
+def test_speaker_model_unknown_values() -> None:
+    """Unknown server values for ``state`` / ``speakerState`` coerce to ``UNKNOWN``."""
+    raw = _speaker_raw(
+        state="REBOOTING",
+        speakerState={"status": "encoding", "mode": "ambient"},
+    )
+    speaker = Speaker.from_unifi_dict(**raw)
+    assert speaker.state is DeviceState.UNKNOWN
+    assert speaker.speaker_state.status is SpeakerStatus.UNKNOWN
+    assert speaker.speaker_state.mode is SpeakerMode.UNKNOWN
+
+
+def test_public_bootstrap_applies_speaker_add_and_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    add_payload = {"type": "add", "item": _speaker_raw()}
+    mt, new, old = pb.process_devices_ws_message(protect_client, add_payload)
+    assert mt is ModelType.SPEAKER
+    assert new is not None and new.id == SPEAKER_ID
+    assert old is None
+    assert SPEAKER_ID in pb.speakers
+
+    # Partial update — only the changed field on the wire. Verify untouched
+    # sub-models survive the merge.
+    update_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": SPEAKER_ID, "modelKey": "speaker", "volume": 90},
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, update_payload)
+    assert old is not None
+    assert new is not None
+    assert new.volume == 90  # type: ignore[attr-defined]
+    assert new.name == "Lobby Speaker"  # type: ignore[attr-defined]
+    assert new.speaker_state.status is SpeakerStatus.IDLE  # type: ignore[attr-defined]
+    assert new.feature_flags.has_mic is True  # type: ignore[attr-defined]
+
+    # A ``name: null`` partial update must merge as ``None``.
+    name_null_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": SPEAKER_ID, "modelKey": "speaker", "name": None},
+    }
+    _, new, _ = pb.process_devices_ws_message(protect_client, name_null_payload)
+    assert new is not None and new.name is None  # type: ignore[attr-defined]
+
+
+def test_arm_profile_model_from_unifi_dict() -> None:
+    profile = ArmProfile.from_unifi_dict(
+        id=PROFILE_ID,
+        name="Night",
+        automations=["a1", "a2"],
+        creator="user-1",
+        schedules=[{"start": "0 22 * * *", "end": "0 6 * * *"}],
+        recordEverything=True,
+        activationDelay=60000,
+        createdAt=1600000000000,
+        updatedAt=1600000100000,
+    )
+    assert profile.id == PROFILE_ID
+    assert profile.name == "Night"
+    assert profile.record_everything is True
+    assert profile.activation_delay == 60000
+    assert len(profile.schedules) == 1
+
+
+def test_arm_profile_model_iso_timestamps() -> None:
+    """API returns ISO-8601 strings for createdAt/updatedAt — must parse correctly."""
+    profile = ArmProfile.from_unifi_dict(
+        id=PROFILE_ID,
+        name="Day",
+        automations=[],
+        creator="user-1",
+        schedules=[],
+        recordEverything=False,
+        activationDelay=0,
+        createdAt="2026-04-23T18:15:43.213Z",
+        updatedAt="2026-04-24T09:00:00.000Z",
+    )
+    assert profile.created_at is not None
+    assert profile.updated_at is not None
+    assert profile.created_at.year == 2026
+    assert profile.created_at.month == 4
+    assert profile.created_at.day == 23
+    assert profile.updated_at.day == 24
+
+
+def test_public_bootstrap_applies_add_and_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    # Wired to the client so the siren-expiry scheduling hook actually runs.
+    protect_client._public_bootstrap = pb
+    add_payload = {
+        "type": "add",
+        "item": {
+            "id": SIREN_ID,
+            "modelKey": "siren",
+            "state": "CONNECTED",
+            "name": "Siren",
+            "mac": "AA",
+            "volume": 50,
+            "ledSettings": {"isEnabled": True},
+            "sirenStatus": {"isActive": False, "activatedAt": None, "duration": None},
+            "connectionType": "lora",
+            "wirelessConnectionState": {
+                "signalState": {"signalQuality": 80, "signalStrength": -50},
+                "batteryStatus": {"percentage": 100, "isLow": False},
+                "bridge": None,
+            },
+        },
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, add_payload)
+    assert mt is ModelType.SIREN
+    assert new is not None and new.id == SIREN_ID
+    assert old is None
+    assert SIREN_ID in pb.sirens
+
+    # Partial update — only changed fields on the wire (realistic).
+    update_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": SIREN_ID, "modelKey": "siren", "volume": 10},
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, update_payload)
+    assert old is not None
+    assert new is not None and new.volume == 10  # type: ignore[attr-defined]
+    # Other fields must be preserved from the cached object.
+    assert new.name == "Siren"  # type: ignore[attr-defined]
+
+    # Partial update of a nested model (``sirenStatus.isActive``).
+    # activatedAt and duration are both Unix-ms — use a timestamp safely in the
+    # future so turn_off_at lies in the future for the whole test.
+    future_ms = int((time.time() + 60) * 1000)
+    status_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {
+            "id": SIREN_ID,
+            "modelKey": "siren",
+            "sirenStatus": {
+                "isActive": True,
+                "activatedAt": future_ms,
+                "duration": 5000,
+            },
+        },
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, status_payload)
+    assert new is not None and new.is_active is True  # type: ignore[attr-defined]
+    assert new.siren_status.is_active is True  # type: ignore[attr-defined]
+
+    # Update for an id that isn't in the cache → dropped.
+    stranger: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": "unknown", "modelKey": "siren", "volume": 1},
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, stranger)
+    assert new is None and old is None
+
+    # remove
+    remove_payload = {
+        "type": "remove",
+        "item": {"id": SIREN_ID, "modelKey": "siren"},
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, remove_payload)
+    assert new is None
+    assert old is not None
+    assert SIREN_ID not in pb.sirens
+
+
+def test_public_bootstrap_ignores_unknown_model(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    _mt, new, old = pb.process_devices_ws_message(
+        protect_client,
+        {"type": "add", "item": {"id": "x", "modelKey": "nope"}},
+    )
+    # ModelType.from_string returns UNKNOWN for unknown values, which is not
+    # in the store map, so no object is created.
+    assert new is None
+    assert old is None
+
+
+def test_public_bootstrap_warning_state_is_per_instance() -> None:
+    """Warning dedupe keys must not leak across multiple client instances."""
+    first = PublicBootstrap()
+    second = PublicBootstrap()
+
+    key = ("add", "siren")
+    first._warned_merge_failures.add(key)
+
+    assert key in first._warned_merge_failures
+    assert key not in second._warned_merge_failures
+
+
+@pytest.mark.asyncio()
+async def test_update_public_populates_cache(
+    protect_client: ProtectApiClient,
+) -> None:
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[Mock(id="c1")]),
+        get_lights_public=AsyncMock(return_value=[Mock(id="l1")]),
+        get_sensors_public=AsyncMock(return_value=[Mock(id="s1")]),
+        get_sirens_public=AsyncMock(
+            return_value=[Mock(id="si1", siren_status=Mock(turn_off_at=None))]
+        ),
+        get_relays_public=AsyncMock(return_value=[Mock(id="r1")]),
+        get_fobs_public=AsyncMock(return_value=[Mock(id="fb1")]),
+        get_speakers_public=AsyncMock(return_value=[Mock(id="sp1")]),
+    )
+
+    pb = await protect_client.update_public()
+    assert "c1" in pb.cameras
+    assert "l1" in pb.lights
+    assert "s1" in pb.sensors
+    assert "si1" in pb.sirens
+    assert "r1" in pb.relays
+    assert "fb1" in pb.fobs
+    assert "sp1" in pb.speakers
+    protect_client._fetch_arm_profiles.assert_awaited_once()
+    assert pb.nvr is not None
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("debug", [True, False])
+@pytest.mark.parametrize("absent", [True, False], ids=["absent", "null"])
+async def test_update_public_sensor_without_feature_flags(
+    protect_client: ProtectApiClient, debug: bool, absent: bool
+) -> None:
+    """A sensor with absent or ``null`` ``featureFlags`` primes with no capabilities."""
+    if not debug:
+        set_no_debug()
+    payload = deepcopy(SENSOR_PAYLOAD)
+    if absent:
+        del payload["featureFlags"]
+    else:
+        payload["featureFlags"] = None
+    _mock_update_public_endpoints(protect_client)
+    del protect_client.get_sensors_public
+    protect_client.api_request_list = AsyncMock(return_value=[payload])  # type: ignore[method-assign]
+
+    pb = await protect_client.update_public()
+
+    sensor = pb.sensors[SENSOR_PAYLOAD["id"]]
+    assert isinstance(sensor.feature_flags, PublicSensorFeatureFlags)
+    assert not any(sensor.supports(c) for c in SensorFeatureCapability)
+    assert sensor.unifi_dict()["id"] == SENSOR_PAYLOAD["id"]
+
+
+@pytest.mark.asyncio()
+async def test_update_public_populates_ulp_users(
+    protect_client: ProtectApiClient,
+) -> None:
+    user = PublicUlpUser(
+        api=protect_client,
+        id="ulp-1",
+        model=ModelType.ULP_USER,
+        first_name="A",
+        last_name="B",
+        full_name="A B",
+        status=UlpUserStatus.ACTIVE,
+    )
+    _mock_update_public_endpoints(
+        protect_client,
+        get_ulp_users_public=AsyncMock(return_value=[user]),
+    )
+
+    pb = await protect_client.update_public()
+    assert pb.ulp_users == {"ulp-1": user}
+
+
+@pytest.mark.asyncio()
+async def test_update_public_tolerates_ulp_users_disabled(
+    protect_client: ProtectApiClient,
+) -> None:
+    ulp_mock = AsyncMock(side_effect=NotAuthorized("identity off"))
+    _mock_update_public_endpoints(
+        protect_client,
+        get_ulp_users_public=ulp_mock,
+    )
+
+    pb = await protect_client.update_public()
+    assert pb.ulp_users == {}
+    ulp_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio()
+async def test_update_public_tolerates_missing_endpoints(
+    protect_client: ProtectApiClient,
+) -> None:
+    _mock_update_public_endpoints(
+        protect_client,
+        get_sensors_public=AsyncMock(side_effect=BadRequest("404")),
+        get_sirens_public=AsyncMock(side_effect=BadRequest("404")),
+        get_relays_public=AsyncMock(side_effect=BadRequest("404")),
+        _fetch_arm_profiles=AsyncMock(side_effect=BadRequest("404")),
+    )
+
+    pb = await protect_client.update_public()
+    assert pb.sensors == {}
+    assert pb.sirens == {}
+    assert pb.relays == {}
+
+
+@pytest.mark.asyncio()
+async def test_update_public_tolerates_every_endpoint_failing(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Even core endpoints (cameras/lights/chimes/nvr) are best-effort."""
+    _mock_update_public_endpoints(
+        protect_client,
+        get_nvr_public=AsyncMock(side_effect=BadRequest("X")),
+        get_cameras_public=AsyncMock(side_effect=BadRequest("X")),
+        get_lights_public=AsyncMock(side_effect=BadRequest("X")),
+        get_chimes_public=AsyncMock(side_effect=BadRequest("X")),
+        get_sensors_public=AsyncMock(side_effect=BadRequest("X")),
+        get_sirens_public=AsyncMock(side_effect=BadRequest("X")),
+        get_relays_public=AsyncMock(side_effect=BadRequest("X")),
+        _fetch_arm_profiles=AsyncMock(side_effect=BadRequest("X")),
+    )
+
+    pb = await protect_client.update_public()
+    assert pb.cameras == {}
+    assert pb.lights == {}
+    assert pb.chimes == {}
+    assert pb.nvr is None
+
+
+@pytest.mark.asyncio()
+async def test_update_public_tolerates_arm_profiles_failure(
+    protect_client: ProtectApiClient,
+) -> None:
+    """
+    Firmware without alarm-manager endpoints: _fetch_arm_profiles raises;
+    update_public must still complete, leave arm_profiles empty, and not propagate.
+    """
+    _mock_update_public_endpoints(
+        protect_client,
+        _fetch_arm_profiles=AsyncMock(side_effect=BadRequest("404")),
+    )
+
+    pb = await protect_client.update_public()
+
+    assert pb.arm_profiles == {}
+    assert pb.nvr is not None
+    assert pb.arm_mode is None
+    protect_client._fetch_arm_profiles.assert_awaited_once()
+
+
+def _siren_snapshot_item() -> dict[str, Any]:
+    """A full siren payload usable as an ``update_public`` snapshot device."""
+    return {
+        "id": SIREN_ID,
+        "modelKey": "siren",
+        "state": "CONNECTED",
+        "name": "Siren",
+        "mac": "AA",
+        "volume": 50,
+        "ledSettings": {"isEnabled": True},
+        "sirenStatus": {"isActive": False, "activatedAt": None, "duration": None},
+        "connectionType": "lora",
+        "wirelessConnectionState": {
+            "signalState": {"signalQuality": 80, "signalStrength": -50},
+            "batteryStatus": {"percentage": 100, "isLow": False},
+            "bridge": None,
+        },
+    }
+
+
+def _mock_text_ws_message(payload: dict[str, Any]) -> Mock:
+    """Build a TEXT public-WS message mock carrying ``payload``."""
+    msg = Mock()
+    msg.type = aiohttp.WSMsgType.TEXT
+    msg.data = orjson.dumps(payload)
+    return msg
+
+
+@pytest.mark.asyncio()
+async def test_update_public_replays_ws_frames_from_prime_window(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A devices-WS update landing mid-prime is replayed onto the fresh snapshot."""
+    client = protect_client
+    siren = Siren.from_unifi_dict(api=client, **deepcopy(_siren_snapshot_item()))
+    update_msg = _mock_text_ws_message(
+        {"type": "update", "item": {"id": SIREN_ID, "modelKey": "siren", "volume": 10}}
+    )
+
+    captured: list[WSSubscriptionMessage] = []
+    client._devices_ws_subscriptions.append(captured.append)
+
+    async def cameras_side_effect() -> list[Any]:
+        # Simulate a frame arriving while the snapshot is still being fetched:
+        # it must be buffered (not applied to the empty cache) and not yet
+        # delivered to the subscriber.
+        client._process_devices_ws_message(update_msg)
+        assert client._prime_ws_buffer
+        assert captured == []
+        return []
+
+    _mock_update_public_endpoints(
+        client,
+        get_sirens_public=AsyncMock(return_value=[siren]),
+        get_cameras_public=AsyncMock(side_effect=cameras_side_effect),
+    )
+
+    pb = await client.update_public()
+
+    # Snapshot volume (50) overwritten by the replayed WS diff (10).
+    assert pb.sirens[SIREN_ID].volume == 10
+    assert client._prime_ws_buffer is None
+    # Exactly one merged frame delivered, after priming.
+    assert len(captured) == 1
+    assert captured[0].action == WSAction.UPDATE
+    assert captured[0].new_obj is not None
+    assert captured[0].new_obj.volume == 10
+
+
+@pytest.mark.asyncio()
+async def test_update_public_rearms_siren_expiry_on_the_snapshot_deadline(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A snapshot superseding a live timed run re-arms against its own deadline."""
+    client = protect_client
+    client._public_bootstrap = PublicBootstrap()
+    running = _siren_snapshot_item()
+    running["sirenStatus"] = {
+        "isActive": True,
+        "activatedAt": int((time.time() + 55) * 1000),
+        "duration": 5000,
+    }
+    client._public_bootstrap.sirens[SIREN_ID] = Siren.from_unifi_dict(
+        api=client, **running
+    )
+    client._schedule_siren_off(SIREN_ID)
+    superseded = client._siren_off_tasks[SIREN_ID]
+
+    # The snapshot reports a run that has already ended.
+    ended = _siren_snapshot_item()
+    ended["sirenStatus"] = {
+        "isActive": True,
+        "activatedAt": int((time.time() - 30) * 1000),
+        "duration": 5000,
+    }
+    _mock_update_public_endpoints(
+        client,
+        get_sirens_public=AsyncMock(
+            return_value=[Siren.from_unifi_dict(api=client, **ended)]
+        ),
+    )
+    captured: list[WSSubscriptionMessage] = []
+    client._devices_ws_subscriptions.append(captured.append)
+
+    pb = await client.update_public()
+
+    armed = client._siren_off_tasks[SIREN_ID]
+    assert armed is not superseded
+    await armed
+
+    assert pb.sirens[SIREN_ID].siren_status.is_active is False
+    assert [msg.new_update_id for msg in captured] == [SIREN_ID]
+
+
+@pytest.mark.asyncio()
+async def test_update_public_replays_events_ws_frames_from_prime_window(
+    protect_client: ProtectApiClient,
+) -> None:
+    """An events-WS frame landing mid-prime is buffered and replayed."""
+    client = protect_client
+    add_msg = _mock_text_ws_message(
+        {
+            "type": "add",
+            "item": {
+                "id": "evt-1",
+                "modelKey": "event",
+                "type": "motion",
+                "start": 1234567890,
+            },
+        }
+    )
+
+    captured: list[WSSubscriptionMessage] = []
+    client._events_ws_subscriptions.append(captured.append)
+
+    async def cameras_side_effect() -> list[Any]:
+        client._process_events_ws_message(add_msg)
+        assert client._prime_ws_buffer
+        assert captured == []
+        return []
+
+    _mock_update_public_endpoints(
+        client, get_cameras_public=AsyncMock(side_effect=cameras_side_effect)
+    )
+
+    await client.update_public()
+
+    assert client._prime_ws_buffer is None
+    # Replayed after priming; the primed cache builds a merged event object.
+    assert len(captured) == 1
+    assert captured[0].action == WSAction.ADD
+    assert captured[0].new_obj is not None
+
+
+@pytest.mark.asyncio()
+async def test_update_public_disarms_buffer_when_prime_fails(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A failed prime tears down the buffer but still delivers its frames."""
+    client = protect_client
+    client._public_bootstrap = PublicBootstrap()
+    siren = Siren.from_unifi_dict(api=client, **deepcopy(_siren_snapshot_item()))
+    client._public_bootstrap.sirens[SIREN_ID] = siren
+    update_msg = _mock_text_ws_message(
+        {"type": "update", "item": {"id": SIREN_ID, "modelKey": "siren", "volume": 10}}
+    )
+
+    captured: list[WSSubscriptionMessage] = []
+    client._devices_ws_subscriptions.append(captured.append)
+
+    async def cameras_side_effect() -> list[Any]:
+        client._process_devices_ws_message(update_msg)
+        raise NotAuthorized("boom")
+
+    _mock_update_public_endpoints(
+        client,
+        get_cameras_public=AsyncMock(side_effect=cameras_side_effect),
+    )
+
+    with pytest.raises(NotAuthorized):
+        await client.update_public()
+
+    assert client._prime_ws_buffer is None
+    # The frame is not swallowed: it drains onto the previous cache (the
+    # pre-buffering live behavior) and reaches the subscriber.
+    assert client._public_bootstrap.sirens[SIREN_ID].volume == 10
+    assert len(captured) == 1
+    assert captured[0].action == WSAction.UPDATE
+
+
+@pytest.mark.asyncio()
+async def test_update_public_concurrent_calls_serialize(
+    protect_client: ProtectApiClient,
+) -> None:
+    """
+    Concurrent primes serialize: the second fetches after the first drains.
+
+    Without serialization, the second prime could apply an older snapshot over
+    the frame the first prime replayed, losing the update.
+    """
+    client = protect_client
+    siren = Siren.from_unifi_dict(api=client, **deepcopy(_siren_snapshot_item()))
+    update_msg = _mock_text_ws_message(
+        {"type": "update", "item": {"id": SIREN_ID, "modelKey": "siren", "volume": 10}}
+    )
+
+    captured: list[WSSubscriptionMessage] = []
+    client._devices_ws_subscriptions.append(captured.append)
+
+    order: list[str] = []
+    first_fetch_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def cameras_side_effect() -> list[Any]:
+        if not order:
+            order.append("first-fetch")
+            first_fetch_started.set()
+            # A frame lands in the first prime window...
+            client._process_devices_ws_message(update_msg)
+            # ...and the first prime is held open while the second call starts.
+            await release_first.wait()
+            return []
+        order.append("second-fetch")
+        # The second prime only fetches after the first drained its buffer.
+        assert client._prime_ws_buffer == []
+        assert len(captured) == 1
+        return []
+
+    _mock_update_public_endpoints(
+        client,
+        get_sirens_public=AsyncMock(return_value=[siren]),
+        get_cameras_public=AsyncMock(side_effect=cameras_side_effect),
+    )
+
+    task1 = asyncio.create_task(client.update_public())
+    await first_fetch_started.wait()
+    task2 = asyncio.create_task(client.update_public())
+    await asyncio.sleep(0)
+    release_first.set()
+    pb1 = await task1
+    pb2 = await task2
+
+    assert order == ["first-fetch", "second-fetch"]
+    # The buffered frame is delivered exactly once and nothing regresses it.
+    assert len(captured) == 1
+    assert client._prime_ws_buffer is None
+    assert pb1 is pb2
+
+
+@pytest.mark.asyncio()
+async def test_subscribe_devices_and_prime_is_order_independent(
+    protect_client: ProtectApiClient,
+) -> None:
+    """The combined entrypoint delivers a mid-prime frame to the typed sub."""
+    client = protect_client
+    client._public_bootstrap = None
+    siren = Siren.from_unifi_dict(api=client, **deepcopy(_siren_snapshot_item()))
+    update_msg = _mock_text_ws_message(
+        {"type": "update", "item": {"id": SIREN_ID, "modelKey": "siren", "volume": 10}}
+    )
+    received: list[ProtectDeviceChange] = []
+
+    async def sirens_side_effect() -> list[Any]:
+        client._process_devices_ws_message(update_msg)
+        return [siren]
+
+    _mock_update_public_endpoints(
+        client, get_sirens_public=AsyncMock(side_effect=sirens_side_effect)
+    )
+
+    with patch.object(client, "_get_devices_websocket", return_value=Mock()):
+        unsub = await client.subscribe_devices_and_prime(received.append)
+
+    assert client.has_public_bootstrap
+    assert client.public_bootstrap.sirens[SIREN_ID].volume == 10
+    assert [(c.device_id, c.change) for c in received if c.device_id == SIREN_ID] == [
+        (SIREN_ID, DeviceChange.UPDATED)
+    ]
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_subscribe_devices_and_prime_rolls_back_on_failure(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A prime failure unsubscribes the typed device sub before propagating."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(
+        client, get_cameras_public=AsyncMock(side_effect=NotAuthorized("boom"))
+    )
+
+    with (
+        patch.object(client, "_get_devices_websocket", return_value=Mock()),
+        pytest.raises(NotAuthorized),
+    ):
+        await client.subscribe_devices_and_prime(lambda _c: None)
+
+    assert client._device_dispatcher is not None
+    assert client._device_dispatcher.subscriber_count == 0
+
+
+@pytest.mark.asyncio()
+async def test_subscribe_events_and_prime_primes_and_registers(
+    protect_client: ProtectApiClient,
+) -> None:
+    """The events combined entrypoint primes and registers without prior prime."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(client)
+
+    with patch.object(client, "_get_events_websocket", return_value=Mock()):
+        unsub = await client.subscribe_events_and_prime(lambda _e, _c: None)
+
+    assert client.has_public_bootstrap
+    assert client._event_dispatcher is not None
+    assert client._event_dispatcher.subscriber_count == 1
+    unsub()
+    assert client._event_dispatcher.subscriber_count == 0
+
+
+@pytest.mark.asyncio()
+async def test_subscribe_events_and_prime_rolls_back_on_failure(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A prime failure unsubscribes the typed event sub before propagating."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(
+        client, get_cameras_public=AsyncMock(side_effect=NotAuthorized("boom"))
+    )
+
+    with (
+        patch.object(client, "_get_events_websocket", return_value=Mock()),
+        pytest.raises(NotAuthorized),
+    ):
+        await client.subscribe_events_and_prime(lambda _e, _c: None)
+
+    assert client._event_dispatcher is not None
+    assert client._event_dispatcher.subscriber_count == 0
+
+
+@pytest.mark.asyncio()
+async def test_activate_relay_output_pulse_without_on_raises(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.activate_relay_output_public(
+            RELAY_ID, 0, pulse_duration_ms=500
+        )
+
+
+@pytest.mark.asyncio()
+async def test_activate_relay_output_pulse_with_off_raises(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.activate_relay_output_public(
+            RELAY_ID, 0, state="off", pulse_duration_ms=500
+        )
+
+
+def test_relay_getitem_and_get_output() -> None:
+    relay = Relay.from_unifi_dict(
+        id=RELAY_ID,
+        modelKey="relay",
+        state="CONNECTED",
+        name="R",
+        mac="AA",
+        ledSettings={"isEnabled": True},
+        outputs=[
+            {
+                "id": 0,
+                "name": "Out A",
+                "type": "generic",
+                "delay": 0,
+                "pulseDuration": 200,
+                "state": "off",
+                "rebootState": "off",
+            },
+            {
+                "id": 1,
+                "name": "Out B",
+                "type": "generic",
+                "delay": 10,
+                "pulseDuration": 100,
+                "state": "on",
+                "rebootState": "off",
+            },
+        ],
+        inputs=[],
+    )
+    assert relay[1].name == "Out B"
+    assert relay[1].state is RelayOutputState.ON
+    assert relay[0].state is RelayOutputState.OFF
+    assert relay.get_output(1) is not None
+    with pytest.raises(KeyError):
+        relay[99]
+
+
+def test_relay_get_input() -> None:
+    relay = Relay.from_unifi_dict(
+        id=RELAY_ID,
+        modelKey="relay",
+        state="CONNECTED",
+        name="R",
+        mac="AA",
+        ledSettings={"isEnabled": True},
+        outputs=[],
+        inputs=[
+            {"id": 0, "name": "In A", "state": "off"},
+            {"id": 1, "name": "In B", "state": "on"},
+        ],
+    )
+    inp = relay.get_input(1)
+    assert inp is not None
+    assert inp.id == 1
+    assert inp.name == "In B"
+    assert relay.get_input(0).name == "In A"
+    assert relay.get_input(99) is None
+
+
+def test_relay_output_unknown_state_does_not_raise() -> None:
+    """Forward-compat: an unknown output state from newer firmware coerces to UNKNOWN."""
+    relay = Relay.from_unifi_dict(
+        id=RELAY_ID,
+        modelKey="relay",
+        state="CONNECTED",
+        name="R",
+        mac="AA",
+        ledSettings={"isEnabled": True},
+        outputs=[
+            {
+                "id": 0,
+                "name": None,
+                "type": None,
+                "delay": None,
+                "pulseDuration": None,
+                "state": "totally_new_state_from_future_firmware",
+                "rebootState": None,
+            }
+        ],
+        inputs=[],
+    )
+    assert relay.outputs[0].state is RelayOutputState.UNKNOWN
+
+
+def test_relay_unknown_enum_values_do_not_raise() -> None:
+    """Forward-compat: unknown future-firmware values coerce to UNKNOWN for the new enums."""
+    relay = Relay.from_unifi_dict(
+        id=RELAY_ID,
+        modelKey="relay",
+        state="CONNECTED",
+        name="R",
+        mac="AA",
+        ledSettings={"isEnabled": True},
+        outputs=[
+            {
+                "id": 0,
+                "name": None,
+                "type": "newTypeNotYetInSpec",
+                "delay": None,
+                "pulseDuration": None,
+                "state": None,
+                "rebootState": None,
+            }
+        ],
+        inputs=[
+            {
+                "id": 0,
+                "name": None,
+                "state": None,
+                "actionTrigger": "newTriggerNotYetInSpec",
+                "actionType": "newActionNotYetInSpec",
+                "actionOutputId": None,
+            }
+        ],
+    )
+    assert relay.outputs[0].type is RelayOutputType.UNKNOWN
+    assert relay.inputs[0].action_trigger is RelayInputActionTrigger.UNKNOWN
+    assert relay.inputs[0].action_type is RelayInputActionType.UNKNOWN
+
+
+@pytest.mark.asyncio()
+async def test_send_alarm_webhook_quotes_id(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.send_alarm_webhook_public("my trigger/with+special")
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == ("/v1/alarm-manager/webhook/my%20trigger%2Fwith%2Bspecial")
+
+
+@pytest.mark.asyncio()
+async def test_get_arm_manager_settings_returns_from_cache(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    pb.nvr = _make_public_nvr(
+        protect_client, arm_mode=_arm_mode_raw("armed", PROFILE_ID)
+    )
+    result = await protect_client.get_arm_manager_settings_public()
+    assert result is pb.nvr.arm_mode
+    assert result is not None
+    assert result.arm_profile_id == PROFILE_ID
+
+
+@pytest.mark.asyncio()
+async def test_get_arm_manager_settings_fetches_nvr_when_no_cache(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = None
+    arm_mode = _arm_mode_raw("disabled", PROFILE_ID)
+    protect_client.get_nvr_public = AsyncMock(
+        return_value=_make_public_nvr(protect_client, arm_mode=arm_mode)
+    )
+    result = await protect_client.get_arm_manager_settings_public()
+    assert result is not None
+    assert result.arm_profile_id == PROFILE_ID
+    protect_client.get_nvr_public.assert_called_once()
+
+
+@pytest.mark.asyncio()
+async def test_get_arm_manager_settings_returns_none_when_nvr_has_no_arm_mode(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = None
+    protect_client.get_nvr_public = AsyncMock(
+        return_value=_make_public_nvr(protect_client, arm_mode=None)
+    )
+
+    result = await protect_client.get_arm_manager_settings_public()
+
+    assert result is None
+    protect_client.get_nvr_public.assert_called_once()
+
+
+@pytest.mark.asyncio()
+async def test_set_current_arm_profile_updates_arm_mode_profile_id(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    pb.nvr = _make_public_nvr(protect_client, arm_mode=_arm_mode_raw("disabled"))
+
+    await protect_client.set_current_arm_profile_public(PROFILE_ID)
+
+    assert pb.arm_mode.arm_profile_id == PROFILE_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicSensor.from_unifi_dict")
+async def test_update_sensor_public_all_settings(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=SENSOR_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SENSOR_ID})
+    await protect_client.update_sensor_public(
+        SENSOR_ID,
+        light_settings={"isEnabled": True, "lowThreshold": 10},
+        humidity_settings={"highThreshold": 80},
+        temperature_settings={"lowThreshold": 15.5},
+        motion_settings={"sensitivity": 60},
+        alarm_settings={"isEnabled": False},
+    )
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {
+        "lightSettings": {"isEnabled": True, "lowThreshold": 10},
+        "humiditySettings": {"highThreshold": 80},
+        "temperatureSettings": {"lowThreshold": 15.5},
+        "motionSettings": {"sensitivity": 60},
+        "alarmSettings": {"isEnabled": False},
+    }
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicSensor.from_unifi_dict")
+async def test_update_sensor_public_armed_fields(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=SENSOR_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SENSOR_ID})
+    await protect_client.update_sensor_public(
+        SENSOR_ID,
+        motion_settings={"sensitivity": 60, "sensitivityWhenArmed": 90},
+        glass_break_settings={"isEnabled": True, "sensitivityWhenArmed": 80},
+        schedule_mode=SensorScheduleMode.WHEN_ARMED,
+        arm_profile_ids=["p1", "p2"],
+        has_custom_sensitivity_when_armed=True,
+    )
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {
+        "motionSettings": {"sensitivity": 60, "sensitivityWhenArmed": 90},
+        "glassBreakSettings": {"isEnabled": True, "sensitivityWhenArmed": 80},
+        "scheduleMode": "when_armed",
+        "armProfileIds": ["p1", "p2"],
+        "hasCustomSensitivityWhenArmed": True,
+    }
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ArmProfile.from_unifi_dict")
+async def test_create_arm_profile(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=PROFILE_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": PROFILE_ID})
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    await protect_client.create_arm_profile_public(
+        name="Night",
+        automations=["a"],
+        schedules=[{"start": "0 22 * * *", "end": "0 6 * * *"}],
+        record_everything=True,
+        activation_delay=60000,
+    )
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {
+        "name": "Night",
+        "automations": ["a"],
+        "schedules": [{"start": "0 22 * * *", "end": "0 6 * * *"}],
+        "recordEverything": True,
+        "activationDelay": 60000,
+    }
+    assert PROFILE_ID in pb.arm_profiles
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ArmProfile.from_unifi_dict")
+async def test_update_arm_profile(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=PROFILE_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": PROFILE_ID})
+    await protect_client.update_arm_profile_public(
+        PROFILE_ID, name="Day", schedules=[{"start": "0 8 * * *", "end": "0 18 * * *"}]
+    )
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {
+        "name": "Day",
+        "schedules": [{"start": "0 8 * * *", "end": "0 18 * * *"}],
+    }
+
+
+@pytest.mark.asyncio()
+async def test_delete_arm_profile(protect_client: ProtectApiClient) -> None:
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    pb.arm_profiles[PROFILE_ID] = Mock()
+    protect_client.api_request_raw = AsyncMock(return_value=None)
+    await protect_client.delete_arm_profile_public(PROFILE_ID)
+    _, kwargs = protect_client.api_request_raw.call_args
+    assert kwargs["url"] == f"/v1/arm-profiles/{PROFILE_ID}"
+    assert kwargs["method"] == "delete"
+    assert PROFILE_ID not in pb.arm_profiles
+
+
+def test_public_bootstrap_property_raises_before_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    assert protect_client.has_public_bootstrap is False
+    with pytest.raises(BadRequest):
+        _ = protect_client.public_bootstrap
+
+
+@pytest.mark.asyncio()
+async def test_update_public_creates_cache(
+    protect_client: ProtectApiClient,
+) -> None:
+    _mock_update_public_endpoints(protect_client)
+    pb = await protect_client.update_public()
+    assert pb is protect_client.public_bootstrap
+    assert protect_client.has_public_bootstrap is True
+
+
+@pytest.mark.asyncio()
+async def test_get_nvr_public_returns_none_arm_mode_when_absent(
+    protect_client: ProtectApiClient,
+) -> None:
+    """get_nvr_public with no armMode in payload → returned PublicNVR.arm_mode is None."""
+    protect_client.api_request_obj = AsyncMock(return_value=deepcopy(_NVR_RAW_BASE))
+    result = await protect_client.get_nvr_public()
+
+    assert isinstance(result, PublicNVR)
+    assert result.arm_mode is None
+
+
+@pytest.mark.asyncio()
+async def test_get_nvr_public_sets_arm_mode_when_present(
+    protect_client: ProtectApiClient,
+) -> None:
+    """get_nvr_public with armMode in payload → returned PublicNVR.arm_mode is populated."""
+    raw = deepcopy(_NVR_RAW_BASE)
+    raw["armMode"] = _arm_mode_raw("armed", PROFILE_ID)
+    protect_client.api_request_obj = AsyncMock(return_value=raw)
+
+    result = await protect_client.get_nvr_public()
+
+    assert isinstance(result, PublicNVR)
+    assert result.arm_mode is not None
+    assert result.arm_mode.arm_profile_id == PROFILE_ID
+
+
+@pytest.mark.asyncio()
+async def test_get_nvr_public_mac_none_when_absent(
+    protect_client: ProtectApiClient,
+) -> None:
+    """get_nvr_public with no mac key in the payload → mac is None."""
+    protect_client.api_request_obj = AsyncMock(return_value=deepcopy(_NVR_RAW_BASE))
+    result = await protect_client.get_nvr_public()
+
+    assert isinstance(result, PublicNVR)
+    assert result.mac is None
+
+
+@pytest.mark.asyncio()
+async def test_get_nvr_public_parses_mac_when_present(
+    protect_client: ProtectApiClient,
+) -> None:
+    """get_nvr_public with a mac key in the payload → mac is parsed."""
+    raw = deepcopy(_NVR_RAW_BASE)
+    raw["mac"] = "AABBCCDDEEFF"
+    protect_client.api_request_obj = AsyncMock(return_value=raw)
+
+    result = await protect_client.get_nvr_public()
+
+    assert isinstance(result, PublicNVR)
+    assert result.mac == "AABBCCDDEEFF"
+
+
+def test_ws_handler_without_cache_emits_none_obj(
+    protect_client: ProtectApiClient,
+) -> None:
+    """With the cache unmaterialised the WS handler no longer fabricates objects."""
+    captured: list[Any] = []
+    protect_client._devices_ws_subscriptions.append(captured.append)
+    msg = aiohttp.WSMessage(
+        aiohttp.WSMsgType.TEXT,
+        orjson.dumps(
+            {
+                "type": "add",
+                "item": {"id": SIREN_ID, "modelKey": "siren", "state": "CONNECTED"},
+            }
+        ).decode(),
+        None,
+    )
+    protect_client._process_devices_ws_message(msg)
+    assert len(captured) == 1
+    assert captured[0].new_obj is None
+    assert captured[0].changed_data["id"] == SIREN_ID
+
+
+@pytest.mark.asyncio()
+async def test_update_public_runs_concurrently(
+    protect_client: ProtectApiClient,
+) -> None:
+    """All endpoint fetches are dispatched via asyncio.gather, not awaited serially."""
+    active = 0
+    peak = 0
+
+    async def _slow_empty() -> list[Any]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return []
+
+    async def _slow_nvr() -> PublicNVR:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return _make_public_nvr(protect_client)
+
+    protect_client.get_nvr_public = _slow_nvr  # type: ignore[method-assign]
+    for name in (
+        "get_cameras_public",
+        "get_lights_public",
+        "get_chimes_public",
+        "get_sensors_public",
+        "get_sirens_public",
+        "get_relays_public",
+        "_fetch_arm_profiles",
+    ):
+        setattr(protect_client, name, _slow_empty)
+    await protect_client.update_public()
+    assert peak >= 7
+
+
+@pytest.mark.asyncio()
+async def test_ws_reconnect_schedules_resync(
+    protect_client: ProtectApiClient,
+) -> None:
+    """When the devices WS reconnects, update_public is scheduled if cache exists."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    update_called = asyncio.Event()
+
+    async def _fake_update() -> PublicBootstrap:
+        update_called.set()
+        return protect_client.public_bootstrap
+
+    protect_client.update_public = _fake_update  # type: ignore[assignment]
+    # Initial connect is not a reconnect and must NOT schedule a resync.
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert protect_client._public_resync_task is None
+    # Drop and reconnect.
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await asyncio.wait_for(update_called.wait(), timeout=1.0)
+
+
+def test_ws_initial_connect_does_not_resync(
+    protect_client: ProtectApiClient,
+) -> None:
+    """First CONNECTED transition is the initial connect, not a reconnect."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert protect_client._public_resync_task is None
+
+
+def test_ws_reconnect_skips_resync_without_cache(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Without a materialised cache, reconnect does not schedule anything."""
+    assert protect_client._public_bootstrap is None
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert protect_client._public_resync_task is None
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("get_websocket", "prop", "subscribe"),
+    [
+        (
+            "_get_events_websocket",
+            "events_websocket_state",
+            "subscribe_events_websocket_state",
+        ),
+        (
+            "_get_devices_websocket",
+            "devices_websocket_state",
+            "subscribe_devices_websocket_state",
+        ),
+    ],
+)
+async def test_websocket_state_properties(
+    protect_client: ProtectApiClient,
+    get_websocket: str,
+    prop: str,
+    subscribe: str,
+) -> None:
+    """Each websocket state property matches what its subscribers are told."""
+    assert getattr(protect_client, prop) is WebsocketState.DISCONNECTED
+    websocket = getattr(protect_client, get_websocket)()
+    assert getattr(protect_client, prop) is WebsocketState.DISCONNECTED
+
+    seen: list[tuple[WebsocketState, WebsocketState]] = []
+    getattr(protect_client, subscribe)(
+        lambda state: seen.append((state, getattr(protect_client, prop)))
+    )
+    states = [
+        WebsocketState.CONNECTED,
+        WebsocketState.DISCONNECTED,
+        WebsocketState.AUTH_FAILED,
+        WebsocketState.CONNECTED,
+    ]
+    for state in states:
+        websocket._state_changed(state)
+        assert getattr(protect_client, prop) is state
+    assert seen == [(state, state) for state in states]
+
+    await protect_client.async_disconnect_ws()
+    assert getattr(protect_client, prop) is WebsocketState.DISCONNECTED
+
+
+def test_is_public_live_follows_devices_websocket(
+    protect_client: ProtectApiClient,
+) -> None:
+    """is_public_live is True only while the devices websocket is CONNECTED."""
+    assert protect_client.is_public_live is False
+    devices_websocket = protect_client._get_devices_websocket()
+    protect_client._get_events_websocket()._state_changed(WebsocketState.CONNECTED)
+    assert protect_client.is_public_live is False
+    devices_websocket._state_changed(WebsocketState.CONNECTED)
+    assert protect_client.is_public_live is True
+    devices_websocket._state_changed(WebsocketState.AUTH_FAILED)
+    assert protect_client.is_public_live is False
+
+
+@pytest.mark.asyncio()
+async def test_doorbell_ring_partial_ws_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Doorbell ring arrives as a ``lastRing`` partial diff; HA reads it."""
+    pb = PublicBootstrap()
+    camera = next(iter(protect_client.bootstrap.cameras.values()))
+    pb.cameras[camera.id] = camera
+    protect_client._public_bootstrap = pb
+
+    before = camera.last_ring
+
+    _, new, _ = pb.process_devices_ws_message(
+        protect_client,
+        {
+            "type": "update",
+            "item": {
+                "id": camera.id,
+                "modelKey": "camera",
+                "lastRing": 1700000000000,
+            },
+        },
+    )
+
+    assert new is not None
+    assert new.last_ring != before  # type: ignore[attr-defined]
+
+
+def test_events_ws_motion_minimal_add_and_end_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Public API motion event: minimal ``add`` then ``end`` partial diff."""
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+
+    # Minimal payload — the public integration websocket sends only
+    # these fields on motion-start (no ``score`` / ``smartDetect*``).
+    new_event, old_event, _ = pb.process_events_ws_message(
+        protect_client,
+        {
+            "type": "add",
+            "item": {
+                "id": "evt-motion-1",
+                "modelKey": "event",
+                "type": "motion",
+                "start": 1700000000000,
+            },
+        },
+    )
+    assert old_event is None
+    assert new_event is not None
+    assert new_event.id == "evt-motion-1"
+    assert new_event.type.value == "motion"
+    assert new_event.end is None
+    assert new_event.smart_detect_types == []  # default applied
+    assert "evt-motion-1" in pb.events
+
+    # Partial update closing the event — only ``end`` on the wire.
+    new2, old2, _ = pb.process_events_ws_message(
+        protect_client,
+        {
+            "type": "update",
+            "item": {
+                "id": "evt-motion-1",
+                "modelKey": "event",
+                "end": 1700000005000,
+            },
+        },
+    )
+    # ``old2`` is a pre-merge snapshot of the cached event (end still unset),
+    # distinct from the in-place-merged ``new2`` returned to the caller.
+    assert old2 is not None and old2.end is None
+    assert old2 is not new_event
+    assert new2 is new_event  # merged in place from cache
+    assert new2 is not None and new2.end is not None
+    # And the cache-stored copy reflects the merge.
+    assert pb.events["evt-motion-1"].end is not None
+
+
+def test_events_ws_sensor_button_pressed_add(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Public API events WS accepts ``sensorButtonPressed`` payloads."""
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+
+    new_event, old_event, _ = pb.process_events_ws_message(
+        protect_client,
+        {
+            "type": "add",
+            "item": {
+                "id": "evt-sensor-button-1",
+                "modelKey": "event",
+                "type": "sensorButtonPressed",
+                "start": 1700000000000,
+                "device": SENSOR_ID,
+                "metadata": {
+                    "button": {
+                        "text": "alarmHubButton",
+                    }
+                },
+            },
+        },
+    )
+
+    assert old_event is None
+    assert new_event is not None
+    assert new_event.type is EventType.SENSOR_BUTTON_PRESSED
+    assert new_event.id == "evt-sensor-button-1"
+    assert pb.events["evt-sensor-button-1"].type is EventType.SENSOR_BUTTON_PRESSED
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected"),
+    [
+        ("sensorSmokeTest", EventType.SENSOR_SMOKE_TEST),
+        ("sensorTamper", EventType.SENSOR_TAMPER),
+        ("relayInputChanged", EventType.RELAY_INPUT_CHANGED),
+        ("alarmHubMotion", EventType.ALARM_HUB_MOTION),
+        ("alarmHubEntryOpened", EventType.ALARM_HUB_ENTRY_OPENED),
+        ("alarmHubEntryClosed", EventType.ALARM_HUB_ENTRY_CLOSED),
+        ("alarmHubRelaySwitched", EventType.ALARM_HUB_RELAY_SWITCHED),
+        ("alarmHubButtonPress", EventType.ALARM_HUB_BUTTON_PRESS),
+        ("alarmHubSmoke", EventType.ALARM_HUB_SMOKE),
+        ("alarmHubGlassBreak", EventType.ALARM_HUB_GLASS_BREAK),
+        ("alarmHubTamper", EventType.ALARM_HUB_TAMPER),
+        ("alarmHubBatteryConnected", EventType.ALARM_HUB_BATTERY_CONNECTED),
+        ("alarmHubBatteryLow", EventType.ALARM_HUB_BATTERY_LOW),
+        ("smartDetectLoiterZone", EventType.SMART_DETECT_LOITER),
+    ],
+)
+def test_events_ws_add_supports_additional_public_event_types(
+    protect_client: ProtectApiClient,
+    event_type: str,
+    expected: EventType,
+) -> None:
+    """Public API events WS can parse additional event types from the spec."""
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+
+    event_id = f"evt-{event_type}"
+    new_event, old_event, _ = pb.process_events_ws_message(
+        protect_client,
+        {
+            "type": "add",
+            "item": {
+                "id": event_id,
+                "modelKey": "event",
+                "type": event_type,
+                "start": 1700000000000,
+            },
+        },
+    )
+
+    assert old_event is None
+    assert new_event is not None
+    assert new_event.type is expected
+    assert pb.events[event_id].type is expected
+
+
+def test_events_ws_add_evicts_oldest(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Event cache is bounded; oldest entry is evicted on overflow."""
+    pb = PublicBootstrap(max_event_cache_size=2)
+    protect_client._public_bootstrap = pb
+
+    for i in range(3):
+        pb.process_events_ws_message(
+            protect_client,
+            {
+                "type": "add",
+                "item": {
+                    "id": f"evt-{i}",
+                    "modelKey": "event",
+                    "type": "motion",
+                    "start": 1700000000000 + i,
+                },
+            },
+        )
+
+    assert list(pb.events) == ["evt-1", "evt-2"]
+
+
+def test_public_bootstrap_rejects_negative_event_cache_size() -> None:
+    with pytest.raises(ValueError, match="max_event_cache_size must be >= 0"):
+        PublicBootstrap(max_event_cache_size=-1)
+
+
+def test_events_ws_add_zero_cache_size_keeps_cache_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap(max_event_cache_size=0)
+    protect_client._public_bootstrap = pb
+
+    pb.process_events_ws_message(
+        protect_client,
+        {
+            "type": "add",
+            "item": {
+                "id": "evt-0",
+                "modelKey": "event",
+                "type": "motion",
+                "start": 1700000000000,
+            },
+        },
+    )
+
+    assert pb.events == {}
+
+
+def test_nvr_ws_partial_update_merges_in_place(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``modelKey: nvr`` WS messages update :attr:`PublicBootstrap.nvr`."""
+    pb = PublicBootstrap()
+    pb.nvr = protect_client.bootstrap.nvr  # seed with a valid NVR object
+    protect_client._public_bootstrap = pb
+
+    before_version = pb.nvr.version
+
+    mt, new, old = pb.process_devices_ws_message(
+        protect_client,
+        {
+            "type": "update",
+            "item": {
+                "id": pb.nvr.id,
+                "modelKey": "nvr",
+                "name": "Renamed NVR",
+            },
+        },
+    )
+
+    assert mt is ModelType.NVR
+    assert old is not None and new is not None
+    assert pb.nvr.name == "Renamed NVR"
+    # Unchanged fields preserved.
+    assert pb.nvr.version == before_version
+
+
+@pytest.mark.asyncio()
+async def test_reconnect_resync_is_debounced(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Rapid reconnects collapse into a single ``update_public`` call."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    call_count = 0
+
+    async def _fake_update() -> PublicBootstrap:
+        nonlocal call_count
+        call_count += 1
+        return protect_client.public_bootstrap
+
+    protect_client.update_public = _fake_update  # type: ignore[assignment]
+    # Initial connect — no resync.
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    # First real reconnect fires.
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    # Let the task run.
+    await asyncio.sleep(0)
+    if protect_client._public_resync_task is not None:
+        await protect_client._public_resync_task
+    # Immediate second reconnect — debounced away.
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await asyncio.sleep(0)
+    assert call_count == 1
+
+
+@pytest.mark.asyncio()
+async def test_reconnect_queues_follow_up_resync_while_running(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Reconnect during active resync queues exactly one follow-up refresh."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    call_count = 0
+
+    async def _fake_update() -> PublicBootstrap:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            first_started.set()
+            await release_first.wait()
+        return protect_client.public_bootstrap
+
+    protect_client.update_public = _fake_update  # type: ignore[assignment]
+
+    # Initial connect — no resync.
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    # First reconnect starts first resync run.
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+    # Another reconnect during the active task should queue one follow-up.
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert protect_client._public_resync_pending is True
+
+    # Complete first run; queued second run should happen once.
+    release_first.set()
+    if protect_client._public_resync_task is not None:
+        await protect_client._public_resync_task
+    await asyncio.sleep(0)
+    if protect_client._public_resync_task is not None:
+        await protect_client._public_resync_task
+
+    assert call_count == 2
+    assert protect_client._public_resync_pending is False
+
+
+@pytest.mark.asyncio()
+async def test_subscribed_models_filters_devices_ws(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """``subscribed_models`` is respected by the public devices WS handler."""
+    protect_client_no_debug._subscribed_models = {ModelType.CAMERA}
+    got: list[WSSubscriptionMessage] = []
+    unsub = protect_client_no_debug.subscribe_devices_websocket(got.append)
+    try:
+        # A ``light`` message must be filtered out entirely.
+        msg = aiohttp.WSMessage(
+            aiohttp.WSMsgType.TEXT,
+            orjson.dumps(
+                {
+                    "type": "update",
+                    "item": {"id": "x", "modelKey": "light", "isLightOn": True},
+                }
+            ).decode(),
+            None,
+        )
+        protect_client_no_debug._process_devices_ws_message(msg)
+        assert got == []
+    finally:
+        unsub()
+
+
+@pytest.mark.asyncio()
+async def test_devices_ws_subscribed_models_overrides_subscribed_models(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """devices_ws_subscribed_models takes priority over subscribed_models."""
+    # Global filter says CAMERA only, but per-WS filter allows RELAY.
+    protect_client_no_debug._subscribed_models = {ModelType.CAMERA}
+    protect_client_no_debug._devices_ws_subscribed_models = {ModelType.RELAY}
+    got: list[WSSubscriptionMessage] = []
+    unsub = protect_client_no_debug.subscribe_devices_websocket(got.append)
+    try:
+        relay_msg = aiohttp.WSMessage(
+            aiohttp.WSMsgType.TEXT,
+            orjson.dumps(
+                {"type": "update", "item": {"id": "r1", "modelKey": "relay"}}
+            ).decode(),
+            None,
+        )
+        protect_client_no_debug._process_devices_ws_message(relay_msg)
+        # RELAY passes through because devices_ws_subscribed_models overrides
+        assert len(got) == 1
+
+        got.clear()
+        camera_msg = aiohttp.WSMessage(
+            aiohttp.WSMsgType.TEXT,
+            orjson.dumps(
+                {"type": "update", "item": {"id": "c1", "modelKey": "camera"}}
+            ).decode(),
+            None,
+        )
+        protect_client_no_debug._process_devices_ws_message(camera_msg)
+        # CAMERA is filtered out because devices_ws_subscribed_models={RELAY}
+        assert got == []
+    finally:
+        protect_client_no_debug._devices_ws_subscribed_models = None
+        unsub()
+
+
+@pytest.mark.asyncio()
+async def test_events_ws_subscribed_models_overrides_subscribed_models(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """events_ws_subscribed_models takes priority over subscribed_models."""
+    # Global filter says CAMERA only, but per-WS filter allows EVENT.
+    protect_client_no_debug._subscribed_models = {ModelType.CAMERA}
+    protect_client_no_debug._events_ws_subscribed_models = {ModelType.EVENT}
+    got: list[WSSubscriptionMessage] = []
+    unsub = protect_client_no_debug.subscribe_events_websocket(got.append)
+    try:
+        event_msg = aiohttp.WSMessage(
+            aiohttp.WSMsgType.TEXT,
+            orjson.dumps(
+                {"type": "add", "item": {"id": "e1", "modelKey": "event"}}
+            ).decode(),
+            None,
+        )
+        protect_client_no_debug._process_events_ws_message(event_msg)
+        # EVENT passes through because events_ws_subscribed_models overrides
+        assert len(got) == 1
+
+        got.clear()
+        camera_msg = aiohttp.WSMessage(
+            aiohttp.WSMsgType.TEXT,
+            orjson.dumps(
+                {"type": "update", "item": {"id": "c1", "modelKey": "camera"}}
+            ).decode(),
+            None,
+        )
+        protect_client_no_debug._process_events_ws_message(camera_msg)
+        # CAMERA is filtered out because events_ws_subscribed_models={EVENT}
+        assert got == []
+    finally:
+        protect_client_no_debug._events_ws_subscribed_models = None
+        unsub()
+
+
+def _build_siren(protect_client: ProtectApiClient, siren_id: str = SIREN_ID) -> Siren:
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    pb.process_devices_ws_message(
+        protect_client,
+        {
+            "type": "add",
+            "item": {
+                "id": siren_id,
+                "modelKey": "siren",
+                "state": "CONNECTED",
+                "name": "Siren",
+                "mac": "AA",
+                "volume": 50,
+                "ledSettings": {"isEnabled": True},
+                "sirenStatus": {
+                    "isActive": False,
+                    "activatedAt": None,
+                    "duration": None,
+                },
+                "connectionType": "lora",
+                "wirelessConnectionState": {
+                    "signalState": {"signalQuality": 80, "signalStrength": -50},
+                    "batteryStatus": {"percentage": 100, "isLow": False},
+                    "bridge": None,
+                },
+            },
+        },
+    )
+    return pb.sirens[siren_id]
+
+
+def _build_relay(protect_client: ProtectApiClient, relay_id: str = RELAY_ID) -> Relay:
+    pb = protect_client._public_bootstrap or PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    pb.process_devices_ws_message(
+        protect_client,
+        {
+            "type": "add",
+            "item": {
+                "id": relay_id,
+                "modelKey": "relay",
+                "state": "CONNECTED",
+                "name": "Relay",
+                "mac": "BB",
+                "ledSettings": {"isEnabled": True},
+                "outputs": [
+                    {
+                        "id": 0,
+                        "name": "Out0",
+                        "type": "relay",
+                        "delay": 0,
+                        "pulseDuration": 500,
+                        "state": "off",
+                        "rebootState": "off",
+                    }
+                ],
+                "inputs": [],
+            },
+        },
+    )
+    return pb.relays[relay_id]
+
+
+@pytest.mark.asyncio()
+async def test_siren_device_action_helpers(
+    protect_client: ProtectApiClient,
+) -> None:
+    siren = _build_siren(protect_client)
+    protect_client.play_siren_public = AsyncMock()
+    protect_client.stop_siren_public = AsyncMock()
+    protect_client.test_siren_sound_public = AsyncMock()
+    protect_client.update_siren_public = AsyncMock(return_value=siren)
+
+    # Siren built with activatedAt=None: turn_off_at is None, fallback to server flag.
+    assert siren.siren_status.turn_off_at is None
+    assert siren.is_active is False
+
+    # play() forwards duration unchanged; play_siren_public is the single
+    # validation/normalization site (covered by test_play_siren_public_*).
+    await siren.play()
+    protect_client.play_siren_public.assert_awaited_with(SIREN_ID, duration=None)
+
+    await siren.play(duration=SirenDuration.TEN)
+    protect_client.play_siren_public.assert_awaited_with(
+        SIREN_ID, duration=SirenDuration.TEN
+    )
+
+    protect_client.play_siren_public.reset_mock()
+    await siren.play(duration=5)
+    protect_client.play_siren_public.assert_awaited_once_with(SIREN_ID, duration=5)
+
+    await siren.stop()
+    protect_client.stop_siren_public.assert_awaited_once_with(SIREN_ID)
+
+    await siren.test_sound(volume=70)
+    protect_client.test_siren_sound_public.assert_awaited_once_with(SIREN_ID, volume=70)
+
+    assert await siren.set_name("New") is siren
+    protect_client.update_siren_public.assert_awaited_with(SIREN_ID, name="New")
+    assert await siren.set_volume(33) is siren
+    protect_client.update_siren_public.assert_awaited_with(SIREN_ID, volume=33)
+    assert await siren.set_status_light(False) is siren
+    protect_client.update_siren_public.assert_awaited_with(
+        SIREN_ID, led_is_enabled=False
+    )
+
+
+@pytest.mark.asyncio()
+async def test_relay_device_action_helpers(
+    protect_client: ProtectApiClient,
+) -> None:
+    relay = _build_relay(protect_client)
+    protect_client.activate_relay_output_public = AsyncMock()
+    protect_client.update_relay_public = AsyncMock(return_value=relay)
+
+    await relay.activate_output(0, state="on", pulse_duration_ms=200)
+    protect_client.activate_relay_output_public.assert_awaited_once_with(
+        RELAY_ID, 0, state="on", pulse_duration_ms=200
+    )
+
+    assert await relay.set_name("R1") is relay
+    protect_client.update_relay_public.assert_awaited_with(RELAY_ID, name="R1")
+    assert await relay.set_status_light(True) is relay
+    protect_client.update_relay_public.assert_awaited_with(
+        RELAY_ID, led_is_enabled=True
+    )
+
+
+def _build_speaker(
+    protect_client: ProtectApiClient, speaker_id: str = SPEAKER_ID
+) -> Speaker:
+    pb = protect_client._public_bootstrap or PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    pb.process_devices_ws_message(
+        protect_client,
+        {"type": "add", "item": _speaker_raw(id=speaker_id)},
+    )
+    return pb.speakers[speaker_id]
+
+
+@pytest.mark.asyncio()
+async def test_speaker_device_action_helpers(
+    protect_client: ProtectApiClient,
+) -> None:
+    speaker = _build_speaker(protect_client)
+    protect_client.update_speaker_public = AsyncMock(return_value=speaker)
+    protect_client.test_speaker_sound_public = AsyncMock()
+
+    assert await speaker.set_name("Lobby") is speaker
+    protect_client.update_speaker_public.assert_awaited_with(SPEAKER_ID, name="Lobby")
+    assert await speaker.set_volume(60) is speaker
+    protect_client.update_speaker_public.assert_awaited_with(SPEAKER_ID, volume=60)
+    assert await speaker.set_mic_volume(30) is speaker
+    protect_client.update_speaker_public.assert_awaited_with(SPEAKER_ID, mic_volume=30)
+    assert await speaker.set_mic_enabled(False) is speaker
+    protect_client.update_speaker_public.assert_awaited_with(
+        SPEAKER_ID, is_mic_enabled=False
+    )
+
+    await speaker.test_sound(volume=55)
+    protect_client.test_speaker_sound_public.assert_awaited_once_with(
+        SPEAKER_ID, volume=55
+    )
+
+
+@pytest.mark.asyncio()
+async def test_speaker_api_update_rejects_generic_mutations(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Generic mutation path must fail loudly for Public API speakers."""
+    speaker = _build_speaker(protect_client)
+    with pytest.raises(BadRequest, match="Speaker mutations"):
+        await speaker._api_update({"name": "new"})
+
+
+def test_public_bootstrap_get_and_unknown_model(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``PublicBootstrap.get`` returns cached obj for known type, ``None`` otherwise."""
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+    assert pb.get(ModelType.SIREN, SIREN_ID) is siren
+    assert pb.get(ModelType.SIREN, "missing") is None
+    # ModelType.UNKNOWN (or any type not in _PUBLIC_STORES) → None.
+    assert pb.get(ModelType.UNKNOWN, SIREN_ID) is None
+
+
+def test_public_bootstrap_store_for(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``store_for`` returns the live store for both registries, else ``None``."""
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+    assert pb.store_for(ModelType.SIREN) is pb.sirens
+    assert pb.store_for(ModelType.SIREN) == {SIREN_ID: siren}
+    # Dedicated-slot type — only reachable through the second registry.
+    assert pb.store_for(ModelType.VIEWPORT) is pb.viewers
+    assert pb.store_for(ModelType.LIVEVIEW) is pb.liveviews
+    assert pb.store_for(ModelType.UNKNOWN) is None
+    assert pb.store_for(ModelType.NVR) is None
+
+
+def test_public_bootstrap_all_devices_empty() -> None:
+    """Empty bootstrap yields nothing, with or without the NVR flag."""
+    pb = PublicBootstrap()
+    assert list(pb.all_devices()) == []
+    assert list(pb.all_devices(include_nvr=True)) == []
+
+
+def test_public_bootstrap_all_devices(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``all_devices`` enumerates every store, spanning both registries."""
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+    camera = next(iter(protect_client.bootstrap.cameras.values()))
+    pb.cameras[camera.id] = camera
+    # A dedicated-slot device (``viewers``) — collision-routed to its own store
+    # by ``ModelType``, so it is only reachable through the second registry.
+    pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": _viewer_raw()}
+    )
+    viewer = pb.viewers[VIEWER_ID]
+    # A liveview is a saved-view config, not a device (no ``mac``); it must be
+    # excluded even though it lives in ``_DEDICATED_SLOT_STORE_ATTRS``.
+    pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": _liveview_raw()}
+    )
+    liveview = pb.liveviews[LIVEVIEW_ID]
+
+    by_id = {id(d) for d in pb.all_devices()}
+    assert by_id == {id(camera), id(siren), id(viewer)}
+    assert all(d is not liveview for d in pb.all_devices())
+
+    # NVR excluded by default, yielded first when requested.
+    pb.nvr = _make_public_nvr(protect_client, arm_mode=_arm_mode_raw("disabled"))
+    assert all(d is not pb.nvr for d in pb.all_devices())
+    with_nvr = list(pb.all_devices(include_nvr=True))
+    assert with_nvr[0] is pb.nvr
+    assert {id(d) for d in with_nvr} == {
+        id(pb.nvr),
+        id(camera),
+        id(siren),
+        id(viewer),
+    }
+
+
+def _registry_store_attrs() -> list[str]:
+    stores = [attr for attr, _cls in public_bootstrap_module._PUBLIC_STORES.values()]
+    stores.extend(public_bootstrap_module._DEDICATED_SLOT_STORE_ATTRS.values())
+    return stores
+
+
+def test_public_bootstrap_to_diagnostics_empty() -> None:
+    """An empty cache dumps ``nvr: None`` and an empty list per registry store."""
+    diag = PublicBootstrap().to_diagnostics()
+    assert diag == {"nvr": None, **{attr: [] for attr in _registry_store_attrs()}}
+
+
+def test_public_bootstrap_to_diagnostics_every_store(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Every registry store, liveviews included, and the NVR are dumped anonymized."""
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+    pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": _viewer_raw()}
+    )
+    pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": _liveview_raw()}
+    )
+    pb.nvr = _make_public_nvr(protect_client)
+
+    diag = pb.to_diagnostics()
+
+    assert set(diag) == {"nvr", *_registry_store_attrs()}
+    assert diag["nvr"]["id"] == anonymize.object_id_mapping[pb.nvr.id]
+    assert diag["nvr"]["id"] != pb.nvr.id
+    for attr, raw_id, model_key in (
+        ("sirens", SIREN_ID, "siren"),
+        ("viewers", VIEWER_ID, "viewer"),
+        ("liveviews", LIVEVIEW_ID, "liveview"),
+    ):
+        (dumped,) = diag[attr]
+        assert dumped["modelKey"] == model_key
+        assert dumped["id"] == anonymize.object_id_mapping[raw_id]
+        assert dumped["id"] != raw_id
+    assert diag["sirens"][0]["mac"] != siren.mac
+    assert siren.id == SIREN_ID
+
+
+def test_public_bootstrap_to_diagnostics_new_registry_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store added to a registry is dumped without other changes."""
+    monkeypatch.setitem(
+        public_bootstrap_module._PUBLIC_STORES, ModelType.UNKNOWN, ("widgets", None)
+    )
+    pb = PublicBootstrap()
+    camera = PublicCamera.from_unifi_dict(**deepcopy(CAMERA_PAYLOAD))
+    pb.widgets = {camera.id: camera}  # type: ignore[attr-defined]
+
+    (dumped,) = pb.to_diagnostics()["widgets"]
+
+    assert dumped["id"] == anonymize.object_id_mapping[camera.id]
+
+
+def test_public_bootstrap_to_diagnostics_anonymizes_rtsps_streams() -> None:
+    """RTSPS stream URLs never leak the console host or stream alias."""
+    pb = PublicBootstrap()
+    camera = PublicCamera.from_unifi_dict(**deepcopy(CAMERA_PAYLOAD))
+    camera.rtsps_streams = RTSPSStreams(
+        high="rtsps://192.168.1.1:7441/secretAlias",
+        low="rtsps://192.168.1.1:7441/otherAlias",
+    )
+    pb.cameras[camera.id] = camera
+
+    (dumped,) = pb.to_diagnostics()["cameras"]
+
+    streams = dumped["rtspsStreams"]
+    assert set(streams) == {"high", "low"}
+    for url in streams.values():
+        assert url.startswith("rtsps://")
+        assert "192.168.1.1" not in url
+        assert "Alias" not in url
+    assert camera.rtsps_streams.high == "rtsps://192.168.1.1:7441/secretAlias"
+
+
+def test_public_bootstrap_to_diagnostics_anonymizes_bridge_clients() -> None:
+    """Bridge client MACs are mapped like ``mac``."""
+    pb = PublicBootstrap()
+    bridge = PublicBridge.from_unifi_dict(**_bridge_raw())
+    pb.bridges[bridge.id] = bridge
+
+    (dumped,) = pb.to_diagnostics()["bridges"]
+
+    (client,) = dumped["clients"]
+    assert client == anonymize.object_id_mapping["112233445566"]
+    assert client != "112233445566"
+    assert dumped["mac"] != "AABBCCDDEEFF"
+    assert bridge.clients == ["112233445566"]
+
+
+def test_public_bootstrap_to_diagnostics_anonymizes_custom_messages(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Custom doorbell messages never leak into the NVR dump."""
+    pb = PublicBootstrap()
+    pb.nvr = _make_public_nvr(protect_client)
+    pb.nvr.doorbell_settings.custom_messages = ["Secret Gate Code"]
+
+    dumped = pb.to_diagnostics()["nvr"]
+
+    (message,) = dumped["doorbellSettings"]["customMessages"]
+    assert message != "Secret Gate Code"
+    assert pb.nvr.doorbell_settings.custom_messages == ["Secret Gate Code"]
+
+
+def test_public_bootstrap_to_diagnostics_ids_match_private_dump(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ids match an ``anonymize_data`` dump of the private bootstrap."""
+    monkeypatch.setattr(anonymize, "object_id_mapping", {})
+    private_camera = next(iter(protect_client.bootstrap.cameras.values()))
+    pb = PublicBootstrap()
+    camera = PublicCamera.from_unifi_dict(
+        **{**deepcopy(CAMERA_PAYLOAD), "id": private_camera.id}
+    )
+    pb.cameras[camera.id] = camera
+
+    private_dump = anonymize.anonymize_data(protect_client.bootstrap.unifi_dict())
+    (dumped,) = pb.to_diagnostics()["cameras"]
+
+    private_ids = {cam["id"] for cam in private_dump["cameras"]}
+    assert dumped["id"] in private_ids
+    assert dumped["id"] != private_camera.id
+
+
+def test_apply_fetch_result_removes_stale_entries(
+    protect_client: ProtectApiClient,
+) -> None:
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+    # Pretend the HTTP fetch returned an empty list → the cached siren is stale.
+    pb.apply_fetch_result("sirens", [])
+    assert SIREN_ID not in pb.sirens
+    # Reinsert via fetch.
+    pb.apply_fetch_result("sirens", [siren])
+    assert pb.sirens[SIREN_ID] is siren
+
+
+def test_process_devices_ws_message_invalid_envelope(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Missing ``type`` / ``modelKey`` / ``id`` short-circuits to ``(None, None, None)``."""
+    pb = PublicBootstrap()
+    # Missing type.
+    assert pb.process_devices_ws_message(
+        protect_client, {"item": {"id": "x", "modelKey": "siren"}}
+    ) == (None, None, None)
+    # Missing modelKey.
+    assert pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": {"id": "x"}}
+    ) == (None, None, None)
+    # Missing id.
+    assert pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": {"modelKey": "siren"}}
+    ) == (None, None, None)
+    # Completely missing item.
+    assert pb.process_devices_ws_message(protect_client, {"type": "add"}) == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_process_events_ws_message_invalid_or_non_event(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    # Invalid envelope.
+    assert pb.process_events_ws_message(protect_client, {}) == (None, None, [])
+    # Non-event modelKey routed to the events handler.
+    assert pb.process_events_ws_message(
+        protect_client,
+        {"type": "add", "item": {"id": "x", "modelKey": "siren"}},
+    ) == (None, None, [])
+
+
+def test_apply_action_add_creation_failure(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``create_from_unifi_dict`` raising → cache untouched, ``_warn_once`` fires."""
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    # A ``siren`` payload missing required fields triggers a validation error.
+    mt, new, old = pb.process_devices_ws_message(
+        protect_client,
+        {
+            "type": "add",
+            "item": {"id": "bad-siren", "modelKey": "siren"},
+        },
+    )
+    assert mt is ModelType.SIREN
+    assert new is None and old is None
+    assert "bad-siren" not in pb.sirens
+
+
+def test_nvr_ws_remove_clears_slot(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    # First an NVR update to populate (reuse existing merge-in-place logic).
+    # Simplest: set the slot directly, then issue a remove envelope.
+    pb.nvr = Mock(id="nvr-1")
+    mt, new, old = pb.process_devices_ws_message(
+        protect_client,
+        {"type": "remove", "item": {"id": "nvr-1", "modelKey": "nvr"}},
+    )
+    assert mt is ModelType.NVR
+    assert new is None and old is not None
+    assert pb.nvr is None
+
+
+def test_events_ws_remove_clears_cache(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    pb.process_events_ws_message(
+        protect_client,
+        {
+            "type": "add",
+            "item": {
+                "id": "evt-rm",
+                "modelKey": "event",
+                "type": "motion",
+                "start": 1700000000000,
+            },
+        },
+    )
+    new, old, _ = pb.process_events_ws_message(
+        protect_client,
+        {"type": "remove", "item": {"id": "evt-rm", "modelKey": "event"}},
+    )
+    assert new is None
+    assert old is not None
+    assert "evt-rm" not in pb.events
+
+
+def test_apply_action_unknown_action_falls_through(
+    protect_client: ProtectApiClient,
+) -> None:
+    """An unrecognized action returns ``(None, old)`` without touching the cache."""
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+    mt, new, old = pb.process_devices_ws_message(
+        protect_client,
+        {"type": "weird", "item": {"id": SIREN_ID, "modelKey": "siren"}},
+    )
+    assert mt is ModelType.SIREN
+    assert new is None
+    assert old is siren
+    assert pb.sirens[SIREN_ID] is siren
+
+
+def test_merge_empty_and_no_op_payloads(
+    protect_client: ProtectApiClient,
+) -> None:
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+    # Empty payload (only identity fields) → merge returns original.
+    _, new, old = pb.process_devices_ws_message(
+        protect_client,
+        {"type": "update", "item": {"id": SIREN_ID, "modelKey": "siren"}},
+    )
+    assert new is siren
+    assert old is siren
+    # Payload with a camelCase key that ``unifi_dict_to_dict`` drops (unknown)
+    # → cleaned is empty → returns original.
+    _, new, old = pb.process_devices_ws_message(
+        protect_client,
+        {
+            "type": "update",
+            "item": {
+                "id": SIREN_ID,
+                "modelKey": "siren",
+                "totallyUnknownField": 123,
+            },
+        },
+    )
+    assert new is siren
+
+
+def test_merge_exception_and_warn_once(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A merge that raises triggers WARNING once, then DEBUG."""
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+    # Reset the per-instance WARNING tracker so we can reliably see the
+    # first-occurrence path.
+    pb._warned_merge_failures.clear()
+
+    def _boom(self: Any, cleaned: dict[str, Any]) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(type(siren), "update_from_dict", _boom)
+
+    update = {
+        "type": "update",
+        "item": {"id": SIREN_ID, "modelKey": "siren", "volume": 10},
+    }
+    # First call → WARNING path in _warn_once.
+    _, new, old = pb.process_devices_ws_message(protect_client, update)
+    assert new is None
+    assert old is siren  # cache still contains the old value.
+    assert pb.sirens[SIREN_ID] is siren
+    # Second call → DEBUG path (already warned for this key).
+    _, new2, _ = pb.process_devices_ws_message(protect_client, update)
+    assert new2 is None
+
+
+def test_parse_ws_envelope_none_item() -> None:
+    """Direct test of ``_parse_ws_envelope`` for the ``data['item'] is None`` path."""
+    from uiprotect.data.public_bootstrap import _parse_ws_envelope  # noqa: PLC0415
+
+    assert _parse_ws_envelope({"type": "add", "item": None}) == (None, {}, None)
+    assert _parse_ws_envelope({}) == (None, {}, None)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Siren.from_unifi_dict")
+async def test_get_siren_public(
+    mock_ctor: Mock, protect_client: ProtectApiClient
+) -> None:
+    mock_ctor.return_value = Mock(id=SIREN_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SIREN_ID})
+    result = await protect_client.get_siren_public(SIREN_ID)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/sirens/{SIREN_ID}"
+    assert result.id == SIREN_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Siren.from_unifi_dict")
+async def test_update_siren_public_name_only(
+    mock_ctor: Mock, protect_client: ProtectApiClient
+) -> None:
+    mock_ctor.return_value = Mock(id=SIREN_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": SIREN_ID})
+    await protect_client.update_siren_public(SIREN_ID, name="Front")
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {"name": "Front"}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.Relay.from_unifi_dict")
+async def test_get_relays_and_relay_public(
+    mock_ctor: Mock, protect_client: ProtectApiClient
+) -> None:
+    mock_ctor.side_effect = [Mock(id=RELAY_ID), Mock(id=RELAY_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": RELAY_ID}])
+    protect_client.api_request_obj = AsyncMock(return_value={"id": RELAY_ID})
+
+    relays = await protect_client.get_relays_public()
+    assert len(relays) == 1
+    assert relays[0].id == RELAY_ID
+    _, kwargs = protect_client.api_request_list.call_args
+    assert kwargs["url"] == "/v1/relays"
+
+    relay = await protect_client.get_relay_public(RELAY_ID)
+    assert relay.id == RELAY_ID
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/relays/{RELAY_ID}"
+
+
+@pytest.mark.asyncio()
+async def test_update_relay_public_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_relay_public(RELAY_ID)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ArmProfile.from_unifi_dict")
+async def test_update_arm_profile_all_params_updates_cache(
+    mock_ctor: Mock, protect_client: ProtectApiClient
+) -> None:
+    """Exercises ``automations`` / ``recordEverything`` / ``activationDelay`` + cache upsert."""
+    profile = Mock(id=PROFILE_ID)
+    mock_ctor.return_value = profile
+    protect_client.api_request_obj = AsyncMock(return_value={"id": PROFILE_ID})
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+
+    await protect_client.update_arm_profile_public(
+        PROFILE_ID,
+        automations=["a1"],
+        record_everything=True,
+        activation_delay=30,
+    )
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {
+        "automations": ["a1"],
+        "recordEverything": True,
+        "activationDelay": 30,
+    }
+    assert pb.arm_profiles[PROFILE_ID] is profile
+
+
+def test_process_devices_ws_message_uses_cache_when_materialised(
+    protect_client: ProtectApiClient,
+) -> None:
+    """When ``_public_bootstrap`` exists, ``new_obj`` comes from the cache."""
+    captured: list[Any] = []
+    protect_client._devices_ws_subscriptions.append(captured.append)
+    _build_siren(protect_client)  # populates the cache with SIREN_ID
+    msg = aiohttp.WSMessage(
+        aiohttp.WSMsgType.TEXT,
+        orjson.dumps(
+            {
+                "type": "update",
+                "item": {"id": SIREN_ID, "modelKey": "siren", "volume": 11},
+            }
+        ).decode(),
+        None,
+    )
+    protect_client._process_devices_ws_message(msg)
+    assert len(captured) == 1
+    assert captured[0].new_obj is not None
+    assert captured[0].new_obj.volume == 11
+    assert captured[0].old_obj is not None
+
+
+@pytest.mark.asyncio()
+async def test_process_events_ws_message_uses_cache_when_materialised(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Events WS pipes cached ``new_obj`` / ``old_obj`` from ``PublicBootstrap``."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    captured: list[Any] = []
+    protect_client._events_ws_subscriptions.append(captured.append)
+    msg = aiohttp.WSMessage(
+        aiohttp.WSMsgType.TEXT,
+        orjson.dumps(
+            {
+                "type": "add",
+                "item": {
+                    "id": "evt-cache",
+                    "modelKey": "event",
+                    "type": "motion",
+                    "start": 1700000000000,
+                },
+            }
+        ).decode(),
+        None,
+    )
+    protect_client._process_events_ws_message(msg)
+    assert len(captured) == 1
+    assert captured[0].new_obj is not None
+    assert captured[0].new_obj.id == "evt-cache"
+
+
+@pytest.mark.asyncio()
+async def test_detection_transition_emits_devices_ws_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A detection transition emits a devices-WS update alongside the events emit."""
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    pb.process_devices_ws_message(Mock(), {"type": "add", "item": dict(CAMERA_PAYLOAD)})
+
+    events_got: list[Any] = []
+    devices_got: list[Any] = []
+    protect_client._events_ws_subscriptions.append(events_got.append)
+    protect_client._devices_ws_subscriptions.append(devices_got.append)
+
+    msg = aiohttp.WSMessage(
+        aiohttp.WSMsgType.TEXT,
+        orjson.dumps(
+            {
+                "type": "add",
+                "item": {
+                    "id": "m1",
+                    "modelKey": "event",
+                    "type": "motion",
+                    "start": 1700000000000,
+                    "device": "cam1",
+                },
+            }
+        ).decode(),
+        None,
+    )
+    protect_client._process_events_ws_message(msg)
+
+    # Existing events-WS emit is unchanged.
+    assert len(events_got) == 1
+    # A devices-WS update is additionally emitted for the affected camera.
+    assert len(devices_got) == 1
+    dmsg = devices_got[0]
+    assert dmsg.action is WSAction.UPDATE
+    assert dmsg.new_obj is pb.cameras["cam1"]
+    assert dmsg.new_update_id == "cam1"
+    assert dmsg.changed_data == {"is_motion_detected": True}
+
+
+@pytest.mark.asyncio()
+async def test_detection_transition_typed_subscriber_resolves_camera(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A detection transition reaches ``subscribe_devices`` as a typed CAMERA change."""
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    pb.process_devices_ws_message(Mock(), {"type": "add", "item": dict(CAMERA_PAYLOAD)})
+
+    changes: list[Any] = []
+    protect_client.subscribe_devices(changes.append)
+
+    msg = aiohttp.WSMessage(
+        aiohttp.WSMsgType.TEXT,
+        orjson.dumps(
+            {
+                "type": "add",
+                "item": {
+                    "id": "m1",
+                    "modelKey": "event",
+                    "type": "motion",
+                    "start": 1700000000000,
+                    "device": "cam1",
+                },
+            }
+        ).decode(),
+        None,
+    )
+    protect_client._process_events_ws_message(msg)
+
+    assert len(changes) == 1
+    change = changes[0]
+    # The synthetic ``changed_data`` lacks ``modelKey``; the dispatcher must
+    # still resolve CAMERA from ``new_obj`` rather than falling back to UNKNOWN.
+    assert change.model_type is ModelType.CAMERA
+    assert change.device_id == "cam1"
+    # ``device_mac`` is the camera's mac, not its id.
+    assert change.device_mac == CAMERA_PAYLOAD["mac"]
+    assert change.model is pb.cameras["cam1"]
+
+
+@pytest.mark.asyncio()
+async def test_non_transition_event_emits_no_devices_ws_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    """An events frame that flips no detection boolean emits no devices-WS update."""
+    pb = PublicBootstrap()
+    protect_client._public_bootstrap = pb
+    pb.process_devices_ws_message(Mock(), {"type": "add", "item": dict(CAMERA_PAYLOAD)})
+
+    devices_got: list[Any] = []
+    protect_client._devices_ws_subscriptions.append(devices_got.append)
+
+    msg = aiohttp.WSMessage(
+        aiohttp.WSMsgType.TEXT,
+        orjson.dumps(
+            {
+                "type": "add",
+                "item": {
+                    "id": "r1",
+                    "modelKey": "event",
+                    "type": "ring",
+                    "start": 1700000000000,
+                    "device": "cam1",
+                },
+            }
+        ).decode(),
+        None,
+    )
+    protect_client._process_events_ws_message(msg)
+    assert devices_got == []
+
+
+@pytest.mark.asyncio()
+async def test_resync_public_bootstrap_logs_on_failure(
+    protect_client: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_resync_public_bootstrap`` swallows and logs any ``update_public`` exception."""
+    protect_client.update_public = AsyncMock(side_effect=RuntimeError("offline"))  # type: ignore[method-assign]
+    with caplog.at_level("ERROR"):
+        await protect_client._resync_public_bootstrap()
+    assert "Failed to resync public bootstrap after reconnect" in caplog.text
+
+
+@pytest.mark.asyncio()
+async def test_resync_public_bootstrap_refreshes_rtsps_cache_in_place(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A reconnect resync re-fetches populated RTSPS fields in place, never emptying."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    camera = PublicCamera.model_construct(
+        id="cam1",
+        state=DeviceState.CONNECTED,
+        rtsps_streams=RTSPSStreams(high="rtsps://example.com/stale"),
+    )
+    protect_client._public_bootstrap.cameras["cam1"] = camera
+    protect_client.update_public = AsyncMock()  # type: ignore[method-assign]
+    fresh = RTSPSStreams(high="rtsps://example.com/fresh")
+    protect_client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=fresh
+    )
+
+    await protect_client._resync_public_bootstrap()
+
+    protect_client.get_camera_rtsps_streams.assert_awaited_once_with("cam1")
+    # Field stayed populated throughout — refreshed in place, never cleared.
+    assert camera.rtsps_streams is fresh
+
+
+@pytest.mark.asyncio()
+async def test_resync_public_bootstrap_keeps_rtsps_on_refresh_failure(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A failing per-camera refresh during resync leaves the stale field in place."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    stale = RTSPSStreams(high="rtsps://example.com/stale")
+    camera = PublicCamera.model_construct(
+        id="cam1", state=DeviceState.CONNECTED, rtsps_streams=stale
+    )
+    protect_client._public_bootstrap.cameras["cam1"] = camera
+    protect_client.update_public = AsyncMock()  # type: ignore[method-assign]
+    protect_client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("offline")
+    )
+
+    await protect_client._resync_public_bootstrap()
+
+    assert camera.rtsps_streams is stale
+
+
+@pytest.mark.asyncio()
+async def test_resync_public_bootstrap_skips_rtsps_refresh_when_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    """With no populated RTSPS fields, resync issues no per-camera refetch."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    protect_client._public_bootstrap.cameras["cam1"] = PublicCamera.model_construct(
+        id="cam1", state=DeviceState.CONNECTED, rtsps_streams=None
+    )
+    protect_client.update_public = AsyncMock()  # type: ignore[method-assign]
+    protect_client.get_camera_rtsps_streams = AsyncMock()  # type: ignore[method-assign]
+
+    await protect_client._resync_public_bootstrap()
+
+    protect_client.get_camera_rtsps_streams.assert_not_awaited()
+
+
+def _public_camera(camera_id: str, state: DeviceState) -> PublicCamera:
+    """Build a bare public camera for ``update_public`` priming tests."""
+    return PublicCamera.model_construct(id=camera_id, state=state, rtsps_streams=None)
+
+
+@pytest.mark.asyncio()
+async def test_update_public_primes_connected_cameras(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``update_public`` fetches and stores RTSPS streams for each connected camera."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    cam2 = _public_camera("cam2", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1, cam2]),
+    )
+    streams = {
+        "cam1": RTSPSStreams(high="rtsps://example.com/cam1"),
+        "cam2": RTSPSStreams(high="rtsps://example.com/cam2"),
+    }
+    protect_client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        side_effect=lambda cid: streams[cid]
+    )
+
+    pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"].rtsps_streams is streams["cam1"]
+    assert pb.cameras["cam2"].rtsps_streams is streams["cam2"]
+    assert protect_client.get_camera_rtsps_streams.await_count == 2
+
+
+@pytest.mark.asyncio()
+async def test_update_public_skips_disconnected_cameras(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Priming only touches connected cameras; offline ones are left unprimed."""
+    online = _public_camera("cam1", DeviceState.CONNECTED)
+    offline = _public_camera("cam2", DeviceState.DISCONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[online, offline]),
+    )
+    fresh = RTSPSStreams(high="rtsps://example.com/cam1")
+    protect_client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=fresh
+    )
+
+    pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"].rtsps_streams is fresh
+    assert pb.cameras["cam2"].rtsps_streams is None
+    protect_client.get_camera_rtsps_streams.assert_awaited_once_with("cam1")
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_is_best_effort(
+    protect_client: ProtectApiClient,
+) -> None:
+    """One camera's failed prime is swallowed and does not abort the rest."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    cam2 = _public_camera("cam2", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1, cam2]),
+    )
+    good = RTSPSStreams(high="rtsps://example.com/cam2")
+
+    async def _fetch(camera_id: str) -> RTSPSStreams:
+        if camera_id == "cam1":
+            raise RuntimeError("offline")
+        return good
+
+    protect_client.get_camera_rtsps_streams = _fetch  # type: ignore[method-assign]
+
+    pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"].rtsps_streams is None
+    assert pb.cameras["cam2"].rtsps_streams is good
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_skips_none_result(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A camera whose fetch returns ``None`` is left with an unset field."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1]),
+    )
+    protect_client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=None
+    )
+
+    pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"].rtsps_streams is None
+
+
+@pytest.mark.asyncio()
+async def test_update_public_carries_forward_rtsps_across_reparse(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Existing streams survive the re-parse and the carried camera is not refetched."""
+    carried = RTSPSStreams(high="rtsps://example.com/carried")
+    protect_client._public_bootstrap = PublicBootstrap()
+    protect_client._public_bootstrap.cameras["cam1"] = PublicCamera.model_construct(
+        id="cam1", state=DeviceState.CONNECTED, rtsps_streams=carried
+    )
+    # The re-parse hands back freshly-built cameras with ``rtsps_streams=None``.
+    fresh_cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    cam2 = _public_camera("cam2", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[fresh_cam1, cam2]),
+    )
+    primed = RTSPSStreams(high="rtsps://example.com/cam2")
+    protect_client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=primed
+    )
+
+    pb = await protect_client.update_public()
+
+    # cam1's streams are carried forward (idempotent — never re-fetched).
+    assert pb.cameras["cam1"].rtsps_streams is carried
+    assert pb.cameras["cam2"].rtsps_streams is primed
+    protect_client.get_camera_rtsps_streams.assert_awaited_once_with("cam2")
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_skips_write_when_camera_replaced(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A camera replaced (remove+add) mid-fetch is not resurrected by the prime."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1]),
+    )
+    replacement = _public_camera("cam1", DeviceState.CONNECTED)
+    streams = RTSPSStreams(high="rtsps://example.com/cam1")
+
+    async def _fetch(camera_id: str) -> RTSPSStreams:
+        # Simulate a remove+add swapping the cached camera while the fetch runs.
+        protect_client._public_bootstrap.cameras["cam1"] = replacement
+        return streams
+
+    protect_client.get_camera_rtsps_streams = _fetch  # type: ignore[method-assign]
+
+    pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"] is replacement
+    assert replacement.rtsps_streams is None
+    assert cam1.rtsps_streams is None
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_does_not_clobber_concurrent_write_through(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A write-through landing mid-fetch is not overwritten by the stale prime."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1]),
+    )
+    created = RTSPSStreams(high="rtsps://example.com/created")
+    fetched = RTSPSStreams(high="rtsps://example.com/fetched")
+
+    async def _fetch(camera_id: str) -> RTSPSStreams:
+        # A create write-through fills the field while the prime fetch is awaited.
+        cam1.rtsps_streams = created
+        return fetched
+
+    protect_client.get_camera_rtsps_streams = _fetch  # type: ignore[method-assign]
+
+    pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"].rtsps_streams is created
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_respects_concurrency_bound(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No more than ``RTSPS_PRIME_CONCURRENCY`` prime fetches run at once."""
+    monkeypatch.setattr(api_module, "RTSPS_PRIME_CONCURRENCY", 2)
+    cameras = [_public_camera(f"cam{i}", DeviceState.CONNECTED) for i in range(4)]
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=cameras),
+    )
+    started: list[str] = []
+    two_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fetch(camera_id: str) -> RTSPSStreams:
+        started.append(camera_id)
+        if len(started) == 2:
+            two_started.set()
+        await release.wait()
+        return RTSPSStreams(high=f"rtsps://example.com/{camera_id}")
+
+    protect_client.get_camera_rtsps_streams = _fetch  # type: ignore[method-assign]
+
+    task = asyncio.create_task(protect_client.update_public())
+    await two_started.wait()
+    # Give any over-eager third fetch a chance to (wrongly) start.
+    await asyncio.sleep(0)
+    assert len(started) == 2
+
+    release.set()
+    await task
+    assert len(started) == 4
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_bounds_hung_fetch(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A camera whose prime fetch hangs is bounded by the per-request timeout."""
+    monkeypatch.setattr(api_module, "RTSPS_PRIME_TIMEOUT", 0.01)
+    monkeypatch.setattr(api_module, "RTSPS_PRIME_RETRIES", 0)
+    hung = _public_camera("cam1", DeviceState.CONNECTED)
+    good = _public_camera("cam2", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[hung, good]),
+    )
+    fresh = RTSPSStreams(high="rtsps://example.com/cam2")
+
+    async def _fetch(camera_id: str) -> RTSPSStreams:
+        if camera_id == "cam1":
+            await asyncio.sleep(10)
+        return fresh
+
+    protect_client.get_camera_rtsps_streams = _fetch  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"].rtsps_streams is None
+    assert pb.cameras["cam2"].rtsps_streams is fresh
+    assert "Could not prime RTSPS streams for 1 camera(s): cam1" in caplog.text
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_retries_transient_failure(
+    protect_client: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A single transient prime failure is healed by the retry."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1]),
+    )
+    healed = RTSPSStreams(high="rtsps://example.com/cam1")
+    calls = 0
+
+    async def _fetch(camera_id: str) -> RTSPSStreams:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient")
+        return healed
+
+    protect_client.get_camera_rtsps_streams = _fetch  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        pb = await protect_client.update_public()
+
+    assert calls == 2
+    assert pb.cameras["cam1"].rtsps_streams is healed
+    assert "Could not prime RTSPS streams" not in caplog.text
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_aggregates_failures_into_one_warning(
+    protect_client: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every camera that still fails after retries lands in a single WARNING."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    cam2 = _public_camera("cam2", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1, cam2]),
+    )
+    protect_client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("offline")
+    )
+
+    with caplog.at_level("WARNING"):
+        pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"].rtsps_streams is None
+    assert pb.cameras["cam2"].rtsps_streams is None
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "Could not prime RTSPS streams" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "cam1" in warnings[0]
+    assert "cam2" in warnings[0]
+    assert "2 camera(s)" in warnings[0]
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_retries_none_result(
+    protect_client: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``None`` prime result is retried and healed on the next attempt."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1]),
+    )
+    healed = RTSPSStreams(high="rtsps://example.com/cam1")
+    calls = 0
+
+    async def _fetch(camera_id: str) -> RTSPSStreams | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return healed
+
+    protect_client.get_camera_rtsps_streams = _fetch  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        pb = await protect_client.update_public()
+
+    assert calls == 2
+    assert pb.cameras["cam1"].rtsps_streams is healed
+    assert "Could not prime RTSPS streams" not in caplog.text
+
+
+@pytest.mark.asyncio()
+async def test_update_public_prime_none_result_warns(
+    protect_client: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A camera returning ``None`` on every attempt lands in the aggregated WARNING."""
+    cam1 = _public_camera("cam1", DeviceState.CONNECTED)
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[cam1]),
+    )
+    protect_client.get_camera_rtsps_streams = AsyncMock(  # type: ignore[method-assign]
+        return_value=None
+    )
+
+    with caplog.at_level("WARNING"):
+        pb = await protect_client.update_public()
+
+    assert pb.cameras["cam1"].rtsps_streams is None
+    assert "Could not prime RTSPS streams for 1 camera(s): cam1" in caplog.text
+
+
+@pytest.mark.asyncio()
+async def test_update_public_reraises_unexpected_exception(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Unexpected (non-``BadRequest``/``NvrError``) endpoint failures propagate."""
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        await protect_client.update_public()
+
+
+@pytest.mark.asyncio()
+async def test_update_public_unexpected_error_leaves_snapshot_untouched(
+    protect_client: ProtectApiClient,
+) -> None:
+    """An unexpected error mid-batch must not half-apply the bootstrap."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    prior_camera = Mock(id="old-cam")
+    pb.cameras["old-cam"] = prior_camera
+    prior_profile = Mock(id="old-profile")
+    pb.arm_profiles["old-profile"] = prior_profile
+
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[Mock(id="new-cam")]),
+        get_sensors_public=AsyncMock(side_effect=RuntimeError("boom")),
+        _fetch_arm_profiles=AsyncMock(return_value=[Mock(id="new-profile")]),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await protect_client.update_public()
+
+    # A successful endpoint (cameras) is NOT applied; arm profiles NOT re-applied.
+    assert pb.cameras == {"old-cam": prior_camera}
+    assert pb.arm_profiles == {"old-profile": prior_profile}
+
+
+@pytest.mark.asyncio()
+async def test_update_public_revoked_key_aborts(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A revoked key (401) surfaces as NotAuthorized before anything is applied."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    prior_camera = Mock(id="old-cam")
+    pb.cameras["old-cam"] = prior_camera
+
+    _mock_update_public_endpoints(
+        protect_client,
+        get_cameras_public=AsyncMock(return_value=[Mock(id="new-cam")]),
+        get_nvr_public=AsyncMock(side_effect=NotAuthorized("401")),
+    )
+
+    with pytest.raises(NotAuthorized):
+        await protect_client.update_public()
+
+    assert pb.cameras == {"old-cam": prior_camera}
+
+
+@pytest.mark.asyncio()
+async def test_update_public_first_refresh_failure_leaves_bootstrap_none(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A failed first refresh must not publish an empty bootstrap."""
+    protect_client._public_bootstrap = None
+
+    _mock_update_public_endpoints(
+        protect_client,
+        get_nvr_public=AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await protect_client.update_public()
+
+    assert protect_client._public_bootstrap is None
+    assert protect_client.has_public_bootstrap is False
+
+
+@pytest.mark.asyncio()
+async def test_update_public_applies_arm_profiles_in_batch(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Arm profiles are applied in place during update_public's batch phase."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    pb.arm_profiles["stale"] = Mock(id="stale")
+    original_dict = pb.arm_profiles
+
+    _mock_update_public_endpoints(
+        protect_client,
+        _fetch_arm_profiles=AsyncMock(return_value=[Mock(id="ap1")]),
+    )
+
+    await protect_client.update_public()
+
+    assert pb.arm_profiles is original_dict  # identity preserved
+    assert "stale" not in pb.arm_profiles
+    assert "ap1" in pb.arm_profiles
+
+
+def test_process_events_ws_message_invalid_envelope_early_return(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Events WS short-circuits on missing ``type`` / ``modelKey``."""
+    captured: list[Any] = []
+    protect_client._events_ws_subscriptions.append(captured.append)
+    for payload in (
+        {"item": {"id": "x", "modelKey": "event"}},  # missing type
+        {"type": "add", "item": {"id": "x"}},  # missing modelKey
+        {"type": "add", "item": {"id": "x", "modelKey": "totally_unknown"}},
+    ):
+        msg = aiohttp.WSMessage(
+            aiohttp.WSMsgType.TEXT,
+            orjson.dumps(payload).decode(),
+            None,
+        )
+        protect_client._process_events_ws_message(msg)
+
+    # Covers the ``_subscribed_models`` filter branch (early return).
+    protect_client._subscribed_models = {ModelType.CAMERA}
+    try:
+        msg = aiohttp.WSMessage(
+            aiohttp.WSMsgType.TEXT,
+            orjson.dumps(
+                {"type": "add", "item": {"id": "x", "modelKey": "event"}}
+            ).decode(),
+            None,
+        )
+        protect_client._process_events_ws_message(msg)
+    finally:
+        protect_client._subscribed_models = set()
+
+    assert captured == []
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ArmProfile.from_unifi_dict")
+async def test_get_arm_profiles_preserves_dict_identity(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """Refreshing arm profiles must update the dict in place, not replace it."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    original_dict = pb.arm_profiles
+    # Seed with a stale entry that must be evicted after refresh.
+    pb.arm_profiles["stale"] = Mock(id="stale")
+
+    mock_ctor.side_effect = [Mock(id=PROFILE_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": PROFILE_ID}])
+
+    await protect_client.get_arm_profiles_public()
+
+    assert pb.arm_profiles is original_dict  # identity preserved
+    assert "stale" not in pb.arm_profiles
+    assert PROFILE_ID in pb.arm_profiles
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.ArmProfile.from_unifi_dict")
+async def test_fetch_arm_profiles_does_not_mutate_cache(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """`_fetch_arm_profiles` returns profiles without touching the cache."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    pb = protect_client.public_bootstrap
+    pb.arm_profiles["stale"] = Mock(id="stale")
+    mock_ctor.side_effect = [Mock(id=PROFILE_ID)]
+    protect_client.api_request_list = AsyncMock(return_value=[{"id": PROFILE_ID}])
+
+    profiles = await protect_client._fetch_arm_profiles()
+
+    assert [p.id for p in profiles] == [PROFILE_ID]
+    assert pb.arm_profiles == {"stale": pb.arm_profiles["stale"]}  # untouched
+
+    original_dict = pb.arm_profiles
+    protect_client._apply_arm_profiles(profiles)
+    assert pb.arm_profiles is original_dict  # identity preserved
+    assert "stale" not in pb.arm_profiles
+    assert PROFILE_ID in pb.arm_profiles
+
+
+@pytest.mark.asyncio()
+async def test_siren_api_update_rejects_generic_mutations(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Generic mutation path must fail loudly for Public API sirens."""
+    siren = _build_siren(protect_client)
+    with pytest.raises(BadRequest, match="Siren mutations"):
+        await siren._api_update({"name": "new"})
+
+
+@pytest.mark.asyncio()
+async def test_relay_api_update_rejects_generic_mutations(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Generic mutation path must fail loudly for Public API relays."""
+    relay = _build_relay(protect_client)
+    with pytest.raises(BadRequest, match="Relay mutations"):
+        await relay._api_update({"name": "new"})
+
+
+def _liveview_raw(**overrides: Any) -> dict[str, Any]:
+    raw: dict[str, Any] = {
+        "id": LIVEVIEW_ID,
+        "modelKey": "liveview",
+        "name": "Garage",
+        "isDefault": False,
+        "isGlobal": True,
+        "owner": OWNER_ID,
+        "layout": 1,
+        "slots": [
+            {
+                "cameras": ["cam-1", "cam-2"],
+                "cycleMode": "motion",
+                "cycleInterval": 10,
+            }
+        ],
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_liveview_model_from_unifi_dict() -> None:
+    raw = _liveview_raw(
+        layout=4,
+        slots=[
+            {
+                "cameras": ["cam-1", "cam-2", "cam-3"],
+                "cycleMode": "motion",
+                "cycleInterval": 10,
+            },
+            {
+                "cameras": ["cam-4"],
+                "cycleMode": "time",
+                "cycleInterval": 30,
+            },
+        ],
+    )
+    liveview = PublicLiveview.from_unifi_dict(**raw)
+    assert liveview.id == LIVEVIEW_ID
+    assert liveview.model is ModelType.LIVEVIEW
+    assert liveview.name == "Garage"
+    assert liveview.is_default is False
+    assert liveview.is_global is True
+    assert liveview.owner == OWNER_ID
+    assert liveview.layout == 4
+    assert len(liveview.slots) == 2
+    assert isinstance(liveview.slots[0], PublicLiveviewSlot)
+    assert liveview.slots[0].camera_ids == ["cam-1", "cam-2", "cam-3"]
+    assert liveview.slots[0].cycle_mode is LiveviewCycleMode.MOTION
+    assert liveview.slots[0].cycle_interval == 10
+    assert liveview.slots[1].camera_ids == ["cam-4"]
+    assert liveview.slots[1].cycle_mode is LiveviewCycleMode.TIME
+
+
+def test_liveview_model_does_not_collide_with_private() -> None:
+    """``PublicLiveview`` and private ``Liveview`` are distinct types."""
+    raw = _liveview_raw()
+    assert PublicLiveview is not Liveview
+    public = PublicLiveview.from_unifi_dict(**raw)
+    assert isinstance(public, PublicLiveview)
+    # The private bootstrap path must still resolve ``liveview`` modelKey to
+    # the private ``Liveview`` class via ``MODEL_TO_CLASS``.
+    private_raw = dict(raw)
+    # Private Liveview uses ``ownerId`` (remapped from ``owner``); the dict
+    # path already accepts ``owner`` via the remap on the private side.
+    private = create_from_unifi_dict(private_raw)
+    assert isinstance(private, Liveview)
+    assert not isinstance(private, PublicLiveview)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicLiveview.from_unifi_dict")
+async def test_get_liveviews_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=LIVEVIEW_ID), Mock(id="other")]
+    protect_client.api_request_list = AsyncMock(
+        return_value=[{"id": LIVEVIEW_ID}, {"id": "other"}]
+    )
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    result = await protect_client.get_liveviews_public()
+
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/liveviews", public_api=True
+    )
+    assert len(result) == 2
+    assert result[0].id == LIVEVIEW_ID
+    assert pb.liveviews == {obj.id: obj for obj in result}
+
+
+@pytest.mark.asyncio()
+async def test_get_liveviews_public_drops_stale_cached_id(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+    pb.liveviews["gone"] = PublicLiveview.from_unifi_dict(
+        **_liveview_raw(id="gone"), api=protect_client
+    )
+    protect_client.api_request_list = AsyncMock(return_value=[_liveview_raw()])
+
+    await protect_client.get_liveviews_public()
+
+    assert list(pb.liveviews) == [LIVEVIEW_ID]
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicLiveview.from_unifi_dict")
+async def test_get_liveview_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=LIVEVIEW_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": LIVEVIEW_ID})
+
+    result = await protect_client.get_liveview_public(LIVEVIEW_ID)
+
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/liveviews/{LIVEVIEW_ID}"
+    assert kwargs["public_api"] is True
+    assert result.id == LIVEVIEW_ID
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicLiveview.from_unifi_dict")
+async def test_get_liveview_public_writes_pb(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    obj = Mock(id=LIVEVIEW_ID)
+    mock_ctor.return_value = obj
+    protect_client.api_request_obj = AsyncMock(return_value={"id": LIVEVIEW_ID})
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    await protect_client.get_liveview_public(LIVEVIEW_ID)
+
+    assert pb.liveviews[LIVEVIEW_ID] is obj
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicLiveview.from_unifi_dict")
+async def test_create_liveview_public_body(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    new_id = "new-liveview-id"
+    obj = Mock(id=new_id)
+    mock_ctor.return_value = obj
+    protect_client.api_request_obj = AsyncMock(return_value={"id": new_id})
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    await protect_client.create_liveview_public(
+        name="X",
+        is_default=False,
+        is_global=True,
+        owner="u1",
+        layout=4,
+        slots=[
+            {
+                "cameras": ["c1"],
+                "cycleMode": "motion",
+                "cycleInterval": 10,
+            }
+        ],
+    )
+
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == "/v1/liveviews"
+    assert kwargs["method"] == "post"
+    assert kwargs["public_api"] is True
+    assert kwargs["json"] == {
+        "name": "X",
+        "isDefault": False,
+        "isGlobal": True,
+        "owner": "u1",
+        "layout": 4,
+        "slots": [{"cameras": ["c1"], "cycleMode": "motion", "cycleInterval": 10}],
+    }
+    # No id, no modelKey in the create body.
+    assert "id" not in kwargs["json"]
+    assert "modelKey" not in kwargs["json"]
+    assert pb.liveviews[new_id] is obj
+
+
+_LIVEVIEW_SLOTS = [
+    {"cameras": ["cam-1", "cam-2"], "cycleMode": "motion", "cycleInterval": 10}
+]
+
+
+@pytest.mark.asyncio()
+async def test_update_liveview_public_fills_body_from_fresh_fetch(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+    pb.liveviews[LIVEVIEW_ID] = PublicLiveview.from_unifi_dict(
+        **_liveview_raw(name="Stale", layout=9, isGlobal=False, slots=[]),
+        api=protect_client,
+    )
+    changes: list[Any] = []
+    protect_client.subscribe_public_store_changes(changes.append)
+    protect_client.api_request_obj = AsyncMock(
+        side_effect=[_liveview_raw(), _liveview_raw(name="new")]
+    )
+
+    result = await protect_client.update_liveview_public(LIVEVIEW_ID, name="new")
+
+    first, second = protect_client.api_request_obj.call_args_list
+    assert first.kwargs == {"url": f"/v1/liveviews/{LIVEVIEW_ID}", "public_api": True}
+    assert second.kwargs["url"] == f"/v1/liveviews/{LIVEVIEW_ID}"
+    assert second.kwargs["method"] == "patch"
+    assert second.kwargs["json"] == {
+        "name": "new",
+        "isGlobal": True,
+        "layout": 1,
+        "slots": _LIVEVIEW_SLOTS,
+    }
+    assert pb.liveviews[LIVEVIEW_ID] is result
+    assert result.name == "new"
+    assert len(changes) == 1
+
+
+@pytest.mark.asyncio()
+async def test_update_liveview_public_slots_keep_fetched_layout(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = PublicBootstrap()
+    protect_client.api_request_obj = AsyncMock(
+        side_effect=[_liveview_raw(layout=4), _liveview_raw(layout=4)]
+    )
+    slots: list[PublicLiveviewSlotDict] = [
+        {"cameras": ["a"], "cycleMode": LiveviewCycleMode.TIME, "cycleInterval": 5}
+    ]
+
+    await protect_client.update_liveview_public(LIVEVIEW_ID, slots=slots)
+
+    assert protect_client.api_request_obj.call_args.kwargs["json"] == {
+        "name": "Garage",
+        "isGlobal": True,
+        "layout": 4,
+        "slots": [{"cameras": ["a"], "cycleMode": "time", "cycleInterval": 5}],
+    }
+
+
+@pytest.mark.asyncio()
+async def test_update_liveview_public_keeps_unknown_cycle_mode(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = None
+    raw_slots = [{"cameras": ["cam-1"], "cycleMode": "future", "cycleInterval": 3}]
+    protect_client.api_request_obj = AsyncMock(
+        side_effect=[_liveview_raw(slots=raw_slots), _liveview_raw()]
+    )
+
+    await protect_client.update_liveview_public(LIVEVIEW_ID, layout=4)
+
+    body = protect_client.api_request_obj.call_args.kwargs["json"]
+    assert body["slots"] == raw_slots
+    assert body["layout"] == 4
+
+
+@pytest.mark.asyncio()
+async def test_update_liveview_public_full_body_skips_fetch(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = PublicBootstrap()
+    protect_client.api_request_obj = AsyncMock(return_value=_liveview_raw())
+    await protect_client.update_liveview_public(
+        LIVEVIEW_ID,
+        name="N",
+        is_global=False,
+        layout=9,
+        slots=[
+            {
+                "cameras": ["a", "b"],
+                "cycleMode": LiveviewCycleMode.TIME,
+                "cycleInterval": 5,
+            }
+        ],
+    )
+    protect_client.api_request_obj.assert_awaited_once()
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {
+        "name": "N",
+        "isGlobal": False,
+        "layout": 9,
+        "slots": [{"cameras": ["a", "b"], "cycleMode": "time", "cycleInterval": 5}],
+    }
+
+
+@pytest.mark.asyncio()
+async def test_update_liveview_public_serializes_same_liveview(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = PublicBootstrap()
+    server = _liveview_raw()
+    calls: list[str] = []
+
+    async def _request(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs.get("method", "get"))
+        await asyncio.sleep(0)
+        if kwargs.get("method") == "patch":
+            server.update(kwargs["json"])
+        return dict(server)
+
+    protect_client.api_request_obj = AsyncMock(side_effect=_request)
+
+    await asyncio.gather(
+        protect_client.update_liveview_public(LIVEVIEW_ID, name="A"),
+        protect_client.update_liveview_public(LIVEVIEW_ID, layout=4),
+    )
+
+    assert calls == ["get", "patch", "get", "patch"]
+    assert server["name"] == "A"
+    assert server["layout"] == 4
+
+
+@pytest.mark.asyncio()
+async def test_update_liveview_public_missing_slots_come_from_fetch(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = PublicBootstrap()
+    protect_client.api_request_obj = AsyncMock(
+        side_effect=[_liveview_raw(), _liveview_raw()]
+    )
+
+    await protect_client.update_liveview_public(
+        LIVEVIEW_ID, name="N", is_global=False, layout=4
+    )
+
+    assert protect_client.api_request_obj.await_count == 2
+    assert protect_client.api_request_obj.call_args.kwargs["json"] == {
+        "name": "N",
+        "isGlobal": False,
+        "layout": 4,
+        "slots": _LIVEVIEW_SLOTS,
+    }
+
+
+@pytest.mark.asyncio()
+async def test_update_liveview_public_different_liveviews_run_in_parallel(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client._public_bootstrap = PublicBootstrap()
+    release = asyncio.Event()
+    fetched: set[str] = set()
+
+    async def _request(**kwargs: Any) -> dict[str, Any]:
+        liveview_id = kwargs["url"].rsplit("/", 1)[-1]
+        if kwargs.get("method") != "patch":
+            fetched.add(liveview_id)
+            await release.wait()
+        return _liveview_raw(id=liveview_id)
+
+    protect_client.api_request_obj = AsyncMock(side_effect=_request)
+    updates = asyncio.gather(
+        protect_client.update_liveview_public("lv-a", name="A"),
+        protect_client.update_liveview_public("lv-b", name="B"),
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert fetched == {"lv-a", "lv-b"}
+    release.set()
+    await updates
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("kwargs", [{"is_default": True}, {"owner": "u9"}])
+async def test_update_liveview_public_rejects_create_only_fields(
+    protect_client: ProtectApiClient, kwargs: dict[str, Any]
+) -> None:
+    protect_client.api_request_obj = AsyncMock()
+    with pytest.raises(BadRequest, match="is_default and owner"):
+        await protect_client.update_liveview_public(LIVEVIEW_ID, name="N", **kwargs)
+    protect_client.api_request_obj.assert_not_awaited()
+
+
+@pytest.mark.asyncio()
+async def test_update_liveview_public_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    with pytest.raises(BadRequest):
+        await protect_client.update_liveview_public(LIVEVIEW_ID)
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("bad_layout", [0, 27, -1])
+async def test_create_liveview_public_rejects_invalid_layout(
+    protect_client: ProtectApiClient,
+    bad_layout: int,
+) -> None:
+    with pytest.raises(BadRequest, match="layout must be between 1 and 26"):
+        await protect_client.create_liveview_public(
+            name="X",
+            is_default=False,
+            is_global=True,
+            owner="u1",
+            layout=bad_layout,
+            slots=[],
+        )
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("bad_layout", [0, 27, -1])
+async def test_update_liveview_public_rejects_invalid_layout(
+    protect_client: ProtectApiClient,
+    bad_layout: int,
+) -> None:
+    with pytest.raises(BadRequest, match="layout must be between 1 and 26"):
+        await protect_client.update_liveview_public(LIVEVIEW_ID, layout=bad_layout)
+
+
+def test_public_bootstrap_applies_liveview_add_and_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    add_payload = {"type": "add", "item": _liveview_raw()}
+    mt, new, old = pb.process_devices_ws_message(protect_client, add_payload)
+    assert mt is ModelType.LIVEVIEW
+    assert new is not None and new.id == LIVEVIEW_ID
+    assert isinstance(new, PublicLiveview)
+    assert not isinstance(new, Liveview)
+    assert old is None
+    assert LIVEVIEW_ID in pb.liveviews
+
+    # Partial WS update — only ``layout`` on the wire. Untouched fields
+    # (slots, owner) must survive the in-place merge.
+    update_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": LIVEVIEW_ID, "modelKey": "liveview", "layout": 4},
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, update_payload)
+    assert old is not None
+    assert new is not None
+    assert new.layout == 4  # type: ignore[attr-defined]
+    assert new.owner == OWNER_ID  # type: ignore[attr-defined]
+    assert len(new.slots) == 1  # type: ignore[attr-defined]
+    assert new.slots[0].camera_ids == ["cam-1", "cam-2"]  # type: ignore[attr-defined]
+
+
+def test_public_bootstrap_liveview_get_lookup(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": _liveview_raw()}
+    )
+    fetched = pb.get(ModelType.LIVEVIEW, LIVEVIEW_ID)
+    assert fetched is not None
+    assert fetched is pb.liveviews[LIVEVIEW_ID]
+    assert isinstance(fetched, PublicLiveview)
+
+
+@pytest.mark.asyncio()
+async def test_update_public_populates_liveviews(
+    protect_client: ProtectApiClient,
+) -> None:
+    lv1 = Mock(id="lv-1")
+    lv2 = Mock(id="lv-2")
+    _mock_update_public_endpoints(
+        protect_client,
+        _fetch_liveviews=AsyncMock(return_value=[lv1, lv2]),
+    )
+
+    pb = await protect_client.update_public()
+
+    assert "lv-1" in pb.liveviews
+    assert "lv-2" in pb.liveviews
+
+    protect_client._fetch_liveviews = AsyncMock(return_value=[lv2])
+    pb = await protect_client.update_public()
+    assert "lv-1" not in pb.liveviews
+    assert "lv-2" in pb.liveviews
+
+
+@pytest.mark.asyncio()
+async def test_liveview_api_update_rejects_generic_mutations() -> None:
+    """Generic mutation path must fail loudly for Public API liveviews."""
+    liveview = PublicLiveview.from_unifi_dict(**_liveview_raw())
+    with pytest.raises(BadRequest, match="Liveview mutations"):
+        await liveview._api_update({"name": "new"})
+
+
+def _bridge_raw(**overrides: Any) -> dict[str, Any]:
+    raw: dict[str, Any] = {
+        "id": BRIDGE_ID,
+        "modelKey": "bridge",
+        "state": "CONNECTED",
+        "name": "Bridge 1",
+        "mac": "AABBCCDDEEFF",
+        "platform": "mt7621",
+        "clients": ["112233445566"],
+        "maxClients": 7,
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_bridge_model_from_unifi_dict() -> None:
+    bridge = PublicBridge.from_unifi_dict(**_bridge_raw())
+    assert bridge.id == BRIDGE_ID
+    assert bridge.model is ModelType.BRIDGE
+    assert bridge.state is DeviceState.CONNECTED
+    assert bridge.name == "Bridge 1"
+    assert bridge.mac == "AABBCCDDEEFF"
+    assert bridge.platform == "mt7621"
+    assert bridge.clients == ["112233445566"]
+    assert bridge.max_clients == 7
+
+
+def test_bridge_model_stays_out_of_private_model_map() -> None:
+    """``PublicBridge`` is routed by ``PublicBootstrap``, not ``MODEL_TO_CLASS``."""
+    public = PublicBridge.from_unifi_dict(**_bridge_raw())
+    assert isinstance(public, PublicBridge)
+    assert ModelType.BRIDGE not in MODEL_TO_CLASS
+    assert PublicBridge not in MODEL_TO_CLASS.values()
+
+
+def test_bridge_model_preserves_optional_platform() -> None:
+    """``bridgePlatform`` is nullable per the spec."""
+    bridge = PublicBridge.from_unifi_dict(**_bridge_raw(platform=None))
+    assert bridge.platform is None
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicBridge.from_unifi_dict")
+async def test_get_bridges_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=BRIDGE_ID), Mock(id="other")]
+    protect_client.api_request_list = AsyncMock(
+        return_value=[{"id": BRIDGE_ID}, {"id": "other"}]
+    )
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    result = await protect_client.get_bridges_public()
+
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/bridges", public_api=True
+    )
+    assert len(result) == 2
+    # List getter must not write into the cache.
+    assert pb.bridges == {}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicBridge.from_unifi_dict")
+async def test_get_bridge_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=BRIDGE_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": BRIDGE_ID})
+    await protect_client.get_bridge_public(BRIDGE_ID)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/bridges/{BRIDGE_ID}"
+    assert kwargs["public_api"] is True
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicBridge.from_unifi_dict")
+async def test_get_bridge_public_writes_pb(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    obj = Mock(id=BRIDGE_ID)
+    mock_ctor.return_value = obj
+    protect_client.api_request_obj = AsyncMock(return_value={"id": BRIDGE_ID})
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    await protect_client.get_bridge_public(BRIDGE_ID)
+
+    assert pb.bridges[BRIDGE_ID] is obj
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicBridge.from_unifi_dict")
+async def test_update_bridge_public_body(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    obj = Mock(id=BRIDGE_ID)
+    mock_ctor.return_value = obj
+    protect_client.api_request_obj = AsyncMock(return_value={"id": BRIDGE_ID})
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    await protect_client.update_bridge_public(BRIDGE_ID, name="renamed")
+
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/bridges/{BRIDGE_ID}"
+    assert kwargs["method"] == "patch"
+    assert kwargs["json"] == {"name": "renamed"}
+    assert pb.bridges[BRIDGE_ID] is obj
+
+
+@pytest.mark.asyncio()
+async def test_update_bridge_public_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_obj = AsyncMock()
+    with pytest.raises(BadRequest):
+        await protect_client.update_bridge_public(BRIDGE_ID)
+    protect_client.api_request_obj.assert_not_called()
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicBridge.from_unifi_dict")
+async def test_update_bridge_public_no_bootstrap(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """``_public_bootstrap is None`` must skip cache writes without raising."""
+    obj = Mock(id=BRIDGE_ID)
+    mock_ctor.return_value = obj
+    protect_client.api_request_obj = AsyncMock(return_value={"id": BRIDGE_ID})
+    protect_client._public_bootstrap = None
+
+    result = await protect_client.update_bridge_public(BRIDGE_ID, name="renamed")
+
+    assert result is obj
+
+
+def test_public_bootstrap_applies_bridge_add_and_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    add_payload = {"type": "add", "item": _bridge_raw()}
+    mt, new, old = pb.process_devices_ws_message(protect_client, add_payload)
+    assert mt is ModelType.BRIDGE
+    assert new is not None and new.id == BRIDGE_ID
+    assert isinstance(new, PublicBridge)
+    assert old is None
+    assert BRIDGE_ID in pb.bridges
+    # The public-API cache must not contaminate other stores.
+    assert BRIDGE_ID not in pb.cameras
+
+    update_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": BRIDGE_ID, "modelKey": "bridge", "maxClients": 12},
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, update_payload)
+    assert old is not None
+    assert new is not None
+    assert new.max_clients == 12  # type: ignore[attr-defined]
+    # Untouched fields survive the in-place merge.
+    assert new.clients == ["112233445566"]  # type: ignore[attr-defined]
+    assert new.platform == "mt7621"  # type: ignore[attr-defined]
+
+
+def test_public_bootstrap_bridge_get_lookup(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": _bridge_raw()}
+    )
+    fetched = pb.get(ModelType.BRIDGE, BRIDGE_ID)
+    assert fetched is not None
+    assert fetched is pb.bridges[BRIDGE_ID]
+    assert isinstance(fetched, PublicBridge)
+
+
+@pytest.mark.asyncio()
+async def test_update_public_populates_bridges(
+    protect_client: ProtectApiClient,
+) -> None:
+    b1 = Mock(id="b-1")
+    b2 = Mock(id="b-2")
+    _mock_update_public_endpoints(
+        protect_client,
+        get_bridges_public=AsyncMock(return_value=[b1, b2]),
+    )
+
+    pb = await protect_client.update_public()
+
+    assert "b-1" in pb.bridges
+    assert "b-2" in pb.bridges
+
+
+@pytest.mark.asyncio()
+async def test_update_public_tolerates_bridge_endpoint_404(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A 404 on /v1/bridges must not abort the whole refresh."""
+    _mock_update_public_endpoints(
+        protect_client,
+        get_bridges_public=AsyncMock(side_effect=BadRequest("404 Not Found")),
+        get_viewers_public=AsyncMock(return_value=[Mock(id="v-1")]),
+    )
+
+    pb = await protect_client.update_public()
+
+    assert pb.bridges == {}
+    assert "v-1" in pb.viewers
+
+
+@pytest.mark.asyncio()
+async def test_bridge_api_update_rejects_generic_mutations() -> None:
+    """Generic mutation path must fail loudly for Public API bridges."""
+    bridge = PublicBridge.from_unifi_dict(**_bridge_raw())
+    with pytest.raises(BadRequest, match="Bridge mutations"):
+        await bridge._api_update({"name": "new"})
+
+
+def _viewer_raw(**overrides: Any) -> dict[str, Any]:
+    raw: dict[str, Any] = {
+        "id": VIEWER_ID,
+        "modelKey": "viewer",
+        "state": "CONNECTED",
+        "name": "Viewer 1",
+        "mac": "AABBCCDDEE01",
+        "liveview": LIVEVIEW_ID,
+        "streamLimit": 16,
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_viewer_model_from_unifi_dict() -> None:
+    viewer = PublicViewer.from_unifi_dict(**_viewer_raw())
+    assert viewer.id == VIEWER_ID
+    assert viewer.model is ModelType.VIEWPORT
+    assert viewer.state is DeviceState.CONNECTED
+    assert viewer.name == "Viewer 1"
+    assert viewer.mac == "AABBCCDDEE01"
+    assert viewer.liveview_id == LIVEVIEW_ID
+    assert viewer.stream_limit == 16
+
+
+def test_viewer_model_preserves_null_liveview() -> None:
+    viewer = PublicViewer.from_unifi_dict(**_viewer_raw(liveview=None))
+    assert viewer.liveview_id is None
+
+
+def test_viewer_model_round_trip_emits_liveview_wire_key() -> None:
+    viewer = PublicViewer.from_unifi_dict(**_viewer_raw())
+    wire = viewer.unifi_dict()
+    assert wire["liveview"] == LIVEVIEW_ID
+    assert "liveviewId" not in wire
+
+
+def test_viewer_model_does_not_collide_with_private() -> None:
+    assert PublicViewer is not Viewer
+    public = PublicViewer.from_unifi_dict(**_viewer_raw())
+    assert isinstance(public, PublicViewer)
+    # ``MODEL_TO_CLASS`` must still resolve ``viewer`` modelKey to the private
+    # ``Viewer`` class — the public-API path is opt-in via PublicBootstrap.
+    assert MODEL_TO_CLASS[ModelType.VIEWPORT] is Viewer
+    assert PublicViewer not in MODEL_TO_CLASS.values()
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicViewer.from_unifi_dict")
+async def test_get_viewers_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.side_effect = [Mock(id=VIEWER_ID), Mock(id="other")]
+    protect_client.api_request_list = AsyncMock(
+        return_value=[{"id": VIEWER_ID}, {"id": "other"}]
+    )
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    result = await protect_client.get_viewers_public()
+
+    protect_client.api_request_list.assert_called_with(
+        url="/v1/viewers", public_api=True
+    )
+    assert len(result) == 2
+    assert pb.viewers == {}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicViewer.from_unifi_dict")
+async def test_get_viewer_public(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=VIEWER_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": VIEWER_ID})
+    await protect_client.get_viewer_public(VIEWER_ID)
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/viewers/{VIEWER_ID}"
+    assert kwargs["public_api"] is True
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicViewer.from_unifi_dict")
+async def test_get_viewer_public_does_not_write_pb(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    obj = Mock(id=VIEWER_ID)
+    mock_ctor.return_value = obj
+    protect_client.api_request_obj = AsyncMock(return_value={"id": VIEWER_ID})
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    assert await protect_client.get_viewer_public(VIEWER_ID) is obj
+
+    assert pb.viewers == {}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicViewer.from_unifi_dict")
+async def test_update_viewer_public_name_only(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    obj = Mock(id=VIEWER_ID)
+    mock_ctor.return_value = obj
+    protect_client.api_request_obj = AsyncMock(return_value={"id": VIEWER_ID})
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+
+    await protect_client.update_viewer_public(VIEWER_ID, name="kitchen")
+
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["url"] == f"/v1/viewers/{VIEWER_ID}"
+    assert kwargs["method"] == "patch"
+    # ``liveview`` must be omitted (no change) when not explicitly passed.
+    assert kwargs["json"] == {"name": "kitchen"}
+    assert pb.viewers[VIEWER_ID] is obj
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicViewer.from_unifi_dict")
+async def test_update_viewer_public_explicit_null_liveview(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """``liveview=None`` must serialize as an explicit null, not be omitted."""
+    mock_ctor.return_value = Mock(id=VIEWER_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": VIEWER_ID})
+
+    await protect_client.update_viewer_public(VIEWER_ID, liveview=None)
+
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {"liveview": None}
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicViewer.from_unifi_dict")
+async def test_update_viewer_public_set_liveview(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    mock_ctor.return_value = Mock(id=VIEWER_ID)
+    protect_client.api_request_obj = AsyncMock(return_value={"id": VIEWER_ID})
+
+    await protect_client.update_viewer_public(VIEWER_ID, liveview="lv-1")
+
+    _, kwargs = protect_client.api_request_obj.call_args
+    assert kwargs["json"] == {"liveview": "lv-1"}
+
+
+@pytest.mark.asyncio()
+async def test_update_viewer_public_empty(
+    protect_client: ProtectApiClient,
+) -> None:
+    protect_client.api_request_obj = AsyncMock()
+    with pytest.raises(BadRequest):
+        await protect_client.update_viewer_public(VIEWER_ID)
+    protect_client.api_request_obj.assert_not_called()
+
+
+def test_public_bootstrap_applies_viewer_add_and_update(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    add_payload = {"type": "add", "item": _viewer_raw()}
+    mt, new, old = pb.process_devices_ws_message(protect_client, add_payload)
+    assert mt is ModelType.VIEWPORT
+    assert new is not None and new.id == VIEWER_ID
+    assert isinstance(new, PublicViewer)
+    assert not isinstance(new, Viewer)
+    assert old is None
+    assert VIEWER_ID in pb.viewers
+    assert VIEWER_ID not in pb.cameras
+
+    # Partial update — only the wire ``liveview`` key flips to null.
+    update_payload: dict[str, Any] = {
+        "type": "update",
+        "item": {"id": VIEWER_ID, "modelKey": "viewer", "liveview": None},
+    }
+    mt, new, old = pb.process_devices_ws_message(protect_client, update_payload)
+    assert old is not None
+    assert new is not None
+    assert new.liveview_id is None  # type: ignore[attr-defined]
+    # ``streamLimit`` (untouched) survives the merge.
+    assert new.stream_limit == 16  # type: ignore[attr-defined]
+
+
+def test_public_bootstrap_viewer_get_lookup(
+    protect_client: ProtectApiClient,
+) -> None:
+    pb = PublicBootstrap()
+    pb.process_devices_ws_message(
+        protect_client, {"type": "add", "item": _viewer_raw()}
+    )
+    fetched = pb.get(ModelType.VIEWPORT, VIEWER_ID)
+    assert fetched is not None
+    assert fetched is pb.viewers[VIEWER_ID]
+    assert isinstance(fetched, PublicViewer)
+
+
+@pytest.mark.asyncio()
+async def test_update_public_populates_viewers(
+    protect_client: ProtectApiClient,
+) -> None:
+    v1 = Mock(id="v-1")
+    v2 = Mock(id="v-2")
+    _mock_update_public_endpoints(
+        protect_client,
+        get_viewers_public=AsyncMock(return_value=[v1, v2]),
+    )
+
+    pb = await protect_client.update_public()
+
+    assert "v-1" in pb.viewers
+    assert "v-2" in pb.viewers
+
+
+@pytest.mark.asyncio()
+async def test_viewer_api_update_rejects_generic_mutations() -> None:
+    """Generic mutation path must fail loudly for Public API viewers."""
+    viewer = PublicViewer.from_unifi_dict(**_viewer_raw())
+    with pytest.raises(BadRequest, match="Viewer mutations"):
+        await viewer._api_update({"name": "new"})
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.PublicViewer.from_unifi_dict")
+async def test_update_viewer_public_no_bootstrap(
+    mock_ctor: Mock,
+    protect_client: ProtectApiClient,
+) -> None:
+    """``_public_bootstrap is None`` must skip cache writes without raising."""
+    obj = Mock(id=VIEWER_ID)
+    mock_ctor.return_value = obj
+    protect_client.api_request_obj = AsyncMock(return_value={"id": VIEWER_ID})
+    protect_client._public_bootstrap = None
+
+    result = await protect_client.update_viewer_public(VIEWER_ID, name="renamed")
+
+    assert result is obj
+
+
+@pytest.mark.asyncio()
+async def test_bridge_set_name_routes_to_bridge_endpoint(
+    protect_client: ProtectApiClient,
+) -> None:
+    bridge = PublicBridge.from_unifi_dict(**_bridge_raw(), api=protect_client)
+    protect_client.update_bridge_public = AsyncMock(return_value=bridge)
+    await bridge.set_name("Renamed")
+    protect_client.update_bridge_public.assert_awaited_once_with(
+        BRIDGE_ID, name="Renamed"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_viewer_set_name_routes_to_viewer_endpoint(
+    protect_client: ProtectApiClient,
+) -> None:
+    viewer = PublicViewer.from_unifi_dict(**_viewer_raw(), api=protect_client)
+    protect_client.update_viewer_public = AsyncMock(return_value=viewer)
+    await viewer.set_name("Renamed")
+    protect_client.update_viewer_public.assert_awaited_once_with(
+        VIEWER_ID, name="Renamed"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_viewer_set_liveview_routes_to_viewer_endpoint(
+    protect_client: ProtectApiClient,
+) -> None:
+    viewer = PublicViewer.from_unifi_dict(**_viewer_raw(), api=protect_client)
+    protect_client.update_viewer_public = AsyncMock(return_value=viewer)
+    await viewer.set_liveview("lv-9")
+    protect_client.update_viewer_public.assert_awaited_once_with(
+        VIEWER_ID, liveview="lv-9"
+    )
+    await viewer.set_liveview(None)
+    protect_client.update_viewer_public.assert_awaited_with(VIEWER_ID, liveview=None)
+
+
+def test_unset_sentinel_repr_and_singleton() -> None:
+    """``_UNSET`` is typed as ``_UnsetType``; ``repr`` is stable for log/debug output."""
+    assert isinstance(_UNSET, _UnsetType)
+    assert repr(_UNSET) == "<UNSET>"
+
+
+def _other_siren_item(siren_id: str = "other-siren-id") -> dict[str, Any]:
+    """A second siren payload so a fetch can add or drop one device."""
+    return {**_siren_snapshot_item(), "id": siren_id, "mac": "BB"}
+
+
+@pytest.mark.asyncio()
+async def test_update_public_initial_prime_emits_no_membership_frames(
+    protect_client: ProtectApiClient,
+) -> None:
+    """The first prime is not a diff — every device would otherwise look added."""
+    client = protect_client
+    client._public_bootstrap = None
+    siren = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    _mock_update_public_endpoints(
+        client, get_sirens_public=AsyncMock(return_value=[siren])
+    )
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+
+    await client.update_public()
+
+    assert captured == []
+
+
+@pytest.mark.asyncio()
+async def test_update_public_emits_add_frame_for_device_added_during_gap(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A device the refresh newly reports reaches subscribers as a devices-WS add."""
+    client = protect_client
+    client._public_bootstrap = None
+    first = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    _mock_update_public_endpoints(
+        client, get_sirens_public=AsyncMock(return_value=[first])
+    )
+    await client.update_public()
+
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+    second = Siren.from_unifi_dict(api=client, **_other_siren_item())
+    client.get_sirens_public = AsyncMock(return_value=[first, second])  # type: ignore[method-assign]
+
+    pb = await client.update_public()
+
+    assert len(captured) == 1
+    msg = captured[0]
+    assert msg.action is WSAction.ADD
+    assert msg.new_update_id == "other-siren-id"
+    assert msg.new_obj is pb.sirens["other-siren-id"]
+    assert msg.old_obj is None
+    assert msg.changed_data == {"modelKey": "siren", "id": "other-siren-id"}
+
+
+@pytest.mark.asyncio()
+async def test_update_public_emits_remove_frame_for_device_dropped_during_gap(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A device the refresh no longer reports reaches subscribers as a remove."""
+    client = protect_client
+    client._public_bootstrap = None
+    first = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    second = Siren.from_unifi_dict(api=client, **_other_siren_item())
+    _mock_update_public_endpoints(
+        client, get_sirens_public=AsyncMock(return_value=[first, second])
+    )
+    await client.update_public()
+
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+    client.get_sirens_public = AsyncMock(return_value=[first])  # type: ignore[method-assign]
+
+    pb = await client.update_public()
+
+    assert "other-siren-id" not in pb.sirens
+    assert len(captured) == 1
+    msg = captured[0]
+    assert msg.action is WSAction.REMOVE
+    assert msg.new_update_id == "other-siren-id"
+    assert msg.new_obj is None
+    assert msg.old_obj is second
+    assert msg.changed_data == {"modelKey": "siren", "id": "other-siren-id"}
+
+
+@pytest.mark.asyncio()
+async def test_update_public_resync_announces_both_sides_to_raw_subscribers(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A raw devices-WS subscriber gets one add and one remove per resync."""
+    client = protect_client
+    client._public_bootstrap = None
+    first = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    second = Siren.from_unifi_dict(api=client, **_other_siren_item())
+    _mock_update_public_endpoints(
+        client, get_sirens_public=AsyncMock(return_value=[first])
+    )
+    await client.update_public()
+
+    captured: list[tuple[WSSubscriptionMessage, set[str]]] = []
+
+    def on_message(msg: WSSubscriptionMessage) -> None:
+        captured.append((msg, set(client.public_bootstrap.sirens)))
+
+    client.subscribe_devices_websocket(on_message)
+    client.get_sirens_public = AsyncMock(return_value=[second])  # type: ignore[method-assign]
+
+    await client.update_public()
+
+    assert {(msg.action, msg.new_update_id) for msg, _ in captured} == {
+        (WSAction.ADD, "other-siren-id"),
+        (WSAction.REMOVE, SIREN_ID),
+    }
+    # Whichever frame the subscriber is on, the whole batch has already merged.
+    assert [ids for _, ids in captured] == [{"other-siren-id"}, {"other-siren-id"}]
+
+
+@pytest.mark.asyncio()
+async def test_update_public_emits_nothing_when_membership_is_unchanged(
+    protect_client: ProtectApiClient,
+) -> None:
+    """An in-place refresh of the same device set stays quiet."""
+    client = protect_client
+    client._public_bootstrap = None
+    siren = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    _mock_update_public_endpoints(
+        client, get_sirens_public=AsyncMock(return_value=[siren])
+    )
+    await client.update_public()
+
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+
+    await client.update_public()
+
+    assert captured == []
+
+
+@pytest.mark.asyncio()
+async def test_update_public_does_not_emit_for_non_device_stores(
+    protect_client: ProtectApiClient,
+) -> None:
+    """ULP users are not devices; their membership changes emit no devices frame."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(client)
+    await client.update_public()
+
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+    user = PublicUlpUser(
+        api=client,
+        id="ulp-1",
+        model=ModelType.ULP_USER,
+        first_name="A",
+        last_name="B",
+        full_name="A B",
+        status=UlpUserStatus.ACTIVE,
+    )
+    client.get_ulp_users_public = AsyncMock(return_value=[user])  # type: ignore[method-assign]
+
+    pb = await client.update_public()
+
+    assert "ulp-1" in pb.ulp_users
+    assert captured == []
+
+
+@pytest.mark.asyncio()
+async def test_update_public_add_frame_carries_primed_rtsps_streams(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A camera's add frame lands after the RTSPS prime, so its streams are set."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(client)
+    await client.update_public()
+
+    streams = RTSPSStreams(high="rtsps://example.com/fresh")
+    client.get_camera_rtsps_streams = AsyncMock(return_value=streams)  # type: ignore[method-assign]
+    camera = PublicCamera.from_unifi_dict(api=client, **dict(CAMERA_PAYLOAD))
+    client.get_cameras_public = AsyncMock(return_value=[camera])  # type: ignore[method-assign]
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+
+    await client.update_public()
+
+    assert len(captured) == 1
+    assert captured[0].action is WSAction.ADD
+    assert captured[0].new_obj is camera
+    assert camera.rtsps_streams is streams
+
+
+@pytest.mark.asyncio()
+async def test_update_public_skips_add_frame_when_replayed_frame_removed_device(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A prime-window remove wins: no add is announced for an object already gone."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(client)
+    await client.update_public()
+
+    siren = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    remove_msg = _mock_text_ws_message(
+        {"type": "remove", "item": {"id": SIREN_ID, "modelKey": "siren"}}
+    )
+
+    async def cameras_side_effect() -> list[Any]:
+        client._process_devices_ws_message(remove_msg)
+        return []
+
+    client.get_sirens_public = AsyncMock(return_value=[siren])  # type: ignore[method-assign]
+    client.get_cameras_public = AsyncMock(side_effect=cameras_side_effect)  # type: ignore[method-assign]
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+
+    pb = await client.update_public()
+
+    assert SIREN_ID not in pb.sirens
+    # Only the replayed remove reaches subscribers — no add for a gone device.
+    assert [msg.action for msg in captured] == [WSAction.REMOVE]
+
+
+@pytest.mark.asyncio()
+async def test_update_public_membership_frames_reach_typed_subscribers(
+    protect_client: ProtectApiClient,
+) -> None:
+    """The synthetic frames resolve to typed ADDED/REMOVED device changes."""
+    client = protect_client
+    client._public_bootstrap = None
+    siren = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    _mock_update_public_endpoints(client)
+    await client.update_public()
+
+    changes: list[ProtectDeviceChange] = []
+    client.subscribe_devices(changes.append)
+
+    client.get_sirens_public = AsyncMock(return_value=[siren])  # type: ignore[method-assign]
+    await client.update_public()
+    client.get_sirens_public = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    await client.update_public()
+
+    assert [change.change for change in changes] == [
+        DeviceChange.ADDED,
+        DeviceChange.REMOVED,
+    ]
+    assert {change.model_type for change in changes} == {ModelType.SIREN}
+    assert {change.device_id for change in changes} == {SIREN_ID}
+    assert changes[0].model is siren
+    assert changes[1].device_mac == "AA"
+
+
+def test_apply_fetch_result_reports_added_and_removed(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``apply_fetch_result`` returns the membership change it applied."""
+    siren = _build_siren(protect_client)
+    pb = protect_client.public_bootstrap
+
+    unchanged = pb.apply_fetch_result("sirens", [siren])
+    assert unchanged.attr == "sirens"
+    assert unchanged.added_ids == []
+    assert unchanged.removed == []
+
+    dropped = pb.apply_fetch_result("sirens", [])
+    assert dropped.added_ids == []
+    assert dropped.removed == [siren]
+
+    re_added = pb.apply_fetch_result("sirens", [siren])
+    assert re_added.added_ids == [SIREN_ID]
+    assert re_added.removed == []
+
+
+@pytest.mark.asyncio()
+async def test_update_public_does_not_repeat_a_wire_announced_add(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A device announced by a live add during the fetch is not announced twice."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(client)
+    await client.update_public()
+
+    siren = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    add_msg = _mock_text_ws_message(
+        {"type": "add", "item": _siren_snapshot_item()},
+    )
+
+    async def cameras_side_effect() -> list[Any]:
+        client._process_devices_ws_message(add_msg)
+        return []
+
+    client.get_sirens_public = AsyncMock(return_value=[siren])  # type: ignore[method-assign]
+    client.get_cameras_public = AsyncMock(side_effect=cameras_side_effect)  # type: ignore[method-assign]
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+
+    pb = await client.update_public()
+
+    assert SIREN_ID in pb.sirens
+    assert [msg.action for msg in captured] == [WSAction.ADD]
+
+
+@pytest.mark.asyncio()
+async def test_update_public_does_not_repeat_a_wire_announced_remove(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A device removed by a live frame during the fetch is not announced twice."""
+    client = protect_client
+    client._public_bootstrap = None
+    siren = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    _mock_update_public_endpoints(
+        client, get_sirens_public=AsyncMock(return_value=[siren])
+    )
+    await client.update_public()
+
+    remove_msg = _mock_text_ws_message(
+        {"type": "remove", "item": {"id": SIREN_ID, "modelKey": "siren"}}
+    )
+
+    async def cameras_side_effect() -> list[Any]:
+        client._process_devices_ws_message(remove_msg)
+        return []
+
+    client.get_sirens_public = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    client.get_cameras_public = AsyncMock(side_effect=cameras_side_effect)  # type: ignore[method-assign]
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+
+    pb = await client.update_public()
+
+    assert SIREN_ID not in pb.sirens
+    assert [msg.action for msg in captured] == [WSAction.REMOVE]
+
+
+@pytest.mark.asyncio()
+async def test_update_public_membership_frames_respect_model_filter(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A caller filtering sirens out is not handed synthetic siren frames."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(client)
+    await client.update_public()
+
+    client._devices_ws_subscribed_models = {ModelType.CAMERA}
+    siren = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    client.get_sirens_public = AsyncMock(return_value=[siren])  # type: ignore[method-assign]
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+
+    pb = await client.update_public()
+
+    assert SIREN_ID in pb.sirens
+    assert captured == []
+
+
+@pytest.mark.asyncio()
+async def test_update_public_clears_membership_tracking_when_prime_fails(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A failed prime must not leave the membership tracker armed."""
+    client = protect_client
+    _mock_update_public_endpoints(
+        client, get_cameras_public=AsyncMock(side_effect=RuntimeError("boom"))
+    )
+
+    with pytest.raises(RuntimeError):
+        await client.update_public()
+
+    assert client._public_membership_seen is None
+
+
+@pytest.mark.asyncio()
+async def test_update_public_still_announces_after_an_unparsable_add_frame(
+    protect_client: ProtectApiClient,
+) -> None:
+    """An add frame the library could not parse must not swallow the diff's add."""
+    client = protect_client
+    client._public_bootstrap = None
+    _mock_update_public_endpoints(client)
+    await client.update_public()
+
+    siren = Siren.from_unifi_dict(api=client, **_siren_snapshot_item())
+    # Missing every required field — model construction fails, so the frame
+    # reaches subscribers with no usable object.
+    bad_add = _mock_text_ws_message(
+        {"type": "add", "item": {"id": SIREN_ID, "modelKey": "siren"}}
+    )
+
+    async def cameras_side_effect() -> list[Any]:
+        client._process_devices_ws_message(bad_add)
+        return []
+
+    client.get_sirens_public = AsyncMock(return_value=[siren])  # type: ignore[method-assign]
+    client.get_cameras_public = AsyncMock(side_effect=cameras_side_effect)  # type: ignore[method-assign]
+    captured: list[WSSubscriptionMessage] = []
+    client.subscribe_devices_websocket(captured.append)
+
+    pb = await client.update_public()
+
+    assert pb.sirens[SIREN_ID] is siren
+    # The unparsable frame carried no object; the diff still announces the add.
+    assert [msg.new_obj for msg in captured] == [None, siren]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_callback_fires_after_refresh(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Resync subscribers fire with ``True`` after update and RTSPS refresh finish."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    order: list[str] = []
+
+    async def _fake_update() -> PublicBootstrap:
+        order.append("update")
+        return protect_client.public_bootstrap
+
+    async def _fake_rtsps() -> None:
+        order.append("rtsps")
+
+    protect_client.update_public = _fake_update  # type: ignore[assignment]
+    protect_client._refresh_all_cached_rtsps = _fake_rtsps  # type: ignore[method-assign]
+    states: list[WebsocketState] = []
+    protect_client.subscribe_devices_websocket_state(states.append)
+    results: list[bool] = []
+
+    def _on_resync(ok: bool) -> None:
+        order.append(f"cb:{ok}")
+        results.append(ok)
+
+    protect_client.subscribe_public_resync(_on_resync)
+
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert states[-1] is WebsocketState.CONNECTED
+    assert results == []
+    assert protect_client._public_resync_task is not None
+    await protect_client._public_resync_task
+
+    assert order == ["update", "rtsps", "cb:True"]
+    assert results == [True]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_callback_reports_failure(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A failed resync fires subscribers with ``False``."""
+    protect_client.update_public = AsyncMock(side_effect=RuntimeError("offline"))  # type: ignore[method-assign]
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+
+    await protect_client._resync_public_bootstrap()
+
+    assert results == [False]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_callback_fires_for_queued_follow_up(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A follow-up resync queued during a running one fires subscribers again."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    call_count = 0
+
+    async def _fake_update() -> PublicBootstrap:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            first_started.set()
+            await release_first.wait()
+        return protect_client.public_bootstrap
+
+    protect_client.update_public = _fake_update  # type: ignore[assignment]
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await asyncio.wait_for(first_started.wait(), timeout=1.0)
+    first_task = protect_client._public_resync_task
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+
+    release_first.set()
+    assert first_task is not None
+    await first_task
+    follow_up = protect_client._public_resync_task
+    assert follow_up is not None
+    assert follow_up is not first_task
+    await follow_up
+
+    assert results == [True, True]
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "close", ["_cancel_public_resync_task", "close_session", "async_disconnect_ws"]
+)
+async def test_public_resync_callback_not_fired_on_cancel(
+    protect_client: ProtectApiClient,
+    close: str,
+) -> None:
+    """Cancelling an in-flight resync on close fires no subscriber."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    started = asyncio.Event()
+
+    async def _hang() -> PublicBootstrap:
+        started.set()
+        await asyncio.Event().wait()
+        return protect_client.public_bootstrap  # pragma: no cover
+
+    protect_client.update_public = _hang  # type: ignore[assignment]
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await getattr(protect_client, close)()
+
+    assert protect_client._public_resync_task is None
+    assert results == []
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("close", ["close_session", "async_disconnect_ws"])
+async def test_public_resync_reconnect_while_closing_starts_no_follow_up(
+    protect_client: ProtectApiClient,
+    close: str,
+) -> None:
+    """A reconnect while a cancelled resync unwinds starts no follow-up."""
+    protect_client._public_bootstrap = PublicBootstrap()
+    started = asyncio.Event()
+
+    async def _hang_first() -> PublicBootstrap:
+        if not started.is_set():
+            started.set()
+            await asyncio.Event().wait()
+        return protect_client.public_bootstrap
+
+    protect_client.update_public = AsyncMock(side_effect=_hang_first)  # type: ignore[method-assign]
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    closing = asyncio.create_task(getattr(protect_client, close)())
+    await asyncio.sleep(0)
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await closing
+    await asyncio.sleep(0.05)
+
+    assert protect_client._public_resync_task is None
+    assert protect_client._public_resync_timer is None
+    assert protect_client._public_resync_pending is False
+    assert protect_client.update_public.await_count == 1
+    assert results == []
+
+    protect_client._last_public_resync = 0.0
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert protect_client._public_resync_task is not None
+    await protect_client._public_resync_task
+    assert results == [True]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_unsubscribe_and_raising_callback(
+    protect_client: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising subscriber is logged without blocking others; unsubscribe stops delivery."""
+    protect_client.update_public = AsyncMock()  # type: ignore[method-assign]
+
+    def _boom(ok: bool) -> None:
+        raise RuntimeError("boom")
+
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(_boom)
+    unsub = protect_client.subscribe_public_resync(results.append)
+
+    with caplog.at_level("ERROR"):
+        await protect_client._resync_public_bootstrap()
+    assert results == [True]
+    assert "Exception while running public resync handler" in caplog.text
+
+    unsub()
+    await protect_client._resync_public_bootstrap()
+    assert results == [True]
+
+
+def _debounced_resync_client(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[bool]:
+    """Connected client whose last resync just ran; returns the resync results."""
+    monkeypatch.setattr(api_module, "PUBLIC_RESYNC_MIN_INTERVAL", 0.05)
+    protect_client._public_bootstrap = PublicBootstrap()
+    protect_client.update_public = AsyncMock()  # type: ignore[method-assign]
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    protect_client._last_public_resync = time.monotonic()
+    return results
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("reconnects", [1, 3])
+async def test_public_resync_debounced_reconnects_run_one_trailing_resync(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+    reconnects: int,
+) -> None:
+    """Reconnects inside the debounce window run one resync when it ends."""
+    results = _debounced_resync_client(protect_client, monkeypatch)
+
+    for _ in range(reconnects):
+        protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+        protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await asyncio.sleep(0)
+    assert protect_client._public_resync_task is None
+    assert results == []
+
+    await asyncio.sleep(0.1)
+    assert protect_client._public_resync_task is not None
+    await protect_client._public_resync_task
+
+    assert protect_client._public_resync_timer is None
+    protect_client.update_public.assert_awaited_once()
+    assert results == [True]
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "close", ["close_session", "close_public_api_session", "async_disconnect_ws"]
+)
+async def test_public_resync_close_cancels_trailing_resync(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+    close: str,
+) -> None:
+    """Closing the client cancels a scheduled trailing resync without firing."""
+    results = _debounced_resync_client(protect_client, monkeypatch)
+    protect_client._on_devices_websocket_state_change(WebsocketState.DISCONNECTED)
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert protect_client._public_resync_timer is not None
+
+    await getattr(protect_client, close)()
+    await asyncio.sleep(0.1)
+
+    assert protect_client._public_resync_timer is None
+    assert protect_client._public_resync_task is None
+    protect_client.update_public.assert_not_awaited()
+    assert results == []
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [(NvrError("timeout"), False), (BadRequest("404"), True)],
+)
+async def test_public_resync_reports_tolerated_endpoint_failure(
+    protect_client: ProtectApiClient,
+    error: Exception,
+    expected: bool,
+) -> None:
+    """A transiently failed endpoint reports ``False``; a missing one does not."""
+    _mock_update_public_endpoints(
+        protect_client, get_sirens_public=AsyncMock(side_effect=error)
+    )
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+
+    await protect_client._resync_public_bootstrap()
+    protect_client.get_sirens_public = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    await protect_client._resync_public_bootstrap()
+
+    assert results == [expected, True]
+
+
+def _retrying_resync_client(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+    *outcomes: Exception | None,
+) -> list[bool]:
+    """Client whose resyncs play ``outcomes`` in order; returns the resync results."""
+    monkeypatch.setattr(api_module, "PUBLIC_RESYNC_RETRY_DELAYS", (0.01, 0.02, 0.03))
+    protect_client._public_bootstrap = PublicBootstrap()
+    protect_client._refresh_all_cached_rtsps = AsyncMock()  # type: ignore[method-assign]
+    protect_client.update_public = AsyncMock(side_effect=list(outcomes))  # type: ignore[method-assign]
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+    return results
+
+
+async def _drain_resync_retries(protect_client: ProtectApiClient) -> None:
+    """Wait until no resync task runs and no retry is pending."""
+    for _ in range(200):
+        task = protect_client._public_resync_task
+        if task is not None and not task.done():
+            await task
+        elif protect_client._public_resync_retry_timer is None:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("resync retries did not settle")  # pragma: no cover
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_retries_transient_failure_until_success(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed resync is retried and a later success reports ``True``."""
+    results = _retrying_resync_client(
+        protect_client, monkeypatch, NvrError("timeout"), RuntimeError("boom"), None
+    )
+
+    await protect_client._resync_public_bootstrap()
+    await _drain_resync_retries(protect_client)
+
+    assert results == [False, False, True]
+    assert protect_client.update_public.await_count == 3
+    assert protect_client._public_resync_retries == 0
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_retries_tolerated_endpoint_failure(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An endpoint that failed transiently inside ``update_public`` is retried."""
+    monkeypatch.setattr(api_module, "PUBLIC_RESYNC_RETRY_DELAYS", (0.01,))
+    _mock_update_public_endpoints(
+        protect_client,
+        get_sirens_public=AsyncMock(side_effect=[NvrError("timeout"), []]),
+    )
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+
+    await protect_client._resync_public_bootstrap()
+    await _drain_resync_retries(protect_client)
+
+    assert results == [False, True]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_not_authorized_is_not_retried(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resync that failed with ``NotAuthorized`` schedules no retry."""
+    results = _retrying_resync_client(
+        protect_client, monkeypatch, NotAuthorized("revoked")
+    )
+
+    await protect_client._resync_public_bootstrap()
+    await asyncio.sleep(0.05)
+
+    assert protect_client._public_resync_retry_timer is None
+    assert protect_client.update_public.await_count == 1
+    assert results == [False]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_retry_gives_up_after_last_step(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The backoff stops after its last step until the next reconnect."""
+    results = _retrying_resync_client(
+        protect_client, monkeypatch, *[NvrError("down")] * 4, None
+    )
+
+    with caplog.at_level("WARNING"):
+        await protect_client._resync_public_bootstrap()
+        await _drain_resync_retries(protect_client)
+    await asyncio.sleep(0.05)
+
+    assert results == [False] * 4
+    assert protect_client.update_public.await_count == 4
+    assert protect_client._public_resync_retry_timer is None
+    assert "still failing after 3 retries" in caplog.text
+
+    protect_client._last_public_resync = 0.0
+    protect_client._devices_ws_has_been_connected = True
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    await _drain_resync_retries(protect_client)
+    assert results == [False] * 4 + [True]
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "close",
+    [
+        "close_session",
+        "close_public_api_session",
+        "async_disconnect_ws",
+    ],
+)
+async def test_public_resync_close_cancels_pending_retry(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+    close: str,
+) -> None:
+    """Closing the client cancels a pending retry without firing."""
+    results = _retrying_resync_client(protect_client, monkeypatch, NvrError("down"))
+
+    await protect_client._resync_public_bootstrap()
+    assert protect_client._public_resync_retry_timer is not None
+
+    await getattr(protect_client, close)()
+    await asyncio.sleep(0.05)
+
+    assert protect_client._public_resync_retry_timer is None
+    assert protect_client._public_resync_task is None
+    assert protect_client.update_public.await_count == 1
+    assert results == [False]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_reconnect_replaces_pending_retry(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect cancels a pending retry and runs only its own resync."""
+    results = _retrying_resync_client(
+        protect_client, monkeypatch, NvrError("down"), None
+    )
+    monkeypatch.setattr(api_module, "PUBLIC_RESYNC_RETRY_DELAYS", (0.05,))
+    protect_client._devices_ws_has_been_connected = True
+
+    await protect_client._resync_public_bootstrap()
+    retry_timer = protect_client._public_resync_retry_timer
+    assert retry_timer is not None
+
+    protect_client._last_public_resync = 0.0
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert retry_timer.cancelled()
+    assert protect_client._public_resync_retry_timer is None
+    assert protect_client._public_resync_task is not None
+    await protect_client._public_resync_task
+    await asyncio.sleep(0.1)
+
+    assert protect_client.update_public.await_count == 2
+    assert results == [False, True]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_follow_up_replaces_retry(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed resync with a queued follow-up schedules no retry of its own."""
+    results = _retrying_resync_client(
+        protect_client, monkeypatch, NvrError("down"), None
+    )
+    protect_client._public_resync_pending = True
+
+    await protect_client._resync_public_bootstrap()
+    assert protect_client._public_resync_retry_timer is None
+    assert protect_client._public_resync_task is not None
+    await protect_client._public_resync_task
+    await asyncio.sleep(0.05)
+
+    assert protect_client.update_public.await_count == 2
+    assert results == [False, True]
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("failing", "refreshed", "success"),
+    [
+        (None, True, True),
+        ("get_sirens_public", True, False),
+        ("get_cameras_public", False, False),
+    ],
+)
+async def test_public_resync_refreshes_rtsps_unless_cameras_fetch_failed(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str | None,
+    refreshed: bool,
+    success: bool,
+) -> None:
+    """The RTSPS refresh is skipped only when the cameras fetch failed."""
+    monkeypatch.setattr(api_module, "PUBLIC_RESYNC_RETRY_DELAYS", ())
+    overrides = {failing: AsyncMock(side_effect=NvrError("timeout"))} if failing else {}
+    _mock_update_public_endpoints(protect_client, **overrides)
+    protect_client._refresh_all_cached_rtsps = AsyncMock()  # type: ignore[method-assign]
+    results: list[bool] = []
+    protect_client.subscribe_public_resync(results.append)
+
+    await protect_client._resync_public_bootstrap()
+
+    assert protect_client._refresh_all_cached_rtsps.await_count == int(refreshed)
+    assert results == [success]
+
+
+@pytest.mark.asyncio()
+async def test_public_resync_reconnect_restarts_backoff(
+    protect_client: ProtectApiClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect after the backoff gave up retries a new failure again."""
+    results = _retrying_resync_client(
+        protect_client, monkeypatch, *[NvrError("down")] * 5
+    )
+    protect_client._devices_ws_has_been_connected = True
+
+    await protect_client._resync_public_bootstrap()
+    await _drain_resync_retries(protect_client)
+    assert results == [False] * 4
+    assert protect_client._public_resync_retry_timer is None
+
+    protect_client._last_public_resync = 0.0
+    protect_client._on_devices_websocket_state_change(WebsocketState.CONNECTED)
+    assert protect_client._public_resync_task is not None
+    await protect_client._public_resync_task
+
+    assert results == [False] * 5
+    assert protect_client._public_resync_retry_timer is not None
+    assert protect_client._public_resync_retries == 1
+    await protect_client.close_session()
+
+
+def _cached_viewer(
+    protect_client: ProtectApiClient,
+) -> tuple[PublicBootstrap, PublicViewer]:
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+    viewer = PublicViewer.from_unifi_dict(**_viewer_raw(), api=protect_client)
+    pb.viewers[VIEWER_ID] = viewer
+    return pb, viewer
+
+
+async def _collect_devices_ws(
+    protect_client: ProtectApiClient, coro: Any
+) -> tuple[Any, list[WSSubscriptionMessage]]:
+    got: list[WSSubscriptionMessage] = []
+    unsub = protect_client.subscribe_devices_websocket(got.append)
+    try:
+        result = await coro
+    finally:
+        unsub()
+    return result, got
+
+
+@pytest.mark.asyncio()
+async def test_viewer_set_liveview_writes_through_and_announces(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``set_liveview`` updates the cached viewer in place and emits one update."""
+    pb, viewer = _cached_viewer(protect_client)
+    protect_client.api_request_obj = AsyncMock(
+        return_value=_viewer_raw(liveview="lv-new")
+    )
+
+    result, got = await _collect_devices_ws(
+        protect_client, viewer.set_liveview("lv-new")
+    )
+
+    assert result is viewer
+    assert pb.viewers[VIEWER_ID] is viewer
+    assert viewer.liveview_id == "lv-new"
+    assert len(got) == 1
+    msg = got[0]
+    assert msg.action is WSAction.UPDATE
+    assert msg.new_update_id == VIEWER_ID
+    assert msg.new_obj is viewer
+    assert isinstance(msg.old_obj, PublicViewer)
+    assert msg.old_obj is not viewer
+    assert msg.old_obj.liveview_id == LIVEVIEW_ID
+    assert msg.changed_data == {
+        "modelKey": "viewer",
+        "id": VIEWER_ID,
+        "liveview": "lv-new",
+    }
+
+
+@pytest.mark.asyncio()
+async def test_viewer_set_liveview_typed_subscriber_changed_fields(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A typed subscriber sees only ``liveview_id`` as changed."""
+    _, viewer = _cached_viewer(protect_client)
+    protect_client.api_request_obj = AsyncMock(
+        return_value=_viewer_raw(liveview="lv-new")
+    )
+    changes: list[ProtectDeviceChange] = []
+    unsub = protect_client.subscribe_devices(changes.append)
+    try:
+        await viewer.set_liveview("lv-new")
+    finally:
+        unsub()
+
+    assert len(changes) == 1
+    assert changes[0].change is DeviceChange.UPDATED
+    assert changes[0].changed_fields == frozenset({"liveview_id"})
+
+
+@pytest.mark.asyncio()
+async def test_viewer_update_name_and_liveview_reports_both_changed(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A PATCH changing name and liveview reports both as changed."""
+    _cached_viewer(protect_client)
+    protect_client.api_request_obj = AsyncMock(
+        return_value=_viewer_raw(name="Kitchen", liveview="lv-new")
+    )
+    changes: list[ProtectDeviceChange] = []
+    unsub = protect_client.subscribe_devices(changes.append)
+    try:
+        _, got = await _collect_devices_ws(
+            protect_client,
+            protect_client.update_viewer_public(
+                VIEWER_ID, name="Kitchen", liveview="lv-new"
+            ),
+        )
+    finally:
+        unsub()
+
+    assert got[0].changed_data == {
+        "modelKey": "viewer",
+        "id": VIEWER_ID,
+        "name": "Kitchen",
+        "liveview": "lv-new",
+    }
+    assert len(changes) == 1
+    assert changes[0].changed_fields == frozenset({"liveview_id", "name"})
+
+
+@pytest.mark.asyncio()
+async def test_viewer_set_liveview_none_announces_clear(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Clearing the liveview with ``None`` is announced as an update."""
+    _, viewer = _cached_viewer(protect_client)
+    protect_client.api_request_obj = AsyncMock(return_value=_viewer_raw(liveview=None))
+
+    _, got = await _collect_devices_ws(protect_client, viewer.set_liveview(None))
+
+    assert viewer.liveview_id is None
+    assert len(got) == 1
+    assert got[0].action is WSAction.UPDATE
+    assert got[0].new_obj is viewer
+    assert got[0].old_obj is not None
+    assert got[0].old_obj.liveview_id == LIVEVIEW_ID
+    assert got[0].changed_data["liveview"] is None
+
+
+@pytest.mark.asyncio()
+async def test_viewer_set_name_only_announces_nothing(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A name-only PATCH writes through but emits nothing."""
+    pb, viewer = _cached_viewer(protect_client)
+    protect_client.api_request_obj = AsyncMock(return_value=_viewer_raw(name="Kitchen"))
+
+    _, got = await _collect_devices_ws(
+        protect_client, protect_client.update_viewer_public(VIEWER_ID, name="Kitchen")
+    )
+
+    assert got == []
+    assert pb.viewers[VIEWER_ID] is viewer
+    assert viewer.name == "Kitchen"
+
+
+@pytest.mark.asyncio()
+async def test_viewer_set_same_liveview_announces_nothing(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Setting the liveview the viewer already shows emits nothing."""
+    _, viewer = _cached_viewer(protect_client)
+    protect_client.api_request_obj = AsyncMock(return_value=_viewer_raw())
+
+    _, got = await _collect_devices_ws(protect_client, viewer.set_liveview(LIVEVIEW_ID))
+
+    assert got == []
+    assert viewer.liveview_id == LIVEVIEW_ID
+
+
+@pytest.mark.asyncio()
+async def test_update_viewer_public_inserts_uncached_and_announces_add(
+    protect_client: ProtectApiClient,
+) -> None:
+    """An uncached viewer is inserted and announced as an ``add``."""
+    pb = protect_client._public_bootstrap = PublicBootstrap()
+    protect_client.api_request_obj = AsyncMock(return_value=_viewer_raw())
+    result, got = await _collect_devices_ws(
+        protect_client, protect_client.update_viewer_public(VIEWER_ID, name="x")
+    )
+
+    assert pb.viewers[VIEWER_ID] is result
+    assert len(got) == 1
+    assert got[0].action is WSAction.ADD
+    assert got[0].new_obj is result
+    assert got[0].old_obj is None
+    assert got[0].changed_data == _viewer_raw()
+
+
+@pytest.mark.asyncio()
+async def test_update_viewer_public_no_bootstrap_announces_nothing(
+    protect_client: ProtectApiClient,
+) -> None:
+    """Without a public bootstrap the response is returned uncached and silent."""
+    protect_client._public_bootstrap = None
+    protect_client.api_request_obj = AsyncMock(
+        return_value=_viewer_raw(liveview="lv-new")
+    )
+    result, got = await _collect_devices_ws(
+        protect_client,
+        protect_client.update_viewer_public(VIEWER_ID, liveview="lv-new"),
+    )
+
+    assert got == []
+    assert result.liveview_id == "lv-new"
+    assert protect_client._public_bootstrap is None
+
+
+@pytest.mark.asyncio()
+async def test_update_viewer_public_failed_patch_announces_nothing(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A failed PATCH leaves the cached viewer untouched and emits nothing."""
+    _, viewer = _cached_viewer(protect_client)
+    protect_client.api_request_obj = AsyncMock(side_effect=NvrError("boom"))
+    got: list[WSSubscriptionMessage] = []
+    unsub = protect_client.subscribe_devices_websocket(got.append)
+    try:
+        with pytest.raises(NvrError):
+            await viewer.set_liveview("lv-new")
+    finally:
+        unsub()
+
+    assert got == []
+    assert viewer.liveview_id == LIVEVIEW_ID
+
+
+@pytest.mark.asyncio()
+async def test_update_viewer_public_respects_devices_ws_filter(
+    protect_client: ProtectApiClient,
+) -> None:
+    """A devices-WS filter excluding viewers suppresses the announcement."""
+    _, viewer = _cached_viewer(protect_client)
+    protect_client._devices_ws_subscribed_models = {ModelType.CAMERA}
+    protect_client.api_request_obj = AsyncMock(
+        return_value=_viewer_raw(liveview="lv-new")
+    )
+
+    _, got = await _collect_devices_ws(protect_client, viewer.set_liveview("lv-new"))
+
+    assert got == []
+    assert viewer.liveview_id == "lv-new"
+
+
+@pytest.mark.asyncio()
+async def test_get_viewer_public_leaves_cached_viewer_untouched(
+    protect_client: ProtectApiClient,
+) -> None:
+    """``get_viewer_public`` returns the response and leaves the cache alone."""
+    pb, viewer = _cached_viewer(protect_client)
+    protect_client.api_request_obj = AsyncMock(
+        return_value=_viewer_raw(liveview="lv-new")
+    )
+    result, got = await _collect_devices_ws(
+        protect_client, protect_client.get_viewer_public(VIEWER_ID)
+    )
+
+    assert got == []
+    assert result is not viewer
+    assert result.liveview_id == "lv-new"
+    assert pb.viewers[VIEWER_ID] is viewer
+    assert viewer.liveview_id == LIVEVIEW_ID
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("close", ["close_session", "close_public_api_session"])
+async def test_close_stops_talkback_streams(
+    protect_client: ProtectApiClient, close: str
+) -> None:
+    """Closing the client stops and forgets every public talkback stream."""
+    stream = Mock()
+    stream.stop = AsyncMock()
+    protect_client._talkback_streams["cam-1"] = stream
+
+    await getattr(protect_client, close)()
+
+    stream.stop.assert_awaited_once()
+    assert protect_client._talkback_streams == {}

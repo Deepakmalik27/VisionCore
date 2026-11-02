@@ -1,0 +1,165 @@
+# Flags
+
+The flags that change what a run means, and the ones that do not.
+
+## Querying
+
+`--query-flow cli` is the only backend today.
+
+Runs `vss search run <path>` as a subprocess per query. Before the first query
+the script resolves the CLI, runs `vss --version` to catch a broken install,
+and points `~/.vss/config.json` at this deployment.
+
+Live decomposition routes each query by default. Dataset-provided
+decompositions are used when live decomposition is disabled or unavailable;
+`--decompositions` explicitly replays a stored set. Without any decomposition,
+every query uses `--search-path` (default `embed`).
+`--no-decompose` disables only the live LLM; it still replays stored routes.
+For a true single-path baseline, use `--fixed-search-path`, which ignores
+dataset routes and cannot be combined with `--decompositions`.
+
+Any non-zero exit **aborts the run**. There is no exit code meaning "this query
+failed but the rest are fine" — continuing would just manufacture zeros that
+read as a retrieval collapse.
+
+
+### Merging
+
+Merging is on by default, as in the agent. The search merges contiguous
+same-sensor windows and reports the mean of their scores. With merging on it
+also fetches twice `--top-k` candidates and cuts back to `--top-k`, which is
+the agent's candidate pool. Unmerged, it fetches only `--top-k`, so fusion can
+only reorder what embed found, and recall drops.
+
+Merged windows span more 5-second segments, which changes the precision
+denominator. Precision and mAP are therefore not comparable between a merged
+and an unmerged run. Result files captured before merging became the default
+were unmerged; `--no-merge-adjacent` reproduces them.
+
+## Index state
+
+Every run wipes the index before it ingests, unless `--skip-ingest` is passed.
+The wipe deletes every uploaded file source in VST, then waits for the cleanup
+webhooks to empty the indexes a `video_file` search reads —
+`mdx-embed-filtered-2025-01-01`, `mdx-raw-2025-01-01` and
+`mdx-behavior-2025-01-01` — then uploads the whole dataset. RTSP cameras are
+never deleted. If the index is already empty, it deletes nothing. `--skip-ingest` deletes
+nothing and uploads nothing, and aborts unless every dataset video is
+registered. Sources outside the dataset that `--skip-ingest` leaves in place
+can be returned by search and score as false positives. The run warns about
+them and records them in `flow.reused_index.other_sources`.
+
+> **WARNING:** The wipe is irreversible and has no prompt. Deleting a source
+> through the agent also deletes its VST storage, including other users'
+> uploaded files on a shared deployment. Confirm the target host before any
+> run without `--skip-ingest`, and preserve anything needed first.
+
+`--check-indices` reports the searched indexes' document counts and exits,
+read-only; use it to see what a run would wipe or reuse.
+
+`--source-type rtsp` requires `--skip-ingest`. The fresh ingest indexes every
+upload as a video file, which an `rtsp` search never reads, so a wiped `rtsp`
+run would score only what the live cameras had already indexed.
+
+`--only-dataset`, `--clear`, `--confirm-delete` and `--skip-existing` no longer
+exist. They once controlled that deletion; passing one is now a usage error
+(exit 2), raised before anything is deleted.
+
+## Ingest gate
+
+`vst-direct` runs are gated on ingestion being complete, not on the first
+searchable hit. Two flags change what the gate means:
+
+- `--ingest-require` (default `embed,tags,raw,behavior`) names the indexes that
+  must finish. Narrow it only for a profile that lacks a service — no RT-VLM,
+  drop `tags`; no RT-CV, drop `raw,behavior` — never to make a slow run pass.
+- `--ingest-quiet-s` (default 15) is the only heuristic: behavior has no
+  predictable count, so it is done when nothing has changed for this long.
+- `--ingest-absent-grace-s` (default 60) covers an index this deployment
+  never produces. If tags or raw have no documents for any video this long
+  after embeddings finish, the gate drops the index and continues (raw takes
+  behavior with it). It also drops behavior at confirmation if raw exists
+  but behavior is zero everywhere. The run is marked degraded, and the
+  summary names the attribute and fusion queries that read the missing index.
+  Embeddings are never dropped, and an index that has documents for even one
+  video is still required for every video. `--ingest-strict` turns this off
+  and times out instead.
+
+Timings are measured from each video's upload start and are late by at most
+`--ingest-poll-s`. `per_index_done_s.embed` is comparable with the docs'
+existing upload "Avg (s)"; `ingest_s` is full ingestion. Raw is done when RT-CV
+releases the stream (or when its count last changed, if later), not at the last
+detection, so sparse footage does not report ingestion as faster than it was.
+
+`--legacy-index-probe` swaps the gate for the old coverage probe, for one
+release. Its pass point is ~20 s into a ~220 s ingest.
+
+---
+
+
+## Flags not covered here
+
+This document explains the flags that change what a run *means*. The rest are
+tuning and escape hatches -- retry budgets, readiness timeouts, explicit service
+URLs, preflight skips -- and are described by `--help`:
+
+```
+--min-cosine-similarity  --source-type          --decompositions
+--upload-timestamp       --complete-backoff     --complete-retries
+--readiness-timeout      --skip-readiness-wait  --skip-vss-preflight
+--skip-vss-configure     --vst-port             --vst-url
+--vss-origin-port        --vss-base-url         --ingress-url
+--ingest-poll-s          --ingest-deadline-s    --chunk-s
+```
+
+Reach for them when a default is wrong for your deployment, not routinely: each
+one moves a run further from the baseline everything else is compared against.
+
+
+## Cookbook
+
+```bash
+# Everything: wipe the index, ingest fresh, routed CLI queries
+--dataset warehouse
+
+# Query only: keep what is indexed, delete and upload nothing
+--dataset warehouse --skip-download --skip-ingest
+
+# Count the searched indexes' documents and exit (read-only)
+--check-indices
+
+# Use a local dataset instead of DSS
+--data-dir ~/Desktop/vss-eval-datasets --dataset warehouse --skip-download
+
+# One fixed path instead of routing (baseline only -- not an eval)
+--fixed-search-path --search-path fusion --attribute "person wearing a hardhat"
+
+# Replay per-query routes stored in an extended dataset, without a live LLM
+--no-decompose
+
+# Ask the critic the reconstructed question, as runs before 3.8.0 did
+--no-original-query
+
+# The older agent-mediated ingest, when deployed VIOS webhooks are off
+--ingest-flow agent-3step
+
+# Longer wait for webhook-driven perception to finish
+--ingest-deadline-s 1800
+
+# A profile without RT-VLM: no tag index to wait for
+--ingest-require embed,raw,behavior
+
+# Name the results file, for comparing two runs deliberately
+--dataset warehouse --skip-download --name embed-baseline
+
+# See what would run, touching nothing
+--dry-run
+```
+
+`--concurrency` defaults to 1 and should stay there for any run whose latency
+numbers you intend to read: concurrent queries contend for the same VLM and
+embedding services, so every per-stage figure inflates. Raise it only when you
+want wall-clock and are reporting retrieval quality alone — CLI queries take
+~8 s each, so a 673-query set is hours at 1.
+
+---

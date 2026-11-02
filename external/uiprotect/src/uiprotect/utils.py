@@ -1,0 +1,713 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import math
+import os
+import re
+import socket
+import time
+import zoneinfo
+from base64 import urlsafe_b64decode
+from collections import Counter
+from collections.abc import Callable, Coroutine, Iterable
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta, tzinfo
+from decimal import Decimal
+from enum import Enum
+from functools import cache, lru_cache, partial
+from hashlib import sha224
+from inspect import isclass
+from ipaddress import IPv4Address, IPv6Address, ip_address
+from operator import attrgetter
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeVar, Union, get_args, overload
+from uuid import UUID
+
+import orjson
+
+from .data.types import (
+    SmartDetectAudioType,
+    SmartDetectObjectType,
+    Version,
+    VideoMode,
+    get_field_type,
+)
+from .exceptions import NvrError
+
+if TYPE_CHECKING:
+    from http.cookies import Morsel
+
+    from aiohttp import ClientResponse
+    from pydantic.fields import FieldInfo
+
+    from uiprotect.api import ProtectApiClient
+    from uiprotect.data import CoordType, Event
+    from uiprotect.data.bootstrap import WSStat
+
+T = TypeVar("T")
+
+DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+DEBUG_ENV = "UFP_DEBUG"
+PROGRESS_CALLABLE = Callable[[int, str], Coroutine[Any, Any, None]]
+TIMEZONE_GLOBAL: tzinfo | None = None
+
+SNAKE_CASE_MATCH_1 = re.compile("(.)([A-Z0-9][a-z]+)")
+SNAKE_CASE_MATCH_2 = re.compile("__([A-Z0-9])")
+SNAKE_CASE_MATCH_3 = re.compile("([a-z0-9])([A-Z])")
+
+_LOGGER = logging.getLogger(__name__)
+
+_CREATE_TYPES = {UUID, Decimal, Path, Version}
+_BAD_UUID = "00000000-0000-00 0- 000-000000000000"
+
+# All IP-related types that need special handling via _cached_ip_address
+# Note: Union is order-independent, so Union[A, B] == Union[B, A]
+_IP_TYPES = frozenset(
+    {
+        # Individual types (from get_field_type extracting first Union arg)
+        IPv4Address,
+        IPv6Address,
+        # Union types (matched against field.annotation directly)
+        Union[IPv4Address, None],
+        Union[IPv4Address, str],
+        Union[IPv4Address, str, None],
+        Union[IPv6Address, None],
+        Union[IPv6Address, str],
+        Union[IPv6Address, str, None],
+        Union[IPv4Address, IPv6Address],
+        Union[IPv4Address, IPv6Address, None],
+        Union[IPv4Address, IPv6Address, str],
+        Union[IPv4Address, IPv6Address, str, None],
+    }
+)
+
+# Precompute which _IP_TYPES allow str to determine empty string handling
+_IP_TYPES_WITH_STR = frozenset(t for t in _IP_TYPES if str in get_args(t))
+
+
+@lru_cache
+def to_camel(string: str) -> str:
+    return "".join(word.capitalize() for word in string.split("_"))
+
+
+def set_debug() -> None:
+    """Sets ENV variable for UFP_DEBUG to on (True)"""
+    os.environ[DEBUG_ENV] = str(True)
+    is_debug.cache_clear()
+
+
+@cache
+def is_debug() -> bool:
+    """Returns if debug ENV is on (True)"""
+    return os.environ.get(DEBUG_ENV) == str(True)
+
+
+async def get_response_reason(response: ClientResponse) -> str:
+    reason = str(response.reason)
+
+    try:
+        data = await response.json()
+        reason = data.get("error", str(data))
+    except Exception:
+        with contextlib.suppress(Exception):
+            reason = await response.text()
+
+    return reason
+
+
+@overload
+def to_js_time(dt: datetime | int) -> int: ...
+
+
+@overload
+def to_js_time(dt: None) -> None: ...
+
+
+def to_js_time(dt: datetime | int | None) -> int | None:
+    """Converts Python datetime to Javascript timestamp"""
+    if dt is None:
+        return None
+
+    if isinstance(dt, int):
+        return dt
+
+    if dt.tzinfo is None:
+        return int(time.mktime(dt.timetuple()) * 1000)
+
+    return int(dt.astimezone(UTC).timestamp() * 1000)
+
+
+def to_ms(duration: timedelta | None) -> int | None:
+    """Converts python timedelta to Milliseconds"""
+    if duration is None:
+        return None
+
+    return round(duration.total_seconds() * 1000)
+
+
+def utc_now() -> datetime:
+    return datetime.now(tz=UTC)
+
+
+def from_js_time(num: float | str | datetime) -> datetime:
+    """Converts Javascript timestamp or ISO-8601 string to Python datetime"""
+    if isinstance(num, datetime):
+        return num
+
+    if isinstance(num, str) and "T" in num:
+        # ISO-8601 path — Python 3.11+ handles a trailing "Z" natively.
+        dt = datetime.fromisoformat(num)
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+    return datetime.fromtimestamp(int(num) / 1000, tz=UTC)
+
+
+@lru_cache(maxsize=1024)
+def convert_to_datetime(source_time: float | str | datetime | None) -> datetime | None:
+    """Converts timestamp to datetime object"""
+    return None if source_time is None else from_js_time(source_time)
+
+
+def format_datetime(
+    dt: datetime | None,
+    default: str | None = None,
+) -> str | None:
+    """Formats a datetime object in a consistent format"""
+    return default if dt is None else dt.strftime(DATETIME_FORMAT)
+
+
+def is_online(data: dict[str, Any]) -> bool:
+    return bool(data["state"] == "CONNECTED")
+
+
+def is_doorbell(data: dict[str, Any]) -> bool:
+    return "doorbell" in str(data["type"]).lower()
+
+
+@lru_cache(maxsize=1024)
+def to_snake_case(name: str) -> str:
+    """Converts string to snake_case"""
+    name = SNAKE_CASE_MATCH_1.sub(r"\1_\2", name)
+    name = SNAKE_CASE_MATCH_2.sub(r"_\1", name)
+    name = SNAKE_CASE_MATCH_3.sub(r"\1_\2", name)
+    return name.lower()
+
+
+def to_camel_case(name: str) -> str:
+    """Converts string to camelCase"""
+    # repeated runs through should not keep lowercasing
+    if "_" in name:
+        name = to_camel(name)
+        return name[0].lower() + name[1:]
+    return name
+
+
+_EMPTY_UUID = UUID("0" * 32)
+
+
+def convert_unifi_data(value: Any, field: FieldInfo) -> Any:  # noqa: PLR0911, PLR0912
+    """Converts value from UFP data into pydantic field class"""
+    origin, type_ = get_field_type(field.annotation)  # type: ignore[arg-type]
+
+    if type_ is Any:
+        return value
+
+    if origin is not None:
+        if origin is list and isinstance(value, list):
+            return [convert_unifi_data(v, field) for v in value]
+        if origin is set and isinstance(value, list):
+            return {convert_unifi_data(v, field) for v in value}
+        if origin is dict and isinstance(value, dict):
+            return {k: convert_unifi_data(v, field) for k, v in value.items()}
+
+    if value is not None:
+        if type_ in _IP_TYPES:
+            # Handle IP addresses - use _cached_ip_address to support cases where
+            # UniFi returns IPv6 for a field typed as IPv4Address or vice versa
+            if value == "":
+                # Return empty string only if str is in the union, otherwise None
+                return value if type_ in _IP_TYPES_WITH_STR else None
+            return _cached_ip_address(value)
+        if type_ is datetime:
+            return from_js_time(value)
+        if type_ in _CREATE_TYPES:
+            # cannot do this check too soon because some types cannot be used in isinstance
+            if isinstance(value, type_):
+                return value
+            if type_ is UUID:
+                if not value:
+                    return None
+                # handle edge case for improperly formatted UUIDs
+                # 00000000-0000-00 0- 000-000000000000
+                if value == _BAD_UUID:
+                    return _EMPTY_UUID
+            return type_(value)
+        if _is_enum_type(type_):
+            if _is_from_string_enum(type_):
+                return type_.from_string(value)
+            return type_(value)
+
+    return value
+
+
+@lru_cache
+def _cached_ip_address(value: str) -> IPv4Address | IPv6Address | str:
+    try:
+        return ip_address(value)
+    except ValueError:
+        return value
+
+
+@lru_cache
+def _is_enum_type(type_: Any) -> bool:
+    """Checks if type is an Enum."""
+    return isclass(type_) and issubclass(type_, Enum)
+
+
+@lru_cache
+def _is_from_string_enum(type_: Any) -> bool:
+    """Checks if Enum has from_string method."""
+    return hasattr(type_, "from_string")
+
+
+def serialize_unifi_obj(value: Any, levels: int = -1) -> Any:  # noqa: PLR0911
+    """Serializes UFP data"""
+    if unifi_dict := getattr(value, "unifi_dict", None):
+        value = unifi_dict()
+
+    if levels != 0 and isinstance(value, dict):
+        return serialize_dict(value, levels=levels - 1)
+    if levels != 0 and isinstance(value, Iterable) and not isinstance(value, str):
+        return serialize_list(value, levels=levels - 1)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (IPv4Address, IPv6Address, UUID, Path, tzinfo, Version)):
+        return str(value)
+    if isinstance(value, datetime):
+        return to_js_time(value)
+    if isinstance(value, timedelta):
+        return to_ms(value)
+
+    return value
+
+
+def serialize_dict(data: dict[str, Any], levels: int = -1) -> dict[str, Any]:
+    """Serializes UFP data dict"""
+    for key in list(data):
+        data[to_camel_case(key)] = serialize_unifi_obj(data.pop(key), levels=levels)
+
+    return data
+
+
+def serialize_coord(coord: CoordType) -> int | float:
+    """Serializes UFP zone coordinate"""
+    if not isinstance(coord, float):
+        return coord
+
+    if math.isclose(coord, 0) or math.isclose(coord, 1):
+        return int(coord)
+    return coord
+
+
+def serialize_point(point: tuple[CoordType, CoordType]) -> list[int | float]:
+    """Serializes UFP zone coordinate point"""
+    return [
+        serialize_coord(point[0]),
+        serialize_coord(point[1]),
+    ]
+
+
+def serialize_list(items: Iterable[Any], levels: int = -1) -> list[Any]:
+    """Serializes UFP data list"""
+    return [serialize_unifi_obj(i, levels=levels) for i in items]
+
+
+def convert_smart_types(items: Iterable[str]) -> list[SmartDetectObjectType]:
+    """Converts list of str into SmartDetectObjectType. Any unknown values will be ignored and logged."""
+    types = []
+    for smart_type in items:
+        try:
+            types.append(SmartDetectObjectType(smart_type))
+        except ValueError:
+            _LOGGER.warning("Unknown smart detect type: %s", smart_type)
+    return types
+
+
+def convert_smart_audio_types(items: Iterable[str]) -> list[SmartDetectAudioType]:
+    """Converts list of str into SmartDetectAudioType. Any unknown values will be ignored and logged."""
+    types = []
+    for smart_type in items:
+        try:
+            types.append(SmartDetectAudioType(smart_type))
+        except ValueError:
+            _LOGGER.warning("Unknown smart detect audio type: %s", smart_type)
+    return types
+
+
+def convert_video_modes(items: Iterable[str]) -> list[VideoMode]:
+    """Converts list of str into VideoMode. Any unknown values will be ignored and logged."""
+    types = []
+    for video_mode in items:
+        mode = VideoMode(video_mode)
+        if mode is VideoMode.UNKNOWN and video_mode != VideoMode.UNKNOWN.value:
+            _LOGGER.warning("Unknown video mode: %s", video_mode)
+            continue
+        types.append(mode)
+    return types
+
+
+async def ip_from_host(host: str) -> IPv4Address | IPv6Address:
+    """
+    Resolve hostname to IP address (IPv4 or IPv6).
+
+    Raises:
+        ValueError: If host cannot be resolved to IP address
+
+    """
+    try:
+        return ip_address(host)
+    except ValueError:
+        pass
+
+    try:
+        loop = asyncio.get_running_loop()
+        addr_info = await loop.getaddrinfo(host, None)
+        ip_str = addr_info[0][4][0]
+    except (socket.gaierror, OSError) as err:
+        raise ValueError(f"Cannot resolve hostname '{host}' to IP address") from err
+
+    return ip_address(ip_str)
+
+
+def format_host_for_url(host: IPv4Address | IPv6Address | str) -> str:
+    """Format host for URLs. IPv6 addresses are wrapped in brackets."""
+    if isinstance(host, str):
+        try:
+            parsed_host = ip_address(host)
+        except ValueError:
+            return host
+        host = parsed_host
+
+    if isinstance(host, IPv6Address):
+        return f"[{host}]"
+    return str(host)
+
+
+def dict_diff(orig: dict[str, Any] | None, new: dict[str, Any]) -> dict[str, Any]:
+    changed: dict[str, Any] = {}
+
+    if orig is None:
+        return new
+
+    for key, value in new.items():
+        if key not in orig:
+            changed[key] = deepcopy(value)
+            continue
+
+        if isinstance(value, dict):
+            sub_changed = dict_diff(orig[key], value)
+
+            if sub_changed:
+                changed[key] = sub_changed
+        elif value != orig[key]:
+            changed[key] = deepcopy(value)
+
+    return changed
+
+
+def ws_stat_summmary(
+    stats: list[WSStat],
+) -> tuple[list[WSStat], float, Counter[str], Counter[str], Counter[str]]:
+    if len(stats) == 0:
+        raise ValueError("No stats to summarize")
+
+    unfiltered = [s for s in stats if not s.filtered]
+    percent = (1 - len(unfiltered) / len(stats)) * 100
+    keys = Counter(k for s in unfiltered for k in s.keys_set)
+    models = Counter(k.model for k in unfiltered)
+    actions = Counter(k.action for k in unfiltered)
+
+    return unfiltered, percent, keys, models, actions
+
+
+async def write_json(output_path: Path, data: list[Any] | dict[str, Any]) -> None:
+    def write() -> None:
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+            f.write("\n")
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, write)
+
+
+def print_ws_stat_summary(
+    stats: list[WSStat],
+    output: Callable[[Any], Any] | None = None,
+) -> None:
+    if output is None:
+        # typer<0.4.1 is incompatible with click>=8.1.0, so the import is
+        # deferred to keep that breakage CLI-only. typer is also an optional
+        # dependency (the `cli` extra); fall back to print when it is absent.
+        try:
+            import typer  # noqa: PLC0415
+
+            output = typer.echo
+        except ImportError:
+            output = print
+
+    unfiltered, percent, keys, models, actions = ws_stat_summmary(stats)
+
+    title = " ws stat summary "
+    side_length = int((80 - len(title)) / 2)
+
+    lines = [
+        "-" * side_length + title + "-" * side_length,
+        f"packet count: {len(stats)}",
+        f"filtered packet count: {len(unfiltered)} ({percent:.4}%)",
+        "-" * 80,
+    ]
+
+    for key, count in models.most_common():
+        lines.append(f"{key}: {count}")
+    lines.append("-" * 80)
+
+    for key, count in actions.most_common():
+        lines.append(f"{key}: {count}")
+    lines.append("-" * 80)
+
+    for key, count in keys.most_common(10):
+        lines.append(f"{key}: {count}")
+    lines.append("-" * 80)
+
+    output("\n".join(lines))
+
+
+async def profile_ws(
+    protect: ProtectApiClient,
+    duration: int,
+    output_path: Path | None = None,
+    ws_progress: PROGRESS_CALLABLE | None = None,
+    do_print: bool = True,
+    print_output: Callable[[Any], Any] | None = None,
+) -> None:
+    if protect.bootstrap.capture_ws_stats:
+        raise NvrError("Profile already in progress")
+
+    _LOGGER.debug("Starting profile...")
+    protect.bootstrap.clear_ws_stats()
+    protect.bootstrap.capture_ws_stats = True
+
+    if ws_progress is not None:
+        await ws_progress(duration, "Waiting for WS messages")
+    else:
+        await asyncio.sleep(duration)
+
+    protect.bootstrap.capture_ws_stats = False
+    _LOGGER.debug("Finished profile...")
+
+    if output_path:
+        json_data = [s.__dict__ for s in protect.bootstrap.ws_stats]
+        await write_json(output_path, json_data)
+
+    if do_print:
+        print_ws_stat_summary(protect.bootstrap.ws_stats, output=print_output)
+
+
+def decode_token_cookie(token_cookie: Morsel[str]) -> dict[str, Any] | None:
+    """Decode an unexpired token cookie's claims without verifying the signature."""
+    try:
+        claims = _decode_jwt_claims(token_cookie.value)
+    except ValueError as ex:
+        _LOGGER.debug("Authentication token decode error: %s", ex)
+        return None
+    if "exp" in claims and claims["exp"] <= time.time():
+        _LOGGER.debug("Authentication token has expired.")
+        return None
+    return claims
+
+
+def _set_timezone(tz: tzinfo | str) -> tzinfo:
+    global TIMEZONE_GLOBAL  # noqa: PLW0603
+
+    if isinstance(tz, str):
+        tz = zoneinfo.ZoneInfo(tz)
+
+    TIMEZONE_GLOBAL = tz
+
+    return TIMEZONE_GLOBAL
+
+
+def get_local_timezone() -> tzinfo:
+    """Gets Olson timezone name for localizing datetimes"""
+    if TIMEZONE_GLOBAL is not None:
+        return TIMEZONE_GLOBAL
+
+    try:
+        from homeassistant.util import (  # noqa: PLC0415
+            dt as dt_util,  # type: ignore[import-not-found]
+        )
+
+        return _set_timezone(dt_util.DEFAULT_TIME_ZONE)
+    except ImportError:
+        pass
+
+    timezone_name = os.environ.get("TZ")
+    if timezone_name:
+        return _set_timezone(timezone_name)
+
+    timezone_name = "UTC"
+    timezone_locale = Path("/etc/localtime")
+    if timezone_locale.exists():
+        tzfile_digest = sha224(Path(timezone_locale).read_bytes()).hexdigest()
+
+        zoneinfo_root = Path("/usr/share/zoneinfo")
+        for root, _, filenames in os.walk(zoneinfo_root):
+            for filename in filenames:
+                fullname = Path(root) / filename
+                digest = sha224(fullname.read_bytes()).hexdigest()
+                if digest == tzfile_digest:
+                    timezone_name = fullname.relative_to(zoneinfo_root).as_posix()
+
+    return _set_timezone(timezone_name)
+
+
+def log_event(event: Event) -> None:
+    from uiprotect.data import EventType  # noqa: PLC0415
+
+    _LOGGER.debug("event WS msg: %s", event.model_dump())
+    if "smart" not in event.type.value:
+        return
+
+    camera = event.camera
+    if camera is None:
+        return
+
+    if event.end is not None:
+        _LOGGER.debug(
+            "%s (%s): Smart detection ended for %s (%s)",
+            camera.name,
+            camera.mac,
+            event.smart_detect_types,
+            event.id,
+        )
+        return
+
+    _LOGGER.debug(
+        "%s (%s): New smart detection started for %s (%s)",
+        camera.name,
+        camera.mac,
+        event.smart_detect_types,
+        event.id,
+    )
+    smart_settings = camera.smart_detect_settings
+    for smart_type in event.smart_detect_types:
+        is_audio = event.type is EventType.SMART_AUDIO_DETECT
+        if is_audio:
+            if smart_type.audio_type is None:
+                return
+
+            is_enabled = (
+                smart_settings.audio_types is not None
+                and smart_type.audio_type in smart_settings.audio_types
+            )
+            last_event = camera.get_last_smart_audio_detect_event(smart_type.audio_type)
+        else:
+            is_enabled = smart_type in smart_settings.object_types
+            last_event = camera.get_last_smart_detect_event(smart_type)
+
+        _LOGGER.debug(
+            "Event info (%s):\n"
+            "    is_smart_detected: %s\n"
+            "    is_recording_enabled: %s\n"
+            "    is_enabled: %s\n"
+            "    event: %s",
+            smart_type,
+            camera.is_smart_detected,
+            camera.is_recording_enabled,
+            is_enabled,
+            last_event,
+        )
+
+
+def run_async(callback: Coroutine[Any, Any, T]) -> T:
+    """Run async coroutine."""
+    return asyncio.run(callback)
+
+
+@lru_cache(maxsize=1024)
+def normalize_mac(mac: str) -> str:
+    """Normalize MAC address."""
+    return mac.lower().replace(":", "").replace("-", "").replace("_", "")
+
+
+_SENTINEL = object()
+
+
+def get_nested_attr(attrs: tuple[str, ...], obj: Any) -> Any:
+    """Fetch a nested attribute."""
+    value = obj
+    for key in attrs:
+        if (value := getattr(value, key, _SENTINEL)) is _SENTINEL:
+            return None
+    return value
+
+
+def get_nested_attr_as_bool(attrs: tuple[str, ...], obj: Any) -> bool:
+    """Fetch a nested attribute as a bool."""
+    value = obj
+    for key in attrs:
+        if (value := getattr(value, key, _SENTINEL)) is _SENTINEL:
+            return False
+    return bool(value)
+
+
+def get_top_level_attr_as_bool(attr: str, obj: Any) -> Any:
+    """Fetch a top level attribute as a bool."""
+    return bool(getattr(obj, attr))
+
+
+def make_value_getter(ufp_value: str) -> Callable[[T], Any]:
+    """Return a function to get a value from a Protect device."""
+    if "." not in ufp_value:
+        return attrgetter(ufp_value)
+    return partial(get_nested_attr, tuple(ufp_value.split(".")))
+
+
+def make_enabled_getter(ufp_enabled: str) -> Callable[[T], bool]:
+    """Return a function to get a value from a Protect device."""
+    if "." not in ufp_enabled:
+        return attrgetter(ufp_enabled)
+    return partial(get_nested_attr, tuple(ufp_enabled.split(".")))
+
+
+def make_required_getter(ufp_required_field: str) -> Callable[[T], bool]:
+    """Return a function to get a value from a Protect device."""
+    if "." not in ufp_required_field:
+        return partial(get_top_level_attr_as_bool, ufp_required_field)
+    return partial(get_nested_attr_as_bool, tuple(ufp_required_field.split(".")))
+
+
+@lru_cache
+def timedelta_total_seconds(td: timedelta) -> float:
+    return td.total_seconds()
+
+
+def pybool_to_json_bool(value: bool) -> str:
+    """Convert a Python bool to a JSON boolean string ('true'/'false')."""
+    return "true" if value else "false"
+
+
+def _decode_jwt_claims(token: str) -> dict[str, Any]:
+    segments = token.split(".")
+    if len(segments) != 3:
+        raise ValueError(f"Expected 3 token segments, got {len(segments)}")
+    payload = segments[1]
+    claims = orjson.loads(urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    if not isinstance(claims, dict):
+        raise ValueError("Token payload is not a JSON object")
+    if "exp" in claims and not isinstance(claims["exp"], int | float):
+        raise ValueError("Expiration Time claim (exp) must be a number")
+    return claims

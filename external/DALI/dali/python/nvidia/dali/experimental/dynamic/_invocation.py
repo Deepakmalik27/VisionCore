@@ -1,0 +1,396 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import threading
+import types
+import weakref
+from typing import TYPE_CHECKING, Any, Optional
+
+from ._async import _Future
+from ._call_site import capture_stack_from_frame
+from ._device import Device
+from ._eval_context import EvalContext as _EvalContext
+from ._eval_mode import EvalMode as _EvalMode
+from ._exceptions import rethrow_exception
+from ._nvtx import NVTXRange
+from ._type import DType
+from nvidia.dali import backend as _b
+
+if TYPE_CHECKING:
+    from ._ops import Operator
+
+
+class Invocation:
+    """
+    A class representing a single invocation of an operator.
+
+    It binds the operator instance and the call arguments.
+    It also tracks the order of invocations of stateful operators, which is important for
+    lazy evaluation of stateful operators or operators with side-effects.
+    """
+
+    def __init__(
+        self,
+        operator_instance: "Operator",
+        call_id: Optional[int],
+        inputs: list[Any] | None = None,
+        args: dict[str, Any] | None = None,
+        is_batch: bool = False,
+        batch_size: Optional[int] = None,
+        previous_invocation: Optional["Invocation"] = None,
+        caller_frame: types.FrameType | None = None,
+    ):
+        """
+        Parameters
+        ----------
+        operator_instance : OperatorInstance
+            The operator instance that is being invoked.
+        call_id : int
+            The call ID of the invocation - necessary to avoid folding of multiple invocations
+            of the same stateful operator.
+        inputs : list
+            The inputs to the operator.
+        args : dict name->argument
+            The argument inputs of the operator. Scalar arguments are part of the operator instance.
+        is_batch : bool
+            Whether this is a batch invocation.
+            NOTE: A batch of 1 and a single tensor are equivalent from the operator's perspective
+                  (operators always work with batches) but differes from the user's perspective.
+        batch_size : int
+            The batch sizes. This is useful chiefly for operators without inputs or ones that alter
+            the batch size.
+        previous_invocation : Invocation
+            The previous invocation of the same operator. Used by stateful operators.
+        caller_frame : FrameType
+            The resolved user call-site frame. Used to capture call stacks for error reporting.
+        """
+        self._operator = operator_instance
+        self._call_id = call_id
+        self._inputs = inputs or []
+        self._args = args or {}
+        self._is_batch = is_batch
+        self._results: tuple[Any] | None = None
+        self._batch_size = batch_size
+        self._num_outputs: int | None = None
+        self._output_devices: list[Device] | None = None
+        self._previous_invocation = previous_invocation
+        self._eval_context = _EvalContext.current()._snapshot()
+        self._eval_mode: _EvalMode | None = None
+        self._future: Optional[_Future] = None
+        self._run_lock = threading.Lock()
+        if caller_frame is not None and _EvalMode.current().value <= _EvalMode.eager.value:
+            self._call_stack = capture_stack_from_frame(caller_frame)
+        else:
+            self._call_stack = None
+
+        if hasattr(self._operator, "_cache"):
+            self._return_op_to_cache = weakref.finalize(
+                self, Invocation._return_op_to_cache_impl, self._operator
+            )
+        else:
+            self._return_op_to_cache = None
+
+    @staticmethod
+    def _return_op_to_cache_impl(op):
+        op._cache[op._key] = op
+
+    def device(self, result_index: int):
+        if self._output_devices is None:
+            self._output_devices = self._operator._infer_output_devices(*self._inputs, **self._args)
+        return self._output_devices[result_index]
+
+    def shape(self, result_index: int):
+        if self._results is None:
+            # TODO(michalz): Try to get shape without full evaluation.
+            self.run(self._eval_context)
+        s = self._results[result_index].shape()
+        return s if self.is_batch else tuple(s)
+
+    @NVTXRange("Invocation.batch_size", category="invocation")
+    def batch_size(self, result_index: int):
+        if not self._is_batch:
+            return None
+        if self._batch_size is not None:
+            return self._batch_size
+        if self._results is None:
+            # TODO(michalz): Try to get batch_size without full evaluation.
+            self.run(self._eval_context)
+        return self._results[result_index].batch_size if self._is_batch else None
+
+    def ndim(self, result_index: int) -> int:
+        if self._results is None:
+            ndim = self._try_get_metadata(result_index, 2)
+            if ndim is not None:
+                return ndim
+            self.run(self._eval_context)
+        return self._results[result_index].ndim()
+
+    def dtype(self, result_index: int) -> DType:
+        if self._results is None:
+            dtype = self._try_get_metadata(result_index, 3)
+            if dtype is not None:
+                return dtype
+            self.run(self._eval_context)
+        return self._results[result_index].dtype
+
+    def layout(self, result_index: int) -> str | None:
+        if self._results is None:
+            layout = self._try_get_metadata(result_index, 4)
+            if layout is not None:
+                layout = str(layout)
+                return None if layout == "" else layout
+            self.run(self._eval_context)
+
+        layout = self._results[result_index].layout()
+        return layout or None  # this will override "" with None
+
+    def _try_get_metadata(self, result_index: int, desc_index: int):
+        # Capture the operator first to guard from a race condition
+        operator = self._operator
+        if self._results is None:
+            assert operator is not None
+            if init_spec := getattr(operator, "_init_spec", None):
+                init_spec(self._inputs, self._args)
+                if output_desc := operator._op_spec.OutputDesc(result_index):
+                    return output_desc[desc_index]
+        return None
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield InvocationResult(self, index)
+
+    def __getitem__(self, index):
+        """
+        Returns a proxy to the index-th result of the invocation.
+        """
+        return InvocationResult(self, index)
+
+    def __len__(self) -> int:
+        if self._num_outputs is None:
+            self._num_outputs = self._operator._infer_num_outputs(*self._inputs, **self._args)
+        return self._num_outputs  # type: ignore
+
+    @property
+    def is_batch(self):
+        return self._is_batch
+
+    def apply_eval_policy(
+        self,
+        has_external_inputs: bool,
+        mode: Optional[_EvalMode] = None,
+        ctx: Optional[_EvalContext] = None,
+    ):
+        """Optionally schedules or runs the operator, depending on the evaluation mode and whether
+        there are any external inputs.
+
+        If there are any external inputs, the operator is run immediately, regardless of EvalMode.
+        """
+        if mode is None:
+            mode = _EvalMode.current()
+
+        if has_external_inputs:
+            self.run(ctx)
+        elif mode.value >= _EvalMode.sync_cpu.value:
+            self.run(ctx)
+        elif mode.value >= _EvalMode.eager.value:
+            self.schedule(ctx)
+        # else - deferred evaluation
+
+        if not has_external_inputs:
+            self._eval_mode = mode
+
+        if mode is _EvalMode.sync_full:
+            stream = ctx.cuda_stream if ctx is not None else _EvalContext.current().cuda_stream
+            if stream is not None:  # If the stream is None, there's no GPU
+                stream.synchronize()
+
+    _nvtx_wait = NVTXRange("Invocation.wait", category="invocation")
+    _nvtx_run = NVTXRange("Invocation.run", category="invocation")
+
+    def run(self, ctx: Optional[_EvalContext] = None):
+        """Executes the operator immediately."""
+        if future := self._future:
+            with Invocation._nvtx_wait:
+                future.wait()
+            self._future = None
+        else:
+            ctx = self._eval_context if ctx is None else ctx
+            try:
+                # We don't want to run from two threads
+                with self._run_lock:
+                    self._run_impl(ctx)
+            except Exception as exception:
+                if self._call_stack is not None and self._eval_mode is not None:
+                    rethrow_exception(exception, self._call_stack, self._eval_mode)
+                raise
+
+    @NVTXRange("Invocation.schedule", category="invocation")
+    def schedule(self, ctx: Optional[_EvalContext] = None):
+        """Schedule the asynchronous execution of the operator"""
+
+        # Note: this function can only be called once, soon after the instance creation
+        # so we don't have to worry about thread-safety
+
+        if self._results is not None or self._future is not None:
+            return
+
+        eval_context = self._eval_context if ctx is None else ctx
+        # If we're already in the background thread, submitting the task
+        # to the async executor creates a deadlock so we run it directly.
+        if eval_context._is_in_background_thread():
+            self._run_impl(eval_context)
+            return
+
+        eval_mode = _EvalMode.current()
+        device = Device.current()
+
+        def _run():
+            # Forward thread-local context to the new thread
+            with eval_context, eval_mode, device:
+                self._run_impl(eval_context)
+
+        # Call _init_spec early to prevent a race condition
+        if init_spec := getattr(self._operator, "_init_spec", None):
+            init_spec(self._inputs, self._args)
+
+        assert self._call_stack is not None
+        self._future = eval_context._async_executor.submit(_run, self._call_stack)
+
+    def _run_impl(self, ctx: _EvalContext):
+        """Run the operator and store the result in self._results"""
+
+        if self._results is not None:
+            return
+
+        with Invocation._nvtx_run:
+            # If the invocation was created with a GPU device, validate that
+            # the evaluation context matches.
+            if (
+                self._eval_context._device is not None
+                and self._eval_context._device.device_type == "gpu"
+            ):
+                if self._eval_context._device != ctx._device:
+                    raise RuntimeError(
+                        f"Device mismatch: Invocation was created with device "
+                        f"'{self._eval_context._device}' "
+                        f"but is being evaluated with device '{ctx._device}'. "
+                        f"This can happen when using an EvalContext context manager "
+                        f"at invocation time and a different EvalContext at evaluation "
+                        f"time. Ensure consistent EvalContext usage."
+                    )
+
+            if self._previous_invocation is not None:
+                self._previous_invocation.run(ctx)
+                self._previous_invocation = None
+            # TODO(michalz): Implement something that doesn't leak memory
+            # cached = ctx.cached_results(self)
+            # if cached is not None:
+            #     self._results = cached
+            # else:
+            r = self._operator._run(
+                ctx,
+                *self._inputs,
+                batch_size=self._batch_size if self._is_batch else None,
+                **self._args,
+            )
+            if isinstance(r, (tuple, list)):
+                self._results = tuple(r)
+            elif isinstance(r, dict):
+                self._results = tuple(r.values())
+            else:
+                self._results = (r,)
+
+            if self._num_outputs is None:
+                self._num_outputs = len(self._results)
+            else:
+                assert self._num_outputs == len(self._results)
+
+            def output_device(x):
+                if isinstance(x, (_b.TensorGPU, _b.TensorListGPU)):
+                    return Device("gpu", x.device_id())
+                else:
+                    return Device.CPU
+
+            if self._output_devices is None:
+                self._output_devices = [output_device(r) for r in self._results]
+            else:
+                for i, d in enumerate(self._output_devices):
+                    assert output_device(self._results[i]) == d
+
+            ctx.cache_results(self, self._results)
+            if self._return_op_to_cache:
+                self._return_op_to_cache()  # the operator instance is ready for a new invocation
+            self._operator = None
+
+    def values(self, ctx: Optional[_EvalContext] = None):
+        """
+        Returns the concrete results of the invocation.
+
+        The invocation may have multiple results (e.g. readers may produce data + labels).
+        The return value is a list of Batch or Tensor objects.
+        """
+        self.run(ctx)
+        return self._results
+
+
+class InvocationResult:
+    """
+    A class representing a single result of an invocation.
+
+    It binds the invocation and the index of the return value.
+    It serves as a proxy to enable lazy evaluation.
+    """
+
+    def __init__(self, invocation, index: int):
+        self._invocation = invocation
+        self._index = index
+
+    @property
+    def device(self):
+        return self._invocation.device(self._index)
+
+    @property
+    def ndim(self) -> int:
+        return self._invocation.ndim(self._index)
+
+    @property
+    def shape(self):
+        return self._invocation.shape(self._index)
+
+    @property
+    def dtype(self) -> DType:
+        return self._invocation.dtype(self._index)
+
+    @property
+    def layout(self):
+        return self._invocation.layout(self._index)
+
+    @property
+    def batch_size(self):
+        return self._invocation.batch_size(self._index)
+
+    @property
+    def is_batch(self):
+        return self._invocation.is_batch
+
+    def value(self, ctx: Optional[_EvalContext] = None):
+        return self._invocation.values(ctx)[self._index]
+
+    @property
+    def invocation(self):
+        return self._invocation
+
+    @property
+    def index(self):
+        return self._index

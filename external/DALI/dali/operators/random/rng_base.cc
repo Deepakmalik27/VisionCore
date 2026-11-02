@@ -1,0 +1,58 @@
+// Copyright (c) 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "dali/operators/random/rng_base.h"
+#include "dali/pipeline/operator/op_schema.h"
+
+namespace dali {
+
+// Note that random.choice does not inherit from RNGAttr as it does not support "dtype".
+DALI_SCHEMA(RNGAttr)
+    .MakeAbstract()
+    .DocStr(R"code(Random Number Generator attributes.
+
+It should be added as parent to all RNG operators.)code")
+    .AddOptionalArg<std::vector<int>>("shape",
+      R"code(Shape of the output data.)code", nullptr, true)
+    .AddOptionalTypeArg("dtype",
+      R"code(Output data type.
+
+.. note::
+  The generated numbers are converted to the output data type, rounding and clamping if necessary.
+)code")
+  .AddRandomSeedArg()
+  .AddRandomStateArg()
+  .OutputNDim(0, [](const OpSpec &spec)->std::optional<int> {
+    if (spec.NumRegularInput() >= 1) {
+      return spec.InputDesc(0).ndim;
+    }
+    std::vector<int> shape;
+    if (spec.TryGetRepeatedArgument(shape, "shape"))
+      return shape.size();
+    else if (spec.HasTensorArgument("shape"))
+      return std::nullopt;
+    else
+      return 0;
+  })
+  .OutputDType(0, [](const OpSpec &spec) {
+    DALIDataType dtype;
+    if (spec.TryGetArgument(dtype, "dtype"))
+      return dtype;
+    else
+      return DALI_FLOAT;  // holds for all RNGs except CoinFlip, which overrides this function
+  })
+  .OutputLayout(0, "");
+
+
+}  // namespace dali

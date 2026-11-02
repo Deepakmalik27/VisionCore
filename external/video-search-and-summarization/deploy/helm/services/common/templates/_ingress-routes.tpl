@@ -1,0 +1,402 @@
+{{/*
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/}}
+
+{{/*
+  THE canonical VSS ingress route table.
+
+  One origin, one mount per service, the same on every developer profile and on
+  the Docker edge (deploy/docker/services/infra/haproxy/haproxy.cfg.template).
+  A service is mounted at its own name and carries whatever it itself serves:
+  /rtvi-vlm/v1/models, /elasticsearch/_cat/indices, /vst/api/v1/sensor/list.
+  These are the paths `vss configure` records
+  (services/agent/packages/vss_cli/src/vss_cli/config.py:INGRESS_SERVICES) and
+  the paths the operate skills document, so a caller never has to ask which
+  profile it is talking to.
+
+  Callers do not choose paths -- they supply a `backends` dict of
+  `<key> -> {service, port}` for the services their profile actually deploys,
+  and this table decides where each one is mounted. A key with no entry is not
+  mounted; per FR-19 a profile that does not run a backend simply has no route
+  rather than a broken one.
+
+  Row fields:
+    key      logical backend, the key callers use in `backends`
+    path     public mount
+    pathType Ingress pathType (Prefix, except /openapi.json which is Exact)
+    rewrite  none  -> forwarded with the prefix intact
+             strip -> prefix removed before the backend sees it
+             /x    -> prefix replaced with /x
+    anchored prepend ^ to the HAProxy rewrite source when true
+
+  Ordering is the rendered order: the UI's /api/* routes before the agent's
+  /api catch-all, and the UI / catch-all last. The HAProxy controller matches
+  longest-prefix regardless, but keeping the file readable in match order is
+  worth more than the few lines it costs.
+*/}}
+{{- define "vss.ingress.routeTable" -}}
+- key: ui
+  path: /api/chat
+  pathType: Prefix
+  rewrite: none
+# /api/agent is served by the UI's embedded backend-agnostic agent adapter (see
+# deploy/docker/services/ui/compose.yml and haproxy.cfg.template p_api_agent
+# rule). Must precede /api so the longest-prefix match falls to the UI rather
+# than being forwarded to the agent backend.
+- key: ui
+  path: /api/agent
+  pathType: Prefix
+  rewrite: none
+- key: ui
+  path: /api/vss-chat
+  pathType: Prefix
+  rewrite: none
+- key: ui
+  path: /api/proxy
+  pathType: Prefix
+  rewrite: none
+- key: agent
+  path: /api
+  pathType: Prefix
+  rewrite: none
+- key: agent
+  path: /chat
+  pathType: Prefix
+  rewrite: none
+- key: agent
+  path: /websocket
+  pathType: Prefix
+  rewrite: none
+- key: agent
+  path: /static
+  pathType: Prefix
+  rewrite: none
+- key: agent
+  path: /docs
+  pathType: Prefix
+  rewrite: none
+- key: agent
+  path: /redoc
+  pathType: Prefix
+  rewrite: none
+- key: agent
+  path: /generate
+  pathType: Prefix
+  rewrite: none
+- key: agent
+  path: /openapi.json
+  pathType: Exact
+  rewrite: none
+- key: vst
+  path: /vst
+  pathType: Prefix
+  rewrite: none
+# VST media links are minted absolute against the origin root. The Docker edge
+# answers them with the same replacement, so a clip URL works on either
+# deployment without the caller rewriting it.
+- key: vst
+  path: /storage
+  pathType: Prefix
+  rewrite: /vst/storage
+  anchored: true
+- key: va-mcp
+  path: /va-mcp
+  pathType: Prefix
+  rewrite: strip
+- key: alert-bridge
+  path: /alert-bridge
+  pathType: Prefix
+  rewrite: strip
+- key: video-analytics-api
+  path: /video-analytics-api
+  pathType: Prefix
+  rewrite: strip
+# No strip: the Docker edge forwards this one whole, and the service is
+# reached by Kibana/ES in most builds, so nothing depends on a stripped form.
+- key: behavior-analytics
+  path: /behavior-analytics
+  pathType: Prefix
+  rewrite: none
+- key: elasticsearch
+  path: /elasticsearch
+  pathType: Prefix
+  rewrite: strip
+- key: rtvi-vlm
+  path: /rtvi-vlm
+  pathType: Prefix
+  rewrite: strip
+- key: rtvi-cv
+  path: /rtvi-cv
+  pathType: Prefix
+  rewrite: strip
+- key: rtvi-embed
+  path: /rtvi-embed
+  pathType: Prefix
+  rewrite: strip
+- key: lvs
+  path: /lvs
+  pathType: Prefix
+  rewrite: strip
+- key: phoenix
+  path: /phoenix
+  pathType: Prefix
+  rewrite: strip
+# One address for the LLM whatever GPU it landed on, so a consumer needs no
+# knowledge of the placement: <origin>/llm/v1/chat/completions reaches the NIM's
+# own /v1/chat/completions. Backed by the in-deployment LLM NIM Service, which
+# is why a profile that runs no NIM does not mount this at all rather than
+# proxying to a Service that was never created.
+- key: llm
+  path: /llm
+  pathType: Prefix
+  rewrite: strip
+- key: ui
+  path: /
+  pathType: Prefix
+  rewrite: none
+{{- end -}}
+
+{{/*
+  "true" when a component is deployed, "" when it is not.
+
+  `default true .Values.x.enabled` cannot express this: sprig's `default` treats
+  `false` as empty and hands back the default, so an explicitly disabled
+  component reads as enabled and the profile mounts a route at a Service that
+  was never created. Key presence is the only reliable signal.
+
+  Pass: dict "vals" $subchartValues "default" true
+  Chain an umbrella with its child: `and $umbrellaOn $childOn`.
+*/}}
+{{- define "vss.ingress.enabled" -}}
+{{- $vals := .vals | default dict -}}
+{{- if hasKey $vals "enabled" -}}
+{{- if $vals.enabled }}true{{ end -}}
+{{- else if .default -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+  The `llm` backend entry, or "" when this profile runs no LLM NIM of its own.
+
+  The four profiles resolve every other backend with their own serviceShort /
+  subchartFullname helper, but the LLM NIM is not a profile-level dependency:
+  it is `nims.nemotron35`, a subchart of a subchart, whose Service is created by
+  the NIM Operator from the NIMService CR and therefore named by that chart's
+  own fullname rule rather than by the profile's. Resolving it once here is what
+  keeps the /llm mount identical on all four, and is why the enablement test
+  lives here too -- a remote-LLM or NIM-less profile mounts nothing and the
+  request falls through to the UI catch-all as a 404, rather than reaching an
+  Ingress backed by a Service that does not exist (FR-19).
+
+  Deliberately not gated on llmBaseUrl: that value says where *consumers* were
+  pointed, not whether a NIM is deployed. The Docker edge draws the same line --
+  bk_llm_strip is DOWN and answers 503 when the LLM NIM container is not up,
+  regardless of where the agent was told to send its own traffic.
+
+  Pass: dict "root" .
+  Returns a YAML mapping for `fromYaml`, empty when there is no in-cluster LLM.
+*/}}
+{{- define "vss.ingress.llmBackend" -}}
+{{- $root := index . "root" -}}
+{{- $vals := $root.Values | default dict -}}
+{{- $nims := index $vals "nims" | default dict -}}
+{{- $llm := index $nims "nemotron35" | default dict -}}
+{{- $on := and
+      (include "vss.ingress.enabled" (dict "vals" $nims "default" false))
+      (include "vss.ingress.enabled" (dict "vals" $llm "default" false)) -}}
+{{- if $on -}}
+{{- $name := "" -}}
+{{- if $llm.fullnameOverride -}}
+{{- $name = $llm.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $short := default "nemotron-35-lightning-30b-a3b" $llm.nameOverride -}}
+{{- /* Same precedence the subchart's own fullname helper sees: its leaf value,
+       then the global Helm merges into it (nims.global, then the chart root). */}}
+{{- $nimsGlobal := index $nims "global" | default dict -}}
+{{- $g := index $vals "global" | default dict -}}
+{{- $pfx := default false (coalesce
+      (index $llm "useReleaseNamePrefix")
+      (index $nimsGlobal "useReleaseNamePrefix")
+      (index $g "useReleaseNamePrefix")) -}}
+{{- $name = ternary (printf "%s-%s" $root.Release.Name $short) $short $pfx -}}
+{{- $name = $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- /* The NIM's own port, not a vssIngress key: a second place to write it is a
+       second place for it to disagree with the Service it is mounting. 8000 is
+       the nims chart default, which the minimal profiles do not restate. */}}
+{{- $svc := index $llm "service" | default dict -}}
+service: {{ $name }}
+port: {{ index $svc "port" | default 8000 }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+  Renders the `paths:` list for one Ingress rule.
+
+  Pass: dict "backends" $b
+  Optional: "only" (list of keys) to render a subset -- used for the host-less
+  east-west rule, which carries the RTVI mounts and nothing else.
+
+  Emitted at zero indent with no leading or trailing blank line; the caller
+  applies `nindent`.
+*/}}
+{{- define "vss.ingress.paths" -}}
+{{- include "vss.ingress.pathRows" . | trim -}}
+{{- end -}}
+
+{{- define "vss.ingress.pathRows" -}}
+{{- $backends := .backends | default dict -}}
+{{- $only := .only | default (list) -}}
+{{- range $row := include "vss.ingress.routeTable" . | fromYamlArray }}
+{{- $b := index $backends $row.key | default dict }}
+{{- if and $b.service (or (eq (len $only) 0) (has $row.key $only)) }}
+- path: {{ $row.path }}
+  pathType: {{ $row.pathType }}
+  backend:
+    service:
+      name: {{ $b.service }}
+      port:
+        number: {{ $b.port }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+  Renders the value of the `haproxy.org/path-rewrite` annotation: one pair per
+  mounted route that rewrites, derived from the same table as the paths, so the
+  two can never disagree about which prefix is stripped (FR-16).
+
+  Emitted at zero indent with no leading or trailing blank line; the caller
+  applies `nindent`.
+*/}}
+{{- define "vss.ingress.pathRewrites" -}}
+{{- include "vss.ingress.pathRewriteRows" . | trim -}}
+{{- end -}}
+
+{{- define "vss.ingress.pathRewriteRows" -}}
+{{- $backends := .backends | default dict -}}
+{{- range $row := include "vss.ingress.routeTable" . | fromYamlArray }}
+{{- $b := index $backends $row.key | default dict }}
+{{- $rw := $row.rewrite | default "none" }}
+{{- if and $b.service (ne $rw "none") }}
+{{- $to := ternary "" $rw (eq $rw "strip") }}
+{{- $anchor := ternary "^" "" ($row.anchored | default false) }}
+{{ $anchor }}{{ $row.path }}/(.*) {{ $to }}/\1
+{{ $anchor }}{{ $row.path }} {{ $to | default "/" }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+  Whether any rewriting route is mounted -- guards the annotation block, since
+  an empty `haproxy.org/path-rewrite` is not the same as an absent one.
+*/}}
+{{- define "vss.ingress.hasPathRewrites" -}}
+{{- if include "vss.ingress.pathRewrites" . }}true{{ end -}}
+{{- end -}}
+
+{{/*
+  Fails the render on a backends dict this table cannot serve: a key that is not
+  in the table (a typo, or a route someone added on one profile only) or an
+  entry with no port. This is what keeps the four profiles from drifting apart
+  again -- a new route has to be added here, where every profile picks it up.
+*/}}
+{{- define "vss.ingress.assertBackends" -}}
+{{- $known := list -}}
+{{- range $row := include "vss.ingress.routeTable" . | fromYamlArray -}}
+{{- $known = append $known $row.key -}}
+{{- end -}}
+{{- $known = uniq $known -}}
+{{- range $k, $v := (.backends | default dict) -}}
+{{- if not (has $k $known) -}}
+{{- fail (printf "vss.ingress: %q is not a canonical route key. The table in services/common/templates/_ingress-routes.tpl defines: %s. Add the route there, not in one profile." $k ($known | sortAlpha | join ", ")) -}}
+{{- end -}}
+{{- if not $v.service -}}
+{{- fail (printf "vss.ingress: backend %q has no service name" $k) -}}
+{{- end -}}
+{{- if not $v.port -}}
+{{- fail (printf "vss.ingress: backend %q has no port" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+  Fails the render when the VIOS sensor would address its stream-processing
+  peer by a name that peer's own chart does not render.
+
+  The sensor derives the peer Service name (vss-vios-streamprocessing, or
+  SDRC's controller when global.vios.useSdrc) from
+  vios.vss-vios-sensor.peerUseReleaseNamePrefix.<peer>, else the global
+  useReleaseNamePrefix: a subchart cannot read a sibling subchart's local
+  useReleaseNamePrefix. The profile CAN read both, so a mixed-prefix install
+  that sets the peer's local flag without telling the sensor is refused here,
+  naming the missing value, instead of deploying a sensor that calls a Service
+  that does not exist. An explicit streamProcessorEndpoint skips the check.
+
+  Pass: the profile's root context.
+*/}}
+{{- define "vss.vios.prefixOf" -}}
+{{- $local := .local | default dict -}}
+{{- $g := .global | default dict -}}
+{{- if and (hasKey $local .key) (kindIs "bool" (index $local .key)) -}}
+{{- ternary "true" "" (index $local .key) -}}
+{{- else if and (hasKey $g "useReleaseNamePrefix") (kindIs "bool" (index $g "useReleaseNamePrefix")) -}}
+{{- ternary "true" "" (index $g "useReleaseNamePrefix") -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "vss.vios.assertPeerNaming" -}}
+{{- $g := .Values.global | default dict -}}
+{{- $vios := .Values.vios | default dict -}}
+{{- $sensor := index $vios "vss-vios-sensor" | default dict -}}
+{{- if and (include "vss.ingress.enabled" (dict "vals" $vios "default" true)) (include "vss.ingress.enabled" (dict "vals" $sensor "default" false)) (not (trim (toString (default "" $sensor.streamProcessorEndpoint)))) -}}
+{{- $peer := "streamprocessing" -}}
+{{- $chartVals := index $vios "vss-vios-streamprocessing" | default dict -}}
+{{- $chartPath := "vios.vss-vios-streamprocessing" -}}
+{{- if dig "vios" "useSdrc" false $g -}}
+{{- $peer = "sdrc" -}}
+{{- $chartVals = index (.Values.infra | default dict) "sdrc" | default dict -}}
+{{- $chartPath = "infra.sdrc" -}}
+{{- end -}}
+{{- if include "vss.ingress.enabled" (dict "vals" $chartVals "default" false) -}}
+{{- $actual := include "vss.vios.prefixOf" (dict "local" $chartVals "key" "useReleaseNamePrefix" "global" $g) -}}
+{{- $seen := include "vss.vios.prefixOf" (dict "local" ($sensor.peerUseReleaseNamePrefix | default dict) "key" $peer "global" $g) -}}
+{{- if ne $actual $seen -}}
+{{- fail (printf "vios.vss-vios-sensor would address its %s peer %s the release-name prefix, but %s renders its Service %s it. The sensor cannot read %s.useReleaseNamePrefix; set vios.vss-vios-sensor.peerUseReleaseNamePrefix.%s: %t to match (or set vios.vss-vios-sensor.streamProcessorEndpoint explicitly)." $peer (ternary "WITH" "WITHOUT" (eq $seen "true")) $chartPath (ternary "WITH" "WITHOUT" (eq $actual "true")) $chartPath $peer (eq $actual "true")) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+  The name a VIOS subchart gives its own objects (<chart>.fullname), for config
+  that addresses them by name, such as SDRC's workload entries. Asking the
+  subchart keeps every values combination in step; when it is not rendered the
+  fallback is the chart name, release-prefixed under the global setting, so a
+  prefixed release never names another release's object.
+
+  Pass: dict "root" <profile root context> "chart" "vss-vios-streamprocessing"
+*/}}
+{{- define "vss.vios.objectName" -}}
+{{- $chart := .chart -}}
+{{- $name := $chart -}}
+{{- if default false (index (.root.Values.global | default dict) "useReleaseNamePrefix") -}}
+{{- $name = printf "%s-%s" .root.Release.Name $chart | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- with index .root.Subcharts "vios" }}{{ with index .Subcharts $chart }}{{ $name = include (printf "%s.fullname" $chart) . }}{{ end }}{{ end -}}
+{{- $name -}}
+{{- end -}}

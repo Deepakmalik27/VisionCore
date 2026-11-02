@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+%YAML:1.0
+
+BaseConfig:
+  debugVerboseLevel: 1
+  minDetectorConfidence: 0.266
+  checkClassMatch: 1
+  useBatchNumForFrameId: 1
+
+TargetManagement:
+  enableBboxUnClipping: 1
+  preserveStreamUpdateOrder: 0
+  maxTargetsPerStream: 200
+  minIouDiff4NewTarget: 0.33
+  minTrackerConfidence: 0.6
+  probationAge: 12
+  maxShadowTrackingAge: 175
+  earlyTerminationAge: 7
+  maxTrajectoryBufferLength: -1
+  outputVisibility: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+  enableReAssoc: 0
+  reidExtractionInterval: 8
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  minMatchingScore4Overall: 0.5
+  minMatchingScore4SizeSimilarity: 0.01
+  minMatchingScore4Iou: 0.15
+  matchingScoreWeight4SizeSimilarity: 0.3
+  matchingScoreWeight4Iou: 0.4
+  tentativeDetectorConfidence: 0.78
+  minMatchingScore4TentativeIou: 0.25
+  minMatchingScore4PeerAssocIou: 0.25
+
+StateEstimator:
+  stateEstimatorType: 4
+  processNoiseVar4Loc: 22.0
+  processNoiseVar4Size: 96.1
+  processNoiseVar4Vel: 84.6
+  measurementNoiseVar4Detector: 78.4
+  measurementNoiseVar4Tracker: 82.3
+
+PoseEstimator:
+  poseEstimatorType: 1
+  useVPICropScaler: 1
+  operateOnClassIds: [0]
+  batchSize: 1
+  workspaceSize: 1000
+  inferDims: [3, 256, 192]
+  networkMode: 1
+  inputOrder: 0
+  colorFormat: 0
+  offsets: [123.6750, 116.2800, 103.5300]
+  netScaleFactor: 0.00392156
+  onnxFile: /opt/storage/BodyPose3DNet/bodypose3dnet_accuracy.onnx
+  modelEngineFile: /opt/storage/BodyPose3DNet/bodypose3dnet_accuracy.onnx_b1_gpu0_fp16.engine
+  poseInferenceInterval: -1
+
+ObjectModelProjection:
+  minPoseConfidence: 0.95
+  outputFootLocation: 1
+  outputConvexHull: 1
+  cameraModelFilepath:
+    Camera: /tmp/camInfo/Camera.yml
+    Camera_01: /tmp/camInfo/Camera_01.yml
+    Camera_02: /tmp/camInfo/Camera_02.yml
+    Camera_03: /tmp/camInfo/Camera_03.yml
+  objectModelType: 0
+
+# ReID and ReIDService are appended from ../reid-append/tracker-reid.yml when
+# standaloneWarehouse.mv3dt.reid.enabled. They must not appear here as well:
+# the tracker's YAML reader takes the first of a duplicated key, so an inline
+# copy would win over the appended one and pin serviceAddress to the Compose
+# network alias, which has no counterpart in Kubernetes.
+
+MultiViewAssociator:
+  multiViewAssociatorType: 1
+  enableLatePeerReAssoc: 1
+  enableIDCorrection: 0
+  enableSeeThrough: 1
+  maxPeerTrackletSize: 30
+  recentlyActiveAge: 550
+  minCommonFrames4MatchScore: 15
+  minPeerTrackletMatchScore: 0.25
+  minPeerVisibility4Fusion: 0.1
+  maxPeerToPredDistance4Fusion: 0.5
+  maxTrackletMatchingTimeSearchRange: 1
+  minReidServiceMatchConfidence: 0
+  maxPeerFrameDiff4NoDet: 5
+
+Communicator:
+  communicatorType: 2
+  pubSubInfoConfigPath: /tmp/generated/pub_sub_info_config.yml
+  mqttProtoAdaptorConfigPath: /opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/configs/config_mqtt.txt

@@ -1,0 +1,337 @@
+from collections.abc import Callable
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from boxmot import (
+    BoostTrackConfig,
+    BotSortConfig,
+    ByteTrackConfig,
+    DeepOcSortConfig,
+    HybridSortConfig,
+    KalmanConfig,
+    MafHdaConfig,
+    OccluBoostConfig,
+    OcSortConfig,
+    SFSORTConfig,
+    StrongSortConfig,
+)
+from boxmot.structures import Boxes, Detections, Frame, GeometryKind, MaskBatch
+from boxmot.trackers.boosttrack.tracker import BoostTrack
+from boxmot.trackers.botsort.tracker import BotSort
+from boxmot.trackers.bytetrack.tracker import ByteTrack
+from boxmot.trackers.common.association.iou import AssociationFunction
+from boxmot.trackers.common.base import BaseTracker
+from boxmot.trackers.common.registry import TRACKER_DEFINITIONS
+from boxmot.trackers.deepocsort.tracker import DeepOcSort
+from boxmot.trackers.hybridsort.tracker import HybridSort
+from boxmot.trackers.maf_hda.tracker import MafHda
+from boxmot.trackers.occluboost.tracker import OccluBoost
+from boxmot.trackers.ocsort.tracker import OcSort
+from boxmot.trackers.sfsort.tracker import SFSORT
+from boxmot.trackers.strongsort.tracker import StrongSort
+
+TrackerFactory = Callable[..., BaseTracker]
+
+
+def _bytetrack(*, is_obb: bool = False, kalman: KalmanConfig | None = None, **kwargs) -> ByteTrack:
+    return ByteTrack(
+        config=ByteTrackConfig(min_hits=1, min_conf=0.05, track_thresh=0.2, iou_threshold=0.1, **kwargs),
+        is_obb=is_obb,
+        kalman=kalman,
+    )
+
+
+def _botsort(*, is_obb: bool = False, kalman: KalmanConfig | None = None, **kwargs) -> BotSort:
+    return BotSort(
+        config=BotSortConfig(
+            use_embeddings=False,
+            use_cmc=False,
+            min_hits=1,
+            track_high_thresh=0.2,
+            track_low_thresh=0.05,
+            new_track_thresh=0.2,
+            match_thresh=0.9,
+            fuse_first_associate=False,
+            **kwargs,
+        ),
+        is_obb=is_obb,
+        kalman=kalman,
+    )
+
+
+def _ocsort(*, is_obb: bool = False, kalman: KalmanConfig | None = None, **kwargs) -> OcSort:
+    return OcSort(
+        config=OcSortConfig(min_hits=1, min_conf=0.05, det_thresh=0.2, iou_threshold=0.1, **kwargs),
+        is_obb=is_obb,
+        kalman=kalman,
+    )
+
+
+def _deepocsort(*, is_obb: bool = False, kalman: KalmanConfig | None = None, **kwargs) -> DeepOcSort:
+    return DeepOcSort(
+        config=DeepOcSortConfig(
+            use_embeddings=False, use_cmc=False, min_hits=1, det_thresh=0.2, iou_threshold=0.1, **kwargs
+        ),
+        is_obb=is_obb,
+        kalman=kalman,
+    )
+
+
+def _hybridsort(*, is_obb: bool = False, kalman: KalmanConfig | None = None, **kwargs) -> HybridSort:
+    return HybridSort(
+        config=HybridSortConfig(
+            use_embeddings=False,
+            cmc_method=None,
+            min_hits=1,
+            det_thresh=0.2,
+            track_thresh=0.2,
+            iou_threshold=0.1,
+            **kwargs,
+        ),
+        is_obb=is_obb,
+        kalman=kalman,
+    )
+
+
+def _boosttrack(*, is_obb: bool = False, kalman: KalmanConfig | None = None, **kwargs) -> BoostTrack:
+    return BoostTrack(
+        config=BoostTrackConfig(
+            use_embeddings=False,
+            use_cmc=False,
+            use_dlo_boost=False,
+            use_duo_boost=False,
+            min_hits=1,
+            det_thresh=0.2,
+            iou_threshold=0.1,
+            **kwargs,
+        ),
+        is_obb=is_obb,
+        kalman=kalman,
+    )
+
+
+def _occluboost(*, is_obb: bool = False, kalman: KalmanConfig | None = None, **kwargs) -> OccluBoost:
+    return OccluBoost(
+        config=OccluBoostConfig(
+            use_embeddings=False,
+            use_cmc=False,
+            use_dlo_boost=False,
+            use_duo_boost=False,
+            min_hits=1,
+            det_thresh=0.2,
+            new_track_thresh=0.2,
+            instant_confirm_thresh=0.2,
+            iou_threshold=0.1,
+            **kwargs,
+        ),
+        is_obb=is_obb,
+        kalman=kalman,
+    )
+
+
+def _sfsort(*, is_obb: bool = False, **kwargs) -> SFSORT:
+    return SFSORT(
+        config=SFSORTConfig(high_th=0.2, low_th=0.05, new_track_th=0.2, match_th_first=0.67, min_hits=1, **kwargs),
+        is_obb=is_obb,
+    )
+
+
+def _strongsort(*, is_obb: bool = False, kalman: KalmanConfig | None = None, **kwargs) -> StrongSort:
+    return StrongSort(config=StrongSortConfig(min_hits=1, **kwargs), is_obb=is_obb, kalman=kalman)
+
+
+def _maf_hda(**kwargs) -> MafHda:
+    return MafHda(config=MafHdaConfig(min_hits=1, **kwargs))
+
+
+TRACKER_FACTORIES: dict[str, TrackerFactory] = {
+    "strongsort": _strongsort,
+    "ocsort": _ocsort,
+    "bytetrack": _bytetrack,
+    "sfsort": _sfsort,
+    "botsort": _botsort,
+    "deepocsort": _deepocsort,
+    "hybridsort": _hybridsort,
+    "boosttrack": _boosttrack,
+    "occluboost": _occluboost,
+    "maf_hda": _maf_hda,
+}
+
+
+class _SimilaritySpy:
+    def __init__(self, value: float = 0.91) -> None:
+        self.value = value
+        self.calls: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def __call__(self, boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
+        boxes_a = np.asarray(boxes_a)
+        boxes_b = np.asarray(boxes_b)
+        self.calls.append((boxes_a.copy(), boxes_b.copy()))
+        return np.full((len(boxes_a), len(boxes_b)), self.value, dtype=np.float32)
+
+
+def _box(value: np.ndarray, **attrs) -> SimpleNamespace:
+    return SimpleNamespace(xyxy=np.asarray(value, dtype=np.float32), **attrs)
+
+
+def _aabb_dets() -> np.ndarray:
+    return np.array([[10, 10, 30, 30, 0.95, 0]], dtype=np.float32)
+
+
+def _img() -> np.ndarray:
+    return np.zeros((80, 120, 3), dtype=np.uint8)
+
+
+def _canonical_update(tracker: BaseTracker, rows: np.ndarray, *, sample_id: str = "sample"):
+    """Exercise the public v24 boundary while keeping kernel assertions concise."""
+
+    image = _img()
+    frame = Frame(
+        torch.from_numpy(image).permute(2, 0, 1).contiguous(),
+        sample_id=sample_id,
+        sequence_id="association",
+        frame_index=0,
+    )
+    embeddings = torch.ones((len(rows), 4), dtype=torch.float32) if tracker.requirements.embeddings else None
+    masks = None
+    if tracker.requirements.masks:
+        values = torch.zeros((len(rows), *frame.image_size), dtype=torch.bool)
+        values[:, 10:30, 10:30] = True
+        masks = MaskBatch(values)
+    detections = Detections(
+        geometry=Boxes(torch.from_numpy(np.ascontiguousarray(rows[:, :4], dtype=np.float32))),
+        scores=torch.from_numpy(np.ascontiguousarray(rows[:, 4], dtype=np.float32)),
+        class_ids=torch.from_numpy(np.ascontiguousarray(rows[:, 5], dtype=np.int64)),
+        sample_id=sample_id,
+        embeddings=embeddings,
+        masks=masks,
+    )
+    return tracker.update(detections, frame if tracker.requirements.frame else None)
+
+
+def _exercise_core_association(name: str, tracker: BaseTracker, spy: _SimilaritySpy) -> None:
+    tracks = [_box(np.array([10, 10, 30, 30], dtype=np.float32), time_since_update=1)]
+    detections = [_box(np.array([11, 11, 31, 31], dtype=np.float32), conf=0.95)]
+
+    if name == "bytetrack":
+        tracker.asso_func = spy
+        tracker._fused_association_cost(tracks, detections)
+        return
+    if name == "botsort":
+        tracker.asso_func = spy
+        tracker._first_association_cost(tracks, detections)
+        return
+    if name == "strongsort":
+        tracker.asso_func = spy
+        tracker._association_cost(tracks, detections)
+        return
+
+    # Prime the track lifecycle before replacing the configured metric with a
+    # spy. The second frame must invoke the same callable slot in core matching.
+    _canonical_update(tracker, _aabb_dets(), sample_id="first")
+    tracker.asso_func = spy
+    _canonical_update(tracker, _aabb_dets(), sample_id="second")
+
+
+@pytest.mark.parametrize("name", tuple(TRACKER_FACTORIES))
+def test_image_trackers_use_selected_geometry_in_core_matching(name: str) -> None:
+    assert set(TRACKER_FACTORIES) == {
+        key for key, definition in TRACKER_DEFINITIONS.items() if not definition.capabilities.requires_detections_3d
+    }
+    tracker = TRACKER_FACTORIES[name](asso_func="giou")
+    expected = AssociationFunction.giou_batch(_aabb_dets()[:, :4], _aabb_dets()[:, :4])
+    np.testing.assert_allclose(tracker.association_similarity(_aabb_dets(), _aabb_dets()), expected)
+
+    spy = _SimilaritySpy()
+    _exercise_core_association(name, tracker, spy)
+
+    assert spy.calls, f"{name} bypassed the configured association function"
+    assert any(len(left) and len(right) for left, right in spy.calls), name
+    # OC-SORT-family matchers intentionally append confidence/motion score
+    # columns; every shared metric consumes the leading four geometry columns.
+    assert all(left.shape[1] >= 4 and right.shape[1] >= 4 for left, right in spy.calls), name
+
+
+def test_association_distance_uses_selected_similarity_for_arrays_and_objects() -> None:
+    tracker = ByteTrack(
+        config=ByteTrackConfig(asso_func="giou"),
+    )
+    boxes_a = np.array([[0, 0, 10, 10]], dtype=np.float32)
+    boxes_b = np.array([[2, 2, 12, 12], [20, 20, 30, 30]], dtype=np.float32)
+    expected = 1.0 - AssociationFunction.giou_batch(boxes_a, boxes_b)
+
+    np.testing.assert_allclose(tracker.association_distance(boxes_a, boxes_b), expected)
+    np.testing.assert_allclose(
+        tracker.association_distance([_box(boxes_a[0])], [_box(box) for box in boxes_b]),
+        expected,
+    )
+    assert tracker.association_distance([], [_box(boxes_b[0])]).shape == (0, 1)
+    assert tracker.association_distance([_box(boxes_a[0])], []).shape == (1, 0)
+    assert tracker.association_distance(np.empty((0, 0)), boxes_b).shape == (0, 2)
+
+
+def test_botsort_preserves_geometric_distance_before_reid_fusion() -> None:
+    tracker = BotSort(
+        config=BotSortConfig(use_embeddings=False, use_cmc=False, asso_func="diou", fuse_first_associate=False),
+    )
+    tracks = [_box(np.array([0, 0, 10, 10], dtype=np.float32))]
+    detections = [_box(np.array([2, 2, 12, 12], dtype=np.float32), conf=0.9)]
+
+    expected = tracker.association_distance(tracks, detections)
+    np.testing.assert_allclose(tracker._first_association_cost(tracks, detections), expected)
+
+
+def test_strongsort_fallback_uses_selected_geometry_and_keeps_stale_gate() -> None:
+    tracker = StrongSort(
+        config=StrongSortConfig(asso_func="hmiou"),
+    )
+    tracks = [
+        _box(np.array([0, 0, 10, 10], dtype=np.float32), time_since_update=1),
+        _box(np.array([1, 1, 11, 11], dtype=np.float32), time_since_update=2),
+    ]
+    detections = [_box(np.array([2, 2, 12, 12], dtype=np.float32))]
+
+    cost = tracker._association_cost(tracks, detections)
+
+    np.testing.assert_allclose(cost[0], tracker.association_distance(tracks[:1], detections)[0])
+    assert cost[1, 0] > tracker.max_iou_dist
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "bytetrack",
+        "botsort",
+        "ocsort",
+        "deepocsort",
+        "hybridsort",
+        "boosttrack",
+        "occluboost",
+        "sfsort",
+    ),
+)
+def test_centroid_requirement_is_frozen_for_resolved_tracker(name: str) -> None:
+    tracker = TRACKER_FACTORIES[name](asso_func="centroid")
+
+    assert tracker.requirements.frame is True
+    _canonical_update(tracker, _aabb_dets())
+    assert tracker.requirements.frame is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    tuple(
+        name
+        for name, definition in TRACKER_DEFINITIONS.items()
+        if GeometryKind.OBB in definition.capabilities.geometry_kinds
+    ),
+)
+@pytest.mark.parametrize("mode", ("iou", "giou", "diou", "ciou", "hmiou", "centroid"))
+def test_every_registered_tracker_accepts_supported_obb_association_modes(name: str, mode: str) -> None:
+    tracker = TRACKER_FACTORIES[name](asso_func=mode, is_obb=True)
+
+    assert tracker.is_obb
+    assert tracker.asso_func_name == f"{mode}_obb"

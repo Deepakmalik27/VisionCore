@@ -1,0 +1,598 @@
+# Usage
+
+Assuming that you've followed the [installation steps](installation.md),
+you're now ready to use this package. `uiprotect` is an async library, so the
+examples below drive an event loop with `asyncio.run`.
+
+## Command line
+
+Most day-to-day tasks are available through the bundled CLI:
+
+```bash
+uiprotect --help
+```
+
+See the [Command Line](cli.md) reference for the full list of subcommands.
+
+## Connecting from Python
+
+Instantiate `ProtectApiClient` with your console's address and a local-access
+user, call `update()` once to fetch the bootstrap snapshot, then read devices
+off the cached `bootstrap`:
+
+```python
+import asyncio
+
+from uiprotect import ProtectApiClient
+
+
+async def main() -> None:
+    protect = ProtectApiClient(
+        host="10.0.0.1",
+        port=443,
+        username="YOUR_USERNAME",
+        password="YOUR_PASSWORD",
+        verify_ssl=True,  # set False only for a self-signed certificate
+    )
+
+    # Fetch the bootstrap snapshot (cameras, lights, sensors, NVR, ...).
+    await protect.update()
+
+    for camera in protect.bootstrap.cameras.values():
+        print(camera.id, camera.name, camera.is_connected)
+
+    await protect.close_session()
+
+
+asyncio.run(main())
+```
+
+!!! warning "About UI Account logins"
+
+    UI Account (cloud) logins and MFA are not supported. Use a local-access
+    user, not the owner account.
+
+## Subscribing to events
+
+The typed event stream delivers `(ProtectEvent, EventChange)` pairs. It is
+backed by the Public Integration API, so the client must be configured with
+an `api_key` and `update_public()` must have run at least once before calling
+`subscribe_events`. The example below primes then subscribes; to avoid
+encoding that ordering yourself, call `subscribe_events_and_prime()` (or
+`subscribe_devices_and_prime()` for device state), which connects the
+WebSocket and primes in the correct order in a single call. With the combined
+helper, frames that arrive while `update_public()` is priming are buffered
+and replayed onto the fresh snapshot, so the already-connected subscriber
+does not miss an update from the prime window; with the explicit two-step
+form the subscriber is registered after priming and simply starts from the
+refreshed cache:
+
+```python
+import asyncio
+import logging
+
+from uiprotect import EventChange, ProtectApiClient, ProtectEvent
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def main() -> None:
+    protect = ProtectApiClient.public_only(
+        "10.0.0.1",
+        443,
+        "YOUR_API_KEY",
+        verify_ssl=True,  # set False only for a self-signed certificate
+    )
+
+    def on_event(event: ProtectEvent, change: EventChange) -> None:
+        if change is EventChange.STARTED:
+            _LOGGER.info("%s on %s", event.type, event.device_id)
+
+    try:
+        await protect.update_public()
+        unsubscribe = protect.subscribe_events(on_event)
+        try:
+            await asyncio.sleep(60)
+        finally:
+            unsubscribe()  # also stops the event TTL sweep task
+    finally:
+        await protect.async_disconnect_ws()
+        await protect.close_session()
+
+
+asyncio.run(main())
+```
+
+The lower-level `subscribe_websocket` continues to deliver raw
+`WSSubscriptionMessage` frames for advanced callers over the private API and
+does not require an API key. The parallel `subscribe_events_websocket` drives
+the Public Integration API WebSocket and **does** require an API key.
+
+Notes on the typed event stream:
+
+- Only detection, sensor, alarm hub and access events are delivered.
+  Administrative events such as `provision`, `factoryReset` and `fwUpdate` are
+  dropped. Use `subscribe_events_websocket` for the unfiltered stream.
+- An event goes through `STARTED`, `UPDATED` and `ENDED`. `REMOVED` means the
+  console deleted an event that had not ended. An event that is already closed
+  on first sight, and an instantaneous one such as `lightMotion`, arrives as
+  `STARTED` immediately followed by `ENDED`.
+- The library also sends `ENDED` itself for open events that belong to a
+  device:
+  - after 30 minutes, checked every 15 minutes while a typed subscriber exists,
+  - after one hour when the events WebSocket reconnects, or when the devices
+    WebSocket reconnects while a typed subscriber exists,
+  - for every open detection when the events WebSocket reconnects (see below).
+- `event.metadata` holds the typed event metadata. `event.raw` is the cached
+  `PublicEvent` for fields `ProtectEvent` does not surface. Both are live
+  objects, updated in place, not snapshots, so `UPDATED` carries no diff.
+  License plate text and face names are not in the public API.
+- `protect.active_events(device_id=...)` returns the running events from the
+  cache, for example to restore binary sensors after a reload. It works without
+  a subscription once `update_public()` has run.
+- Identities (`public_bootstrap.ulp_users`) and `event.device_mac` come from
+  the cache. A newly enrolled user resolves to
+  `UnknownIdentity(reason="ulp_user_not_cached")` and a new device has
+  `device_mac` `None` until the next `update_public()`, reconnect or
+  [periodic refresh](#periodic-refresh-of-these-stores).
+- Callbacks are plain functions called on the event loop. They must not block
+  and must not be `async def`. An exception in a callback is logged and
+  swallowed, and the other subscribers still run.
+
+### Subscribing to device state
+
+`subscribe_devices` delivers a typed `ProtectDeviceChange` for each `ADDED`,
+`UPDATED` or `REMOVED` device over the Public Integration API. It needs a prior
+`update_public()` and raises `RuntimeError` otherwise.
+`subscribe_devices_and_prime()` does both in one call and replays updates that
+arrive while priming, so none are missed.
+
+```python
+import logging
+
+from uiprotect import DeviceChange, ProtectDeviceChange
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def on_device(change: ProtectDeviceChange) -> None:
+    if change.change is DeviceChange.UPDATED and "state" in change.changed_fields:
+        _LOGGER.info("%s changed state", change.device_id)
+
+
+unsubscribe = await protect.subscribe_devices_and_prime(on_device)
+```
+
+- `change.model` is the live cached `Public*` model, not a snapshot, and
+  `None` for `REMOVED`.
+- `change.changed_fields` is set only for `UPDATED`. It holds the snake_case
+  names of the fields in the update, not their old and new values.
+- Bulk WebSocket frames are split into one change per device.
+- Connection changes arrive as `UPDATED` with `state` in `changed_fields`.
+- Detection events come from `subscribe_events`. While the events WebSocket
+  runs, a camera whose derived detection flags flip also arrives here as
+  `UPDATED`.
+- `change.device_mac` is `None` for a device that is not in the cache yet,
+  until the next `update_public()` or reconnect.
+- Callbacks follow the same rules as for events.
+
+### Detecting a revoked API key
+
+A revoked or invalid API key can't be re-authenticated from inside the client
+— the key is static — so the public WebSocket would otherwise redial forever on
+repeated `401` handshakes without the consumer ever learning the key died.
+After two consecutive `401`s the client emits `WebsocketState.AUTH_FAILED` over
+the existing state channels (`subscribe_events_websocket_state` /
+`subscribe_devices_websocket_state`) and switches to a longer backoff to stop
+hammering the NVR. `AUTH_FAILED` **implies disconnected** — the socket is closed
+and cannot recover without a new key — so the client always emits a
+`DISCONNECTED` transition first when it trips. A consumer that tracks
+connectivity as `state is WebsocketState.CONNECTED` and one that only reacts to
+`DISCONNECTED` edges both observe the loss; `AUTH_FAILED` is the additional
+signal that the cause is a dead key rather than a transient drop. Subscribe to
+that channel to be notified, then install a fresh key with `set_api_key()` — it
+re-arms both public WebSockets immediately so recovery doesn't wait out the
+backoff:
+
+```python
+def on_state(state: WebsocketState) -> None:
+    if state is WebsocketState.AUTH_FAILED:
+        protect.set_api_key(fetch_new_api_key())
+
+
+unsub = protect.subscribe_events_websocket_state(on_state)
+```
+
+### Reading the current websocket state
+
+The state channels only report transitions. To read the current state of the
+public websockets, use `protect.events_websocket_state` and
+`protect.devices_websocket_state`. Each returns the last `WebsocketState`
+delivered on its channel; a websocket that was never started or has been
+closed reads `DISCONNECTED`. The value is updated before the state callbacks
+run, so a callback that reads the property sees the new state.
+`protect.is_public_live` is shorthand for
+`devices_websocket_state is WebsocketState.CONNECTED`. Combined with
+`PublicDeviceModel.is_reachable`, this gives an entity's availability without
+tracking state in the consumer:
+
+```python
+available = protect.is_public_live and device.is_reachable
+```
+
+Entities that depend on events can additionally check
+`protect.events_websocket_state is WebsocketState.CONNECTED`.
+
+Events arrive **only** on the events WebSocket, so if it drops and reconnects
+while the devices WebSocket stays up, an `end` frame missed during the gap
+would otherwise leave the event active — a camera's derived
+`is_*_currently_detected` stuck ON until the periodic TTL sweep (~45 min worst
+case) closes it. On events-WS reconnect the client therefore **force-ends
+active detection events regardless of age** (a still-active detection
+re-asserts on its next frame) and flushes other channels past the 1 h
+staleness window. Both the typed `subscribe_events` stream (an `ENDED` change)
+and `subscribe_devices` (a camera update) see the drop immediately, and the
+derived camera flags read correct on the next synchronous access.
+
+A device added to (or removed from) the console while the devices WebSocket is
+down produces no wire frame either. Every successful `update_public()` — the
+reconnect resync included — re-fetches the public bootstrap and announces that
+difference on the same channel: one `add` frame
+per device the refresh newly reports and one `remove` frame per device it no
+longer reports, delivered after the whole snapshot has merged so a subscriber
+reacting to a frame already sees a consistent bootstrap. `subscribe_devices`
+surfaces them as `DeviceChange.ADDED` / `DeviceChange.REMOVED`, exactly like
+live traffic, so consumers need no add/remove bookkeeping of their own. The
+initial `update_public()` prime stays silent — it is the baseline, not a diff.
+
+The reconnect resync runs in the background, so `CONNECTED` reaches
+`subscribe_devices_websocket_state` subscribers **before** the cache is
+refreshed. To learn when it is fresh again, use `subscribe_public_resync`: its
+callback fires once `update_public()` and, unless the cameras fetch failed,
+the RTSPS refresh have finished. It does not fire on the first connect, which
+your own `update_public()` primes.
+Every reconnect after that is covered. One during a running resync queues a
+follow-up; one within `PUBLIC_RESYNC_MIN_INTERVAL` of the last resync
+schedules a single trailing resync for when the window ends, however many
+reconnects land in it. Each of those fires the callback again. `True` means
+every bootstrap endpoint was refetched; `False` means the refresh raised or an
+endpoint failed transiently (timeout, 429, 5xx) and kept its stale data. An
+endpoint the console does not expose is not a failure. The RTSPS refresh is
+skipped when the cameras fetch failed, and the next successful resync catches
+up; it still runs when only another endpoint failed. It is best-effort: a
+camera whose streams fail to refresh keeps its previous URLs and does not turn
+the result into `False`.
+
+A resync that reports `False` is retried up to three times with a bounded
+backoff (`PUBLIC_RESYNC_RETRY_DELAYS`: 10 s, 30 s, then 60 s), and each retry
+fires the callback again, so a retry that succeeds reports `True`. After the
+last step the library gives up until the next reconnect. A resync that failed
+with `NotAuthorized` is not retried; the key must be fixed first, and the
+websocket reports that through `WebsocketState.AUTH_FAILED`. A reconnect, or a
+follow-up queued by one, replaces a pending retry with its own resync, so the
+two never both run for the same gap. `close_session()` and
+`async_disconnect_ws()` cancel a running or scheduled resync, or a pending
+retry, without firing. After `True` there is no need to call `update_public()`
+yourself.
+
+A `False` is not always followed by another attempt: it is final after
+`NotAuthorized` or after the last backoff step, and the callback does not say
+which. A consumer that must not stay stale should refresh with
+`update_public()` or reauthenticate itself rather than wait for the library.
+`update_public()` keeps the RTSPS streams already cached on each camera, so
+current stream URLs need `get_camera_rtsps_streams(camera_id)`.
+
+```python
+def on_resync(success: bool) -> None:
+    if success:
+        refresh_entities_from(protect.public_bootstrap)
+
+
+unsub = protect.subscribe_public_resync(on_resync)
+```
+
+### Stores without a websocket channel
+
+`public_bootstrap.arm_profiles`, `public_bootstrap.liveviews` and
+`public_bootstrap.ulp_users` get no devices-websocket frame when they change
+(the console sends none for liveviews, and the other two have no `modelKey`).
+Use `subscribe_public_store_changes` instead. Its callback receives a
+`PublicStoreChange(store, added, removed, updated)`: `store` is
+`"arm_profiles"`, `"liveviews"` or `"ulp_users"`, and the other three are
+frozensets of ids.
+
+It fires when `update_public()` (the first prime, your own calls, and the
+reconnect resync), the periodic refresh below, `refresh_public_store()`,
+`get_arm_profiles_public()`, `get_liveviews_public()`, `get_liveview_public()`,
+`create_arm_profile_public()` / `update_arm_profile_public()` /
+`delete_arm_profile_public()`, or `create_liveview_public()` /
+`update_liveview_public()` change a store. Liveview frames from the devices
+websocket fire it too, and `update_public()` sends no synthetic devices-websocket
+`add`/`remove` frames for these stores. `updated` compares values per id,
+so a refetch that returns the same data fires nothing, and a resync after your
+own create or update does not announce it a second time. If an arm-profile
+create, update, delete or `get_arm_profiles_public()` finishes while an
+`update_public()` fetch is in flight, that refresh leaves `arm_profiles` alone
+rather than roll the write back; the next refresh picks up anything it missed.
+An endpoint that fails during `update_public()` keeps its cached data and fires
+nothing. The first prime reports every id it caches as `added`. Callbacks run
+synchronously, after the whole refresh has been applied. Device stores keep the
+devices websocket as their only change channel.
+
+```python
+from uiprotect.data import PublicStoreChange
+
+
+def on_store_change(change: PublicStoreChange) -> None:
+    if change.store == "arm_profiles":
+        refresh_arm_profile_entities(protect.public_bootstrap.arm_profiles)
+
+
+unsub = protect.subscribe_public_store_changes(on_store_change)
+```
+
+### Periodic refresh of these stores
+
+Without a websocket channel, an edit made on the console or by another client
+would stay invisible until the next reconnect. The client therefore refetches
+`arm_profiles`, `ulp_users` and `liveviews` on a timer. The first successful
+`update_public()` starts it. Each store gets one turn per
+`public_refresh_interval` seconds (default `PUBLIC_REFRESH_INTERVAL`, 900); a
+skipped or failed turn waits for the next one. The refreshes take turns, so one
+request goes out every `interval / 3` seconds.
+Results go through the same apply path as above, so
+`subscribe_public_store_changes` fires only when the data actually changed.
+
+```python
+protect = ProtectApiClient.public_only(
+    host, port, api_key=api_key, public_refresh_interval=300.0
+)
+```
+
+To refresh one of these stores right away, for example when the private
+websocket reports a liveview change, call
+`await protect.refresh_public_store("liveviews")`. It announces the result
+like a timer turn, but the store ends at least as new as the call: it waits
+for a running `update_public()` and for an in-flight refresh of the same
+store, calls made before its fetch starts share that fetch, and a result a
+write made stale during the fetch is refetched once instead of discarded.
+If the fetch fails, the store keeps its cached data and the error (for
+example `NvrError`, `NotAuthorized` or `BadRequest`) is raised to every call
+sharing that fetch. Manual refreshes do not affect the timer's failure and
+recovery logging. If the client is torn down while a call waits, the call
+returns without raising.
+
+Pass `public_refresh_interval=None` to turn the timer off. A turn is skipped
+while `update_public()` is running, since it refetches the store anyway, and
+while the same store's previous refresh (timer or manual) is still in flight.
+A manual refresh of one store does not skip or discard the timer turns of the
+other stores. A result is
+discarded if `update_public()` or a write to that store (including
+`get_arm_profiles_public()` and `get_liveviews_public()`) updated it during the
+fetch, or if
+`update_public()` is still running when it arrives. A failed refresh keeps the
+cached data, logs one warning, and is retried on the next turn. The recovery is
+logged once. An endpoint the firmware does not expose (`BadRequest`) is logged
+at debug level only. On consoles without UniFi Identity, `NotAuthorized` from
+`ulp-users` is expected and also logged at debug level.
+
+`close_session()`, `close_public_api_session()` and `async_disconnect_ws()` all
+stop the timer. An `update_public()` still running when one of them is called,
+or started before it returns, does not start it again; a later
+`update_public()` does. Device stores are not
+refreshed on this timer: the devices websocket stays their change channel.
+
+## Camera RTSPS streams
+
+RTSPS stream URLs live on the camera as `PublicCamera.rtsps_streams`. The
+library owns their entire lifecycle: `update_public()` primes them, so a
+consumer reads the field synchronously and carries no fetch/cache code:
+
+```python
+await protect.update_public()
+
+# Read synchronously off the camera — primed by update_public().
+camera = protect.public_bootstrap.cameras[camera_id]
+streams = camera.rtsps_streams
+```
+
+Priming is **always** run by `update_public()`: connected cameras without
+streams are fetched under a bounded-concurrency semaphore, best-effort (one
+slow/offline camera is skipped, never aborting the rest), and disconnected
+cameras are skipped. `get_camera_rtsps_streams(camera_id)` is a flag-free fetch
+primitive used internally — it issues a plain GET with no cache side-effects.
+
+The field stays correct from the sources the client controls — stream
+create/delete is **not** signalled over the WebSocket, so passive observation
+is impossible:
+
+- **Write-through.** `create_camera_rtsps_streams` writes its result onto the
+  camera's `rtsps_streams`; `delete_camera_rtsps_streams` drops the deleted
+  qualities (and clears the field to `None` once no streams remain).
+- **Prime / refresh on connect.** When a public devices-WS frame moves a camera
+  to `CONNECTED` (a reconnect or firmware change can rotate the `rtsp_alias`), a
+  background fetch is scheduled. A camera that was **offline at `update_public()`
+  time** — so skipped by the connected-only prime — is **primed** when it comes
+  online mid-session, not left streamless until the next reload. An
+  already-populated camera is **refreshed in place** instead. Either way a
+  WebSocket reconnect resync also refreshes every populated camera. The field is
+  **never emptied** — the old URLs stay readable until the fresh ones land, so
+  synchronous consumers reading `camera.rtsps_streams` never observe a spurious
+  `None`. It is only ever cleared by a camera `remove` frame (which drops the
+  whole camera) or the client's own `delete_camera_rtsps_streams`.
+- **Observable.** A background prime/refresh that actually changes a camera's
+  streams is announced: the client emits a synthetic devices-WS `update` for
+  that camera (`new_obj` is the refreshed camera) through the existing devices
+  subscription, so both `subscribe_devices_websocket` and typed
+  `subscribe_devices` consumers observe stream availability without polling.
+  A refresh that yields no change — an identity-guard backoff, a fetch failure,
+  or a re-fetch equal to the cached value — emits nothing.
+
+## Siren timed runs
+
+`siren.play(duration)` starts a timed run and the console reports it on
+`sirenStatus` (`isActive`, `activatedAt`, and `duration` in **milliseconds** —
+the play request takes seconds). It reports nothing when the run ends, so
+`Siren.is_active` compares the clock against `siren_status.turn_off_at`.
+
+The client also **announces** the end of the run: it arms a timer at
+`turn_off_at`, and when the run expires it clears the cached
+`sirenStatus.isActive` and emits a synthetic devices-WS `update` for the siren
+(`new_obj` is the siren) through the existing devices subscription. Both
+`subscribe_devices_websocket` and typed `subscribe_devices` consumers observe
+the siren stopping without scheduling a timer of their own.
+
+The timer follows the device: every siren frame re-derives the deadline from
+the merged status (so a restarted or manually stopped run re-arms or disarms
+it), a `remove` frame drops it, a devices-websocket disconnect drops it and the
+reconnect re-arms it from the cached status (the resync refreshes that status
+when it runs), and `close_session()` drains any that are still pending.
+
+The expiry is **inferred, not observed**: `activatedAt` is server time and the
+deadline is compared against the local clock, so clock skew between the console
+and the client shifts the announcement by the same amount.
+
+## Viewer liveview changes
+
+The console sends no devices-websocket frame when a viewer's liveview changes.
+`update_viewer_public` (and so `PublicViewer.set_liveview` / `set_name`)
+writes the PATCH response into the cached `PublicViewer` in place and returns
+that cached object, so `protect.public_bootstrap.viewers[viewer_id]` stays the
+same object. It then emits a synthetic devices-WS message for the viewer:
+
+- `update` when `liveview_id` changed (`new_obj` is the cached viewer,
+  `old_obj` a copy from before the change). `changed_data` carries
+  `modelKey`, `id` and every field that differs from `old_obj` (`liveview`,
+  plus `name` if the same PATCH renamed it), like a partial websocket frame.
+  A name-only
+  PATCH for an already-cached viewer, or setting the liveview the viewer
+  already shows, emits nothing.
+- `add` when the viewer was not cached yet; it is inserted and becomes
+  `new_obj`, with no `old_obj`, and `changed_data` is the full response.
+
+A failed PATCH emits nothing, and so does a client with no public bootstrap
+(the response is returned uncached). The `subscribed_models` filter of the
+devices websocket applies.
+
+`get_viewer_public`, like the other public GET helpers, returns the response
+without touching `public_bootstrap.viewers` and emits no event.
+
+A public refresh (`update_public`) that started before the PATCH can finish
+after it and overwrite the cached viewer with the old liveview. No websocket
+frame corrects that for viewers; the next refresh does.
+
+## Public vs. private API
+
+`uiprotect` can talk to UniFi Protect two ways, and is actively migrating
+from the second to the first:
+
+- **Public Integration API** — Ubiquiti's officially documented REST API
+  under `/integration/v1/…`. It authenticates with an **API key** (see [API key](index.md#api-key))
+  and is the forward-looking path. The typed `subscribe_events` stream and the
+  public-API CLI groups (`users-public`, `liveviews`, `sirens`, …) are
+  driven by this API. Requests on this path are **auto-paced** to stay under
+  the server's per-API-key rate budget — the client seeds its rate from the
+  `RateLimit-Policy` header on the first response (with safety margin for the
+  shared-budget public WebSocket) and falls back to a conservative default
+  until that header is seen, so a bootstrap fan-out no longer trips a `429`
+  storm. Rotating the key via `set_api_key()` resets the pacing.
+- **Private API** — the undocumented endpoints under
+  `/api/…` plus the binary WebSocket update stream. It authenticates with
+  username/password and powers most of the historical `bootstrap`-based
+  surface. It is **not** documented by Ubiquiti, can shift between firmware
+  versions, and uiprotect uses it only where the public API has no
+  equivalent.
+
+Prefer the public API for new code. Use the private API only for capabilities
+the public API does not offer, and expect it to change between Protect
+releases.
+
+## Device convenience setters (public API)
+
+Camera, light, sensor and chime devices from `public_bootstrap` expose `set_*`
+convenience methods that patch a single setting and write the server's response
+straight back into the cached device — so a **public-only client** (API key, no
+username/password) can mutate a device without hand-building nested
+`update_*_public` bodies:
+
+```python
+await protect.update_public()
+camera = next(iter(protect.public_bootstrap.cameras.values()))
+
+# Write-through: the cached camera reflects the change on return.
+await camera.set_status_light(True)
+await camera.set_mic_volume(50)
+assert protect.public_bootstrap.cameras[camera.id].mic_volume == 50
+```
+
+Each setter validates the device's capability flags (e.g. a camera without a
+microphone rejects `set_mic_volume`), applies the same numeric bounds the server
+enforces, and serialises concurrent read-modify-write setters (chime ring
+volume, camera smart-detect toggles, light mode/device settings) on one device
+under a per-object lock.
+`PublicCamera.rtsps_streams` is owned out-of-band by the library and is never
+touched by a setter.
+
+The private-API `Device.set_*_public` shims have been removed in favour of these
+public setters.
+
+## POS transaction overlay (public API)
+
+`create_pos_transaction_public()` records a point-of-sale transaction as a
+camera event so the receipt can be overlaid on recorded footage:
+
+```python
+from uiprotect.data import PosTransactionType
+
+result = await protect.create_pos_transaction_public(
+    camera_id,
+    type=PosTransactionType.SALE,
+    external_id="order-4711",
+    amount=12.50,
+    currency="USD",
+    line_items=[{"title": "Coffee", "quantity": 2}],
+)
+```
+
+`external_id` is unique per camera and drives best-effort idempotency: a repeat
+comes back with `created=False` and `event_id` echoing the event already
+ingested, while a concurrent repeat raises `BadRequest` on the server's 409 and
+should be retried shortly. That de-duplication is in-memory and per-process, so
+it does not survive a Protect restart. Overlay capture is best-effort too — a
+200 confirms the event was recorded, not that footage exists for the window.
+
+## Shared identity interface
+
+The public device models expose the same derived identity attributes as the
+private tree: `display_name` (falling back `name → type`, mirroring the private
+`name → market_name → type`) and a `type` alias for the raw `device_type`
+field. So `PublicNVR().display_name` and `PublicCamera().type` work the same as
+their private-tree counterparts.
+
+Code that handles "the NVR" or "a camera" generically — for example the Home
+Assistant integration's device-info paths, which must now accept either tree —
+can type against the `ProtectDeviceIdentity` protocol instead of `cast()`-ing
+between the unrelated private (`NVR`, `Camera`, …) and public (`PublicNVR`,
+`PublicCamera`, …) types. Both trees satisfy it structurally:
+
+```python
+from uiprotect.data import ProtectDeviceIdentity
+
+
+def label(device: ProtectDeviceIdentity) -> str:
+    # Accepts an NVR or a PublicNVR (a Camera or a PublicCamera, …) unchanged.
+    return f"{device.display_name} ({device.type}) [{device.mac}] {device.id}"
+```
+
+The protocol covers `id`, `mac`, `display_name`, `type`, and `model`; `mac` and
+`type` are optional because the public tree omits them on older firmware.
+
+`PublicDeviceModel` adds two more derived attributes for generic entity code:
+`is_reachable`, which is `state is DeviceState.CONNECTED` for most devices, and
+`model_name`, the console-reported `device_type` with a per-class fallback for
+families current firmware does not self-describe. A `Fob` is the case for both:
+it reports reachability through `away_state` rather than `state`, so its
+`is_reachable` is always `True`, and it names itself `"Key Fob"` because the
+console sends no `type` for it. A `LinkStation` with no `type` falls back by
+role, to `"Alarm Hub"` or `"Link Station"`. A `Relay` or `Siren` with no `type`
+falls back to `"Relay"` or `"Siren"`.

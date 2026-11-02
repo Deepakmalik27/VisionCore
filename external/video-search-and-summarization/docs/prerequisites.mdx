@@ -1,0 +1,852 @@
+---
+title: "Prerequisites"
+description: ""
+position: 1
+---
+This section covers the prerequisites for deploying and using the VSS Blueprint.
+
+<Note>
+The shared hardware, software, credentials, and runtime requirements below
+apply to **all systems**. DGX Spark and Thor setup sections add platform
+settings; completing only a platform section does not complete prerequisites.
+Complete the shared Docker, Docker Compose, Buildx, and NGC CLI setup in the
+appendix as well as the platform-specific steps. Start with
+[Pin and configure Docker](#pin-and-configure-docker).
+For an agent-assisted host check after cloning, use
+[Prepare your coding agent](/getting-started/quickstart#prepare-your-coding-agent).
+</Note>
+
+## Hardware Requirements
+
+The VSS Blueprint has been validated and tested on the following NVIDIA GPUs:
+
+- NVIDIA H100
+- NVIDIA GB300
+- NVIDIA RTX PRO 6000 Blackwell
+- NVIDIA L40S
+- NVIDIA DGX SPARK
+- NVIDIA IGX Thor
+- NVIDIA AGX Thor
+- NVIDIA RTX PRO 4500 Blackwell (limited support to alerts profile)
+
+For GPUs that are not validated and tested, the OTHER configuration is available (experimental). See the deployment steps in each workflow guide for the GPU tab options.
+
+If you need to know which platforms support your use-case, see the [Performance](/appendix/performance) section for benchmark results across models, use cases, and GPU platforms.
+
+<Note>
+If you're looking for a pre-configured environment to try out the VSS Blueprint, please refer to the [Brev Launchable](/appendix/additional-deployments/brev-launchable) section.
+</Note>
+
+## Software Requirements
+
+The following software must be installed on your system:
+
+- **OS:**
+
+  - x86 hosts: Ubuntu 24.04
+  - DGX Station (GB300): DGX OS 7.6.0
+  - DGX-SPARK: DGX OS 7.5.0
+  - IGX-THOR (T5000 and T7000): IGX-SW 2.0 Production (LTS), including IGX OS 2.0 (Ubuntu 24.04)
+  - Jetson AGX-THOR: JetPack 7.2 (Jetson Linux/L4T r39.2)
+  - Jetson AGX Orin and Jetson Orin NX: public JetPack 7.2.2 release
+- **NVIDIA Driver:**
+
+  - 595.58.03 (x86 hosts with Ubuntu 24.04)
+  - 595.58.03 (DGX Station GB300)
+  - 580.173.02 (DGX-SPARK)
+  - 580.00, bundled with IGX-SW 2.0 (IGX-THOR)
+  - 595.78 (Jetson AGX Orin, AGX-THOR, and Jetson Orin NX)
+- **NVIDIA Container Toolkit:** 1.17.8+
+- **Docker:** 28.3.3+ and earlier than 29.5.0
+- **Docker Compose:** v2.39.1+
+- **Docker Buildx:** 0.23.0 (working version); 0.23.0 or later and earlier than 0.35.0
+- **NGC CLI:** 4.10.0+
+- **Python runner for Build Vision AI:** `uv` is required for the Skill's
+  mandatory service-graph checks and helper scripts.
+
+Install `uv` before starting the coding agent:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Build Vision AI runs the NemoClaw setup notebook non-interactively with a
+Python 3.12 environment and notebook packages supplied by `uv`. The pinned
+NemoClaw installer installs a compatible Node.js and npm runtime. A Jupyter
+kernel with Python 3.11 or later is required only when you follow the
+[interactive NemoClaw notebook guide](/vision-agent/agent-harnesses/nemo-claw/setup-vss-and-skills).
+
+<Note>
+For detailed installation instructions for the software requirements listed above, see the [Appendix](/getting-started/prerequisites#appendix-software-prerequisites-installation-guide):
+
+- **x86 systems**
+
+  - [Install NVIDIA Driver](/getting-started/prerequisites#install-nvidia-driver)
+
+    - [Install Fabric Manager (select systems)](/getting-started/prerequisites)
+  - [Install Docker](/getting-started/prerequisites#install-docker)
+  - [Install NVIDIA Container Toolkit](/getting-started/prerequisites#install-nvidia-container-toolkit)
+- **DGX-SPARK, IGX-THOR and AGX-THOR**
+
+  - [Setup DGX-SPARK](/getting-started/prerequisites#setup-dgx-spark)
+  - [Setup AGX-THOR](/getting-started/prerequisites#setup-agx-thor)
+  - [Setup IGX-THOR](/getting-started/prerequisites#setup-igx-thor)
+- **all systems**
+
+  - [Configure Docker](/getting-started/prerequisites#configure-docker)
+  - [Install Docker Compose](/getting-started/prerequisites#install-docker-compose)
+  - [Install Docker Buildx](/getting-started/prerequisites#install-docker-buildx)
+  - [Install NGC CLI](/getting-started/prerequisites#install-ngc-cli)
+</Note>
+
+## Runtime Environment Settings
+
+In addition to the above prerequisites, the following runtime environment settings are required:
+
+### Linux Kernel Settings
+
+```bash
+# Ensure the sysctl.d directory exists
+sudo ls -l /etc/sysctl.d
+
+# Write VSS kernel settings to 99-vss.conf (persistent across reboots)
+sudo bash -c "printf '%s\n' \
+  'net.ipv6.conf.all.disable_ipv6 = 1' \
+  'net.ipv6.conf.default.disable_ipv6 = 1' \
+  'net.ipv6.conf.lo.disable_ipv6 = 1' \
+  'net.core.rmem_max = 5242880' \
+  'net.core.wmem_max = 5242880' \
+  'net.ipv4.tcp_rmem = 4096 87380 16777216' \
+  'net.ipv4.tcp_wmem = 4096 65536 16777216' \
+  > /etc/sysctl.d/99-vss.conf"
+
+# Reload sysctl to apply the new settings
+sudo sysctl --system
+```
+
+### Power Mode (only on IGX-THOR and AGX-THOR)
+
+```bash
+# Set max power mode
+# NOTE: the below command requires a reboot to take effect
+sudo nvpmodel -m 0
+```
+
+After reboot:
+
+```bash
+# Set max clocks
+sudo jetson_clocks
+```
+
+<Note>
+The above is reset to default settings if the system is rebooted.
+</Note>
+
+### Cache cleaner (only on DGX-SPARK, IGX-THOR and AGX-THOR)
+
+Run the cache cleaner script for DGX SPARK and Jetson Thor.
+
+Create the cache cleaner script at `/usr/local/bin/sys-cache-cleaner.sh`:
+
+```bash
+sudo tee /usr/local/bin/sys-cache-cleaner.sh << 'EOF'
+#!/bin/bash
+# Exit immediately if any command fails
+set -e
+
+# Disable hugepages
+echo "disable vm/nr_hugepage"
+echo 0 | tee /proc/sys/vm/nr_hugepages
+
+# Notify that the cache cleaner is running
+echo "Starting cache cleaner - Running"
+echo "Press Ctrl + C to stop"
+# Repeatedly sync and drop caches every 3 seconds
+while true; do
+	sync && echo 3 | tee /proc/sys/vm/drop_caches > /dev/null
+	sleep 3
+done
+EOF
+
+sudo chmod +x /usr/local/bin/sys-cache-cleaner.sh
+```
+
+#### Running in the background
+
+```bash
+sudo -b /usr/local/bin/sys-cache-cleaner.sh
+```
+
+<Note>
+The above runs the cache cleaner in the current session only; it does not persist across reboots. To have the cache cleaner run across reboots, create a systemd service instead.
+</Note>
+
+### Host firewall and Docker bridge subnets
+
+If a default-deny firewall is enabled on the host, allow inbound traffic from the Docker bridge subnets used by VSS. Otherwise, bridge-networked containers cannot reach host-networked services and the affected workflow silently produces no output. See [Bridge-network container cannot reach a VSS service on the host](/appendix/faq#bridge-network-container-cannot-reach-a-vss-service-on-the-host) for diagnostics and the fix.
+
+## Minimum System Requirements
+
+- 18 core CPU (x86 systems)
+- 128 GB RAM
+- 1 TB SSD
+- 1 x 1 Gbps network interface
+- NVIDIA GPU capacity required by the selected development profile. Use the
+  [Development Profile GPU Requirements](#development-profile-gpu-requirements)
+  tables below; validated layouts range from one to four GPUs depending on the
+  profile, hardware, and model placement.
+
+## Network and Browser Access
+
+The machine running the web browser must be able to reach TCP port `7777` on
+the deployment host. This port serves the VSS UI and routes optional web
+applications included in the selected service graph, such as Kibana and
+Phoenix. The default Build Vision AI deployment does not include Phoenix or
+the in-stack VSS Agent; the manual base-profile deployment includes both.
+
+For cloud deployments, configure the instance firewall or security group to allow inbound TCP traffic on port `7777` from the browser client. For local deployments, ensure `http://localhost:7777/` is reachable from the deployment host.
+
+## NGC + Hugging Face API Keys
+
+The credentials you need depend on the images, models, and optional agent
+harness selected for the deployment. Standard VSS deployment paths require an
+NGC Personal API Key. A Hugging Face token is required only when a selected
+model or helper downloads gated or rate-limited weights from Hugging Face. See
+the [credential decision table](#credentials-used-by-the-build-vision-ai-skill)
+before deploying.
+
+### Create an NVIDIA NGC Account
+
+1. Go to https://ngc.nvidia.com
+2. Click **Sign up** if you don't have an account, or **Sign in** if you do
+3. Complete the registration process with your email address
+
+### Generate an API Key
+
+1. Once logged in, click on your username in the top right corner
+2. Select **Setup** from the dropdown menu
+3. Navigate to **API Keys** under the **Keys/Secrets** section
+4. Click **Generate API Key**
+5. Click **Generate Personal Key** (available at both the top-center and top-right of the page)
+6. Provide a descriptive name for your API key (e.g., "VSS Blueprint Development")
+7. Select **NGC Catalog** for Key Permissions
+8. Click **Generate Personal Key**
+9. Copy the generated API key immediately - you won't be able to see it again
+10. Store it securely in a password manager or encrypted file
+
+<Note>
+Keep your NGC API key secure and never commit it to version control systems.
+Credential management policies and persistence mechanisms ultimately depend on
+your environment and security requirements and are left to your discretion.
+</Note>
+
+<Info>
+The Cosmos3 Reasoner NIM (1.7.0+) requires a **Personal API Key**. Legacy NGC API keys
+are not supported and will fail authentication when pulling or running this container.
+This applies when you explicitly deploy the standalone Cosmos3 Reasoner NIM.
+The default `base` and `search` profiles serve the Cosmos3 model through
+RT-VLM and do not start the standalone VLM NIM container. Other NGC images and
+model artifacts still require an authorized NGC credential.
+</Info>
+
+### Verify Your NGC Access
+
+To verify your NGC key has the correct permissions:
+
+```bash
+# Set your NGC API key
+export NGC_CLI_API_KEY='your_ngc_api_key'
+
+# Authenticate Docker for gated NIM and other nvcr.io images. The username is
+# the literal string $oauthtoken; the password is your NGC Personal API Key.
+# Managed VSS images on ghcr.io are public and require no registry login.
+printf '%s' "$NGC_CLI_API_KEY" | \
+  docker login nvcr.io --username '$oauthtoken' --password-stdin
+
+# Test access to the required resources
+ngc registry resource list "nvidia/vss-developer/*"
+ngc registry resource list "nvidia/vss-core/*"
+
+# Test access to the required images
+ngc registry image list "nvidia/vss-core/*"
+
+# Test access to the required models
+ngc registry model list "nvidia/tao/*"
+```
+
+If you encounter permission errors, contact NVIDIA support for assistance.
+
+The `Login Succeeded` response verifies NGC Docker registry authentication.
+Run this step before the Build Vision AI Skill or any manual
+`docker compose up` command that pulls gated NIM or other `nvcr.io` images. A
+later `docker compose config --quiet` validates that Compose can render the
+model, but a successful exit does not prove that every operationally required
+environment value is set. Review its unset-variable warnings against the
+selected profile. The command does not contact the registry or validate image
+entitlements.
+
+### Hugging Face Access Token
+
+Some optional model selections download weights from
+[Hugging Face](https://huggingface.co/). Create a token only when the selected
+deployment path identifies `HF_TOKEN` as required. Public downloads can also
+be rate limited without a token.
+
+1. Log in to [Hugging Face](https://huggingface.co/)
+2. Go to [Access Tokens](https://huggingface.co/settings/tokens) and create a token with **Read** permission
+3. Export the token before deploying:
+
+```bash
+export HF_TOKEN='hf_your_token_here'
+```
+
+<Warning>
+The token must have **READ** permission only. Do not commit it to version control.
+</Warning>
+
+<Note>
+`HF_TOKEN` is also used for gated **Nemotron Omni** model weights and some remote vLLM deploy flows. For **audio-in-video** on the base agent profile, set `ENABLE_AUDIO=true` in the local `user-overrides.env` file and follow [Using Nemotron Omni (audio-enabled remote VLM)](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-vlm#using-nemotron-omni-audio-enabled-vlm) in [Configure the VLM](/vision-agent/vss-agents/agent-customization/customize-models/configure-the-vlm).
+</Note>
+
+### Credentials used by the Build Vision AI Skill
+
+The `vss-build-vision-ai` Skill asks for credentials before it deploys. Which
+keys are required depends on model placement and whether you choose the optional
+NemoClaw harness.
+
+| Credential | Required when |
+| --- | --- |
+| `NGC_CLI_API_KEY` | Pulling gated NIM, model, sample-data, and other artifacts from NGC. This is required for the standard deployment paths. Use the same Personal API Key for `docker login nvcr.io`. Managed VSS images on public GHCR require no registry login. |
+| `COMPATIBLE_API_KEY` | The NemoClaw harness uses a public OpenAI-compatible endpoint that requires a bearer token. Obtain the key from the endpoint provider. |
+| `NVIDIA_API_KEY` | A selected LLM or VLM is served from `build.nvidia.com` or `integrate.api.nvidia.com`. Create a key from [NVIDIA API Keys](https://build.nvidia.com/settings/api-keys). |
+| `HF_TOKEN` | A selected model or helper downloads gated or rate-limited weights from Hugging Face. |
+
+Keep provider credentials out of chat transcripts and generated build
+artifacts. For a custom OpenAI-compatible endpoint, put the provider-issued key
+in the checkout-root, gitignored `nemoclaw.env` file, or export it in the shell
+that starts the coding-agent session:
+
+```bash
+COMPATIBLE_API_KEY='your-provider-api-key'
+```
+
+The Skill loads `nemoclaw.env` before harness setup. If you export the variable
+instead, restart the coding-agent session from that shell so it inherits the
+credential.
+
+A self-hosted OpenAI-compatible harness endpoint that does not require a real
+token can use the documented placeholder. Selecting **no harness** requires no
+harness credential. These choices do not remove the NGC or model-download
+credentials required by the VSS stack itself. The Skill stops before deployment
+and identifies any missing credential; it does not silently switch providers.
+
+## Development Profile GPU Requirements
+
+The following tables show the number of GPUs needed for each development profile:
+
+<Tabs>
+<Tab title="H100">
+
+| **Profile** | **Shared GPU** | **Dedicated GPU** | **Remote LLM** | **Remote VLM** | **Remote LLM + VLM** |
+| --- | --- | --- | --- | --- | --- |
+| [dev-profile-base](/getting-started/quickstart) | 1 | 2 | 1 | 1 | 1 |
+| [dev-profile-lvs](/vision-agent/agent-workflows/video-summarization) | 1 | 2 | 1 | 1 | 1 |
+| [dev-profile-alerts (Alert verification with VLM)](/vision-agent/agent-workflows/alert-verification) <sup>1</sup> | 2 | 3 | 2 | 2 | 1 |
+| [dev-profile-alerts (Real-Time Alerts with VLM)](/vision-agent/agent-workflows/real-time-alerts) <sup>1</sup> | 2 | 3 | 2 | — | — |
+| [dev-profile-search](/vision-agent/agent-workflows/search) <sup>2</sup> | 2 | 4 | 2 | 2 | 2 |
+
+</Tab>
+<Tab title="GB300">
+
+All supported profiles use one GB300 GPU. The profile quickstarts assign every
+local service to that GPU; a remote model option offloads the selected model but
+does not remove the GPU required by the profile services.
+
+| **Profile** | **Default / local models** | **Remote LLM** | **Remote VLM** | **Remote LLM + VLM** |
+| --- | --- | --- | --- | --- |
+| [dev-profile-base](/getting-started/quickstart) | 1 | 1 | 1 | 1 |
+| [dev-profile-lvs](/vision-agent/agent-workflows/video-summarization) | 1 | 1 | 1 | 1 |
+| [dev-profile-alerts (Alert verification with VLM)](/vision-agent/agent-workflows/alert-verification) <sup>1</sup> | 1 | 1 | 1 | 1 |
+| [dev-profile-alerts (Real-Time Alerts with VLM)](/vision-agent/agent-workflows/real-time-alerts) <sup>1</sup> | 1 | 1 | — | — |
+| [dev-profile-search](/vision-agent/agent-workflows/search) <sup>2</sup> | 1 | 1 | 1 | 1 |
+
+</Tab>
+<Tab title="RTXPRO6000BW">
+
+| **Profile** | **Shared GPU** | **Dedicated GPU** | **Remote LLM** | **Remote VLM** | **Remote LLM + VLM** |
+| --- | --- | --- | --- | --- | --- |
+| [dev-profile-base](/getting-started/quickstart) | 1 | 2 | 1 | 1 | 1 |
+| [dev-profile-lvs](/vision-agent/agent-workflows/video-summarization) | 1 | 2 | 1 | 1 | 1 |
+| [dev-profile-alerts (Alert verification with VLM)](/vision-agent/agent-workflows/alert-verification) <sup>1</sup> | 2 | 3 | 2 | 2 | 1 |
+| [dev-profile-alerts (Real-Time Alerts with VLM)](/vision-agent/agent-workflows/real-time-alerts) <sup>1</sup> | 2 | 3 | 2 | — | — |
+| [dev-profile-search](/vision-agent/agent-workflows/search) <sup>2</sup> | 2 | 4 | 2 | 2 | 2 |
+
+</Tab>
+<Tab title="RTXPRO4500BW">
+
+RTX PRO 4500 Blackwell is supported only for the alerts profile with a remote
+LLM. Set `HARDWARE_PROFILE=RTXPRO4500BW` explicitly when automatic detection
+does not identify the GPU. On x86 hosts with Ubuntu 24.04, use NVIDIA driver
+595.58.03 or later.
+
+| **Profile** | **Remote LLM** |
+| --- | --- |
+| [dev-profile-alerts (Alert verification with VLM)](/vision-agent/agent-workflows/alert-verification) <sup>1</sup> | 2 |
+| [dev-profile-alerts (Real-Time Alerts with VLM)](/vision-agent/agent-workflows/real-time-alerts) <sup>1</sup> | 2 |
+
+</Tab>
+<Tab title="L40S">
+
+Shared local LLM/VLM placement is not supported on L40S. Use the dedicated-GPU
+layout or one of the remote-model layouts below.
+
+| **Profile** | **Dedicated GPU** | **Remote LLM** | **Remote VLM** | **Remote LLM + VLM** |
+| --- | --- | --- | --- | --- |
+| [dev-profile-base](/getting-started/quickstart) | 2 | 1 | 1 | 1 |
+| [dev-profile-lvs](/vision-agent/agent-workflows/video-summarization) | 2 | 1 | 1 | 1 |
+| [dev-profile-alerts (Alert verification with VLM)](/vision-agent/agent-workflows/alert-verification) <sup>1</sup> | 3 | 2 | 2 | 1 |
+| [dev-profile-alerts (Real-Time Alerts with VLM)](/vision-agent/agent-workflows/real-time-alerts) <sup>1</sup> | 3 | 2 | — | — |
+| [dev-profile-search](/vision-agent/agent-workflows/search) <sup>2</sup> | 4 | 3 | 3 | 2 |
+
+</Tab>
+<Tab title="DGX-SPARK">
+
+| **Profile** | **Local LLM + RT-VLM** | **Remote LLM + local RT-VLM** | **Remote LLM + remote VLM** |
+| --- | --- | --- | --- |
+| [dev-profile-base](/getting-started/quickstart) | 1 | 1 | — |
+| [dev-profile-alerts (Alert verification with VLM)](/vision-agent/agent-workflows/alert-verification) <sup>1</sup> | 1 | 1 | — |
+| [dev-profile-alerts (Real-Time Alerts with VLM)](/vision-agent/agent-workflows/real-time-alerts) <sup>1</sup> | 1 | 1 | — |
+| [dev-profile-search](/vision-agent/agent-workflows/search) | — | — | 1 |
+
+</Tab>
+<Tab title="IGX-THOR">
+
+| **Profile** | **Local LLM + RT-VLM** | **Remote LLM + local RT-VLM** |
+| --- | --- | --- |
+| [dev-profile-base](/getting-started/quickstart) | 1 | 1 |
+| [dev-profile-alerts (Alert verification with VLM)](/vision-agent/agent-workflows/alert-verification) <sup>1</sup> | 1 | 1 |
+| [dev-profile-alerts (Real-Time Alerts with VLM)](/vision-agent/agent-workflows/real-time-alerts) <sup>1</sup> | 1 | 1 |
+
+</Tab>
+<Tab title="AGX-THOR">
+
+| **Profile** | **Local LLM + RT-VLM** | **Remote LLM + local RT-VLM** | **Remote LLM + remote VLM** |
+| --- | --- | --- | --- |
+| [dev-profile-base](/getting-started/quickstart) | 1 | 1 | — |
+| [dev-profile-alerts (Alert verification with VLM)](/vision-agent/agent-workflows/alert-verification) <sup>1</sup> | 1 | 1 | — |
+| [dev-profile-alerts (Real-Time Alerts with VLM)](/vision-agent/agent-workflows/real-time-alerts) <sup>1</sup> | 1 | 1 | — |
+| [dev-profile-search](/vision-agent/agent-workflows/search) | — | — | 1 |
+
+</Tab>
+</Tabs>
+
+<Note>
+The checked-in base and alerts configurations provide a co-located local LLM and
+RT-VLM on DGX Spark, IGX Thor, and AGX Thor. These local layouts have not yet
+been measured on the target hardware, so a remote LLM is recommended for
+latency and as the fallback if local model loading fails. In the Remote LLM
+layout, RT-VLM runs locally. Search is supported on DGX Spark and AGX Thor only
+and requires both the LLM and VLM to be remote;
+IGX Thor does not support the search profile. The LVS profile is not supported
+on these edge platforms.
+</Note>
+
+### References
+
+<sup>1</sup> GPU device '0' is needed to run alerts.
+
+<sup>2</sup> GPU devices '0' and '1' are needed to run search.
+
+## VLM Custom Weights
+
+The VSS Blueprint supports using VLM custom weights for specialized use cases. This section explains how to download custom weights from NGC or Hugging Face.
+
+### Download Custom Weights from NGC
+
+If VLM custom weights are available on NGC, you can download them using the NGC CLI:
+
+```bash
+# Set your NGC API key if not already set
+export NGC_CLI_API_KEY='your_ngc_api_key'
+
+# Download custom weights from NGC
+ngc registry model download-version <org>/<team>/<model>:<version>
+
+# Move downloaded custom weights to desired path/folder
+mv </downloaded/path/in/ngc/output> </path/to/custom/weights>
+```
+
+The weights will be downloaded to a local directory. Note the path to this directory, then set `VLM_CUSTOM_WEIGHTS` in the selected profile's `*-overrides.env` file before deploying (the deployment guides use `user-overrides.env` as an example).
+
+### Download Custom Weights from Hugging Face
+
+To download custom VLM weights from Hugging Face, you can use the `huggingface-cli` tool or Git LFS:
+
+**Using huggingface-cli:**
+
+```bash
+# Install Hugging Face CLI if not already installed
+pip install -U "huggingface_hub[cli]"
+
+# Login to Hugging Face (required for gated models)
+huggingface-cli login
+
+# Create a base directory where the custom weights can be downloaded
+mkdir -p </path/to/custom/weights>
+
+# Download a model
+huggingface-cli download <model-id> --local-dir </path/to/custom/weights>
+```
+
+**Using Git LFS:**
+
+```bash
+# Install Git LFS if not already installed
+sudo apt install git-lfs
+git lfs install
+
+# Clone the model repository
+git clone https://huggingface.co/<model-id> </path/to/custom/weights>
+```
+
+<Note>
+Some Hugging Face models may be gated and require access approval. Visit the model page on Hugging Face and request access if needed. You must also authenticate using `huggingface-cli login` before downloading gated models.
+</Note>
+
+### Verify Downloaded Weights
+
+After downloading custom weights, verify the directory structure and contents:
+
+```bash
+# List the contents of the weights directory
+ls -lh </path/to/custom/weights>
+```
+
+Typical VLM weight directories contain:
+
+- Model configuration files (e.g., `config.json`)
+- Model weights (e.g., `pytorch_model.bin`, `model.safetensors`, or sharded weights)
+- Tokenizer files (e.g., `tokenizer.json`, `tokenizer_config.json`)
+- Other metadata files
+
+## Common Installation Issues
+
+When pulling resources from NGC, you may encounter the following issues:
+
+**Error:** `Missing org - If Authenticated, org is also required.`
+
+**Steps to resolve:**
+
+1. Generate an NGC API key with your desired org selected.
+2. Ensure that the org you selected in `ngc config set` is the same as the org you selected in the NGC API key generation.
+
+## Appendix: Software Prerequisites Installation Guide
+
+### Install NVIDIA Driver
+
+#### Ubuntu 24.04
+
+NVIDIA Driver version 595.58.03 is required with Ubuntu 24.04.
+
+You can download the driver directly from:
+https://www.nvidia.com/en-us/drivers/details/266021/
+
+#### Additional resources
+
+For detailed installation instructions, refer to the official NVIDIA Driver Installation Guide:
+https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/index.html
+
+You can also browse drivers for your specific GPU and platform from the NVIDIA Driver Downloads page:
+https://www.nvidia.com/Download/index.aspx
+
+<Note>
+After installation, verify the driver is correctly installed by running `nvidia-smi` to confirm the driver version and GPU detection.
+</Note>
+
+<Note>
+**NVIDIA Fabric Manager Requirement**
+
+NVIDIA Fabric Manager is required on systems with multiple GPUs that are connected using NVLink or NVSwitch technology. This typically applies to:
+
+- **NVIDIA DGX systems** — e.g., DGX A100, DGX H100, DGX-2, DGX Station (multi-GPU)
+- **HGX platforms** — e.g., H100 4-GPU/8-GPU baseboards
+- **NVSwitch-based systems** — servers with NVSwitch fabric (e.g., 8-way HGX B200/H100 with NVSwitch)
+- **Multi-GPU servers with NVLink** — OEM systems that use NVLink to connect GPUs rather than PCIe only
+- **Datacenter GPUs with NVLink** — hosts with NVIDIA H100, B200, or similar GPUs in an NVLink topology
+
+Fabric Manager is **not required** for:
+
+- Single GPU systems
+- Multi-GPU systems without NVLink/NVSwitch (PCIe-only configurations)
+
+For full details, refer to the official NVIDIA Fabric Manager documentation:
+
+- Installation Guide: https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html
+
+Example setup on Ubuntu 24.04. Use Fabric Manager version **595.58.03** so that it matches the installed NVIDIA driver (see [Install NVIDIA Driver](/getting-started/prerequisites#install-nvidia-driver) for driver requirements):
+
+```bash
+# Install the Fabric Manager package that matches driver 595.58.03
+sudo apt-get update
+sudo apt-get install -y nvidia-fabricmanager-595=595.58.03-1ubuntu1
+
+# Enable and start the service
+sudo systemctl enable nvidia-fabricmanager
+sudo systemctl start nvidia-fabricmanager
+
+# Verify the service is running
+sudo systemctl status nvidia-fabricmanager
+```
+
+If that exact package revision is unavailable from your apt repository, download and install the matching Debian package directly:
+
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/nvidia-fabricmanager_595.58.03-1ubuntu1_amd64.deb
+sudo dpkg -i nvidia-fabricmanager_595.58.03-1ubuntu1_amd64.deb
+```
+
+Fabric Manager must match the installed driver version.
+</Note>
+
+### Install Docker
+
+Docker version 28.3.3 or later and earlier than 29.5.0 is required. If Docker is
+not installed, first install Docker Engine from the
+[official Ubuntu apt repository](https://docs.docker.com/engine/install/ubuntu/).
+The latest package is not necessarily in the VSS-tested range.
+
+<Note>
+Do not install Docker via `snap`. The snap-packaged Docker runs inside a confined sandbox with restricted filesystem access, which can perform differently in the deployment process. Install Docker using the official Docker apt repository as linked above.
+</Note>
+
+#### Run docker without sudo
+
+After installation, complete the Linux post-installation steps so that Docker can run without sudo. See [Linux post-installation steps for Docker Engine](https://docs.docker.com/engine/install/linux-postinstall/).
+
+<a id="configure-docker"></a>
+
+### Pin and configure Docker
+
+From the VSS repository root, run the checked-in setup script before starting
+any containers:
+
+```bash
+bash deploy/docker/scripts/pin_docker_version.sh
+docker version --format '{{.Server.Version}}'
+docker info --format '{{.CgroupDriver}}'
+```
+
+The script installs the repository's known-good Docker Engine, Compose,
+Buildx, and containerd package versions when the installed engine is outside
+the tested range. It holds the applicable packages and safely merges the
+required `native.cgroupdriver=cgroupfs` setting into `/etc/docker/daemon.json`.
+It is idempotent and skips the package change when Docker is already in range.
+
+<Note>
+The script uses `sudo`, supports Ubuntu hosts with `apt`, and can restart
+Docker. Run it before other containers are started. If the host cannot install
+the pinned packages, see the script's error and the
+[Docker troubleshooting guidance](/appendix/faq) before changing
+`daemon.json` manually.
+</Note>
+
+### Install Docker Compose
+
+Docker Compose v2.39.1 or later is required. Docker Compose v2 is typically installed as a plugin with modern Docker installations.
+
+**Check if Docker Compose is already installed and meets the minimum version:**
+
+```bash
+docker compose version
+```
+
+The default `docker-compose-plugin` package in Ubuntu repositories may provide a version older than v2.39.1.
+If the version is missing or too old, select the binary for the host
+architecture and install the required version manually:
+
+```bash
+case "$(uname -m)" in
+  x86_64) COMPOSE_ARCH=x86_64 ;;
+  aarch64|arm64) COMPOSE_ARCH=aarch64 ;;
+  *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+sudo curl -fSL "https://github.com/docker/compose/releases/download/v2.39.1/docker-compose-linux-${COMPOSE_ARCH}" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+```
+
+**Verify installation:**
+
+```bash
+docker compose version
+```
+
+<Note>
+Docker Compose v2 uses the command `docker compose` (without hyphen) instead of the older `docker-compose` command.
+</Note>
+
+### Install Docker Buildx
+
+Buildx version 0.23.0 or later and earlier than 0.35.0 is required. Version 0.23.0 is the known working version.
+
+**Check if Docker Buildx is already installed and meets the version range:**
+
+```bash
+docker buildx version
+```
+
+If the version is missing, older than 0.23.0, or 0.35.0 or newer, install working version 0.23.0:
+
+```bash
+case "$(uname -m)" in
+  x86_64) BUILDX_ARCH=amd64 ;;
+  aarch64|arm64) BUILDX_ARCH=arm64 ;;
+  *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+sudo curl -fSL "https://github.com/docker/buildx/releases/download/v0.23.0/buildx-v0.23.0.linux-${BUILDX_ARCH}" \
+  -o /usr/local/lib/docker/cli-plugins/docker-buildx
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+```
+
+**Verify installation:**
+
+```bash
+docker buildx version
+```
+
+### Install NVIDIA Container Toolkit
+
+The NVIDIA Container Toolkit is required to run the NVIDIA containers. Follow the guide here for installing the NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+
+### Install NGC CLI
+
+NGC CLI version 4.10.0 or later is required to download blueprints and authenticate with NGC resources.
+
+**Download and install NGC CLI:**
+
+For ARM64 Linux:
+
+```bash
+curl -sLo "/tmp/ngccli.zip" https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/versions/4.10.0/files/ngccli_arm64.zip
+```
+
+For AMD64 Linux:
+
+```bash
+curl -sLo "/tmp/ngccli.zip" https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/versions/4.10.0/files/ngccli_linux.zip
+```
+
+After downloading, install NGC CLI:
+
+```bash
+sudo mkdir -p /usr/local/bin
+sudo unzip -qo /tmp/ngccli.zip -d /usr/local/lib
+sudo chmod +x /usr/local/lib/ngc-cli/ngc
+sudo ln -sfn /usr/local/lib/ngc-cli/ngc /usr/local/bin/ngc
+```
+
+**Verify installation:**
+
+```bash
+ngc --version
+```
+
+**Configure NGC CLI with your API key:**
+
+```bash
+ngc config set
+```
+
+When prompted, enter your NGC API key. For information on obtaining API keys, see [NGC + Hugging Face API Keys](/getting-started/prerequisites#ngc--hugging-face-api-keys).
+
+<Note>
+NGC CLI downloads page: https://ngc.nvidia.com/setup/installers/cli
+
+NGC CLI documentation: https://docs.ngc.nvidia.com/cli/index.html
+</Note>
+
+### Setup DGX-SPARK
+
+For setup instructions, see the [DGX Spark User Guide](https://docs.nvidia.com/dgx/dgx-spark/index.html).
+
+Setup installs DGX OS (including the NVIDIA driver), Docker with NVIDIA Container Toolkit integration, and NGC access.
+
+DGX Spark ships with DGX OS pre-installed; do not flash a separate OS image for normal setup. VSS deployments require DGX OS 7.5.0, NVIDIA driver 580.173.02.
+
+Connect the display, keyboard, mouse, and network before connecting power. The system powers on as soon as the power supply is connected. Complete the OOBE wizard and allow its software download and automatic reboot to finish; do not power off or reboot while software is being installed.
+
+<Note>
+- Depending on the installation method used, Docker might require `sudo` to run. If so, see [Run docker without sudo](/getting-started/prerequisites#run-docker-without-sudo).
+</Note>
+
+### Setup AGX-THOR
+
+Setup JetPack 7.2 (Jetson Linux/L4T r39.2) via instructions in the [Jetson AGX Thor Developer Kit User Guide](https://docs.nvidia.com/jetson/agx-thor-devkit/user-guide/latest/index.html). Use the Jetson ISO r39.2 USB installation path and select NVMe as the target storage.
+
+- Create the bootable USB with BalenaEtcher; copying the ISO files to a USB drive is not sufficient.
+- Accept the QSPI update when prompted. Do not skip this update.
+- After installation, remove the USB drive before rebooting, complete `oem-config`, and install JetPack with `sudo apt install nvidia-jetpack`.
+- The resulting stack must report Jetson Linux/L4T r39.2, NVIDIA driver 595.78.
+
+<Note>
+The Jetson ISO update path requires an existing BSP at L4T r35.5 or later.
+Use another supported update path for older installations.
+</Note>
+
+<Note>
+- When using the Jetson USB installation method, Docker and the NVIDIA Container Toolkit are included. When using L4T flash or SDK Manager, install them separately: [Install Docker](/getting-started/prerequisites#install-docker), [Install NVIDIA Container Toolkit](/getting-started/prerequisites#install-nvidia-container-toolkit).
+- Depending on the installation method used, Docker might require `sudo` to run. If so, see [Run docker without sudo](/getting-started/prerequisites#run-docker-without-sudo).
+</Note>
+
+### Setup IGX-THOR
+
+Setup IGX-SW 2.0 Production (LTS), including IGX OS 2.0, via instructions in the [Jetson IGX Thor User Guide](https://docs.nvidia.com/igx/user-guide/latest/OV/introduction.html).
+
+- Setup installs NVIDIA driver 580.00 with the IGX-SW 2.0 stack.
+- For T5000, install from a bootable USB and select **Install IGX OS with Real-Time Kernel**.
+- For T7000, use a bootable USB or BMC Virtual Media. Update the firmware in the BMC WebUI before installing, and connect the monitor to the iGPU DisplayPort rather than the dGPU port.
+- After installing either platform, install the IGX AI software with `sudo apt install nvidia-igx-ai` and enable the NVIDIA CDI service as described in the user guide.
+
+<Note>
+Use the public IGX-SW 2.0 GA release for customer-facing deployments.
+Do not use pre-release builds unless the Tegra team has approved an exception.
+</Note>
+
+<Note>
+- When using the Jetson USB installation method, Docker and the NVIDIA Container Toolkit are included. When using L4T flash or SDK Manager, install them separately: [Install Docker](/getting-started/prerequisites#install-docker), [Install NVIDIA Container Toolkit](/getting-started/prerequisites#install-nvidia-container-toolkit).
+- Depending on the installation method used, Docker might require `sudo` to run. If so, see [Run docker without sudo](/getting-started/prerequisites#run-docker-without-sudo).
+</Note>
+
+### NIM configuration settings
+
+The deployment ships with NIM (NVIDIA Inference Microservice) configuration via environment variables for supported NIMs and GPUs. You can use the default env files, rely on NIM defaults for unsupported GPUs, or supply your own env files at install time.
+
+#### Default configuration
+
+For each supported NIM and GPU, the deployment includes a corresponding env file under `./deploy/docker/services/nim/<nim-name>/`. For example, for the cosmos3-reasoner NIM on an NVIDIA RTX PRO 6000 Blackwell:
+
+```bash
+./deploy/docker/services/nim/cosmos3-reasoner/hw-RTXPRO6000BW.env
+```
+
+#### Unsupported GPU hardware
+
+For GPU hardware outside the listed profiles, set `HARDWARE_PROFILE=OTHER` in the selected profile's `*-overrides.env` file. The deployment uses a default empty env file and the NIM falls back to its own defaults.
+
+```bash
+./deploy/docker/services/nim/cosmos3-reasoner/hw-OTHER.env
+```
+
+#### Custom env files at install time
+
+You can define your own env variants for a NIM in the selected profile's `*-overrides.env` file. Set `LLM_ENV_FILE` and/or `VLM_ENV_FILE`; paths can be absolute or relative to `deploy/docker`.
+
+```ini
+LLM_ENV_FILE=/path/to/llm.env
+VLM_ENV_FILE=/path/to/vlm.env
+```

@@ -1,0 +1,147 @@
+# Native Tracker Layout
+
+BoxMOT keeps tracker-domain code separate from native implementation details:
+
+- Python tracker implementations: algorithm packages at
+  `boxmot/trackers/<name>/tracker.py`, with representation families and input
+  capabilities declared by each tracker
+- Shared Python tracker support: `boxmot/trackers/common/`
+- Native C++ tracker family: `boxmot/native/cpp/trackers/<name>/`
+- Native C++ model-free tracker base: `boxmot/native/cpp/trackers/base/`
+- Independent native ReID runtime and C ABI: `boxmot/native/cpp/reid/`
+- ABI-neutral native runtime helpers: `boxmot/native/cpp/include/boxmot/native/`
+- Low-level ctypes binding: `boxmot/native/trackers/<name>.py`
+- Canonical tracker adapter: `boxmot/trackers/<name>/native.py`
+- Backend selection and validation: `boxmot/trackers/common/factory.py`
+
+This keeps `boxmot.native` limited to C++ sources, build support, and raw ABI
+bindings. Canonical Torch structures and tracker requirements remain in the
+tracker domain.
+
+## Organization
+
+- `boxmot/native/cpp/trackers/base/`: shared association, assignment, and typed tracker-ABI primitives.
+- `boxmot/native/cpp/reid/`: standalone appearance inference implementation; tracker targets must not include or link it.
+- `boxmot/native/cpp/include/boxmot/native/`: low-level helpers shared across independent native libraries.
+- `boxmot/native/cpp/trackers/<name>/include/<name>/`: public tracker-specific headers.
+- `boxmot/native/cpp/trackers/<name>/src/`: tracker-specific implementation and ABI entrypoints.
+
+Tracker-specific code should stay in its own directory even when two trackers
+look similar. Only tracker primitives shared across algorithms belong in
+`trackers/base`; general native runtime helpers belong under `cpp/include`, and
+model inference belongs under its owning component subtree.
+
+## Selection
+
+Select the native backend in an immutable tracker specification:
+
+```python
+from boxmot import create_tracker
+from boxmot.trackers import TrackerSpec
+
+tracker = create_tracker(TrackerSpec(name="bytetrack", backend="cpp", geometry="aabb"))
+```
+
+## Build entrypoints
+
+- Per-tracker builds still work from `boxmot/native/cpp/trackers/<name>/` and are what the low-level bindings load.
+- The tree can also be configured from `boxmot/native/cpp/` to build the shared base and all registered native trackers together.
+
+`boxmot_tracker_base` contains only association and assignment code. Tracker
+targets do not link native ReID or ONNX Runtime, and do not request or directly
+link OpenCV DNN. The aggregate build also exposes a separate
+`boxmot_native_reid`/`reid_capi` target by default; pass
+`-DBOXMOT_BUILD_NATIVE_REID=OFF` for a tracker-only aggregate build. Standalone
+per-tracker builds default to tracker-only operation. Individual OpenCV
+distributions may add their own transitive dependencies to modules required for
+camera-motion compensation.
+
+Build the native appearance encoder independently with:
+
+```bash
+cmake -S boxmot/native/cpp/reid -B build/native/reid -DCMAKE_BUILD_TYPE=Release
+cmake --build build/native/reid --target reid_capi
+```
+
+## Current scope
+
+Typed v2 native backends are registered for:
+
+- `botsort`
+- `bytetrack`
+- `occluboost`
+- `ocsort`
+- `sfsort`
+
+Each tracker exposes an in-process shared library. Python streams keyed
+Parquet rows through this live API; positional NPY replay executables are not
+built or published.
+
+OcSort uses `boxmot_ocsort_create_v2` with `BoxMOTOCSORTConfigV2`; its process
+noise priors are internal constants. Versioning the constructor prevents older
+libraries from reading the revised configuration layout. Detection and track
+batches continue to use the shared typed v2 API.
+
+OccluBoost uses `boxmot_occluboost_create_v3` with `BoxMOTOccluBoostConfigV3`.
+Its configuration shares detection, association, confirmation, and lifetime
+settings across AABB and OBB. Rebuild older libraries to use this layout;
+the Python loader rejects the previous constructor ABI. Appearance smoothing,
+appearance rescue, DLO/DUO boosting, and track-confidence controls use the same
+settings and defaults as Python.
+
+ByteTrack and BotSort use `boxmot_bytetrack_create_v3` /
+`BoxMOTByteTrackConfigV3` and `boxmot_botsort_create_v3` /
+`BoxMOTBotSortConfigV3`. Both configurations expose `max_lost_frames` as a direct
+count of tracker updates, with no FPS scaling, and share Python's score-fusion
+and duplicate-suppression controls. BotSort also exposes appearance smoothing
+through `alpha_fixed_emb`. Rebuild older libraries: the
+Python loader rejects the previous constructor ABI. Detection and track batches
+continue to use the shared typed v2 API.
+
+Build requirements:
+
+- C++17 compiler and build tools
+- CMake 3.16+
+- OpenCV 4.x development files and runtime libraries
+- Eigen3 3.3+ development headers
+
+See [Install native dependencies](../../../docs/native/index.md#install-dependencies)
+for platform-specific package commands and runtime library setup. The Python
+`opencv-python` package does not replace the C++ development packages.
+
+## ABI v2
+
+The flat C ABI accepts separate float geometry, score, and embedding buffers
+and separate `int64` class and detection-index buffers. Updates return a
+library-allocated `BoxMOTTrackBatchV2`; callers must release it with the
+tracker's `boxmot_<name>_result_free_v2` function. C++ tracker libraries never
+load a ReID model: BotSort and OccluBoost consume embedding buffers supplied by
+the high-level adapter or another caller. The Python-facing native adapters can
+derive a missing buffer from a `Frame` before crossing this ABI.
+
+## Embedding in a C++ Program
+
+For a standalone C++ application, link against the tracker core target directly. Example for ByteTrack:
+
+```cmake
+add_subdirectory("${BOXMOT_ROOT}/boxmot/native/cpp/trackers/bytetrack" "${CMAKE_BINARY_DIR}/boxmot_bytetrack")
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE bytetrack_core)
+```
+
+Then include the tracker headers and feed detections from your detector each frame:
+
+```cpp
+#include "bytetrack/tracker.hpp"
+#include "bytetrack/types.hpp"
+
+bytetrack::Config config;
+bytetrack::ByteTrackTracker tracker(config);
+
+std::vector<bytetrack::Detection> detections;
+// Fill detection.xyxy, detection.conf, detection.cls, and detection.det_ind.
+std::vector<bytetrack::TrackOutput> tracks = tracker.Update(detections, frame);
+```
+
+See [Native C++ Integration](../../../docs/native/index.md) for the public
+native-backend workflow and embedding guidance.

@@ -1,0 +1,2104 @@
+"""Tests for uiprotect.unifi_protect_server."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+from copy import deepcopy
+from datetime import datetime, timedelta
+from http.cookies import SimpleCookie
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import aiohttp
+import pytest
+from aiohttp import WSServerHandshakeError
+from yarl import URL
+
+from tests.conftest import (
+    TEST_CAMERA_EXISTS,
+    TEST_SENSOR_EXISTS,
+    MockDatetime,
+    MockWebsocket,
+)
+from uiprotect.data import EventType, WSPacket
+from uiprotect.data.base import ProtectModel
+from uiprotect.data.devices import EVENT_PING_INTERVAL, Camera
+from uiprotect.data.types import ModelType
+from uiprotect.data.user import Keyring, Keyrings, UlpUser, UlpUsers
+from uiprotect.data.websocket import (
+    WSAction,
+    WSJSONPacketFrame,
+    WSSubscriptionMessage,
+)
+from uiprotect.exceptions import DataDecodeError
+from uiprotect.utils import normalize_mac, print_ws_stat_summary, to_js_time, utc_now
+from uiprotect.websocket import Websocket, WebsocketState
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from uiprotect import ProtectApiClient
+
+PACKET_RAW = "AQEBAAAAAHR4nCXMQQrCMBBA0auUWRvIpJOm8Qbi2gNMZiZQ0NRFqIh4dwluP7z/AZa+7Q3OE7AqnCZo9ro9lbtddFRPhCayuOorOyqYXfEJXcprEqQZ55UHe+xq96u9h7HDWh9x+y+UqeZAsUrQrCFajFQWgu8PBLYjMAIBAQAAAAC2eJxVjr0KwzAMhF8leO6QOLZDOrdT126lg2PLxRA7wVYKIeTdK1PoD2jQfTodtzFcZ2DHiiUfH+xQsYw6IYFGtbyplaKRnDhE+0u7N81mSuW9LnugzxMgGLxSaCZ8u//z8xMifg4BUFuNmvS2kzY6QCqKdaaXsrNOcSN1ywfbgXGtg1JwpjSPfopkjMs4EloypK/ypSirrRau50I6w21vuQQpxaBEiQiThfECa/FBqcT2F6ZyTac="
+
+
+@pytest.fixture(name="packet")
+def packet_fixture():
+    return WSPacket(base64.b64decode(PACKET_RAW))
+
+
+class SubscriptionTest:
+    callback_count: int = 0
+    unsub: Callable[[], None] | None = None
+
+    def callback(self, msg: WSSubscriptionMessage):
+        self.callback_count += 1
+
+        assert isinstance(msg.new_obj, ProtectModel)
+
+        if msg.action == WSAction.ADD:
+            assert msg.old_obj is None
+        else:
+            assert isinstance(msg.old_obj, ProtectModel)
+            assert msg.old_obj.update_from_dict(msg.changed_data) == msg.new_obj
+
+        if self.callback_count == 2:
+            raise Exception
+
+        if self.callback_count >= 3 and self.unsub is not None:
+            self.unsub()
+
+
+async def _wait_for_ws_state(
+    protect_client: ProtectApiClient, state: WebsocketState
+) -> None:
+    reached = asyncio.Event()
+
+    def _on_state(new_state: WebsocketState) -> None:
+        if new_state is state:
+            reached.set()
+
+    unsub = protect_client.subscribe_websocket_state(_on_state)
+    try:
+        if protect_client._get_websocket().state is not state:
+            await reached.wait()
+    finally:
+        unsub()
+
+
+@pytest.mark.asyncio()
+@pytest.mark.timeout(0)
+async def test_ws_all(
+    protect_client_ws: ProtectApiClient,
+    ws_messages: dict[str, dict[str, Any]],
+):
+    """Unfiltered WS subscription dispatches every packet through the callback."""
+    protect_client = protect_client_ws
+    sub = SubscriptionTest()
+    sub.unsub = protect_client.subscribe_websocket(sub.callback)
+
+    websocket = protect_client._get_websocket()
+
+    await _wait_for_ws_state(protect_client, WebsocketState.CONNECTED)
+
+    ws_connect: MockWebsocket | None = websocket._ws_connection  # type: ignore[assignment]
+    assert ws_connect is not None
+
+    await _wait_for_ws_state(protect_client, WebsocketState.DISCONNECTED)
+
+    assert sub.callback_count == 3
+
+
+@pytest.mark.asyncio()
+@pytest.mark.timeout(0)
+async def test_ws_filtered(
+    protect_client_ws: ProtectApiClient,
+):
+    """Model-filtered WS subscription captures stats for every packet."""
+    protect_client = protect_client_ws
+    protect_client.bootstrap.capture_ws_stats = True
+    protect_client._ignore_stats = True
+    protect_client._subscribed_models = {
+        ModelType.EVENT,
+        ModelType.CAMERA,
+        ModelType.LIGHT,
+        ModelType.VIEWPORT,
+        ModelType.SENSOR,
+        ModelType.LIVEVIEW,
+    }
+    sub = SubscriptionTest()
+    sub.unsub = protect_client.subscribe_websocket(sub.callback)
+
+    websocket = protect_client._get_websocket()
+
+    await _wait_for_ws_state(protect_client, WebsocketState.CONNECTED)
+
+    ws_connect: MockWebsocket | None = websocket._ws_connection  # type: ignore[assignment]
+    assert ws_connect is not None
+
+    await _wait_for_ws_state(protect_client, WebsocketState.DISCONNECTED)
+
+    print_ws_stat_summary(protect_client.bootstrap.ws_stats)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.datetime", MockDatetime)
+async def test_ws_event_ring(
+    protect_client_no_debug: ProtectApiClient,
+    now,
+    camera,
+    packet: WSPacket,
+):
+    protect_client = protect_client_no_debug
+
+    def get_camera():
+        return protect_client.bootstrap.cameras[camera["id"]]
+
+    camera_before = get_camera().model_copy()
+
+    expected_updated_id = "0441ecc6-f0fa-4b19-b071-7987c143138a"
+    expected_event_id = "bf9a241afe74821ceffffd05"
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data["newUpdateId"] = expected_updated_id
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "id": expected_event_id,
+        "type": "ring",
+        "start": to_js_time(now - timedelta(seconds=1)),
+        "end": to_js_time(now),
+        "score": 0,
+        "smartDetectTypes": [],
+        "smartDetectEvents": [],
+        "camera": camera["id"],
+        "partition": None,
+        "user": None,
+        "metadata": {},
+        "thumbnail": f"e-{expected_event_id}",
+        "heatmap": f"e-{expected_event_id}",
+        "modelKey": "event",
+    }
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    protect_client._process_ws_message(msg)
+
+    camera = get_camera()
+
+    event = camera.last_ring_event
+    camera_before.last_ring_event_id = None
+    camera.last_ring_event_id = None
+
+    assert camera.last_ring == event.start
+    camera.last_ring = None
+    camera_before.last_ring = None
+
+    assert camera.model_dump() == camera_before.model_dump()
+    assert event.id == expected_event_id
+    assert event.type == EventType.RING
+
+    for channel in camera.channels:
+        assert channel._api is not None
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.datetime", MockDatetime)
+async def test_ws_event_motion(
+    protect_client_no_debug: ProtectApiClient,
+    now,
+    camera,
+    packet: WSPacket,
+):
+    protect_client = protect_client_no_debug
+
+    def get_camera():
+        return protect_client.bootstrap.cameras[camera["id"]]
+
+    camera_before = get_camera().model_copy()
+
+    expected_updated_id = "0441ecc6-f0fa-4b19-b071-7987c143138a"
+    expected_event_id = "bf9a241afe74821ceffffd05"
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data["newUpdateId"] = expected_updated_id
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "id": expected_event_id,
+        "type": "motion",
+        "start": to_js_time(now - timedelta(seconds=30)),
+        "end": to_js_time(now),
+        "score": 0,
+        "smartDetectTypes": [],
+        "smartDetectEvents": [],
+        "camera": camera["id"],
+        "partition": None,
+        "user": None,
+        "metadata": {},
+        "thumbnail": f"e-{expected_event_id}",
+        "heatmap": f"e-{expected_event_id}",
+        "modelKey": "event",
+    }
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    protect_client._process_ws_message(msg)
+
+    camera = get_camera()
+
+    event = protect_client.bootstrap.events[camera.last_motion_event_id]
+    camera_before.last_motion_event_id = None
+    camera.last_motion_event_id = None
+
+    assert camera.last_motion == event.start
+    camera_before.last_motion = None
+    camera.last_motion = None
+
+    assert camera.model_dump() == camera_before.model_dump()
+    assert event.id == expected_event_id
+    assert event.type == EventType.MOTION
+    assert event.start == (now - timedelta(seconds=30))
+
+    for channel in camera.channels:
+        assert channel._api is not None
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.datetime", MockDatetime)
+async def test_ws_event_unknown_type_dropped(
+    protect_client_no_debug: ProtectApiClient,
+    now,
+    camera,
+    packet: WSPacket,
+    caplog: pytest.LogCaptureFixture,
+):
+    """An ``add`` event frame with a type newer firmware introduced is dropped, not raised."""
+    protect_client = protect_client_no_debug
+
+    expected_event_id = "bf9a241afe74821ceffffd05"
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data["newUpdateId"] = "0441ecc6-f0fa-4b19-b071-7987c143138a"
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "id": expected_event_id,
+        "type": "someFutureFirmwareEvent",
+        "start": to_js_time(now - timedelta(seconds=1)),
+        "end": to_js_time(now),
+        "score": 0,
+        "smartDetectTypes": [],
+        "smartDetectEvents": [],
+        "camera": camera["id"],
+        "partition": None,
+        "user": None,
+        "metadata": {},
+        "thumbnail": f"e-{expected_event_id}",
+        "heatmap": f"e-{expected_event_id}",
+        "modelKey": "event",
+    }
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    with caplog.at_level(logging.DEBUG, logger="uiprotect.data.bootstrap"):
+        # Must not raise a pydantic ValidationError on the unknown enum value.
+        protect_client._process_ws_message(msg)
+
+    assert expected_event_id not in protect_client.bootstrap.events
+    # Skipped up front by the proactive guard, not the generic validation backstop.
+    assert any("Unknown event type" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.datetime", MockDatetime)
+async def test_ws_event_nfc_card_scanned(
+    protect_client_no_debug: ProtectApiClient,
+    now,
+    camera,
+    packet: WSPacket,
+):
+    protect_client = protect_client_no_debug
+
+    def get_camera():
+        return protect_client.bootstrap.cameras[camera["id"]]
+
+    camera_before = get_camera().model_copy()
+
+    expected_updated_id = "0441ecc6-f0fa-4b03-b071-7987c143138a"
+    expected_event_id = "6730b5af01029603e4003bdb"
+    expected_nfc_id = "66B2A649"
+    expected_user_id = "672b570000f79603e400049d"
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data["newUpdateId"] = expected_updated_id
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "id": expected_event_id,
+        "modelKey": "event",
+        "type": "nfcCardScanned",
+        "start": to_js_time(now - timedelta(seconds=30)),
+        "end": to_js_time(now),
+        "score": 0,
+        "smartDetectTypes": [],
+        "smartDetectEvents": [],
+        "camera": camera["id"],
+        "metadata": {
+            "nfc": {"nfcId": expected_nfc_id, "userId": expected_user_id},
+            "ramDescription": "",
+            "ramClassifications": [],
+        },
+        "thumbnail": f"e-{expected_event_id}",
+        "heatmap": f"e-{expected_event_id}",
+    }
+
+    camera = get_camera()
+
+    assert camera.last_nfc_card_scanned_event is None
+    assert camera.feature_flags.support_nfc is True
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    protect_client._process_ws_message(msg)
+
+    event = camera.last_nfc_card_scanned_event
+    camera_before.last_nfc_card_scanned_event_id = None
+    camera.last_nfc_card_scanned_event_id = None
+
+    assert camera.last_nfc_card_scanned == event.start
+    camera_before.last_nfc_card_scanned = None
+    camera.last_nfc_card_scanned = None
+
+    assert camera.model_dump() == camera_before.model_dump()
+    assert event.id == expected_event_id
+    assert event.type == EventType.NFC_CARD_SCANNED
+    assert event.metadata.nfc.nfc_id == expected_nfc_id
+    assert event.start == (now - timedelta(seconds=30))
+    assert event.end == now
+
+    for channel in camera.channels:
+        assert channel._api is not None
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.datetime", MockDatetime)
+async def test_ws_event_fingerprint_identified(
+    protect_client_no_debug: ProtectApiClient,
+    now,
+    camera,
+    packet: WSPacket,
+):
+    protect_client = protect_client_no_debug
+
+    def get_camera():
+        return protect_client.bootstrap.cameras[camera["id"]]
+
+    camera_before = get_camera().model_copy()
+
+    expected_updated_id = "0441ecc6-f0fa-4b03-b071-7987c143138a"
+    expected_event_id = "6730b5af01029603e4003bdb"
+    expected_ulp_id = "0ef32f12-f291-123d-ab12-30e373e12345"
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data["newUpdateId"] = expected_updated_id
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "id": expected_event_id,
+        "modelKey": "event",
+        "type": "fingerprintIdentified",
+        "start": to_js_time(now - timedelta(seconds=30)),
+        "end": to_js_time(now),
+        "score": 0,
+        "smartDetectTypes": [],
+        "smartDetectEvents": [],
+        "camera": camera["id"],
+        "metadata": {
+            "fingerprint": {"ulpId": expected_ulp_id},
+            "ramDescription": "",
+            "ramClassifications": [],
+        },
+        "thumbnail": f"e-{expected_event_id}",
+        "heatmap": f"e-{expected_event_id}",
+    }
+
+    camera = get_camera()
+
+    assert camera.last_fingerprint_identified_event is None
+    assert camera.feature_flags.has_fingerprint_sensor is True
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    protect_client._process_ws_message(msg)
+
+    event = camera.last_fingerprint_identified_event
+    camera_before.last_fingerprint_identified_event_id = None
+    camera.last_fingerprint_identified_event_id = None
+
+    assert camera.last_fingerprint_identified == event.start
+    camera_before.last_fingerprint_identified = None
+    camera.last_fingerprint_identified = None
+
+    assert camera.model_dump() == camera_before.model_dump()
+    assert event.id == expected_event_id
+    assert event.type == EventType.FINGERPRINT_IDENTIFIED
+    assert event.metadata.fingerprint.ulp_id == expected_ulp_id
+    assert event.start == (now - timedelta(seconds=30))
+    assert event.end == now
+
+    for channel in camera.channels:
+        assert channel._api is not None
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.datetime", MockDatetime)
+async def test_ws_event_smart(
+    protect_client_no_debug: ProtectApiClient,
+    now,
+    camera,
+    packet: WSPacket,
+):
+    protect_client = protect_client_no_debug
+
+    def get_camera():
+        return protect_client.bootstrap.cameras[camera["id"]]
+
+    bootstrap_before = protect_client.bootstrap.unifi_dict()
+    camera_before = get_camera().model_copy()
+
+    expected_updated_id = "0441ecc6-f0fa-4b19-b071-7987c143138a"
+    expected_event_id = "bf9a241afe74821ceffffd05"
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data["newUpdateId"] = expected_updated_id
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "id": expected_event_id,
+        "type": "smartDetectZone",
+        "start": to_js_time(now - timedelta(seconds=30)),
+        "end": to_js_time(now),
+        "score": 0,
+        "smartDetectTypes": ["person"],
+        "smartDetectEvents": [],
+        "camera": camera["id"],
+        "partition": None,
+        "user": None,
+        "metadata": {},
+        "thumbnail": f"e-{expected_event_id}",
+        "heatmap": f"e-{expected_event_id}",
+        "modelKey": "event",
+    }
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    protect_client._process_ws_message(msg)
+
+    bootstrap_before["lastUpdateId"] = expected_updated_id
+    bootstrap = protect_client.bootstrap.unifi_dict()
+    camera = get_camera()
+
+    smart_event = camera.last_smart_detect_event
+    camera.last_smart_detect_event_id = None
+    camera.last_smart_detect = None
+    camera_before.last_smart_detect_event_id = None
+    camera_before.last_smart_detect = None
+
+    assert bootstrap == bootstrap_before
+    assert camera.model_dump() == camera_before.model_dump()
+    assert smart_event.id == expected_event_id
+    assert smart_event.type == EventType.SMART_DETECT
+    assert smart_event.start == (now - timedelta(seconds=30))
+    assert smart_event.end == now
+
+    for channel in camera.channels:
+        assert channel._api is not None
+
+
+@pytest.mark.asyncio()
+@patch("uiprotect.api.datetime", MockDatetime)
+async def test_ws_event_update(
+    protect_client_no_debug: ProtectApiClient,
+    now,
+    camera,
+    packet: WSPacket,
+):
+    protect_client = protect_client_no_debug
+
+    def get_camera() -> Camera:
+        return protect_client.bootstrap.cameras[camera["id"]]
+
+    bootstrap_before = protect_client.bootstrap.unifi_dict()
+    camera_before = get_camera().model_copy()
+
+    new_stats = camera_before.stats.unifi_dict()
+    # rxBytes and txBytes were removed in Protect 6.1+, handle both cases
+    if new_stats.get("rxBytes") is not None:
+        new_stats["rxBytes"] += 100
+    if new_stats.get("txBytes") is not None:
+        new_stats["txBytes"] += 100
+    new_stats["video"]["recordingStart"] = to_js_time(now)
+    new_stats_unifi = camera_before.unifi_dict(data={"stats": deepcopy(new_stats)})
+
+    expected_updated_id = "0441ecc6-f0fa-4b19-b071-7987c143138a"
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "update",
+        "newUpdateId": expected_updated_id,
+        "modelKey": "camera",
+        "id": camera["id"],
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = new_stats_unifi
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    protect_client._process_ws_message(msg)
+
+    camera_index = -1
+    for index, camera_dict in enumerate(bootstrap_before["cameras"]):
+        if camera_dict["id"] == camera["id"]:
+            camera_index = index
+            break
+
+    bootstrap_before["cameras"][camera_index]["stats"] = new_stats
+    bootstrap_before["lastUpdateId"] = expected_updated_id
+    bootstrap = protect_client.bootstrap.unifi_dict()
+
+    assert bootstrap == bootstrap_before
+
+
+@pytest.mark.skipif(not TEST_SENSOR_EXISTS, reason="Missing testdata")
+@patch("uiprotect.data.devices.utc_now")
+@patch("uiprotect.data.base.EVENT_PING_INTERVAL_SECONDS", 0)
+@pytest.mark.asyncio()
+async def test_ws_emit_alarm_callback(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    sensor,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+    protect_client.emit_message = Mock()  # type: ignore[method-assign]
+
+    obj = protect_client.bootstrap.sensors[sensor["id"]]
+
+    expected_updated_id = "0441ecc6-f0fa-4b19-b071-7987c143138a"
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"alarmTriggeredAt": to_js_time(now)}
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "update",
+        "newUpdateId": expected_updated_id,
+        "modelKey": "sensor",
+        "id": sensor["id"],
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"alarmTriggeredAt": to_js_time(now)}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert not obj.is_alarm_detected
+    with patch("uiprotect.data.bootstrap.utc_now", mock_now):
+        protect_client._process_ws_message(msg)
+    assert obj.is_alarm_detected
+    mock_now.return_value = utc_now() + EVENT_PING_INTERVAL
+    assert not obj.is_alarm_detected
+
+    # The event message should be emitted
+    assert protect_client.emit_message.call_count == 1
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # An empty messages should be emitted
+    assert protect_client.emit_message.call_count == 2
+
+    message: WSSubscriptionMessage = protect_client.emit_message.call_args[0][0]
+    assert message.changed_data == {}
+
+    assert not obj.is_alarm_detected
+
+
+@pytest.mark.asyncio()
+async def test_check_ws_connected(
+    protect_client_ws: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+):
+    caplog.set_level(logging.DEBUG)
+    unsub = protect_client_ws.subscribe_websocket(lambda _: None)
+    await _wait_for_ws_state(protect_client_ws, WebsocketState.CONNECTED)
+    assert protect_client_ws._private_websocket.is_connected
+    unsub()
+
+
+@pytest.mark.asyncio()
+async def test_check_ws_connected_state_callback(
+    protect_client_ws: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+):
+    websocket = protect_client_ws._private_websocket
+    assert not websocket.is_connected
+
+    caplog.set_level(logging.DEBUG)
+    states: list[bool] = []
+
+    def _on_state(state: bool):
+        states.append(state)
+
+    unsub_state = protect_client_ws.subscribe_websocket_state(_on_state)
+    unsub = protect_client_ws.subscribe_websocket(lambda _: None)
+    await _wait_for_ws_state(protect_client_ws, WebsocketState.CONNECTED)
+
+    assert states == [WebsocketState.CONNECTED]
+    await protect_client_ws.async_disconnect_ws()
+    await _wait_for_ws_state(protect_client_ws, WebsocketState.DISCONNECTED)
+
+    assert states == [WebsocketState.CONNECTED, WebsocketState.DISCONNECTED]
+    unsub()
+    unsub_state()
+
+
+class _QuietWebsocket:
+    """WS that connects but never delivers a data frame (blocks on receive)."""
+
+    is_closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self.is_closed
+
+    async def close(self) -> None:
+        self.is_closed = True
+
+    async def receive(self, timeout: float | None) -> Any:
+        await asyncio.Event().wait()  # blocks until the task is cancelled
+
+
+def _build_websocket(session: Any, **kwargs: Any):
+    states: list[WebsocketState] = []
+    ws = Websocket(
+        lambda: URL("wss://test.example/ws"),
+        AsyncMock(return_value={}),
+        lambda: None,
+        AsyncMock(return_value=session),
+        lambda _: None,
+        states.append,
+        **kwargs,
+    )
+    return ws, states
+
+
+@pytest.mark.asyncio()
+async def test_ws_connected_emitted_before_first_frame():
+    """CONNECTED must fire on connect, not gated behind the first data frame."""
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(return_value=_QuietWebsocket())
+    ws, states = _build_websocket(session)
+
+    ws.start()
+    try:
+        for _ in range(500):
+            if states:
+                break
+            await asyncio.sleep(0.01)
+        assert states == [WebsocketState.CONNECTED]
+        assert not ws._seen_non_close_message
+    finally:
+        ws.stop()
+        await ws.wait_closed()
+
+
+@pytest.mark.asyncio()
+async def test_ws_heartbeat_passed_to_ws_connect():
+    """The heartbeat kwarg is threaded through to aiohttp's ws_connect."""
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(return_value=_QuietWebsocket())
+    ws, _ = _build_websocket(session, heartbeat=180.0)
+
+    ws.start()
+    try:
+        for _ in range(500):
+            if session.ws_connect.call_count:
+                break
+            await asyncio.sleep(0.01)
+        assert session.ws_connect.call_args.kwargs["heartbeat"] == 180.0
+    finally:
+        ws.stop()
+        await ws.wait_closed()
+
+
+def test_websocket_state_auth_failed_is_distinct_member():
+    """AUTH_FAILED is a third, non-aliasing WebsocketState member."""
+    assert len(WebsocketState) == 3
+    assert WebsocketState.AUTH_FAILED not in (
+        WebsocketState.CONNECTED,
+        WebsocketState.DISCONNECTED,
+    )
+    assert WebsocketState.AUTH_FAILED.value == "auth_failed"
+
+
+def _handshake_401() -> WSServerHandshakeError:
+    return WSServerHandshakeError(
+        request_info=Mock(),
+        history=(),
+        status=401,
+        message="Unauthorized",
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        WSServerHandshakeError(
+            request_info=Mock(), history=(), status=500, message="Boom"
+        ),
+        aiohttp.ClientError(),
+        TimeoutError(),
+        ValueError("unexpected"),
+    ],
+)
+@pytest.mark.asyncio()
+async def test_run_inner_loop_non_auth_error_resets_counter(exc: Exception):
+    """Any non-401 failure returns False and zeroes the auth-failure counter."""
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(side_effect=exc)
+    ws, _ = _build_websocket(session)
+    ws._consecutive_auth_failures = 5
+
+    result = await ws._run_inner_loop(URL("wss://test.example/ws"))
+
+    assert result is False
+    assert ws._consecutive_auth_failures == 0
+
+
+@pytest.mark.asyncio()
+async def test_ws_auth_failed_emitted_after_repeated_401():
+    """Repeated 401 handshakes surface a single AUTH_FAILED edge, not CONNECTED."""
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(side_effect=_handshake_401())
+    ws, states = _build_websocket(session, backoff=0, auth_failed_backoff=0)
+
+    ws.start()
+    try:
+        for _ in range(500):
+            if WebsocketState.AUTH_FAILED in states:
+                break
+            await asyncio.sleep(0.01)
+        assert WebsocketState.AUTH_FAILED in states
+        assert WebsocketState.CONNECTED not in states
+        # a single AUTH_FAILED edge despite repeated 401s (dedup)
+        assert states.count(WebsocketState.AUTH_FAILED) == 1
+        # AUTH_FAILED needs at least the threshold (2) consecutive handshakes
+        assert session.ws_connect.call_count >= 2
+    finally:
+        ws.stop()
+        await ws.wait_closed()
+
+
+class _ClosingWebsocket:
+    """WS that connects, then delivers a CLOSE frame so the loop reconnects."""
+
+    is_closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self.is_closed
+
+    async def close(self) -> None:
+        self.is_closed = True
+
+    async def receive(self, timeout: float | None) -> Any:
+        self.is_closed = True
+        return aiohttp.WSMessage(aiohttp.WSMsgType.CLOSE, None, None)
+
+
+class _ErroringWebsocket:
+    """WS that connects, then delivers an ERROR frame so the loop bails out."""
+
+    is_closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self.is_closed
+
+    async def close(self) -> None:
+        self.is_closed = True
+
+    async def receive(self, timeout: float | None) -> Any:
+        self.is_closed = True
+        return aiohttp.WSMessage(aiohttp.WSMsgType.ERROR, "boom", None)
+
+
+@pytest.mark.asyncio()
+async def test_ws_error_frame_logs_payload_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An ERROR frame ends the receive loop and logs its payload."""
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(return_value=_ErroringWebsocket())
+    ws, states = _build_websocket(session)
+
+    with caplog.at_level(logging.ERROR, logger="uiprotect.websocket"):
+        await ws._websocket_inner_loop(URL("wss://test.example/ws"))
+
+    assert states == [WebsocketState.CONNECTED]
+    record = next(r for r in caplog.records if "Error from Websocket" in r.getMessage())
+    assert "boom" in record.getMessage()
+    # No exception is in flight here, so nothing may be attached as one:
+    # .exception() would render a bogus "NoneType: None" traceback.
+    assert record.exc_info is None
+
+
+@pytest.mark.asyncio()
+async def test_ws_auth_failed_after_connected_emits_disconnected_first():
+    """CONNECTED -> AUTH_FAILED must surface a DISCONNECTED edge in between."""
+    session = AsyncMock()
+    calls = 0
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _ClosingWebsocket()
+        raise _handshake_401()
+
+    session.ws_connect = AsyncMock(side_effect=connect)
+    ws, states = _build_websocket(session, backoff=0, auth_failed_backoff=0)
+
+    ws.start()
+    try:
+        for _ in range(500):
+            if WebsocketState.AUTH_FAILED in states:
+                break
+            await asyncio.sleep(0.01)
+        assert WebsocketState.AUTH_FAILED in states
+        # a consumer tracking only connect/disconnect edges sees the loss
+        assert WebsocketState.DISCONNECTED in states
+        # ordering: CONNECTED, then DISCONNECTED, then AUTH_FAILED
+        assert states.index(WebsocketState.CONNECTED) < states.index(
+            WebsocketState.DISCONNECTED
+        )
+        assert states.index(WebsocketState.DISCONNECTED) < states.index(
+            WebsocketState.AUTH_FAILED
+        )
+        # AUTH_FAILED stays deduped across the backoff loop (no flapping)
+        assert states.count(WebsocketState.AUTH_FAILED) == 1
+        assert states.count(WebsocketState.DISCONNECTED) == 1
+    finally:
+        ws.stop()
+        await ws.wait_closed()
+
+
+@pytest.mark.asyncio()
+async def test_ws_single_401_then_connect_does_not_emit_auth_failed():
+    """A transient 401 that reconnects successfully never trips AUTH_FAILED."""
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(side_effect=[_handshake_401(), _QuietWebsocket()])
+    ws, states = _build_websocket(session, backoff=0, auth_failed_backoff=0)
+
+    ws.start()
+    try:
+        for _ in range(500):
+            if WebsocketState.CONNECTED in states:
+                break
+            await asyncio.sleep(0.01)
+        assert WebsocketState.CONNECTED in states
+        assert WebsocketState.AUTH_FAILED not in states
+    finally:
+        ws.stop()
+        await ws.wait_closed()
+
+
+@pytest.mark.asyncio()
+async def test_reset_auth_failure_wakes_backoff():
+    """reset_auth_failure() interrupts a long post-auth-failure backoff."""
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(side_effect=_handshake_401())
+    ws, states = _build_websocket(session, backoff=0, auth_failed_backoff=1000)
+
+    ws.start()
+    try:
+        for _ in range(500):
+            if WebsocketState.AUTH_FAILED in states:
+                break
+            await asyncio.sleep(0.01)
+        assert WebsocketState.AUTH_FAILED in states
+        calls_before = session.ws_connect.call_count
+
+        ws.reset_auth_failure()  # would otherwise wait ~1000s
+
+        for _ in range(500):
+            if session.ws_connect.call_count > calls_before:
+                break
+            await asyncio.sleep(0.01)
+        # the parked 1000s backoff was interrupted: a fresh dial happened
+        assert session.ws_connect.call_count > calls_before
+    finally:
+        ws.stop()
+        await ws.wait_closed()
+
+
+@pytest.mark.asyncio()
+async def test_check_ws_no_ws_initial(
+    protect_client: ProtectApiClient,
+    caplog: pytest.LogCaptureFixture,
+):
+    caplog.set_level(logging.DEBUG)
+
+    await protect_client.async_disconnect_ws()
+    assert not protect_client._private_websocket
+
+
+@pytest.mark.skipif(not TEST_CAMERA_EXISTS, reason="Missing testdata")
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_ignores_nvr_mac_and_guid(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    camera,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "update",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "camera",
+        "id": camera["id"],
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"nvrMac": "any", "guid": "any", "isSmartDetected": False}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+    protect_client._process_ws_message(msg)
+
+    assert len(messages) == 1
+
+    action_frame: WSJSONPacketFrame = packet.action_frame
+    action_frame.data = {
+        "action": "update",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138b",
+        "modelKey": "camera",
+        "id": camera["id"],
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame
+    data_frame.data = {"nvrMac": "any", "guid": "any"}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    protect_client._process_ws_message(msg)
+
+    assert len(messages) == 1
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_keyring_update(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+
+    keyring_id = "some_id"
+    old_ulp_user = "b45f9411-133d-400d-b92f-a434877123"
+    new_ulp_user = "b45f9411-133d-400d-b92f-a434877321"
+
+    keyring = Keyring(
+        id=keyring_id,
+        ulp_user=old_ulp_user,
+        device_type="test",
+        device_id="test",
+        registry_type="test",
+        registry_id="test",
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+
+    protect_client.bootstrap.keyrings = Keyrings()
+    protect_client.bootstrap.keyrings.add(keyring)
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "update",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "keyring",
+        "id": "some_id",
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"ulpUser": new_ulp_user}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id).ulp_user == old_ulp_user
+
+    protect_client._process_ws_message(msg)
+
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id).ulp_user == new_ulp_user
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_keyring_remove(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+
+    keyring_id = "some_id"
+    ulp_user = "b45f9411-133d-400d-b92f-a434877123"
+
+    keyring = Keyring(
+        id=keyring_id,
+        ulp_user=ulp_user,
+        device_type="test",
+        device_id="test",
+        registry_type="test",
+        registry_id="test",
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+
+    protect_client.bootstrap.keyrings = Keyrings()
+    protect_client.bootstrap.keyrings.add(keyring)
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "remove",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "keyring",
+        "id": keyring_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id) is not None
+
+    protect_client._process_ws_message(msg)
+
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id) is None
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_keyring_add_nfc(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+    protect_client.bootstrap.keyrings = Keyrings()
+
+    keyring_id = "some_id"
+    ulp_user = "b45f9411-133d-400d-b92f-a434877123"
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "add",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "keyring",
+        "id": keyring_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "id": keyring_id,
+        "modelKey": "keyring",
+        "deviceType": "camera",
+        "deviceId": "663d0aa400918803e4006454",
+        "registryType": "nfc",
+        "registryId": "046A5702E27548",
+        "lastActivity": None,
+        "metadata": {"nfc": {"isUACard": False}},
+        "ulpUser": ulp_user,
+        "createdAt": to_js_time(now),
+        "updatedAt": to_js_time(now),
+    }
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    assert keyring_id not in protect_client.bootstrap.keyrings.as_list()
+
+    protect_client._process_ws_message(msg)
+
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id) is not None
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id).ulp_user == ulp_user
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_keyring_add_fingerprint(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+    protect_client.bootstrap.keyrings = Keyrings()
+
+    keyring_id = "some_id"
+    ulp_user = "b45f9411-133d-400d-b92f-a434877123"
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "add",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "keyring",
+        "id": keyring_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "id": keyring_id,
+        "modelKey": "keyring",
+        "deviceType": "camera",
+        "deviceId": "663d0aa400918803e4004578",
+        "registryType": "fingerprint",
+        "registryId": "2",
+        "lastActivity": None,
+        "ulpUser": ulp_user,
+    }
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id) is None
+
+    protect_client._process_ws_message(msg)
+
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id) is not None
+    assert protect_client.bootstrap.keyrings.by_id(keyring_id).ulp_user == ulp_user
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_ulp_user_add(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+    protect_client.bootstrap.ulp_users = UlpUsers()
+    some_id = "some_id"
+    some_ulp_id = "42313461-eaa0-45f6-b12d-a0783ed3d4s2"
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "add",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "ulpUser",
+        "id": some_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {
+        "ulpId": some_ulp_id,
+        "firstName": "viewonly",
+        "lastName": "",
+        "fullName": "viewonly",
+        "avatar": "",
+        "status": "ACTIVE",
+        "id": some_id,
+        "modelKey": "ulpUser",
+    }
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    assert protect_client.bootstrap.ulp_users.by_id(some_id) is None
+
+    protect_client._process_ws_message(msg)
+
+    assert protect_client.bootstrap.ulp_users.by_id(some_id) is not None
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_ulp_user_update(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+
+    some_ulp_id = "42313461-eaa0-45f6-b12d-a0783ed3d4s2"
+
+    ulp_usr = UlpUser(
+        id=some_ulp_id,
+        ulp_id=some_ulp_id,
+        first_name="viewonly",
+        last_name="",
+        full_name="viewonly",
+        status="ACTIVE",
+        model_key="ulpUser",
+    )
+
+    protect_client.bootstrap.ulp_users = UlpUsers()
+    protect_client.bootstrap.ulp_users.add(ulp_usr)
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "update",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "ulpUser",
+        "id": some_ulp_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"status": "DEACTIVATED"}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    assert protect_client.bootstrap.ulp_users.by_id(some_ulp_id).status == "ACTIVE"
+
+    protect_client._process_ws_message(msg)
+
+    assert protect_client.bootstrap.ulp_users.by_id(some_ulp_id).status == "DEACTIVATED"
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_ulp_user_remove(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+
+    some_ulp_id = "42313461-eaa0-45f6-b12d-a0783ed3d4s2"
+
+    ulp_usr = UlpUser(
+        id=some_ulp_id,
+        ulp_id=some_ulp_id,
+        first_name="viewonly",
+        last_name="",
+        full_name="viewonly",
+        status="ACTIVE",
+        model_key="ulpUser",
+    )
+
+    protect_client.bootstrap.ulp_users = UlpUsers()
+    protect_client.bootstrap.ulp_users.add(ulp_usr)
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "remove",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "ulpUser",
+        "id": some_ulp_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    assert protect_client.bootstrap.ulp_users.by_id(some_ulp_id) is not None
+
+    protect_client._process_ws_message(msg)
+
+    assert protect_client.bootstrap.ulp_users.by_id(some_ulp_id) is None
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_ulp_user_remove_user_not_exist(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+
+    some_ulp_id = "42313461-eaa0-45f6-b12d-a0783ed3d4s2"
+
+    protect_client.bootstrap.ulp_users = UlpUsers()
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "remove",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "ulpUser",
+        "id": some_ulp_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    protect_client._process_ws_message(msg)
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_ulp_user_update_user_not_exist(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+
+    some_ulp_id = "42313461-eaa0-45f6-b12d-a0783ed3d4s2"
+
+    protect_client.bootstrap.ulp_users = UlpUsers()
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "update",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "ulpUser",
+        "id": some_ulp_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"status": "DEACTIVATED"}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    protect_client._process_ws_message(msg)
+
+    unsub()
+
+
+@patch("uiprotect.data.devices.utc_now")
+@pytest.mark.asyncio()
+async def test_ws_ulp_user_unknown_action(
+    mock_now,
+    protect_client_no_debug: ProtectApiClient,
+    now: datetime,
+    packet: WSPacket,
+):
+    mock_now.return_value = now
+    protect_client = protect_client_no_debug
+
+    some_ulp_id = "42313461-eaa0-45f6-b12d-a0783ed3d4s2"
+
+    protect_client.bootstrap.ulp_users = UlpUsers()
+
+    messages: list[WSSubscriptionMessage] = []
+
+    def capture_ws(message: WSSubscriptionMessage) -> None:
+        messages.append(message)
+
+    unsub = protect_client.subscribe_websocket(capture_ws)
+
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "not_supported",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "ulpUser",
+        "id": some_ulp_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"status": "DEACTIVATED"}
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    assert len(messages) == 0
+
+    packet = WSPacket(msg.data)
+
+    protect_client._process_ws_message(msg)
+
+    unsub()
+
+
+def _setup_auth_state(
+    client: ProtectApiClient,
+    cookie: str = "test-cookie",
+    csrf: str = "test-csrf-token",
+) -> None:
+    """Helper to set up authentication state for testing."""
+    client._is_authenticated = True
+    client.set_header("cookie", cookie)
+    client.set_header("x-csrf-token", csrf)
+
+
+def _assert_auth_cleared(client: ProtectApiClient) -> None:
+    """Helper to assert authentication state is cleared."""
+    assert client._is_authenticated is False
+    assert client.headers.get("cookie") is None
+    assert client.headers.get("x-csrf-token") is None
+
+
+@pytest.mark.asyncio()
+async def test_auth_websocket_without_force(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _auth_websocket without force parameter doesn't clear auth state."""
+    protect_client = protect_client_no_debug
+    _setup_auth_state(protect_client)
+
+    headers = await protect_client._auth_websocket(force=False)
+
+    assert protect_client._is_authenticated is True
+    assert headers is not None
+    assert protect_client.headers.get("cookie") == "test-cookie"
+    assert protect_client.headers.get("x-csrf-token") == "test-csrf-token"
+
+
+@pytest.mark.asyncio()
+async def test_auth_websocket_with_force_clears_auth_state(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _auth_websocket with force=True clears authentication state."""
+    protect_client = protect_client_no_debug
+    _setup_auth_state(protect_client)
+
+    headers = await protect_client._auth_websocket(force=True)
+
+    assert headers is not None
+    _assert_auth_cleared(protect_client)
+
+
+@pytest.mark.asyncio()
+async def test_auth_websocket_with_force_clears_session_cookies(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _auth_websocket with force=True clears session cookie jar."""
+    protect_client = protect_client_no_debug
+    session = await protect_client.get_session()
+    cookies = SimpleCookie()
+    cookies["test_cookie"] = "test_value"
+    session.cookie_jar.update_cookies(cookies)
+    # Verify cookie was actually added before testing removal
+    assert len(list(session.cookie_jar)) > 0
+
+    await protect_client._auth_websocket(force=True)
+
+    assert len(list(session.cookie_jar)) == 0
+
+
+@pytest.mark.asyncio()
+async def test_auth_websocket_returns_headers(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _auth_websocket returns the headers dictionary."""
+    protect_client = protect_client_no_debug
+    _setup_auth_state(protect_client, cookie="auth-cookie", csrf="csrf-token")
+
+    headers = await protect_client._auth_websocket(force=False)
+
+    assert headers is not None
+    assert isinstance(headers, dict)
+    assert headers == protect_client.headers
+
+
+@pytest.mark.asyncio()
+async def test_auth_websocket_calls_ensure_authenticated(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _auth_websocket calls ensure_authenticated."""
+    protect_client = protect_client_no_debug
+    protect_client.ensure_authenticated.reset_mock()
+
+    await protect_client._auth_websocket(force=False)
+
+    protect_client.ensure_authenticated.assert_called_once()
+
+
+@pytest.mark.asyncio()
+async def test_auth_websocket_with_force_calls_ensure_authenticated(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _auth_websocket with force=True calls ensure_authenticated after clearing state."""
+    protect_client = protect_client_no_debug
+    protect_client._is_authenticated = True
+    protect_client.ensure_authenticated.reset_mock()
+
+    await protect_client._auth_websocket(force=True)
+
+    protect_client.ensure_authenticated.assert_called_once()
+
+
+@pytest.mark.asyncio()
+async def test_auth_websocket_with_no_session(
+    protect_client_no_debug: ProtectApiClient,
+) -> None:
+    """Test _auth_websocket with force=True when session is None."""
+    protect_client = protect_client_no_debug
+    if protect_client._session is not None:
+        await protect_client._session.close()
+    protect_client._session = None
+    _setup_auth_state(protect_client)
+
+    headers = await protect_client._auth_websocket(force=True)
+
+    assert headers is not None
+    _assert_auth_cleared(protect_client)
+
+
+def _send_ws_packet(
+    protect_client: ProtectApiClient,
+    packet: WSPacket,
+    action: str,
+    model_key: str,
+    device_id: str,
+    data: dict[str, Any],
+) -> list[WSSubscriptionMessage]:
+    """Build a WS packet from action/data dicts and send it through the client."""
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": action,
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": model_key,
+        "id": device_id,
+    }
+
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = data
+
+    msg = MagicMock()
+    msg.data = packet.pack_frames()
+
+    messages: list[WSSubscriptionMessage] = []
+    unsub = protect_client.subscribe_websocket(messages.append)
+    protect_client._process_ws_message(msg)
+    unsub()
+    return messages
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "model_key",
+    ["automationEvent", "automation", "linkstation", "siren", "smartDetectObjects"],
+)
+async def test_ws_unknown_model_type_ignored(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+    model_key: str,
+):
+    """Unknown model types (not in ModelType enum) are silently ignored."""
+    messages = _send_ws_packet(
+        protect_client_no_debug, packet, "update", model_key, "some-id", {"k": "v"}
+    )
+    assert len(messages) == 0
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("action", ["add", "update", "remove"])
+async def test_ws_aiport_ignored(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+    action: str,
+    caplog: pytest.LogCaptureFixture,
+):
+    """AiPort frames are dropped without a message, a log line or a refresh."""
+    caplog.set_level(logging.DEBUG, logger="uiprotect.data.bootstrap")
+    mock_refresh = AsyncMock()
+
+    with patch.object(
+        type(protect_client_no_debug.bootstrap), "refresh_device", mock_refresh
+    ):
+        messages = _send_ws_packet(
+            protect_client_no_debug,
+            packet,
+            action,
+            "aiport",
+            "aiport-id",
+            {"id": "aiport-id", "modelKey": "aiport", "name": "AI Port"},
+        )
+
+    assert messages == []
+    mock_refresh.assert_not_called()
+    assert not [r for r in caplog.records if r.name == "uiprotect.data.bootstrap"]
+
+
+@pytest.mark.asyncio()
+async def test_ws_known_model_type_without_class_add(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+):
+    """ModelType in enum but not in MODEL_TO_CLASS raises DataDecodeError on add, caught gracefully."""
+    mock_refresh = AsyncMock()
+
+    with patch.object(
+        type(protect_client_no_debug.bootstrap), "refresh_device", mock_refresh
+    ):
+        messages = _send_ws_packet(
+            protect_client_no_debug,
+            packet,
+            "add",
+            "schedule",
+            "some-schedule-id",
+            {"id": "some-schedule-id", "modelKey": "schedule", "name": "test"},
+        )
+
+    assert len(messages) == 0
+    mock_refresh.assert_called_once_with(ModelType.SCHEDULE, "some-schedule-id")
+
+
+@pytest.mark.asyncio()
+async def test_ws_known_model_type_without_class_update_ignored(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+):
+    """Known ModelType not in bootstrap_models_types_and_event_set falls through without error on update."""
+    messages = _send_ws_packet(
+        protect_client_no_debug,
+        packet,
+        "update",
+        "schedule",
+        "some-schedule-id",
+        {"name": "updated-name"},
+    )
+    assert len(messages) == 0
+
+
+@pytest.mark.asyncio()
+async def test_refresh_device_catches_data_decode_error(
+    protect_client_no_debug: ProtectApiClient,
+):
+    """refresh_device catches DataDecodeError from get_device for model types without a class."""
+    protect_client = protect_client_no_debug
+    protect_client.get_device = AsyncMock(  # type: ignore[method-assign]
+        side_effect=DataDecodeError("Unknown modelKey"),
+    )
+
+    # Should not raise — DataDecodeError is caught and logged as warning
+    await protect_client.bootstrap.refresh_device(ModelType.SCHEDULE, "some-id")
+
+
+_MODELS_WITHOUT_MAC = pytest.mark.parametrize(
+    ("model_type", "devices_key"),
+    [
+        (ModelType.LIVEVIEW, "liveviews"),
+        (ModelType.USER, "users"),
+    ],
+)
+
+
+@pytest.mark.asyncio()
+@_MODELS_WITHOUT_MAC
+async def test_ws_remove_model_without_mac(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+    model_type: ModelType,
+    devices_key: str,
+):
+    """Remove frames for bootstrap models without a MAC are emitted."""
+    bootstrap = protect_client_no_debug.bootstrap
+    obj = next(iter(getattr(bootstrap, devices_key).values()))
+    assert not hasattr(obj, "mac")
+    mac_lookup_before = dict(bootstrap.mac_lookup)
+
+    messages = _send_ws_packet(
+        protect_client_no_debug,
+        WSPacket(packet.pack_frames()),
+        "remove",
+        model_type.value,
+        obj.id,
+        {},
+    )
+
+    assert len(messages) == 1
+    assert messages[0].action is WSAction.REMOVE
+    assert messages[0].old_obj is obj
+    assert obj.id not in getattr(bootstrap, devices_key)
+    assert obj.id not in bootstrap.id_lookup
+    assert bootstrap.mac_lookup == mac_lookup_before
+
+
+@pytest.mark.asyncio()
+@_MODELS_WITHOUT_MAC
+async def test_ws_add_model_without_mac(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+    model_type: ModelType,
+    devices_key: str,
+):
+    """Add frames for bootstrap models without a MAC are emitted."""
+    bootstrap = protect_client_no_debug.bootstrap
+    devices = getattr(bootstrap, devices_key)
+    obj = devices.pop(next(iter(devices)))
+    assert not hasattr(obj, "mac")
+    del bootstrap.id_lookup[obj.id]
+    mac_lookup_before = dict(bootstrap.mac_lookup)
+
+    messages = _send_ws_packet(
+        protect_client_no_debug,
+        WSPacket(packet.pack_frames()),
+        "add",
+        model_type.value,
+        obj.id,
+        obj.unifi_dict(),
+    )
+
+    assert len(messages) == 1
+    assert messages[0].action is WSAction.ADD
+    assert messages[0].new_obj is devices[obj.id]
+    assert bootstrap.id_lookup[obj.id].model is model_type
+    assert bootstrap.mac_lookup == mac_lookup_before
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("ignore_unadopted", "is_adopted", "is_adopted_by_other", "stored"),
+    [
+        (True, False, False, False),
+        (True, True, True, False),
+        (True, True, False, True),
+        (False, False, False, True),
+    ],
+)
+async def test_ws_add_device_adoption_gate(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+    ignore_unadopted: bool,
+    is_adopted: bool,
+    is_adopted_by_other: bool,
+    stored: bool,
+):
+    """Add frames store a device only when it passes the adoption gate."""
+    protect_client_no_debug.ignore_unadopted = ignore_unadopted
+    bootstrap = protect_client_no_debug.bootstrap
+    raw = next(iter(bootstrap.cameras.values())).unifi_dict()
+    camera_id = "663d0aa400918803e4006999"
+    mac = "AABBCCDDEEFF"
+    raw.update(
+        id=camera_id,
+        mac=mac,
+        isAdopted=is_adopted,
+        isAdoptedByOther=is_adopted_by_other,
+    )
+
+    _send_ws_packet(
+        protect_client_no_debug,
+        WSPacket(packet.pack_frames()),
+        "add",
+        "camera",
+        camera_id,
+        raw,
+    )
+
+    assert (camera_id in bootstrap.cameras) is stored
+    assert (camera_id in bootstrap.id_lookup) is stored
+    assert (normalize_mac(mac) in bootstrap.mac_lookup) is stored
+
+
+@pytest.mark.asyncio()
+async def test_ws_remove_and_add_event(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+    now: datetime,
+    camera: dict[str, Any],
+):
+    """Remove and add frames for an event are emitted."""
+    bootstrap = protect_client_no_debug.bootstrap
+    event_id = "bf9a241afe74821ceffffd05"
+    event_data = {
+        "id": event_id,
+        "type": "motion",
+        "start": to_js_time(now - timedelta(seconds=1)),
+        "end": to_js_time(now),
+        "score": 0,
+        "smartDetectTypes": [],
+        "smartDetectEvents": [],
+        "camera": camera["id"],
+        "partition": None,
+        "user": None,
+        "metadata": {},
+        "thumbnail": f"e-{event_id}",
+        "heatmap": f"e-{event_id}",
+        "modelKey": "event",
+    }
+    mac_lookup_before = dict(bootstrap.mac_lookup)
+
+    messages = _send_ws_packet(
+        protect_client_no_debug,
+        WSPacket(packet.pack_frames()),
+        "add",
+        "event",
+        event_id,
+        event_data,
+    )
+
+    assert len(messages) == 1
+    assert messages[0].action is WSAction.ADD
+    event = bootstrap.events[event_id]
+    assert messages[0].new_obj is event
+
+    messages = _send_ws_packet(
+        protect_client_no_debug,
+        WSPacket(packet.pack_frames()),
+        "remove",
+        "event",
+        event_id,
+        {},
+    )
+
+    assert len(messages) == 1
+    assert messages[0].action is WSAction.REMOVE
+    assert messages[0].old_obj is event
+    assert event_id not in bootstrap.events
+    assert bootstrap.mac_lookup == mac_lookup_before
+
+
+@pytest.mark.asyncio()
+async def test_ws_remove_and_add_device_updates_mac_lookup(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+):
+    """Remove and add frames for a device keep ``mac_lookup`` in sync."""
+    bootstrap = protect_client_no_debug.bootstrap
+    camera = next(iter(bootstrap.cameras.values()))
+    raw = camera.unifi_dict()
+    mac = normalize_mac(camera.mac)
+    assert mac in bootstrap.mac_lookup
+
+    messages = _send_ws_packet(
+        protect_client_no_debug,
+        WSPacket(packet.pack_frames()),
+        "remove",
+        "camera",
+        camera.id,
+        {},
+    )
+
+    assert len(messages) == 1
+    assert messages[0].old_obj is camera
+    assert mac not in bootstrap.mac_lookup
+
+    messages = _send_ws_packet(
+        protect_client_no_debug,
+        WSPacket(packet.pack_frames()),
+        "add",
+        "camera",
+        camera.id,
+        raw,
+    )
+
+    assert len(messages) == 1
+    assert bootstrap.mac_lookup[mac].id == camera.id
+
+
+@pytest.mark.asyncio()
+async def test_ws_update_for_unknown_device_is_ignored(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+    caplog: pytest.LogCaptureFixture,
+):
+    """An update frame for a device missing from the bootstrap is dropped."""
+    caplog.set_level(logging.DEBUG)
+    bootstrap = protect_client_no_debug.bootstrap
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": "update",
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": "camera",
+        "id": "not-a-camera",
+    }
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"isRecording": True}
+
+    assert bootstrap.process_ws_packet(WSPacket(packet.pack_frames())) is None
+    assert "Unexpected camera: not-a-camera" in caplog.text
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("action", ["add", "update", "remove"])
+@pytest.mark.parametrize("model_key", ["bridge", "group", "userLocation"])
+async def test_ws_unmodelled_private_frames_are_ignored(
+    protect_client_no_debug: ProtectApiClient,
+    packet: WSPacket,
+    action: str,
+    model_key: str,
+):
+    """Private bridge, group and user location frames are dropped unrefreshed."""
+    bootstrap = protect_client_no_debug.bootstrap
+    action_frame: WSJSONPacketFrame = packet.action_frame  # type: ignore[assignment]
+    action_frame.data = {
+        "action": action,
+        "newUpdateId": "0441ecc6-f0fa-4b19-b071-7987c143138a",
+        "modelKey": model_key,
+        "id": "obj-1",
+    }
+    data_frame: WSJSONPacketFrame = packet.data_frame  # type: ignore[assignment]
+    data_frame.data = {"id": "obj-1", "modelKey": model_key, "name": "Obj"}
+
+    assert bootstrap.process_ws_packet(WSPacket(packet.pack_frames())) is None
+    assert not bootstrap._refresh_tasks

@@ -1,0 +1,110 @@
+// Copyright (c) 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <gtest/gtest.h>
+#include <cerrno>
+#include <limits>
+#include <string>
+#include <vector>
+#include "dali/util/numpy.h"
+#include "dali/core/stream.h"
+
+
+namespace dali {
+namespace numpy {
+
+TEST(NumpyLoaderTest, ParseHeader) {
+  {
+    HeaderData target;
+    ParseHeaderContents(target, "{'descr':'<i2', 'fortran_order':True, 'shape':(4,7),}");
+    ASSERT_EQ(target.type(), DALI_INT16);
+    ASSERT_EQ(target.fortran_order, true);
+    ASSERT_EQ(target.shape, (TensorShape<>{7, 4}));
+  }
+  {
+    HeaderData target;
+    ParseHeaderContents(target,
+        "  {  'descr' : '<f4'   ,   'fortran_order'  : False, 'shape' : (4,)}");
+    ASSERT_EQ(target.type(), DALI_FLOAT);
+    ASSERT_EQ(target.fortran_order, false);
+    ASSERT_EQ(target.shape, (TensorShape<>{4}));
+  }
+  {
+    HeaderData target;
+    ParseHeaderContents(target, "{'descr':'<f8','fortran_order':False,'shape':(),}");
+    ASSERT_EQ(target.type(), DALI_FLOAT64);
+    ASSERT_EQ(target.fortran_order, false);
+    ASSERT_TRUE(target.shape.empty());
+  }
+}
+
+TEST(NumpyLoaderTest, ParseHeaderError) {
+  HeaderData target;
+  std::vector<std::string> wrong = {
+    "random_string",
+    "{descr:'<f4'}",
+    "{'descr':'','fortran_order':False,'shape':(4,7),}",
+    "{'descr':'<f4\\",
+    "{'descr':'<f4','fortran_order':false,'shape':(4,7),}"
+    "{'descr':'<f4','fortran_order':false,'shape':(a, b, c),}"
+    "{'descr':'<f4','fortran_order':False,'shape':[4,7],}"
+  };
+  for (const auto &header : wrong) {
+    EXPECT_THROW(ParseHeaderContents(target, header), std::runtime_error);
+  }
+}
+
+TEST(NumpyLoaderTest, RejectsInvalidOrOverflowingShape) {
+  HeaderData target;
+  EXPECT_THROW(
+      ParseHeaderContents(target, "{'descr':'<f4','fortran_order':False,'shape':(-1,),}"),
+      std::runtime_error);
+
+  ParseHeaderContents(
+      target, "{'descr':'<f4','fortran_order':False,'shape':(4294967296,4294967296),}");
+  EXPECT_THROW(target.size(), std::runtime_error);
+  EXPECT_THROW(target.nbytes(), std::runtime_error);
+
+  auto byte_overflow_shape =
+      std::to_string(std::numeric_limits<size_t>::max() / sizeof(uint64_t) + 1);
+  ParseHeaderContents(target, "{'descr':'<u8','fortran_order':False,'shape':(" +
+                                  byte_overflow_shape + ",),}");
+  EXPECT_NO_THROW(target.size());
+  EXPECT_THROW(target.nbytes(), std::runtime_error);
+}
+
+TEST(NumpyLoaderTest, ParseHeaderPreservesErrno) {
+  HeaderData target;
+  const auto saved_errno = errno;
+  errno = EDOM;
+  ParseHeaderContents(target, "{'descr':'<f4','fortran_order':False,'shape':(1,),}");
+  const auto parsed_errno = errno;
+  errno = saved_errno;
+  EXPECT_EQ(parsed_errno, EDOM);
+}
+
+TEST(NumpyLoaderTest, ParseHeaderDoesNotReadPastStringView) {
+  HeaderData target;
+  std::string header = "{'descr':'<f4','fortran_order':False,'shape':(";
+  std::string valid_suffix_outside_view = "1,),}";
+  std::string backing_storage = header + valid_suffix_outside_view;
+
+  EXPECT_THROW(
+      ParseHeaderContents(
+          target, std::string_view(backing_storage.data(), header.size())),
+      std::runtime_error);
+}
+
+}  // namespace numpy
+}  // namespace dali

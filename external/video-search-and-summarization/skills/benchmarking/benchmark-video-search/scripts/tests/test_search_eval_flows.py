@@ -1,0 +1,3467 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the pluggable search-eval flow backends.
+
+The new search flow needs a live deployment to exercise end to end, so
+everything that CAN be checked without one is checked here: result
+normalization across both wire formats, the silent-unfiltered-scoring trap,
+CLI argument construction per retrieval path, stdout parsing, decomposition
+routing, and VST name matching.
+
+    python3 -m pytest scripts/tests/test_search_eval_flows.py
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any, ClassVar
+
+import pytest
+import requests
+
+# scripts/tests -> scripts
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import flows
+
+# Representative hits in each wire format. Field names taken from
+# vss_core.search_core.models.search.SearchResult (new) and
+# vss_agents.tools.search.SearchResult / CriticResult (legacy).
+NEW_FLOW_HIT: dict[str, Any] = {
+    "video_name": "warehouse_01.mp4",
+    "description": "a forklift moves left",
+    "start_time": "2025-01-01T00:00:10Z",
+    "end_time": "2025-01-01T00:00:15Z",
+    "sensor_id": "abc-123",
+    "screenshot_url": "https://vst/screenshot.jpg",
+    "similarity": 0.82,
+    "object_ids": ["7"],
+    "verification": {"result": "confirmed", "criteria_met": {"forklift": True}},
+}
+
+LEGACY_HIT: dict[str, Any] = {
+    **{k: v for k, v in NEW_FLOW_HIT.items() if k != "verification"},
+    "critic_result": {"result": "rejected", "criteria_met": {"forklift": False}},
+}
+
+NO_VERIFICATION_HIT: dict[str, Any] = {k: v for k, v in NEW_FLOW_HIT.items() if k != "verification"}
+
+SCORING_FIELDS = ("video_name", "start_time", "end_time", "similarity")
+
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+
+
+def test_new_flow_verification_is_read() -> None:
+    result = flows.normalize_result(NEW_FLOW_HIT)
+    assert result["verification"]["result"] == "confirmed"
+    assert result["_verification_source"] == "verification"
+
+
+def test_legacy_critic_result_is_read() -> None:
+    result = flows.normalize_result(LEGACY_HIT)
+    assert result["verification"]["result"] == "rejected"
+    assert result["_verification_source"] == "critic_result"
+
+
+def test_both_flows_normalize_to_identical_scoring_fields() -> None:
+    """The whole point: metrics must not be able to tell the flows apart."""
+    new = flows.normalize_result(NEW_FLOW_HIT)
+    legacy = flows.normalize_result(LEGACY_HIT)
+    assert {k: new[k] for k in SCORING_FIELDS} == {k: legacy[k] for k in SCORING_FIELDS}
+
+
+def test_missing_verification_block_is_flagged_absent() -> None:
+    result = flows.normalize_result(NO_VERIFICATION_HIT)
+    assert result["verification"]["result"] == "unverified"
+    assert result["_verification_source"] == flows.VERIFICATION_ABSENT
+
+
+def test_null_verification_is_absent_not_a_verdict() -> None:
+    """``verification: null`` means the critic never ran for this hit.
+
+    Treating it as an empty verdict would re-enable critic-filtered metrics on
+    a response that was never verified.
+    """
+    result = flows.normalize_result({**NEW_FLOW_HIT, "verification": None})
+    assert result["_verification_source"] == flows.VERIFICATION_ABSENT
+
+
+def test_similarity_score_alias_accepted() -> None:
+    result = flows.normalize_result({**NO_VERIFICATION_HIT, "similarity_score": 0.5, "similarity": None})
+    assert result["similarity"] in (0.5, None)
+
+
+def test_for_scoring_drops_bookkeeping_keys() -> None:
+    scored = flows.for_scoring(flows.normalize_results([NEW_FLOW_HIT]))
+    assert all(not k.startswith("_") for k in scored[0])
+    assert scored[0]["video_name"] == "warehouse_01.mp4"
+
+
+# ---------------------------------------------------------------------------
+# The regression this layer exists to prevent
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_reader_silently_misses_new_flow_rejections() -> None:
+    """Documents the bug, so nobody 'simplifies' the normalizer away.
+
+    A reader that knows only ``critic_result`` finds zero rejections against
+    the new flow and scores an UNFILTERED set under a filtered label.
+    """
+    raw = [NEW_FLOW_HIT, {**NEW_FLOW_HIT, "verification": {"result": "rejected"}}]
+    missed_by_legacy_reader = sum(
+        1 for r in raw if (r.get("critic_result") or {}).get("result") == "rejected"
+    )
+    assert missed_by_legacy_reader == 0
+
+    _, rejected = flows.filter_rejected(flows.normalize_results(raw))
+    assert rejected == 1
+
+
+def test_absent_verification_is_detectable() -> None:
+    assert not flows.has_verification(flows.normalize_results([NO_VERIFICATION_HIT]))
+    assert flows.has_verification(flows.normalize_results([NEW_FLOW_HIT]))
+
+
+# ---------------------------------------------------------------------------
+# CLI argument construction
+# ---------------------------------------------------------------------------
+
+
+def test_embed_path_argv() -> None:
+    backend = flows.CliQueryBackend(["vss"], search_path="embed", top_k=10, min_cosine_similarity=0.3)
+    argv = backend.build_argv("red forklift")
+    assert argv[:4] == ["vss", "search", "run", "embed"]
+    assert "--query" in argv and "red forklift" in argv
+    assert "--attribute" not in argv
+    assert argv[argv.index("--top-k") + 1] == "10"
+
+
+def test_attribute_path_takes_no_query() -> None:
+    backend = flows.CliQueryBackend(["vss"], search_path="attribute", attributes=["white jacket"])
+    argv = backend.build_argv("ignored for this path")
+    assert "--query" not in argv
+    assert "white jacket" in argv
+
+
+def test_fusion_path_carries_both_legs() -> None:
+    backend = flows.CliQueryBackend(["vss"], search_path="fusion", attributes=["red hard hat"])
+    argv = backend.build_argv("person running")
+    assert "--query" in argv and "--attribute" in argv
+
+
+def test_merging_is_on_by_default_like_the_agent() -> None:
+    """Merging is what makes the search fetch the agent's doubled pool."""
+    assert "--no-merge-adjacent" not in flows.CliQueryBackend(["vss"]).build_argv("q")
+    assert "--no-merge-adjacent" in flows.CliQueryBackend(["vss"], merge_adjacent=False).build_argv("q")
+
+
+def test_merge_adjacent_flag_defaults_on_and_can_be_turned_off() -> None:
+    import run_eval_flows as rf
+
+    assert rf.parse_args(["--endpoint", "https://host:8000"]).merge_adjacent is True
+    assert rf.parse_args(["--endpoint", "https://host:8000", "--no-merge-adjacent"]).merge_adjacent is False
+
+
+def test_invalid_search_path_rejected_before_any_request() -> None:
+    try:
+        flows.CliQueryBackend(["vss"], search_path="nonsense")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for an unknown search path")
+
+
+def test_cli_failure_keeps_its_exit_code(monkeypatch: Any) -> None:
+    class _Proc:
+        returncode, stdout, stderr = 5, "", "search index does not exist"
+
+    monkeypatch.setattr("flows.query.subprocess.run", lambda *_a, **_k: _Proc())
+    with pytest.raises(flows.CliExitError) as error:
+        flows.CliQueryBackend(["vss"]).search("a person")
+    assert error.value.returncode == 5
+
+
+# ---------------------------------------------------------------------------
+# CLI output parsing
+# ---------------------------------------------------------------------------
+
+
+def test_parses_searchoutput_envelope() -> None:
+    hits, messages, timings = flows.parse_cli_output(
+        '{"data": [{"video_name": "a.mp4"}], "search_messages": ["hi"]}'
+    )
+    assert len(hits) == 1
+    assert messages == ["hi"]
+    assert timings == {}
+
+
+def test_parses_stage_timings_when_present() -> None:
+    """Deployments carrying the search_core timings change report per-stage cost."""
+    hits, _messages, timings = flows.parse_cli_output(
+        '{"data": [], "search_messages": [], "timings": {"stages": '
+        '{"embed_search: ES search execution": '
+        '{"total_s": 0.7395, "self_s": 0.7395, "calls": 1, "concurrent_children": 0.0}}, '
+        '"total_s": 1.4964}}'
+    )
+    assert hits == []
+    assert timings["total_s"] == 1.4964
+    stage = timings["stages"]["embed_search: ES search execution"]
+    assert stage["self_s"] == 0.7395
+    assert stage["concurrent_children"] == 0.0
+
+
+def test_absent_timings_are_empty_not_zero() -> None:
+    """A deployment without the change must not look like a search that took no time."""
+    _hits, _messages, timings = flows.parse_cli_output('{"data": []}')
+    assert timings == {}
+
+
+def test_timings_are_kept_per_query_not_in_one_slot() -> None:
+    """Queries run concurrently; a single slot would cross-contaminate them."""
+    backend = flows.CliQueryBackend(["vss"])
+    assert backend.timings_by_query == {}
+    backend.timings_by_query["q1"] = {"total_s": 1.0}
+    backend.timings_by_query["q2"] = {"total_s": 2.0}
+    assert backend.timings_by_query["q1"]["total_s"] == 1.0
+
+
+def test_parses_bare_list() -> None:
+    hits, messages, _timings = flows.parse_cli_output('[{"video_name": "a.mp4"}]')
+    assert len(hits) == 1
+    assert messages == []
+
+
+def test_empty_stdout_is_unanswerable_but_empty_data_is_a_real_zero() -> None:
+    with pytest.raises(flows.QueryUnanswerableError, match="empty stdout"):
+        flows.parse_cli_output("")
+    with pytest.raises(flows.QueryUnanswerableError, match="empty stdout"):
+        flows.parse_cli_output("   \n ")
+    assert flows.parse_cli_output('{"data": [], "search_messages": []}')[0] == []
+    assert flows.parse_cli_output('{"data": null}')[0] == []
+
+
+def test_parses_ndjson_with_a_trailing_job_event() -> None:
+    """The real CLI shape: result envelope + lifecycle event, both on stdout.
+
+    Regression for the bug that made a working CLI report mAP 0.0000 -- a
+    whole-buffer json.loads raises "Extra data" here, and 106 of 121 queries
+    were silently discarded.
+    """
+    stdout = (
+        '{"data": [{"video_name": "Vandalism040_x264.mp4"}], "search_messages": [], '
+        '"job_id": "search-01M1DV0K", "persisted": false, "record": "absent"}\n'
+        '{"event":"vss_job_completed","group":"search","job_id":"search-01M1DV0K",'
+        '"status":"completed","exit_hint":0}'
+    )
+    hits, messages, _timings = flows.parse_cli_output(stdout)
+    assert len(hits) == 1
+    assert hits[0]["video_name"] == "Vandalism040_x264.mp4"
+    assert messages == []
+
+
+def test_job_event_alone_is_unanswerable_not_zero_recall() -> None:
+    """A lifecycle event with no result envelope means the CLI never answered.
+
+    Returning [] here made it arithmetically identical to a search that ran and
+    matched nothing, so a protocol skew averaged into the aggregate as a miss.
+    """
+    with pytest.raises(flows.QueryUnanswerableError):
+        flows.parse_cli_output('{"event":"vss_job_completed","status":"completed"}')
+
+
+def test_an_empty_data_envelope_is_still_a_real_zero() -> None:
+    """The distinction the exception exists to draw: `"data": []` IS an answer."""
+    hits, messages, _ = flows.parse_cli_output('{"data": [], "search_messages": []}')
+    assert hits == []
+    assert messages == []
+
+
+def test_ndjson_search_messages_are_surfaced() -> None:
+    stdout = '{"data": [], "search_messages": ["degraded to attribute-only"]}\n{"event":"x"}'
+    hits, messages, _timings = flows.parse_cli_output(stdout)
+    assert hits == []
+    assert messages == ["degraded to attribute-only"]
+
+
+def test_tolerates_banner_before_json() -> None:
+    hits, _, _ = flows.parse_cli_output('WARNING: something\n{"data": [{"video_name": "a.mp4"}]}')
+    assert len(hits) == 1
+
+
+def test_unparseable_output_is_unanswerable() -> None:
+    """Deliberately NOT the old behaviour, which was to return [] and score 0."""
+    with pytest.raises(flows.QueryUnanswerableError):
+        flows.parse_cli_output("not json at all")
+
+
+def test_a_timeout_is_unanswerable_not_an_empty_result(monkeypatch: Any) -> None:
+    """A 300s hang is an environment fault, the same class as a non-zero exit.
+
+    It used to return ([], latency), which is what a perfect search that matched
+    nothing returns.
+    """
+    import subprocess
+
+    def hang(*_a: Any, **_k: Any) -> Any:
+        raise subprocess.TimeoutExpired(cmd="vss", timeout=300)
+
+    monkeypatch.setattr(subprocess, "run", hang)
+    with pytest.raises(flows.QueryUnanswerableError):
+        flows.CliQueryBackend(["vss"]).search("red forklift")
+
+
+# ---------------------------------------------------------------------------
+# Exit-code policy
+# ---------------------------------------------------------------------------
+
+
+def test_environment_faults_are_fatal_not_zero_scores() -> None:
+    """Exit 5 means nothing was ingested -- scoring it 0.0 fakes a regression."""
+    assert all(flows.is_fatal_exit(c) for c in (2, 3, 4, 5))
+    assert not flows.is_fatal_exit(0)
+
+
+def test_undocumented_exit_codes_are_also_fatal() -> None:
+    """Regression: a broken CLI install exits 1, which is not in the table.
+
+    Treating undocumented codes as soft failures scored 121 queries at mAP
+    0.0000 in a real run against a stale venv -- the exact silent-zero this
+    policy exists to prevent.
+    """
+    assert flows.is_fatal_exit(1)
+    assert flows.is_fatal_exit(127)
+
+
+# ---------------------------------------------------------------------------
+# /complete retry policy
+# ---------------------------------------------------------------------------
+
+
+def test_502_is_retried_not_failed() -> None:
+    """Observed on 10.86.12.161: 502 on attempt 1, 200 with chunks on attempt 2."""
+    assert flows.classify_complete_failure(502, "Bad Gateway") == flows.COMPLETE_RETRY
+    assert flows.classify_complete_failure(500, "boom") == flows.COMPLETE_RETRY
+    assert flows.classify_complete_failure(503, "") == flows.COMPLETE_RETRY
+
+
+def test_duplicate_camera_id_means_the_work_already_landed() -> None:
+    """Not a failure: a prior attempt registered the stream before erroring.
+
+    warehouse_sample returned this on every retry yet had working embeddings
+    and searchable results, so retrying forever would have been wrong and
+    failing the ingest would have been wrong too.
+    """
+    body = (
+        'RTVI-CV add failed: RTVI-CV returned 500: {"reason": '
+        '"STREAM_ADD_FAIL, Duplicate Camera id, unable to add stream"}'
+    )
+    assert flows.classify_complete_failure(502, body) == flows.COMPLETE_ALREADY_REGISTERED
+    # Case-insensitive: the marker is matched against a lowercased body.
+    assert flows.classify_complete_failure(500, "DUPLICATE CAMERA ID") == flows.COMPLETE_ALREADY_REGISTERED
+
+
+def test_client_errors_are_fatal_not_retried() -> None:
+    """A 400 will never succeed on retry; burning the budget hides the cause."""
+    assert flows.classify_complete_failure(400, "bad request") == flows.COMPLETE_FATAL
+    assert flows.classify_complete_failure(404, "no such sensor") == flows.COMPLETE_FATAL
+
+
+# ---------------------------------------------------------------------------
+# Concurrent-mutation detection
+# ---------------------------------------------------------------------------
+
+
+def test_inventory_change_is_detected() -> None:
+    """A shared box wiped mid-run must not yield silently-wrong metrics.
+
+    Observed on 10.86.12.161: 17 ingested sources were replaced by an unrelated
+    set while the eval was in progress.
+    """
+    before = {"ok": True, "count": 3, "names": ["a", "b", "c"]}
+    after = {"ok": True, "count": 2, "names": ["a", "z"]}
+    diff = flows.compare_inventory(before, after)
+    assert diff["stable"] is False
+    assert diff["disappeared"] == ["b", "c"]
+    assert diff["appeared"] == ["z"]
+
+
+def test_unchanged_inventory_is_stable() -> None:
+    snap = {"ok": True, "count": 2, "names": ["a", "b"]}
+    assert flows.compare_inventory(snap, dict(snap))["stable"] is True
+
+
+def test_unavailable_inventory_is_unknown_not_stable() -> None:
+    """Unknown must not be reported as 'stable' -- that would be a false pass."""
+    diff = flows.compare_inventory({"ok": False, "names": []}, {"ok": True, "count": 1, "names": ["a"]})
+    assert diff["stable"] is None
+
+
+# ---------------------------------------------------------------------------
+# VST name matching
+# ---------------------------------------------------------------------------
+
+
+def test_name_variants_cover_both_vst_spellings() -> None:
+    """VST is inconsistent about the extension.
+
+    Observed on 10.86.12.161 (2026-08-25), both spellings present at once::
+
+        warehouse_safety_0001        <- stem only
+        sample-drone-bridge.mp4      <- extension retained
+    """
+    registered = {"warehouse_safety_0001", "sample-drone-bridge.mp4"}
+    assert flows.is_registered("warehouse_safety_0001.mp4", registered)
+    assert flows.is_registered("sample-drone-bridge.mp4", registered)
+    assert not flows.is_registered("never_uploaded.mp4", registered)
+
+
+def test_name_matching_is_case_insensitive() -> None:
+    assert flows.is_registered("Warehouse_Sample.MP4", {"warehouse_sample"})
+
+
+def test_sensor_streams_payload_is_parsed_to_id_name_pairs(monkeypatch) -> None:
+    """``/sensor/streams`` nests one dict per stream id; --clear depends on this."""
+
+    class _Resp:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> list:
+            return [
+                {"abc-123": [{"name": "warehouse_sample", "url": "rtsp://x"}]},
+                {"def-456": [{"name": "Assault036_x264"}]},
+                {"ghi-789": []},  # registered but no stream yet
+                {},  # defensive: malformed entry
+            ]
+
+    monkeypatch.setattr(
+        "flows.readiness.requests.get", lambda *_a, **_k: _Resp()
+    )
+    streams = flows.list_sensor_streams("https://host:30888")
+    assert streams == {"abc-123": "warehouse_sample", "def-456": "Assault036_x264"}
+
+
+def test_sensor_list_url_does_not_double_the_vst_prefix() -> None:
+    assert flows.sensor_list_url("https://h:30888") == "https://h:30888/vst/api/v1/sensor/list"
+    assert flows.sensor_list_url("https://h:30888/") == "https://h:30888/vst/api/v1/sensor/list"
+
+
+# ---------------------------------------------------------------------------
+# Decomposition-driven routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("data", [[{}], "not-a-list", ["not-an-object"]])
+def test_live_decomposer_rejects_malformed_model_inventory(monkeypatch: pytest.MonkeyPatch, data: Any) -> None:
+    """Malformed OpenAI-compatible inventories must enter the normal fallback path."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"data": data}
+
+    monkeypatch.setattr("flows.decompose.requests.get", lambda *_args, **_kwargs: _Response())
+
+    with pytest.raises(flows.DecompositionError, match="malformed model list|without an id"):
+        flows.LiveDecomposer("https://llm", repo_root=flows.REPO_ROOT)
+
+
+def test_live_decomposer_warns_when_model_discovery_is_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"data": [{"id": "first"}, {"id": "second"}]}
+
+    monkeypatch.setattr("flows.decompose.requests.get", lambda *_args, **_kwargs: _Response())
+    with pytest.warns(UserWarning, match="--llm-model"):
+        decomposer = flows.LiveDecomposer("https://llm", repo_root=flows.REPO_ROOT)
+    assert decomposer.model == "first"
+
+
+def _decompose_with(
+    monkeypatch: pytest.MonkeyPatch, message: dict[str, Any], model: str = "nvidia/nemotron-3-nano",
+    **decomposer_kw: Any,
+) -> tuple[Any, list[dict[str, Any]]]:
+    sent: list[dict[str, Any]] = []
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"choices": [{"message": message}]}
+
+    def fake_post(_url: str, *, json: dict[str, Any], **_kw: Any) -> _Response:
+        sent.append(json)
+        return _Response()
+
+    monkeypatch.setattr("flows.decompose.requests.post", fake_post)
+    decomposer = flows.LiveDecomposer("https://llm", repo_root=flows.REPO_ROOT, model=model, **decomposer_kw)
+    return decomposer, sent
+
+
+def test_decomposition_turns_thinking_off_like_the_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    decomposer, sent = _decompose_with(monkeypatch, {"content": '{"query": "forklift", "has_action": true}'})
+    decomposition, _ = decomposer.decompose("a forklift moving")
+    assert decomposition == {"query": "forklift", "has_action": True}
+    assert sent[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert decomposer.describe()["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_decomposition_sends_no_template_kwargs_to_other_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A strict OpenAI-compatible server may reject the unknown field."""
+    decomposer, sent = _decompose_with(
+        monkeypatch, {"content": '{"query": "forklift"}'}, model="meta/llama-3.1-70b-instruct"
+    )
+    decomposer.decompose("a forklift moving")
+    assert "chat_template_kwargs" not in sent[0]
+    assert decomposer.describe()["chat_template_kwargs"] is None
+
+
+def test_decomposition_lists_every_vst_video_like_the_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    import run_eval_flows as rf
+
+    annotations = {"q": [{"video_name": "answer_clip"}]}
+    monkeypatch.setattr(
+        rf.flows, "list_sensor_sources",
+        lambda _url: {
+            "a": {"name": "answer_clip", "url": "/storage/answer_clip.mp4"},
+            "b": {"name": "Other_Clip", "url": "/storage/Other_Clip.mp4"},
+            "c": {"name": "dock_cam", "url": "rtsp://cam/dock"},
+        },
+    )
+    assert rf.decomposition_sources(annotations, "https://vst") == ["Other_Clip", "answer_clip"]
+    assert rf.decomposition_sources(annotations, "https://vst", "rtsp") == ["dock_cam"]
+
+    def unreachable(_url: str) -> dict[str, str]:
+        raise OSError("down")
+
+    monkeypatch.setattr(rf.flows, "list_sensor_sources", unreachable)
+    assert rf.decomposition_sources(annotations, "https://vst") == ["answer_clip"]
+
+
+@pytest.mark.parametrize(
+    ("model", "tag"),
+    [
+        ("nvidia/llama-3.3-nemotron-super-49b-v1.5", "/no_think"),
+        ("nvidia/llama-3.1-nemotron-nano-8b-v1", "detailed thinking off"),
+        ("nvidia/nvidia-nemotron-nano-9b-v2", "/no_think"),
+        ("nvidia/nvidia-nemotron-3-nano-30b-a3b", None),
+        ("meta/llama-3.1-70b-instruct", None),
+    ],
+)
+def test_decomposition_turns_thinking_off_in_the_system_message_like_the_agent(
+    monkeypatch: pytest.MonkeyPatch, model: str, tag: str | None,
+) -> None:
+    decomposer, sent = _decompose_with(monkeypatch, {"content": '{"query": "forklift"}'}, model=model)
+    decomposer.decompose("a forklift moving")
+    system = sent[0]["messages"][0]["content"]
+    if tag is None:
+        assert system == flows.decompose._SYSTEM
+    else:
+        assert system == f"{flows.decompose._SYSTEM}\n{tag}"
+    assert decomposer.describe()["system_thinking_tag"] == tag
+
+
+def test_an_rtsp_run_labels_the_prompt_sources_as_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    decomposer, sent = _decompose_with(monkeypatch, {"content": '{"query": "forklift"}'}, source_type="rtsp")
+    decomposer.decompose("a forklift moving", video_sources=["dock_cam"])
+    assert "Video streams: dock_cam" in sent[0]["messages"][1]["content"]
+
+
+def test_thinking_markers_match_the_agent() -> None:
+    source = (
+        flows.REPO_ROOT
+        / "services/agent/packages/vss_agents/src/vss_agents/utils/reasoning_utils.py"
+    )
+    if not source.is_file():
+        pytest.skip("agent source not in this checkout")
+    match = re.search(r"_ENABLE_THINKING_MARKERS\s*=\s*\(([^)]*)\)", source.read_text())
+    assert match, "the agent no longer defines _ENABLE_THINKING_MARKERS"
+    agent_markers = tuple(re.findall(r"[\"']([^\"']+)[\"']", match.group(1)))
+    assert agent_markers == flows.decompose.ENABLE_THINKING_MARKERS
+
+
+def test_a_null_thinking_reply_is_a_decomposition_error_not_a_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nemotron in thinking mode put everything in reasoning_content and returned content: null."""
+    decomposer, _ = _decompose_with(monkeypatch, {"content": None, "reasoning_content": "Let me think..."})
+    with pytest.raises(flows.DecompositionError, match="no content.*Let me think"):
+        decomposer.decompose("a forklift moving")
+
+
+def test_an_inline_think_block_is_stripped_before_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    reply = '<think>\nThe user wants a forklift.\n</think>\n```json\n{"query": "forklift"}\n```'
+    decomposer, _ = _decompose_with(monkeypatch, {"content": reply})
+    assert decomposer.decompose("a forklift")[0] == {"query": "forklift"}
+
+
+def test_routing_rule_matches_the_four_cli_paths() -> None:
+    """Derived from the paths' input models, not invented.
+
+    See QUERY_DECOMPOSITION_PROMPT in vss_agents/tools/search.py.
+    """
+    assert flows.route({"attributes": [], "has_action": True}) == "embed"
+    assert flows.route({"attributes": ["person in red"], "has_action": True}) == "fusion"
+    assert flows.route({"attributes": ["person in red"], "has_action": False}) == "attribute"
+    assert flows.route({"object_ids": [7]}) == "object"
+
+
+def test_object_ids_win_over_attributes() -> None:
+    """An explicit id lookup is an identity query, not a search."""
+    assert flows.route({"object_ids": [7], "attributes": ["person in red"]}) == "object"
+
+
+def test_missing_has_action_defaults_to_attribute_like_the_agent() -> None:
+    """execute_core_search treats a missing has_action as attribute-only."""
+    assert flows.route({"attributes": ["person in red"]}) == "attribute"
+    assert flows.route({"attributes": ["person in red"], "has_action": None}) == "attribute"
+
+
+def test_action_query_copied_into_attributes_stays_on_fusion() -> None:
+    """The agent has no copied-query guard; only single-word pruning."""
+    decomposition = {
+        "query": "person dropping a box",
+        "attributes": ["person dropping a box"],
+        "has_action": True,
+    }
+    assert flows.route(decomposition) == "fusion"
+    assert flows.plan_for("person dropping a box", decomposition)["attributes"] == ["person dropping a box"]
+
+
+def test_copied_query_with_appearance_words_stays_on_fusion() -> None:
+    decomposition = {
+        "query": "worker in a hi-vis vest lifting a box",
+        "attributes": ["worker in a hi-vis vest lifting a box"],
+        "has_action": True,
+    }
+    assert flows.route(decomposition) == "fusion"
+    plan = flows.plan_for("worker in a hi-vis vest lifting a box", decomposition)
+    assert plan["attributes"] == ["worker in a hi-vis vest lifting a box"]
+
+
+def test_single_word_attributes_are_pruned_like_the_agent() -> None:
+    decomposition = {"query": "person walking", "attributes": ["red"], "has_action": True}
+    assert flows.route(decomposition) == "embed"
+    assert flows.plan_for("person walking", decomposition)["attributes"] == []
+    assert flows.effective_attributes({"attributes": ["red", "hi-vis", "red.jacket"]}) == [
+        "hi-vis", "red.jacket",
+    ]
+
+
+def test_plan_without_decomposition_reproduces_fixed_flags() -> None:
+    """An un-annotated dataset must behave exactly as before."""
+    plan = flows.plan_for("a person walking", None, default_path="embed", default_attributes=["x"])
+    assert plan["path"] == "embed"
+    assert plan["query"] == "a person walking"
+    assert plan["attributes"] == ["x"]
+    assert plan["routed"] is False
+
+
+def test_plan_uses_the_rewritten_query_not_the_raw_text() -> None:
+    """Decomposition strips time ranges and source names out of the query.
+
+    Embedding the raw text would treat "between 1pm and 2pm" as visual content.
+    """
+    decomposition = {
+        "query": "man pushing cart wearing beige shirt",
+        "attributes": ["person wearing beige shirt"],
+        "has_action": True,
+        "timestamp_start": "2025-01-01T13:00:00Z",
+        "video_sources": ["Endeavor heart"],
+    }
+    plan = flows.plan_for("Find a man pushing a cart wearing a beige shirt between 1 pm and 2 pm", decomposition)
+    assert plan["path"] == "fusion"
+    assert plan["query"] == "man pushing cart wearing beige shirt"
+    assert plan["timestamp_start"] == "2025-01-01T13:00:00Z"
+    assert plan["video_sources"] == ["Endeavor heart"]
+
+
+def test_routed_argv_carries_the_decomposed_request() -> None:
+    backend = flows.CliQueryBackend(
+        ["vss"],
+        decompositions={
+            "Person wearing a hardhat dropping a box": {
+                "query": "person dropping box wearing hardhat",
+                "attributes": ["person wearing a hardhat"],
+                "has_action": True,
+            }
+        },
+    )
+    argv = backend.build_argv("Person wearing a hardhat dropping a box")
+    assert argv[:4] == ["vss", "search", "run", "fusion"]
+    assert "person dropping box wearing hardhat" in argv
+    assert "person wearing a hardhat" in argv
+
+
+def test_unrouted_query_in_a_routed_run_falls_back_to_the_default_path() -> None:
+    """A partially annotated dataset must not crash on the gaps."""
+    backend = flows.CliQueryBackend(["vss"], decompositions={"other": {"attributes": ["x"]}})
+    argv = backend.build_argv("Person climbing a ladder")
+    assert argv[:4] == ["vss", "search", "run", "embed"]
+
+
+# ---------------------------------------------------------------------------
+# --original-query: the question, sent alongside the arguments derived from it
+# ---------------------------------------------------------------------------
+
+
+def test_original_query_carries_the_question_the_decomposition_replaced() -> None:
+    """`--query` gets the rewrite; `--original-query` gets what was asked.
+
+    These are different strings by design -- the decomposition strips the time
+    range and source name so they are not embedded as visual content -- and the
+    critic wants the second one.
+    """
+    asked = "Find a man pushing a cart wearing a beige shirt between 1 pm and 2 pm"
+    backend = flows.CliQueryBackend(
+        ["vss"],
+        decompositions={
+            asked: {
+                "query": "man pushing cart wearing beige shirt",
+                "attributes": ["man wearing a beige shirt"],
+                "has_action": True,
+            }
+        },
+    )
+    argv = backend.build_argv(asked)
+    assert argv[argv.index("--query") + 1] == "man pushing cart wearing beige shirt"
+    assert argv[argv.index("--original-query") + 1] == asked
+
+
+def test_object_path_sends_the_question_even_though_it_sends_no_query() -> None:
+    """Without this the object path is never verified at all.
+
+    ``object`` passes only ``--object-id``, so ``SearchInput.query`` is empty
+    and ``attributes`` is empty; the host's reconstruction produces "" and
+    returns before reaching the critic. The question is the only text there is.
+    """
+    backend = flows.CliQueryBackend(
+        ["vss"],
+        decompositions={"Where did person 7 go?": {"object_ids": [7]}},
+    )
+    argv = backend.build_argv("Where did person 7 go?")
+    assert argv[:4] == ["vss", "search", "run", "object"]
+    assert "--query" not in argv
+    assert argv[argv.index("--original-query") + 1] == "Where did person 7 go?"
+
+
+def test_original_query_can_be_withheld_to_reproduce_an_older_run() -> None:
+    backend = flows.CliQueryBackend(["vss"], pass_original_query=False)
+    assert "--original-query" not in backend.build_argv("red forklift")
+    assert backend.describe()["pass_original_query"] is False
+
+
+def test_original_query_is_on_by_default_and_recorded_in_the_flow_block() -> None:
+    """Default-on, and the result file says which way it ran.
+
+    A run that silently withheld it is not comparable with one that did not --
+    same retrieval, different critic verdicts -- so the flag has to survive into
+    the artifact rather than being reconstructable only from the command line.
+    """
+    backend = flows.CliQueryBackend(["vss"])
+    assert "--original-query" in backend.build_argv("red forklift")
+    assert backend.describe()["pass_original_query"] is True
+
+
+def test_blank_question_sends_no_flag() -> None:
+    """Click would take `--original-query ''`; the host would then ignore it."""
+    assert "--original-query" not in flows.CliQueryBackend(["vss"]).build_argv("   ")
+
+
+def test_unsupported_flag_is_detected_from_help_not_from_a_failed_query(
+    monkeypatch: Any,
+) -> None:
+    """The probe reads --help, so an old CLI costs one subprocess, not a run."""
+    import subprocess
+
+    class _Proc:
+        def __init__(self, code: int, out: str) -> None:
+            self.returncode, self.stdout, self.stderr = code, out, ""
+
+    seen: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kw: Any) -> Any:
+        seen.append(argv)
+        return _Proc(0, "Options:\n  --query TEXT\n  --original-query TEXT\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert flows.cli_supports_flag(["vss"], "--original-query") is True
+    assert seen[0] == ["vss", "search", "run", "embed", "--help"]
+
+    def only_query(*_a: Any, **_k: Any) -> Any:
+        return _Proc(0, "Options:\n  --query TEXT\n")
+
+    monkeypatch.setattr(subprocess, "run", only_query)
+    assert flows.cli_supports_flag(["vss"], "--original-query") is False
+
+
+def test_an_unhelpful_probe_reports_absent_rather_than_present(monkeypatch: Any) -> None:
+    """Failure to answer must not be read as yes.
+
+    Guessing "supported" costs the whole run (exit 2 on query 1); guessing
+    "unsupported" costs a slightly worse critic question.
+    """
+    import subprocess
+
+    class _Proc:
+        returncode, stdout, stderr = 2, "", "no such command"
+
+    def usage_error(*_a: Any, **_k: Any) -> Any:
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", usage_error)
+    assert flows.cli_supports_flag(["vss"], "--original-query") is False
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise FileNotFoundError("vss")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert flows.cli_supports_flag(["vss"], "--original-query") is False
+
+
+def test_the_flag_matches_the_field_the_cli_actually_declares() -> None:
+    """Pin the eval's flag name to the product model that defines it.
+
+    Skips where ``vss_cli`` is not importable, which is the normal case when
+    these tests run without the agent package installed -- so green here does
+    not prove the flag exists, only that it has not been renamed underneath us.
+    """
+    try:
+        from vss_cli.search.group import SearchGroup, _Common
+    except Exception as error:  # pragma: no cover - depends on the environment  # noqa: BLE001
+        pytest.skip(f"vss_cli is not importable here: {error}")
+
+    assert "original_query" in _Common.model_fields, (
+        "the eval sends --original-query on every path, so it has to live on _Common"
+    )
+    # Every path inherits _Common, so every path accepts it -- including
+    # `object`, which has no other text field.
+    for action in SearchGroup.actions:
+        assert "original_query" in action.Input.model_fields, action.name
+
+
+def test_load_decompositions_accepts_sidecar_and_dataset_shapes(tmp_path: Path) -> None:
+    sidecar = tmp_path / "s.json"
+    sidecar.write_text('{"q1": {"attributes": ["person in red"], "has_action": true}}')
+    assert flows.load_decompositions(sidecar)["q1"]["attributes"] == ["person in red"]
+
+    dataset = tmp_path / "d.json"
+    dataset.write_text('{"queries": {"q1": {"segments": [], "decomposition": {"attributes": ["a"]}}}}')
+    assert flows.load_decompositions(dataset)["q1"]["attributes"] == ["a"]
+
+
+def test_legacy_dataset_shape_still_loads() -> None:
+    """queries[q] is the segment list -- every existing dataset."""
+    annotations, decompositions = flows.unpack_dataset(
+        {"queries": {"q1": [{"video_name": "a", "start_time": "t"}]}}
+    )
+    assert annotations["q1"] == [{"video_name": "a", "start_time": "t"}]
+    assert decompositions == {}
+
+
+def test_extended_dataset_shape_carries_decompositions() -> None:
+    """Decompositions live next to the ground truth they belong to."""
+    annotations, decompositions = flows.unpack_dataset(
+        {
+            "queries": {
+                "q1": {
+                    "segments": [{"video_name": "a", "start_time": "t"}],
+                    "decomposition": {"attributes": ["person in red"], "has_action": True},
+                }
+            }
+        }
+    )
+    assert annotations["q1"] == [{"video_name": "a", "start_time": "t"}]
+    assert decompositions["q1"]["attributes"] == ["person in red"]
+
+
+def test_extended_shape_without_a_decomposition_is_fine() -> None:
+    """A partially annotated dataset must not lose its ground truth."""
+    annotations, decompositions = flows.unpack_dataset(
+        {"queries": {"q1": {"segments": [{"video_name": "a"}]}}}
+    )
+    assert annotations["q1"] == [{"video_name": "a"}]
+    assert decompositions == {}
+
+
+def test_annotations_shape_is_identical_across_both_dataset_forms() -> None:
+    """Scoring must not be able to tell which form the dataset used."""
+    segments = [{"video_name": "a", "start_time": "t"}]
+    legacy, _ = flows.unpack_dataset({"queries": {"q1": segments}})
+    extended, _ = flows.unpack_dataset({"queries": {"q1": {"segments": segments}}})
+    assert legacy == extended
+
+
+def test_path_distribution_counts_executed_plans() -> None:
+    plans = [{"path": "embed"}, {"path": "fusion"}, {"path": "embed"}]
+    assert flows.path_distribution(plans) == {"embed": 2, "fusion": 1}
+
+
+# ---------------------------------------------------------------------------
+# CLI discovery
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_cmd_wins_and_is_shell_split() -> None:
+    """shlex, not str.split -- a quoted path with spaces must survive."""
+    argv, how = flows.resolve_vss_cmd(explicit_cmd="'/opt/my tools/vss' --flag")
+    assert argv == ["/opt/my tools/vss", "--flag"]
+    assert how == "--vss-cmd"
+
+
+def test_repo_root_without_the_cli_package_is_rejected(tmp_path: Path) -> None:
+    """A checkout without the current CLI workspace is rejected explicitly."""
+    (tmp_path / "services/agent").mkdir(parents=True)
+    try:
+        flows.resolve_vss_cmd(repo_root=str(tmp_path))
+    except FileNotFoundError as e:
+        assert "libs/vss/cli" in str(e)
+        return
+    raise AssertionError("expected FileNotFoundError for a checkout without the CLI")
+
+
+def test_repo_root_with_the_cli_package_is_accepted(tmp_path: Path) -> None:
+    (tmp_path / "libs/vss/cli").mkdir(parents=True)
+    argv, how = flows.resolve_vss_cmd(repo_root=str(tmp_path))
+    assert argv == ["uv", "run", "--project", f"{tmp_path}/libs/vss", "vss"]
+    assert "--vss-repo-root" in how
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_configure_origin_uses_the_unified_port_not_the_agent_port(scheme: str) -> None:
+    """The agent port does not route /elasticsearch or /rtvi-embed.
+
+    Pointing `vss configure` at it finds 1/7 services and every query then
+    exits 4 -- observed on 10.86.12.161.
+    """
+    assert flows.vss_origin_for(f"{scheme}://10.87.88.126:8000") == f"{scheme}://10.87.88.126:7777"
+    assert flows.vss_origin_for(f"{scheme}://host:8000", port=9999) == f"{scheme}://host:9999"
+
+
+# ---------------------------------------------------------------------------
+# Drift guard against run_eval.py
+#
+# flows/metrics.py was vendored from run_eval.py so this flow can stand alone.
+# What must not drift is everything EXCEPT the one intentional divergence:
+# match_segment moved from equal-start to half-open overlap, so evaluate_query
+# no longer agrees with the legacy runner on event-bounded ground truth. That
+# is asserted here rather than assumed, so the exception stays visible.
+#
+# These tests SKIP when run_eval.py is not importable, which is the normal case
+# in this repo -- it lives in ci-vss-oss. A green run therefore does not prove
+# parity, and pytest.skip says so out loud where a bare `return` did not.
+# DELETE THIS SECTION when run_eval.py is removed.
+# ---------------------------------------------------------------------------
+
+
+def _legacy():
+    """Import run_eval.py, or skip if it has already been removed."""
+    try:
+        from search_eval import run_eval
+    except Exception:  # noqa: BLE001
+        return None
+    return run_eval
+
+
+HITS_FOR_SCORING = [
+    {"video_name": "warehouse_sample_20250101_000000_e0482.mp4",
+     "start_time": "2025-01-01T00:00:05Z", "end_time": "2025-01-01T00:00:22Z"},
+    {"video_name": "other_video.mp4",
+     "start_time": "2025-01-01T00:01:00Z", "end_time": "2025-01-01T00:01:05Z"},
+]
+GROUND_TRUTH = [
+    {"video_name": "warehouse_sample", "start_time": "2025-01-01T00:00:05Z",
+     "end_time": "2025-01-01T00:00:10Z"},
+    {"video_name": "warehouse_sample", "start_time": "2025-01-01T00:00:15Z",
+     "end_time": "2025-01-01T00:00:20Z"},
+]
+
+
+def test_vendored_metrics_agree_where_the_grid_makes_them_agree() -> None:
+    """Identical scores on chunk-shaped ground truth, which is most of it.
+
+    GROUND_TRUTH here is 5s and grid-aligned, and for that shape overlap and
+    equal-start accept exactly the same results -- so the divergence is
+    invisible and the two runners must still agree exactly.
+    """
+    legacy = _legacy()
+    if legacy is None:
+        pytest.skip("run_eval.py not importable (lives in ci-vss-oss); parity unverified")
+
+    mine = flows.evaluate_query("q", HITS_FOR_SCORING, GROUND_TRUTH, 1.23)
+    theirs = legacy.evaluate_query("q", HITS_FOR_SCORING, GROUND_TRUTH, 1.23)
+    assert mine == theirs
+
+
+def test_vendored_metrics_diverge_on_event_bounded_ground_truth() -> None:
+    """...and deliberately disagree once the ground truth leaves the grid.
+
+    Pinning the divergence stops someone "restoring parity" later by reverting
+    the fix, and documents which baselines are incomparable.
+    """
+    legacy = _legacy()
+    if legacy is None:
+        pytest.skip("run_eval.py not importable (lives in ci-vss-oss); parity unverified")
+
+    event_gt = [{"video_name": "warehouse_sample",
+                 "start_time": "2025-01-01T00:00:02Z", "end_time": "2025-01-01T00:00:07Z"}]
+    hit = [{"video_name": "warehouse_sample.mp4",
+            "start_time": "2025-01-01T00:00:00Z", "end_time": "2025-01-01T00:00:05Z"}]
+    assert flows.evaluate_query("q", hit, event_gt, 1.0)["recall"] == 1.0
+    assert legacy.evaluate_query("q", hit, event_gt, 1.0)["recall"] == 0.0
+
+
+def test_vendored_segmentation_matches_run_eval() -> None:
+    legacy = _legacy()
+    if legacy is None:
+        pytest.skip("run_eval.py not importable (lives in ci-vss-oss); parity unverified")
+    assert flows.post_process_api_results(HITS_FOR_SCORING) == legacy.post_process_api_results(
+        HITS_FOR_SCORING
+    )
+    assert flows.SEGMENT_SIZE == legacy.SEGMENT_SIZE
+    assert flows.HIT_K_VALUES == legacy.HIT_K_VALUES
+
+
+def test_vendored_dataset_registry_matches_run_eval() -> None:
+    """Shared dataset entries must not drift; new-flow-only ones may be added.
+
+    The guard exists to catch a path or subset being silently changed in one
+    runner and not the other -- not to freeze the registry. A dataset built for
+    the new flow (physicalai-dev) has no reason to exist in run_eval.py, which
+    is being retired, so extra keys here are allowed and *changed* keys are not.
+    """
+    legacy = _legacy()
+    if legacy is None:
+        pytest.skip("run_eval.py not importable (lives in ci-vss-oss); parity unverified")
+    shared = set(flows.DATASETS) & set(legacy.DATASETS)
+    assert shared == set(legacy.DATASETS), (
+        f"run_eval.py has datasets the new flow lacks: {set(legacy.DATASETS) - shared}"
+    )
+    for name in sorted(shared):
+        assert flows.DATASETS[name] == legacy.DATASETS[name], f"{name} drifted"
+    # Intentional divergence, like match_segment above: run_eval.py defaults to
+    # /tmp, which is world-writable, and this path holds the answer key. Pinned
+    # so the divergence stays deliberate rather than becoming drift.
+    assert flows.DEFAULT_DATA_DIR != legacy.DEFAULT_DATA_DIR
+    # gettempdir() rather than a literal: it is what the platform actually
+    # considers shared-writable, and spelling the path out here would itself
+    # trip the scanner rule this assertion exists to keep satisfied.
+    assert not str(flows.DEFAULT_DATA_DIR).startswith(tempfile.gettempdir())
+    assert flows.vst_url_for("https://h:8000") == legacy._get_vst_url("https://h:8000")
+
+
+def test_flow_package_imports_nothing_from_run_eval() -> None:
+    """The point of vendoring: deleting run_eval.py must not break this flow."""
+    import pathlib
+
+    flows_dir = pathlib.Path(flows.__file__).parent
+    offenders = []
+    for module in flows_dir.glob("*.py"):
+        for line in module.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("import run_eval", "from run_eval")):
+                offenders.append(f"{module.name}: {stripped}")
+    assert offenders == [], offenders
+
+
+# ---------------------------------------------------------------------------
+# Registries
+# ---------------------------------------------------------------------------
+
+
+def test_registries_expose_the_implemented_backends() -> None:
+    assert set(flows.INGEST_BACKENDS) == {"legacy-put", "agent-3step", "vst-direct"}
+    assert set(flows.QUERY_BACKENDS) == {"cli"}
+
+
+def test_the_default_ingest_flow_is_the_one_the_product_uses() -> None:
+    """vst-direct, because that is what the UI does.
+
+    It reports no chunk count, so the guard that made `agent-3step` safe is
+    replaced by the post-ingest index probe -- which must therefore be on by
+    default too, or "nothing indexed" and "nothing matched" become the same
+    result file.
+    """
+    import run_eval_flows as rf
+
+    parsed = rf.parse_args(["--endpoint", "https://host:8000"])
+    assert parsed.ingest_flow == "vst-direct"
+    assert parsed.skip_index_probe is False
+    assert parsed.skip_ingest is False
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [["--only-dataset"], ["--clear", "--confirm-delete"], ["--skip-existing"], ["--no-skip-existing"],
+     ["--clear", "--only-dataset", "--skip-ingest"]],
+)
+def test_old_cleanup_flags_are_rejected_before_anything_is_deleted(flags: list[str]) -> None:
+    """They once guarded deletion; accepting them now would hide that every run wipes."""
+    import run_eval_flows as rf
+
+    with pytest.raises(SystemExit) as exc:
+        rf.parse_args(["--endpoint", "https://host:8000", *flags])
+    assert exc.value.code == 2
+
+
+def test_rtsp_search_is_refused_unless_the_index_is_reused() -> None:
+    """A fresh ingest writes only the upload anchors, which an rtsp search never reads."""
+    import run_eval_flows as rf
+
+    with pytest.raises(SystemExit) as exc:
+        rf.parse_args(["--endpoint", "https://host:8000", "--source-type", "rtsp"])
+    assert exc.value.code == 2
+    args = rf.parse_args(["--endpoint", "https://host:8000", "--source-type", "rtsp", "--skip-ingest"])
+    assert args.source_type == "rtsp"
+
+
+def test_expected_sources_exist_even_when_readiness_wait_is_skipped() -> None:
+    import run_eval_flows as rf
+
+    assert rf.expected_sources_from_upload(
+        {
+            "per_file": [
+                {"video_name": "uploaded.mp4", "success": True},
+                {"video_name": "failed.mp4", "success": False},
+            ],
+        }
+    ) == ["uploaded.mp4"]
+
+
+# ---------------------------------------------------------------------------
+# vst-direct: what the UI does, minus the two steps that produced evidence
+# ---------------------------------------------------------------------------
+
+
+def test_vst_direct_posts_to_vios_and_never_calls_the_agent() -> None:
+    backend = flows.VstDirectIngest("https://host:30888/")
+    assert backend.upload_url == "https://host:30888/vst/api/v1/storage/file"
+    described = backend.describe()
+    assert described["flow"] == "vst-direct"
+    # Stated, not inferred: a reader comparing this against a 3-step run has to
+    # know the success criterion changed.
+    assert "none" in described["ingest_proof"]
+
+
+def test_vst_direct_reports_no_chunk_count_rather_than_zero(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """`None` means nobody counted; `0` would mean counted and empty.
+
+    The three-step flow fails an upload that reports zero chunks. There is no
+    equivalent signal here, so the record must not manufacture one.
+    """
+    import requests
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"not really an mp4")
+
+    class _Resp:
+        status_code = 200
+        text = '{"sensorId": "abc-123"}'
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"sensorId": "abc-123"}
+
+    posted: list[str] = []
+
+    def fake_post(url: str, **kw: Any) -> Any:
+        posted.append(url)
+        return _Resp()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    record = flows.VstDirectIngest("https://host:30888").upload(video)
+
+    assert posted == ["https://host:30888/vst/api/v1/storage/file"]
+    assert record["success"] is True
+    assert record["sensor_id"] == "abc-123"
+    assert record["chunks_processed"] is None
+    assert record["ingest_proof"] == "none"
+
+
+def test_vst_direct_checks_the_anchor_instead_of_assuming_it(monkeypatch: Any) -> None:
+    """Ground truth is offsets from 2025-01-01; VIOS chooses the real anchor.
+
+    The webhook request bodies in the search profile's notification_config.json
+    are empty, so nothing passes creation_time the way the agent's /complete
+    does. If VIOS anchors elsewhere, every query scores zero and it reads as a
+    retrieval collapse rather than an ingest problem.
+    """
+    import requests
+
+    class _Resp:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+    backend = flows.VstDirectIngest("https://host:30888")
+
+    def anchored(*_a: Any, **_k: Any) -> Any:
+        return _Resp({"abc-123": [{"startTime": "2025-01-01T00:00:00.000Z",
+                                   "endTime": "2025-01-01T00:00:30.000Z"}]})
+
+    monkeypatch.setattr(requests, "get", anchored)
+    good = backend.verify_anchor("abc-123")
+    assert good["found"] is True
+    assert good["matches_expected_anchor"] is True
+
+    def same_day_wrong_time(*_a: Any, **_k: Any) -> Any:
+        return _Resp({"abc-123": [{"startTime": "2025-01-01T11:04:00.000Z"}]})
+
+    monkeypatch.setattr(requests, "get", same_day_wrong_time)
+    wrong_time = backend.verify_anchor("abc-123")
+    assert wrong_time["matches_expected_anchor"] is False
+
+    def equivalent_offset(*_a: Any, **_k: Any) -> Any:
+        return _Resp({"abc-123": [{"startTime": "2025-01-01T05:30:00+05:30"}]})
+
+    monkeypatch.setattr(requests, "get", equivalent_offset)
+    same_instant = backend.verify_anchor("abc-123")
+    assert same_instant["matches_expected_anchor"] is True
+
+    def wall_clock(*_a: Any, **_k: Any) -> Any:
+        return _Resp({"abc-123": [{"startTime": "2026-09-09T11:04:00.000Z",
+                                   "endTime": "2026-09-09T11:04:30.000Z"}]})
+
+    monkeypatch.setattr(requests, "get", wall_clock)
+    bad = backend.verify_anchor("abc-123")
+    assert bad["found"] is True
+    assert bad["matches_expected_anchor"] is False
+
+
+def test_vst_direct_anchor_read_uses_a_short_timeout(monkeypatch: Any) -> None:
+    import requests
+
+    seen_timeouts: list[int] = []
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    def fake_get(_url: str, *, timeout: int) -> _Resp:
+        seen_timeouts.append(timeout)
+        return _Resp()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    flows.VstDirectIngest("https://host:30888").verify_anchor("abc-123")
+    assert seen_timeouts == [30]
+
+
+def test_the_probe_gate_reads_a_flag_not_a_prose_string() -> None:
+    """The regression that made this whole guard dead code.
+
+    The gate compared ``describe()["ingest_proof"]`` to "none" while describe()
+    returned "none (webhook fan-out is fire-and-forget)". It never fired, the
+    result file recorded ``index_probe: null``, and a run against a half-built
+    index scored recall 0.3534 where the same queries had reached 0.5103. A
+    boolean cannot drift out of sync with its own explanation.
+    """
+    assert flows.VstDirectIngest.proves_indexing is False
+    assert flows.AgentThreeStepIngest.proves_indexing is True
+    assert flows.LegacyPutIngest.proves_indexing is True
+
+
+def test_a_crowded_out_video_is_confirmed_before_being_called_missing(
+    monkeypatch: Any,
+) -> None:
+    """The broad query samples by similarity, so absence from it proves nothing.
+
+    A fully indexed video whose chunks rank below other videos' would abort a
+    perfectly healthy run. Only a source-scoped query that ALSO comes back empty
+    counts as missing.
+    """
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    scoped_asked: list[str] = []
+
+    def backend(**kw: Any) -> Any:
+        decomps = kw.get("decompositions") or {}
+        source = next(iter(decomps.values()), {}).get("video_sources", [None])[0]
+
+        class _Probe:
+            def search(self, query: str) -> tuple[list[dict[str, Any]], float]:
+                if source is None:  # the broad query: clip_b is crowded out
+                    return [{"video_name": "clip_a.mp4"}], 0.1
+                scoped_asked.append(source)
+                return [{"video_name": f"{source}.mp4"}], 0.1  # but it IS indexed
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", backend)
+    monkeypatch.setattr(flows, "list_sensor_streams", lambda _u: {"s1": "clip_a", "s2": "clip_b"})
+    result = rf.probe_index_coverage(
+        _Backend(), ["clip_a", "clip_b"], vst_url="https://vst", attempts=2, backoff_s=0
+    )
+    assert result["covered"] is True
+    assert scoped_asked == ["clip_b"], "only the crowded-out source needs a scoped query"
+
+
+def test_vsts_own_casing_reaches_the_scoped_probe(monkeypatch: Any) -> None:
+    """`--video-source` is matched case-sensitively, so it must not be folded.
+
+    `list_sensor_names` lowercases for case-insensitive membership tests. Passing
+    that value on reaches `should_clauses_for_source`, which builds `term` and
+    `wildcard` clauses against ES `.keyword` fields -- case-sensitive -- so
+    "assault036_x264" never matches the stored "Assault036_x264" and a fully
+    indexed run aborts. physicalai-dev is named exactly that way.
+    """
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    scoped: list[str] = []
+
+    def backend(**kw: Any) -> Any:
+        decomps = kw.get("decompositions") or {}
+        source = next(iter(decomps.values()), {}).get("video_sources", [None])[0]
+
+        class _Probe:
+            def search(self, query: str) -> tuple[list[dict[str, Any]], float]:
+                if source is None:
+                    return [], 0.1  # broad query surfaces nothing
+                scoped.append(source)
+                return [{"video_name": source}], 0.1
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", backend)
+    monkeypatch.setattr(
+        flows, "list_sensor_streams", lambda _u: {"s1": "Assault036_x264"}
+    )
+    result = rf.probe_index_coverage(
+        _Backend(), ["Assault036_x264.mp4"], vst_url="https://vst", attempts=1, backoff_s=0
+    )
+    assert scoped == ["Assault036_x264"], "VST's spelling must survive, not a lowercased copy"
+    assert result["covered"] is True
+
+
+def test_vst_upload_suffix_reaches_scoped_probe_when_broad_hits_crowd_it_out(
+    monkeypatch: Any,
+) -> None:
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    registered_name = "clip_1_20250101_000000_e0482.mp4"
+    scoped: list[str] = []
+
+    def backend(**kw: Any) -> Any:
+        routes = kw.get("decompositions") or {}
+        source = next(iter(routes.values()), {}).get("video_sources", [None])[0]
+
+        class _Probe:
+            def search(self, _query: str) -> tuple[list[dict[str, Any]], float]:
+                if source is None:
+                    return [{"video_name": "clip_10.mp4"}], 0.1
+                scoped.append(source)
+                return [{"video_name": registered_name}], 0.1
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", backend)
+    monkeypatch.setattr(flows, "list_sensor_streams", lambda _u: {"s1": registered_name})
+    result = rf.probe_index_coverage(
+        _Backend(), ["clip_1"], vst_url="https://vst", attempts=1, backoff_s=0
+    )
+    assert scoped == [registered_name]
+    assert result["covered"] is True
+
+
+def test_a_genuinely_absent_source_survives_the_scoped_check(monkeypatch: Any) -> None:
+    """The confirmation must not turn every miss into a pass."""
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    def backend(**kw: Any) -> Any:
+        decomps = kw.get("decompositions") or {}
+        source = next(iter(decomps.values()), {}).get("video_sources", [None])[0]
+
+        class _Probe:
+            def search(self, query: str) -> tuple[list[dict[str, Any]], float]:
+                if source is None:
+                    return [{"video_name": "clip_a.mp4"}], 0.1
+                return [], 0.1  # scoped query finds nothing: really not indexed
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", backend)
+    monkeypatch.setattr(flows, "list_sensor_streams", lambda _u: {"s1": "clip_a", "s2": "clip_b"})
+    monkeypatch.setattr(rf.time, "sleep", lambda _s: None)
+    result = rf.probe_index_coverage(
+        _Backend(), ["clip_a", "clip_b"], vst_url="https://vst", attempts=2, backoff_s=0
+    )
+    assert result["covered"] is False
+    assert result["missing"] == ["clip_b"]
+    assert result["per_source_verified"] is True
+
+
+def test_probe_does_not_accept_prefix_collision_even_from_scoped_search(monkeypatch: Any) -> None:
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    def wrong_video(**_kw: Any) -> Any:
+        class _Probe:
+            def search(self, _query: str) -> tuple[list[dict[str, Any]], float]:
+                return [{"video_name": "clip_10.mp4"}], 0.1
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", wrong_video)
+    monkeypatch.setattr(flows, "list_sensor_streams", lambda _u: {"s1": "clip_1"})
+    result = rf.probe_index_coverage(_Backend(), ["clip_1"], vst_url="https://vst", attempts=1, backoff_s=0)
+    assert result["covered"] is False
+    assert result["missing"] == ["clip_1"]
+
+
+def test_without_vst_the_probe_says_it_could_not_verify_per_source(
+    monkeypatch: Any,
+) -> None:
+    """Weaker mode, and the artifact records that it was weaker."""
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    def backend(**kw: Any) -> Any:
+        class _Probe:
+            def search(self, query: str) -> tuple[list[dict[str, Any]], float]:
+                return [{"video_name": "clip_a.mp4"}, {"video_name": "clip_b.mp4"}], 0.1
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", backend)
+    result = rf.probe_index_coverage(_Backend(), ["clip_a", "clip_b"], attempts=1, backoff_s=0)
+    assert result["covered"] is True
+    assert result["per_source_verified"] is False
+
+
+def test_partial_coverage_is_a_failure_not_a_pass(monkeypatch: Any) -> None:
+    """"Something is indexed" passes on 1 video out of 32.
+
+    That is precisely the state readiness already waves through, so a probe
+    that only asks whether the index is non-empty adds nothing.
+    """
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    def one_video(**kw: Any) -> Any:
+        class _Probe:
+            def search(self, query: str) -> tuple[list[dict[str, Any]], float]:
+                return [{"video_name": "clip_a.mp4"}], 0.1
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", one_video)
+    monkeypatch.setattr(rf.time, "sleep", lambda _s: None)
+    result = rf.probe_index_coverage(
+        _Backend(), ["clip_a", "clip_b", "clip_c"], attempts=2, backoff_s=0
+    )
+    assert result["covered"] is False
+    assert result["missing_count"] == 2
+    assert set(result["missing"]) == {"clip_b", "clip_c"}
+
+
+def test_full_coverage_passes_and_matches_names_the_way_scoring_does(
+    monkeypatch: Any,
+) -> None:
+    """VST spellings differ from dataset names, so reuse the scorer's matcher.
+
+    Comparing raw strings would report every source missing on a perfectly
+    healthy index.
+    """
+    import run_eval_flows as rf
+
+    built: list[Any] = []
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+        search_path = "fusion"
+        min_cosine_similarity = 0.99
+
+    def all_videos(**kw: Any) -> Any:
+        built.append(kw)
+
+        class _Probe:
+            def search(self, query: str) -> tuple[list[dict[str, Any]], float]:
+                return [
+                    {"video_name": "clip_a_20250101_000000_e0482.mp4"},
+                    {"video_name": "clip_b.mp4"},
+                ], 0.1
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", all_videos)
+    result = rf.probe_index_coverage(_Backend(), ["clip_a", "clip_b"], attempts=2, backoff_s=0)
+
+    assert result == {
+        "checked": True, "covered": True, "attempts": 1, "sources": 2,
+        "per_source_verified": False,
+    }
+    # A throwaway backend: the run's own --min-cosine-similarity floor or a
+    # non-embed --search-path must not filter a healthy index into an alarm.
+    assert built[0]["search_path"] == "embed"
+    assert "min_cosine_similarity" not in built[0]
+
+
+def test_coverage_is_retried_because_perception_is_asynchronous(
+    monkeypatch: Any,
+) -> None:
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    calls = {"n": 0}
+
+    def filling_up(**kw: Any) -> Any:
+        class _Probe:
+            def search(self, query: str) -> tuple[list[dict[str, Any]], float]:
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    return [{"video_name": "clip_a.mp4"}], 0.1
+                return [{"video_name": "clip_a.mp4"}, {"video_name": "clip_b.mp4"}], 0.1
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", filling_up)
+    monkeypatch.setattr(rf.time, "sleep", lambda _s: None)
+    result = rf.probe_index_coverage(_Backend(), ["clip_a", "clip_b"], attempts=5, backoff_s=0)
+    assert result["covered"] is True
+    assert result["attempts"] == 3
+
+
+def test_a_broken_cli_is_reported_as_itself_not_as_an_empty_index(
+    monkeypatch: Any,
+) -> None:
+    """Exit 4 means misconfigured. Calling that "nothing indexed" sends the
+    reader to the wrong service."""
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    def broken(**kw: Any) -> Any:
+        class _Probe:
+            def search(self, query: str) -> tuple[list[dict[str, Any]], float]:
+                raise flows.CliExitError("vss exited 4 (configuration)")
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", broken)
+    result = rf.probe_index_coverage(_Backend(), ["clip_a"], attempts=5, backoff_s=0)
+    assert result["covered"] is False
+    assert result["attempts"] == 1  # not retried; it will not fix itself
+    assert "CliExitError" in result["error"]
+
+
+def test_missing_index_is_retried_until_it_appears(monkeypatch: Any) -> None:
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    calls = 0
+
+    def starting_index(**_kw: Any) -> Any:
+        class _Probe:
+            def search(self, _query: str) -> tuple[list[dict[str, Any]], float]:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise flows.CliExitError("vss exited 5 (index absent)", returncode=5)
+                return [{"video_name": "clip_a.mp4"}], 0.1
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", starting_index)
+    monkeypatch.setattr(rf.time, "sleep", lambda _s: None)
+    result = rf.probe_index_coverage(_Backend(), ["clip_a"], attempts=3, backoff_s=0)
+    assert result["covered"] is True
+    assert result["attempts"] == 2
+    assert calls == 2
+
+
+def test_missing_index_exhausts_bounded_probe_budget(monkeypatch: Any) -> None:
+    import run_eval_flows as rf
+
+    class _Backend:
+        vss_cmd: ClassVar[list[str]] = ["vss"]
+        cwd = None
+
+    calls = 0
+
+    def missing_index(**_kw: Any) -> Any:
+        class _Probe:
+            def search(self, _query: str) -> tuple[list[dict[str, Any]], float]:
+                nonlocal calls
+                calls += 1
+                raise flows.CliExitError("vss exited 5 (index absent)", returncode=5)
+
+        return _Probe()
+
+    monkeypatch.setattr(flows, "CliQueryBackend", missing_index)
+    monkeypatch.setattr(rf.time, "sleep", lambda _s: None)
+    result = rf.probe_index_coverage(_Backend(), ["clip_a"], attempts=2, backoff_s=0)
+    assert result["covered"] is False
+    assert result["attempts"] == 2
+    assert result["missing"] == ["clip_a"]
+    assert "index absent" in result["error"]
+    assert calls == 2
+
+
+def test_probe_caps_critic_without_changing_scored_queries() -> None:
+    import run_eval_flows as rf
+
+    regular = flows.CliQueryBackend(["vss"])
+    probe = rf._probe_backend(regular, 1000)
+    argv = probe.build_argv("a person")
+    assert argv[argv.index("--critic-eval-count") + 1] == "1"
+    assert "--critic-eval-count" not in regular.build_argv("a person")
+
+
+def test_an_unreachable_vst_is_unchecked_not_a_passing_anchor(monkeypatch: Any) -> None:
+    import requests
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise requests.ConnectionError("refused")
+
+    monkeypatch.setattr(requests, "get", boom)
+    result = flows.VstDirectIngest("https://host:30888").verify_anchor("abc-123")
+    assert result["checked"] is False
+    assert "matches_expected_anchor" not in result
+
+
+def test_default_vss_cmd_uses_the_project_local_cli() -> None:
+    cmd = flows.default_vss_cmd("/home/me/vss")
+    assert cmd == ["uv", "run", "--project", "/home/me/vss/libs/vss", "vss"]
+
+
+# ---------------------------------------------------------------------------
+# Selective pruning (--only-dataset)
+# ---------------------------------------------------------------------------
+
+
+def _fake_streams() -> dict[str, str]:
+    return {
+        "id-ours-1": "1219",                 # dataset video, stem spelling
+        "id-ours-2": "video_00570.mp4",      # dataset video, extension retained
+        "id-theirs": "someone_elses_clip",   # foreign
+        "id-theirs2": "warehouse_sample",    # foreign
+    }
+
+
+_EMPTY_COUNTS = {"embed": 0, "raw": 0, "behavior": 0}
+
+
+def _wipe_fakes(monkeypatch: Any, states: list[tuple[dict[str, str], dict[str, int]]]) -> dict[str, Any]:
+    """Each _index_state read pops the next state; the last one repeats.
+
+    Any POST fails the test: the ingress answers ``_delete_by_query`` with 403,
+    so the wipe must only delete sources and wait.
+    """
+    from flows import cleanup
+
+    calls: dict[str, Any] = {"cleared": 0, "reads": 0}
+
+    def _state(*_a: Any) -> tuple[dict[str, str], dict[str, int]]:
+        calls["reads"] += 1
+        return states.pop(0) if len(states) > 1 else states[0]
+
+    def _clear(*_a: Any) -> dict[str, Any]:
+        calls["cleared"] += 1
+        return {"found": 2, "deleted": 2, "failed": [], "names": ["a", "b"]}
+
+    monkeypatch.setattr(cleanup, "_index_state", _state)
+    monkeypatch.setattr(cleanup, "clear_all_videos", _clear)
+    monkeypatch.setattr(cleanup.requests, "post", lambda *_a, **_k: pytest.fail("the ingress refuses deletes"))
+    return calls
+
+
+def test_wipe_deletes_nothing_when_the_index_is_already_clean(monkeypatch: Any) -> None:
+    from flows import cleanup
+
+    calls = _wipe_fakes(monkeypatch, [({}, dict(_EMPTY_COUNTS))])
+    out = cleanup.wipe_index("https://h:8000", "https://h:30888", "https://h:7777", sleep=lambda _s: None)
+
+    assert out["clean_before"] is True
+    assert calls["cleared"] == 0
+
+
+def test_wipe_aborts_at_once_on_documents_no_source_owns(monkeypatch: Any) -> None:
+    """No webhook will ever delete them, so waiting would only delay the abort."""
+    from flows import cleanup
+
+    calls = _wipe_fakes(monkeypatch, [({}, {**_EMPTY_COUNTS, "raw": 40})])
+    with pytest.raises(SystemExit, match="no source") as exc:
+        cleanup.wipe_index("https://h:8000", "https://h:30888", "https://h:7777", sleep=lambda _s: None)
+
+    assert "raw=40" in str(exc.value)
+    assert "mdx-raw-2025-01-01" in str(exc.value)
+    assert calls["cleared"] == 0
+
+
+def test_wipe_deletes_sources_and_waits_for_their_webhooks(monkeypatch: Any) -> None:
+    """Documents drain after the sources go; a late write resets the count."""
+    from flows import cleanup
+
+    dirty = (_fake_streams(), {**_EMPTY_COUNTS, "embed": 9})
+    draining = ({}, {**_EMPTY_COUNTS, "embed": 4})
+    empty = ({}, dict(_EMPTY_COUNTS))
+    late = ({}, {**_EMPTY_COUNTS, "tags": 3})
+    calls = _wipe_fakes(monkeypatch, [dirty, draining, empty, late, empty, empty])
+    out = cleanup.wipe_index("https://h:8000", "https://h:30888", "https://h:7777", sleep=lambda _s: None)
+
+    assert calls["cleared"] == 1
+    assert calls["reads"] == 6
+    assert out["deleted"] == 2
+    assert out["sources_before"] == 4
+    assert out["documents_before"]["embed"] == 9
+
+
+def test_wipe_names_leftover_documents_when_they_never_drain(monkeypatch: Any) -> None:
+    from flows import cleanup
+
+    _wipe_fakes(monkeypatch, [(_fake_streams(), dict(_EMPTY_COUNTS)), ({}, {**_EMPTY_COUNTS, "raw": 1})])
+    clock = _FakeClock()
+    with pytest.raises(SystemExit, match="documents with no source"):
+        cleanup.wipe_index(
+            "https://h:8000", "https://h:30888", "https://h:7777",
+            timeout_s=30, poll_s=5, clock=clock, sleep=clock.sleep,
+        )
+
+
+def test_wipe_aborts_when_sources_keep_registering(monkeypatch: Any) -> None:
+    from flows import cleanup
+
+    _wipe_fakes(monkeypatch, [(_fake_streams(), dict(_EMPTY_COUNTS))])
+    clock = _FakeClock()
+    with pytest.raises(SystemExit, match="still registered"):
+        cleanup.wipe_index(
+            "https://h:8000", "https://h:30888", "https://h:7777",
+            timeout_s=30, poll_s=5, clock=clock, sleep=clock.sleep,
+        )
+
+
+def test_wipe_aborts_when_a_source_will_not_delete(monkeypatch: Any) -> None:
+    from flows import cleanup
+
+    _wipe_fakes(monkeypatch, [(_fake_streams(), dict(_EMPTY_COUNTS))])
+    monkeypatch.setattr(
+        cleanup, "clear_all_videos", lambda *_a: {"found": 4, "deleted": 3, "failed": ["x"], "names": []}
+    )
+    with pytest.raises(SystemExit, match="could not be deleted"):
+        cleanup.wipe_index("https://h:8000", "https://h:30888", "https://h:7777", sleep=lambda _s: None)
+
+
+def test_the_wipe_deletes_uploaded_files_and_never_an_rtsp_camera(monkeypatch: Any) -> None:
+    """Deleting a camera also deletes its VST storage, and this eval never reads its indexes."""
+    from flows import cleanup
+
+    monkeypatch.setattr(cleanup, "list_sensor_sources", lambda _u: {
+        "f1": {"name": "1219", "url": "/storage/1219.mp4"},
+        "c1": {"name": "dock_cam", "url": "rtsp://cam/dock"},
+        "f2": {"name": "video_00570.mp4", "url": ""},
+    })
+    deleted: list[str] = []
+
+    class _Ok:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def _delete(url: str, **_k: Any) -> _Ok:
+        deleted.append(url.rsplit("/", 1)[-1])
+        return _Ok()
+
+    monkeypatch.setattr(cleanup.requests, "delete", _delete)
+    out = cleanup.clear_all_videos("https://h:8000", "https://h:30888")
+
+    assert sorted(deleted) == ["f1", "f2"]
+    assert out["deleted"] == 2
+    assert out["kept_rtsp"] == ["dock_cam"]
+    files, rtsp = cleanup.file_sources("https://h:30888")
+    assert set(files) == {"f1", "f2"} and rtsp == ["dock_cam"]
+
+
+def test_wipe_refuses_endpoints_on_different_hosts() -> None:
+    from flows import cleanup
+
+    cleanup.check_cleanup_hosts("https://h:8000", "https://h:30888", "https://h:7777")
+    with pytest.raises(SystemExit, match="--ingress-url"):
+        cleanup.check_cleanup_hosts("https://h:8000", "https://h:30888", "https://other:7777")
+    with pytest.raises(SystemExit, match="--vst-url"):
+        cleanup.check_cleanup_hosts("https://h:8000", "https://other:30888", "https://h:7777")
+
+
+def test_every_loopback_spelling_is_one_host_to_the_wipe() -> None:
+    from flows import cleanup
+
+    cleanup.check_cleanup_hosts("https://localhost:8000", "https://[::1]:30888", "https://127.0.0.1:7777")
+    with pytest.raises(SystemExit, match="--ingress-url"):
+        cleanup.check_cleanup_hosts("https://localhost:8000", "https://127.0.0.1:30888", "https://other:7777")
+
+
+@pytest.mark.parametrize("endpoint", ["localhost:8000", "h:8000", "https:///api", ""])
+def test_wipe_refuses_an_endpoint_with_no_hostname(endpoint: str) -> None:
+    """Host-less URLs all parse to hostname None, so None == None would pass the host check."""
+    from flows import cleanup
+
+    with pytest.raises(SystemExit, match="no hostname"):
+        cleanup.check_cleanup_hosts(endpoint, "other:30888", "other:7777")
+    with pytest.raises(SystemExit, match="no hostname"):
+        cleanup.check_cleanup_hosts(endpoint, endpoint, endpoint)
+
+
+def test_skip_ingest_aborts_when_a_dataset_video_is_not_registered(monkeypatch: Any) -> None:
+    """Its queries would score zero, read as "nothing found" not "never indexed"."""
+    import run_eval_flows as rf
+
+    monkeypatch.setattr(rf.flows, "list_sensor_names", lambda *_a, **_k: {"1219"})
+    with pytest.raises(SystemExit, match="not registered"):
+        rf.check_reused_index("https://h:30888", ["1219", "video_00570"])
+
+
+def test_skip_ingest_records_sources_outside_the_dataset(monkeypatch: Any) -> None:
+    import run_eval_flows as rf
+
+    monkeypatch.setattr(
+        rf.flows, "list_sensor_names",
+        lambda *_a, **_k: {n.lower() for n in _fake_streams().values()},
+    )
+    out = rf.check_reused_index("https://h:30888", ["1219", "video_00570"])
+
+    assert out == {"dataset_sources": 2, "other_sources": ["someone_elses_clip", "warehouse_sample"]}
+
+
+def test_bad_inputs_abort_before_the_wipe_deletes_anything(tmp_path: Path, monkeypatch: Any) -> None:
+    """The wipe deletes every file source; finding the inputs unusable after it is too late."""
+    import run_eval_flows as rf
+
+    monkeypatch.setattr(rf.flows, "load_dataset_file", lambda *_a: {"queries": {"q": []}})
+    with pytest.raises(SystemExit, match="before deleting anything: no .mp4"):
+        rf.check_inputs_before_wipe(tmp_path / "missing", tmp_path, "warehouse", "")
+
+    monkeypatch.setattr(rf.flows, "load_dataset_file", lambda *_a: {"queries": {}})
+    with pytest.raises(SystemExit, match="no queries"):
+        rf.check_inputs_before_wipe(tmp_path, tmp_path, "warehouse", "")
+
+    def _broken(*_a: Any) -> dict[str, Any]:
+        raise json.JSONDecodeError("bad", "{", 0)
+
+    monkeypatch.setattr(rf.flows, "load_dataset_file", _broken)
+    with pytest.raises(SystemExit, match="could not read"):
+        rf.check_inputs_before_wipe(tmp_path, tmp_path, "warehouse", "")
+
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "1219.mp4").write_bytes(b"")
+    monkeypatch.setattr(rf.flows, "load_dataset_file", lambda *_a: {"queries": {"q": []}})
+    rf.check_inputs_before_wipe(videos, tmp_path, "warehouse", "")
+
+
+def test_a_failed_decomposition_keeps_its_elapsed_time(tmp_path: Path, monkeypatch: Any) -> None:
+    """A timed-out call took time; total_latency_s must not report it as instant."""
+    import run_eval_flows as rf
+
+    clock = _FakeClock(100.0)
+
+    class _SlowFailure(_FlakyDecomposer):
+        def decompose(self, query: str, video_sources: list[str] | None = None) -> tuple[dict[str, Any], float]:
+            clock.sleep(4.0)
+            raise flows.DecompositionError("timed out")
+
+    monkeypatch.setattr(rf.time, "monotonic", clock)
+    dataset_dir = tmp_path / "warehouse"
+    dataset_dir.mkdir()
+    (dataset_dir / "dataset.json").write_text(json.dumps({"queries": {"a person running": []}}))
+    backend = flows.CliQueryBackend(["vss"], search_path="embed")
+    backend.search = lambda _q: ([], 0.01)  # type: ignore[method-assign]
+    result = rf.run_evaluation(
+        backend, tmp_path, "warehouse", "", output_file=str(tmp_path / "result.json"),
+        decomposer=_SlowFailure(set()), max_decompose_failed_pct=100,
+    )
+
+    row = result["query_results"][0]
+    assert row["decompose_s"] == pytest.approx(4.0)
+    assert row["total_latency_s"] == pytest.approx(4.01)
+    assert result["summary"]["decomposition"]["mean_s"] is None
+
+
+def test_dataset_video_names_come_from_the_ground_truth(tmp_path: Path, monkeypatch: Any) -> None:
+    """A partial local download must not hide an annotated video from the reuse check."""
+    import run_eval_flows as rf
+
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "a.mp4").write_bytes(b"")
+    monkeypatch.setattr(rf.flows, "load_dataset_file", lambda *_a: {})
+    monkeypatch.setattr(
+        rf.flows, "unpack_dataset",
+        lambda _d: ({"q": [{"video_name": "a.mp4"}, {"video_name": "b"}]}, {}),
+    )
+    assert rf.dataset_video_names(videos, tmp_path, "warehouse", "") == ["a", "b"]
+    assert rf.dataset_video_names(tmp_path / "missing", tmp_path, "warehouse", "") == ["a", "b"]
+
+    monkeypatch.setattr(rf.flows, "unpack_dataset", lambda _d: ({"q": [{"start": 0}]}, {}))
+    assert rf.dataset_video_names(videos, tmp_path, "warehouse", "") == ["a"]
+
+
+class _EsResp:
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+        self.text = json.dumps(body)
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return self._body
+
+
+def test_indexed_counts_reads_only_the_indexes_a_video_file_search_reads(monkeypatch: Any) -> None:
+    """Dated RTSP indexes and tags are never searched here, and no deletion empties them."""
+    from flows import ingest_readiness as ir
+
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def _get(url: str, params: dict[str, str], **_k: Any) -> _EsResp:
+        seen.append((url, params))
+        return _EsResp({"count": 3 if "mdx-raw-" in url else 0})
+
+    monkeypatch.setattr(ir.requests, "get", _get)
+    counts = ir.indexed_counts("https://h:7777/")
+
+    assert counts == {"embed": 0, "raw": 3, "behavior": 0}
+    assert [u for u, _ in seen] == [
+        f"https://h:7777/elasticsearch/{index}/_count"
+        for index in (flows.EMBED_INDEX, flows.RAW_INDEX, flows.BEHAVIOR_INDEX)
+    ]
+    assert all("*" not in u for u, _ in seen)
+    assert all(p["allow_no_indices"] == "true" for _, p in seen)
+
+
+def test_indexed_counts_rejects_a_malformed_response(monkeypatch: Any) -> None:
+    from flows import ingest_readiness as ir
+
+    monkeypatch.setattr(ir.requests, "get", lambda *_a, **_k: _EsResp({"error": "nope"}))
+    with pytest.raises(ir.IngestPollError):
+        ir.indexed_counts("https://h:7777")
+
+
+@pytest.mark.parametrize(
+    ("counts", "exit_code", "embed_only_warning"),
+    [
+        ({"embed": 5, "raw": 7, "behavior": 3}, 0, False),
+        ({"embed": 5, "raw": 7, "behavior": 0}, 0, True),
+        ({"embed": 0, "raw": 7, "behavior": 3}, 1, False),
+    ],
+)
+def test_check_indices_exit_code_tracks_the_embed_index(
+    monkeypatch: Any, capsys: Any, counts: dict[str, int], exit_code: int, embed_only_warning: bool
+) -> None:
+    """Require embed documents; warn, but pass, when attribute/fusion have no behavior documents."""
+    import run_eval_flows as rf
+
+    monkeypatch.setattr(rf.flows, "indexed_counts", lambda _url: counts)
+    assert rf.check_indices("https://h:7777") == exit_code
+    out = capsys.readouterr()
+    for index in flows.SEARCHED_INDEXES.values():
+        assert index in out.out
+    assert ("Step 4" in out.err) is bool(exit_code)
+    assert ("only the embed path" in out.err) is embed_only_warning
+
+
+@pytest.mark.parametrize("error", [requests.ConnectionError("refused"), ValueError("malformed")])
+def test_check_indices_reports_a_failed_read_as_exit_1(monkeypatch: Any, capsys: Any, error: Exception) -> None:
+    import run_eval_flows as rf
+
+    def _fail(_url: str) -> dict[str, int]:
+        raise error
+
+    monkeypatch.setattr(rf.flows, "indexed_counts", _fail)
+    assert rf.check_indices("https://h:7777") == 1
+    assert str(error) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("extra_argv", "expected_url"),
+    [
+        ([], "https://h:7777"),
+        (["--vss-origin-port", "9999"], "https://h:9999"),
+        (["--ingress-url", "https://ingress.example"], "https://ingress.example"),
+    ],
+)
+def test_check_indices_reads_the_gate_ingress_and_exits_before_anything_else(
+    monkeypatch: Any, extra_argv: list[str], expected_url: str
+) -> None:
+    """The same ingress the wipe and the ingest gate read; nothing is listed, deleted or uploaded."""
+    import run_eval_flows as rf
+
+    seen: list[str] = []
+    monkeypatch.setattr(rf, "check_indices", lambda url: seen.append(url) or 0)
+    monkeypatch.setattr(rf.flows, "wipe_index", lambda *_a, **_k: pytest.fail("--check-indices must not wipe"))
+    monkeypatch.setattr(sys, "argv", ["run_eval_flows.py", "--endpoint", "https://h:8000", "--check-indices", *extra_argv])
+    with pytest.raises(SystemExit) as exc:
+        rf.main()
+    assert exc.value.code == 0
+    assert seen == [expected_url]
+
+
+def test_check_indices_refuses_dry_run(capsys: Any) -> None:
+    import run_eval_flows as rf
+
+    with pytest.raises(SystemExit) as exc:
+        rf.parse_args(["--endpoint", "https://h:8000", "--check-indices", "--dry-run"])
+    assert exc.value.code == 2
+    assert "cannot be combined with --dry-run" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Flow description vs live decomposition
+# ---------------------------------------------------------------------------
+
+
+class _Backend:
+    """Minimal stand-in: describe() reports routing from `decompositions`."""
+
+    def __init__(self) -> None:
+        self.decompositions: dict[str, Any] = {}
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "routing": "per-query (from decompositions)" if self.decompositions else "fixed",
+            "decompositions": len(self.decompositions),
+        }
+
+
+class _Decomposer:
+    @staticmethod
+    def describe() -> dict[str, Any]:
+        return {"llm_url": "https://llm:30081", "model": "nemotron", "temperature": 0.0}
+
+
+def test_flow_records_live_decomposition_before_any_query_runs() -> None:
+    """A live decomposer fills `decompositions` only as queries run.
+
+    describe() is called before the first query, so on its own it reports
+    `routing: fixed, decompositions: 0` for a run that decomposes everything --
+    and the saved flow block then tells the reader one path was measured.
+    """
+    import run_eval_flows as rf
+
+    backend = _Backend()
+    assert backend.describe()["routing"] == "fixed"  # the trap
+
+    out = rf.describe_query_flow(backend, _Decomposer())
+    assert out["routing"] == "per-query (live decomposition)"
+    assert out["live_decomposition"]["model"] == "nemotron"
+
+
+def test_dry_run_reports_planned_decomposition_without_building_one() -> None:
+    """The dry run builds no decomposer -- that would call the LLM."""
+    import run_eval_flows as rf
+
+    out = rf.describe_query_flow(_Backend(), None, planned_llm_url="https://llm:30081")
+    assert out["routing"] == "per-query (live decomposition)"
+    assert out["live_decomposition"]["llm_url"] == "https://llm:30081"
+    assert out["live_decomposition"]["model"] == "(discovered at run time)"
+
+
+def test_flow_reports_false_when_nothing_decomposes() -> None:
+    import run_eval_flows as rf
+
+    out = rf.describe_query_flow(_Backend(), None)
+    assert out["routing"] == "fixed"
+    assert out["live_decomposition"] is False
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_llm_origin_is_derived_from_the_agent_endpoint(scheme: str) -> None:
+    """Decomposition must not depend on the caller remembering a flag.
+
+    The NIM is not behind the unified origin, so it is derived the same way VST
+    is: same host, its own port.
+    """
+    assert flows.llm_url_for(f"{scheme}://10.86.12.161:8000") == f"{scheme}://10.86.12.161:30081"
+    assert flows.llm_url_for(f"{scheme}://host:8000", 31000) == f"{scheme}://host:31000"
+    assert flows.llm_url_for(f"{scheme}://host:8000/") == f"{scheme}://host:30081"
+
+
+def test_vst_and_llm_origins_do_not_collide() -> None:
+    endpoint = "https://10.86.12.161:8000"
+    assert flows.vst_url_for(endpoint) != flows.llm_url_for(endpoint)
+
+
+# ---------------------------------------------------------------------------
+# Decomposition fallback when the LLM is unreachable
+# ---------------------------------------------------------------------------
+
+
+def test_load_decompositions_reads_a_provenance_answer_key(tmp_path: Path) -> None:
+    """The sidecar keys its map under `expected_decomposition`, not `queries`."""
+    p = tmp_path / "devset_provenance.json"
+    p.write_text(json.dumps({
+        "n_videos": 32,
+        "expected_decomposition": {
+            "person running": {"query": "person running", "attributes": [], "has_action": True},
+            "person in a red cap running": {
+                "query": "person in a red cap running",
+                "attributes": ["person in a red cap"],
+                "has_action": True,
+            },
+        },
+    }))
+    out = flows.load_decompositions(p)
+    assert set(out) == {"person running", "person in a red cap running"}
+    assert flows.route(out["person running"]) == "embed"
+    assert flows.route(out["person in a red cap running"]) == "fusion"
+
+
+def test_sidecar_is_found_only_when_it_carries_an_answer_key(tmp_path: Path) -> None:
+    (tmp_path / "with-key").mkdir()
+    (tmp_path / "with-key" / "devset_provenance.json").write_text(
+        json.dumps({"expected_decomposition": {"q": {"attributes": []}}})
+    )
+    (tmp_path / "no-key").mkdir()
+    (tmp_path / "no-key" / "devset_provenance.json").write_text(json.dumps({"n_videos": 4}))
+    (tmp_path / "no-file").mkdir()
+
+    assert flows.sidecar_decompositions_for(tmp_path, "with-key") is not None
+    assert flows.sidecar_decompositions_for(tmp_path, "no-key") is None
+    assert flows.sidecar_decompositions_for(tmp_path, "no-file") is None
+
+
+def test_the_llm_unreachable_fallback_lands_on_embed() -> None:
+    """Not fusion. The default --search-path IS the fallback, so it has to be
+    the path that needs nothing a decomposition would have supplied.
+
+    `attribute` and `fusion` both require a per-query attribute that only
+    decomposition produces. Falling back to either means handing them the whole
+    query as one attribute -- the failure this eval already measured at mAP
+    -25%, HIT@1 halved and +59% latency.
+    """
+    import run_eval_flows as rf
+
+    assert rf.parse_args(["--endpoint", "https://host:8000"]).search_path == "embed"
+
+
+def test_fixed_search_path_disables_live_and_stored_decompositions() -> None:
+    import run_eval_flows as rf
+
+    args = rf.parse_args(["--endpoint", "https://host:8000", "--fixed-search-path"])
+    assert args.no_decompose is True
+    assert args.fixed_search_path is True
+
+
+def test_fixed_search_path_rejects_explicit_decompositions() -> None:
+    import run_eval_flows as rf
+
+    with pytest.raises(SystemExit) as exc:
+        rf.parse_args([
+            "--endpoint", "https://host:8000", "--fixed-search-path",
+            "--decompositions", "routes.json",
+        ])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("fixed,expected_path", [(False, "fusion"), (True, "embed")])
+def test_stored_route_replay_and_fixed_path_are_distinct(
+    tmp_path: Path, fixed: bool, expected_path: str
+) -> None:
+    import run_eval_flows as rf
+
+    dataset_dir = tmp_path / "warehouse"
+    dataset_dir.mkdir()
+    (dataset_dir / "dataset.json").write_text(json.dumps({
+        "schema_version": 2,
+        "queries": {
+            "a person running in a hardhat": {
+                "segments": [],
+                "decomposition": {
+                    "query": "person running in a hardhat",
+                    "attributes": ["person in a hardhat"],
+                    "has_action": True,
+                },
+            },
+        },
+    }))
+    backend = flows.CliQueryBackend(["vss"], search_path="embed")
+    paths: list[str] = []
+
+    def search(query: str) -> tuple[list[dict[str, Any]], float]:
+        paths.append(backend.plan_for_query(query)["path"])
+        return [], 0.01
+
+    backend.search = search  # type: ignore[method-assign]
+    result = rf.run_evaluation(
+        backend, tmp_path, "warehouse", "", output_file=str(tmp_path / "result.json"),
+        use_dataset_decompositions=not fixed,
+    )
+    assert paths == [expected_path]
+    assert result["flow"]["query"]["planned_paths"] == f"{expected_path}=1"
+
+
+class _FlakyDecomposer(_Decomposer):
+    """Decomposes every query as fusion, except those in ``failing``."""
+
+    def __init__(self, failing: set[str]) -> None:
+        self.failing = failing
+
+    def decompose(self, query: str, video_sources: list[str] | None = None) -> tuple[dict[str, Any], float]:
+        if query in self.failing:
+            raise flows.DecompositionError(f"decomposition request failed for {query!r}: 503")
+        return {"query": query, "attributes": ["person in a hardhat"], "has_action": True}, 0.5
+
+
+def _run_with_decomposer(tmp_path: Path, queries: list[str], failing: set[str], **kw: Any) -> tuple[dict[str, Any], dict[str, str]]:
+    import run_eval_flows as rf
+
+    dataset_dir = tmp_path / "warehouse"
+    dataset_dir.mkdir()
+    (dataset_dir / "dataset.json").write_text(json.dumps({"queries": {q: [] for q in queries}}))
+    backend = flows.CliQueryBackend(["vss"], search_path="embed")
+    sent: dict[str, str] = {}
+
+    def search(query: str) -> tuple[list[dict[str, Any]], float]:
+        plan = backend.plan_for_query(query)
+        sent[query] = plan["path"]
+        return [], 0.01
+
+    backend.search = search  # type: ignore[method-assign]
+    result = rf.run_evaluation(
+        backend, tmp_path, "warehouse", "", output_file=str(tmp_path / "result.json"),
+        decomposer=_FlakyDecomposer(failing), **kw,
+    )
+    return result, sent
+
+
+def test_a_failed_decomposition_falls_back_to_embed_like_the_agent(tmp_path: Path) -> None:
+    """The agent searches the original query on embed; the run still finishes."""
+    queries = [f"a person running {i}" for i in range(5)]
+    result, sent = _run_with_decomposer(tmp_path, queries, {queries[2]})
+
+    assert sent[queries[2]] == "embed"
+    assert all(sent[q] == "fusion" for q in queries if q != queries[2])
+    failed = [r for r in result["query_results"] if r.get("decompose_failed")]
+    assert [r["query"] for r in failed] == [queries[2]]
+    assert failed[0]["decomposition"] == {"query": queries[2]}
+    dec = result["summary"]["decomposition"]
+    assert dec["failed"] == 1
+    assert dec["queries"] == 5
+    assert dec["mean_s"] == 0.5
+    assert dec["failed_queries"][0]["query"] == queries[2]
+
+
+def test_too_many_failed_decompositions_abort_the_run(tmp_path: Path) -> None:
+    """Past the limit the numbers measure embed, not the agent's routing."""
+    queries = ["a person running", "a person walking"]
+    with pytest.raises(SystemExit, match="fell back to embed"):
+        _run_with_decomposer(tmp_path, queries, {queries[0]})
+
+
+def test_an_aborted_decomposition_run_saves_each_error_and_no_summary(tmp_path: Path) -> None:
+    queries = ["a person running", "a person walking"]
+    with pytest.raises(SystemExit, match="no summary written"):
+        _run_with_decomposer(tmp_path, queries, {queries[0]})
+
+    saved = json.loads((tmp_path / "result.json").read_text())
+    assert saved["summary"] is None
+    assert "--max-decompose-failed-pct" in saved["aborted"]
+    assert [r["query"] for r in saved["query_results"] if r.get("decompose_failed")] == [queries[0]]
+
+
+def test_decomposition_failures_past_the_cap_stop_the_run_early(tmp_path: Path) -> None:
+    """Once the end-of-run check is bound to fail, the rest of the queries are not run."""
+    queries = [f"a person running {i}" for i in range(10)]
+    with pytest.raises(SystemExit, match="stopped early"):
+        _run_with_decomposer(tmp_path, queries, set(queries), max_decompose_failed_pct=20.0)
+
+    saved = json.loads((tmp_path / "result.json").read_text())
+    # 3/10 is the first count above 20%; with one worker nothing starts after it.
+    assert len(saved["query_results"]) == 3
+    assert saved["aborted"].startswith("3/10 queries fell back to embed")
+
+
+def test_an_aborted_decomposition_run_is_saved_even_with_an_unanswered_query(tmp_path: Path) -> None:
+    """The unanswered check must not raise first and lose the decomposition errors."""
+    import run_eval_flows as rf
+
+    queries = ["a person running", "a person walking", "a person sitting"]
+    dataset_dir = tmp_path / "warehouse"
+    dataset_dir.mkdir()
+    (dataset_dir / "dataset.json").write_text(json.dumps({"queries": {q: [] for q in queries}}))
+    backend = flows.CliQueryBackend(["vss"], search_path="embed")
+
+    def search(query: str) -> tuple[list[dict[str, Any]], float]:
+        if query == queries[2]:
+            raise flows.QueryUnanswerableError("no data envelope")
+        return [], 0.01
+
+    backend.search = search  # type: ignore[method-assign]
+    # 1/3 is under the early-stop cap; 1/2 answered is over it at the end.
+    with pytest.raises(SystemExit, match="fell back to embed"):
+        rf.run_evaluation(
+            backend, tmp_path, "warehouse", "", output_file=str(tmp_path / "result.json"),
+            decomposer=_FlakyDecomposer({queries[0]}), max_decompose_failed_pct=40.0,
+        )
+
+    saved = json.loads((tmp_path / "result.json").read_text())
+    assert saved["summary"] is None
+    assert [r["query"] for r in saved["query_results"] if r.get("decompose_failed")] == [queries[0]]
+    assert [u["query"] for u in saved["unanswered"]] == [queries[2]]
+
+
+def test_decomposition_failures_under_the_cap_never_stop_the_run(tmp_path: Path) -> None:
+    queries = [f"a person running {i}" for i in range(10)]
+    result, sent = _run_with_decomposer(
+        tmp_path, queries, {queries[0], queries[1]}, max_decompose_failed_pct=20.0,
+    )
+    assert len(sent) == 10
+    assert result["summary"]["decomposition"]["failed"] == 2
+    assert "aborted" not in result
+
+
+def test_the_fallback_path_needs_nothing_a_decomposition_would_supply() -> None:
+    """The property that makes embed the right fallback, not just the default."""
+    argv = flows.CliQueryBackend(["vss"], search_path="embed").build_argv("a person running")
+    assert argv[:4] == ["vss", "search", "run", "embed"]
+    assert "--attribute" not in argv, "an attribute could only have come from a decomposition"
+    assert "--object-id" not in argv
+    assert argv[argv.index("--query") + 1] == "a person running"
+
+
+def test_the_two_paths_that_must_not_be_fallbacks_are_refused_without_attributes() -> None:
+    """And the refusal happens before any network call, not on query 1."""
+    import run_eval_flows as rf
+
+    for path in ("attribute", "fusion"):
+        args = rf.parse_args(["--endpoint", "https://host:8000", "--search-path", path])
+        with pytest.raises(SystemExit) as exc:
+            rf.build_query_backend(args)
+        assert "requires at least one --attribute" in str(exc.value)
+
+
+def test_flow_records_that_the_run_fell_back(tmp_path: Path) -> None:
+    """A fallback run must not read as a deliberate fixed-path choice."""
+    import run_eval_flows as rf
+
+    fb = {"attempted": "https://llm:30081", "error": "refused",
+          "fell_back_to": "dataset answer key (devset_provenance.json)"}
+    out = rf.describe_query_flow(_Backend(), None, fallback=fb)
+    assert out["live_decomposition"]["fell_back_to"].startswith("dataset answer key")
+    assert out["live_decomposition"]["error"] == "refused"
+
+
+# ---------------------------------------------------------------------------
+# Names the runner reads but never binds
+# ---------------------------------------------------------------------------
+
+
+def test_no_function_reads_a_name_it_never_binds() -> None:
+    """Catch the NameError class of bug that only a live run would surface.
+
+    `run_evaluation` once read `decompose_fallback`, a local of `main()` that was
+    never passed in. Nothing here called `run_evaluation` -- it needs a
+    deployment -- so the tests stayed green while every real run raised
+    NameError at the flow-description line.
+
+    Walking the AST costs nothing and covers every function in the module. A
+    name loaded inside a function must be bound by that function, by one of its
+    enclosing functions (closures are legitimate and this module uses them), by
+    the module, or by builtins.
+    """
+    import ast
+    import builtins
+
+    source = (Path(__file__).resolve().parents[1] / "run_eval_flows.py").read_text()
+    tree = ast.parse(source)
+
+    def bindings(node: ast.AST) -> set[str]:
+        """Names this scope binds, not descending into nested scopes."""
+        out: set[str] = set()
+        args = getattr(node, "args", None)
+        if isinstance(args, ast.arguments):
+            out |= {a.arg for a in args.args + args.kwonlyargs + args.posonlyargs}
+            if args.vararg:
+                out.add(args.vararg.arg)
+            if args.kwarg:
+                out.add(args.kwarg.arg)
+
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.add(n.name)
+                continue  # its interior is a scope of its own
+            if isinstance(n, ast.Lambda):
+                continue
+            if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                out.add(n.id)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                out |= {(a.asname or a.name).split(".")[0] for a in n.names}
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                out.add(n.name)
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                out |= set(n.names)
+            stack.extend(ast.iter_child_nodes(n))
+        return out
+
+    def loads(node: ast.AST) -> set[str]:
+        """Names this scope reads, not descending into nested scopes."""
+        out: set[str] = set()
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                out.add(n.id)
+            stack.extend(ast.iter_child_nodes(n))
+        return out
+
+    module_scope = bindings(tree) | set(dir(builtins))
+    unbound: dict[str, set[str]] = {}
+
+    def visit(node: ast.AST, enclosing: set[str], path: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope = enclosing | bindings(child)
+                name = f"{path}.{child.name}" if path else child.name
+                missing = loads(child) - scope
+                if missing:
+                    unbound[name] = missing
+                visit(child, scope, name)
+            else:
+                visit(child, enclosing, path)
+
+    visit(tree, module_scope, "")
+    assert not unbound, f"names read but never bound: {unbound}"
+
+
+# ---------------------------------------------------------------------------
+# Segment matching: overlap, not equal start times
+# ---------------------------------------------------------------------------
+
+_F = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _window(video: str, start_s: int, length_s: int = 5) -> dict[str, str]:
+    import datetime
+
+    base = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(seconds=start_s)
+    return {
+        "video_name": video,
+        "start_time": base.strftime(_F),
+        "end_time": (base + datetime.timedelta(seconds=length_s)).strftime(_F),
+    }
+
+
+def test_chunk_aligned_ground_truth_matches_exactly_as_before() -> None:
+    """vad-r1-v2 is 100% 5s and 100% grid-aligned; its scoring must not move."""
+    gt = [_window("vidA", 10)]
+    assert flows.match_segment(_window("vidA", 10), gt)[0] == 0
+    for off_by_one in (0, 5, 15, 20):
+        assert flows.match_segment(_window("vidA", off_by_one), gt)[0] == -1
+
+
+def test_a_result_inside_an_event_matches_it() -> None:
+    """physicalai-dev segments are event bounds, often off the 5s grid.
+
+    Results are snapped to that grid, so equal-start matching made 23.6% of its
+    queries unscoreable and threw away 57% of the time its ground truth covers.
+    """
+    event = [_window("vidA", 7, length_s=27)]  # 00:07 -> 00:34, off-grid start
+    for inside in (5, 10, 20, 30):
+        assert flows.match_segment(_window("vidA", inside), event)[0] == 0, inside
+    for outside in (0, 35, 60):
+        assert flows.match_segment(_window("vidA", outside), event)[0] == -1, outside
+
+
+def test_adjacent_segments_do_not_overlap() -> None:
+    """Half-open intervals: [10,15) and [15,20) touch but do not overlap."""
+    gt = [_window("vidA", 15)]
+    assert flows.match_segment(_window("vidA", 10), gt)[0] == -1
+    assert flows.match_segment(_window("vidA", 15), gt)[0] == 0
+
+
+def test_overlap_does_not_turn_one_event_into_several_hits() -> None:
+    """Each ground-truth segment is still claimed once."""
+    event = [_window("vidA", 7, length_s=27)]
+    out = flows.evaluate_query("q", [_window("vidA", s) for s in (10, 15, 20)], event, 1.0)
+    assert out["true_positives"] == 1
+    assert out["recall"] == 1.0
+
+
+def test_a_different_video_never_matches() -> None:
+    gt = [_window("vidA", 10)]
+    assert flows.match_segment(_window("vidB", 10), gt)[0] == -1
+
+
+@pytest.mark.parametrize(
+    "api_name, ground_truth, expected",
+    [
+        ("clip_1.mp4", "clip_1", True),
+        ("clip_1.mkv", "clip_1.mp4", True),
+        ("clip_1_20250101_000000_e0482.mp4", "clip_1", True),
+        ("clip_10.mp4", "clip_1", False),
+        ("clip_1_unrelated.mp4", "clip_1", False),
+    ],
+)
+def test_video_name_match_requires_complete_identity(api_name: str, ground_truth: str, expected: bool) -> None:
+    assert flows.video_name_matches(api_name, ground_truth) is expected
+
+
+def test_prefix_collision_does_not_inflate_scores() -> None:
+    scored = flows.evaluate_query("q", [_window("clip_10.mp4", 10)], [_window("clip_1", 10)], 0.1)
+    assert scored["precision"] == 0.0
+    assert scored["recall"] == 0.0
+    assert scored["average_precision"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# no_opinion: the safety check that catches a critic which ran and said nothing
+# ---------------------------------------------------------------------------
+
+
+def _scored(**over: Any) -> dict[str, Any]:
+    """One query_result in the shape _summarize consumes."""
+    base = {
+        "precision": 0.5, "recall": 0.5, "f1": 0.5, "average_precision": 0.5,
+        "reciprocal_rank": 1.0, "hit_at_k": dict.fromkeys(flows.HIT_K_VALUES, 1),
+        "latency_s": 1.0, "num_rejected": 0,
+    }
+    base["critic_filtered"] = {k: base[k] for k in
+                               ("precision", "recall", "f1", "average_precision", "reciprocal_rank")}
+    base["critic_filtered"]["hit_at_k"] = dict(base["hit_at_k"])
+    base.update(over)
+    return base
+
+
+def _summary(sources: set[str], verdicts: dict[str, int]) -> dict[str, Any]:
+    import run_eval_flows as rf
+
+    return rf._summarize(
+        [_scored(), _scored()],
+        dataset="d", subset="", wall_clock_s=10.0, concurrency=1,
+        sources_seen=sources, upload_stats=None, verdicts=verdicts,
+    )
+
+
+def test_a_critic_that_only_ever_said_unverified_is_no_opinion() -> None:
+    """Blocks present, zero opinions -- the state that reads as agreement.
+
+    filter_rejected drops nothing, so critic_filtered comes out numerically
+    identical to raw and looks like the critic endorsed retrieval. A VST clip
+    URL that RT-VLM cannot fetch can produce this state at exit 0.
+    """
+    summary = _summary({"verification"}, {"unverified": 10})
+    assert summary["critic"]["status"] == "no_opinion"
+    assert "critic_filtered" not in summary, "suppressed, or it would equal raw"
+    assert "total_rejected" not in summary
+
+
+def test_one_real_verdict_is_enough_to_report_critic_filtered() -> None:
+    summary = _summary({"verification"}, {"confirmed": 1, "unverified": 9})
+    assert summary["critic"]["status"] == "ok"
+    assert "critic_filtered" in summary
+    assert summary["total_rejected"] == 0
+
+
+def test_rejections_alone_also_count_as_an_opinion() -> None:
+    """`rejected` is a verdict too -- only `unverified` is the absence of one."""
+    summary = _summary({"verification"}, {"rejected": 4})
+    assert summary["critic"]["status"] == "ok"
+    assert "critic_filtered" in summary
+
+
+def test_no_verification_blocks_at_all_omits_the_critic_key() -> None:
+    """Distinct from no_opinion: nothing ran, so there is nothing to report.
+
+    Both suppress critic_filtered, but a reader has to be able to tell "the
+    critic is broken" from "this deployment has no critic".
+    """
+    summary = _summary({flows.VERIFICATION_ABSENT}, {})
+    assert "critic" not in summary
+    assert "critic_filtered" not in summary
+
+
+def test_the_absent_sentinel_is_not_mistaken_for_a_real_source() -> None:
+    """A mixed run still reports, but the sentinel alone must not qualify."""
+    assert _summary({flows.VERIFICATION_ABSENT}, {"confirmed": 5}).get("critic") is None
+    assert _summary(
+        {flows.VERIFICATION_ABSENT, "verification"}, {"confirmed": 5}
+    )["critic"]["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Ingest gate: completion read from what perception wrote
+# ---------------------------------------------------------------------------
+
+_SID = "11111111-2222-3333-4444-555555555555"
+_NAME = "warehouse_sample"
+_ANCHOR_MS = flows.ingest_readiness.anchor_epoch_ms()
+
+
+def _warehouse(**overrides: Any) -> Any:
+    """The measured 210 s, 30 fps copy of warehouse_sample, uploaded at t=0."""
+    fields: dict[str, Any] = {
+        "name": _NAME, "sensor_id": _SID, "duration_s": 210.0, "fps": 30.0,
+        "upload_start_mono": 0.0, "video_name": _NAME, "file_size_mb": 150.0, "upload_s": 1.2,
+    }
+    fields.update(overrides)
+    return flows.ExpectedVideo(**fields)
+
+
+def _snap(
+    *, cv: bool = False, raw: int = 0, last_s: float | None = None,
+    embed: int = 0, tags: int = 0, behavior: int = 0,
+) -> Any:
+    tag_index = "default_" + _SID.replace("-", "_")
+    return flows.Snapshot(
+        cv_active={_NAME, "rtsp://vst/whatever"} if cv else {"some-other-camera"},
+        raw={_NAME: (raw, _ANCHOR_MS + last_s * 1000 if last_s is not None else None)} if raw else {},
+        embed={_SID: embed} if embed else {},
+        tags={tag_index: tags} if tags else {},
+        behavior={_NAME: behavior} if behavior else {},
+    )
+
+
+def _state(video: Any = None, **kw: Any) -> Any:
+    return flows.VideoState(video or _warehouse(), anchor_ms=_ANCHOR_MS, **kw)
+
+
+def _measured_timeline(t: float) -> Any:
+    """Each index finishing when it did on the deployment (seconds after upload)."""
+    frac = min(1.0, t / 218.2)
+    return _snap(
+        cv=2.4 <= t < 216.0,
+        raw=min(6298, int(frac * 6298)) if t > 0 else 0,
+        last_s=frac * 209.966,
+        embed=min(42, int(t / 26.3 * 42)),
+        tags=42 if t >= 8.9 else 0,
+        behavior=8 if t >= 185.5 else (3 if t >= 100 else 0),
+    )
+
+
+class _FakeClock:
+    def __init__(self, start: float = 0.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def _gate(expected: list[Any], poll_fn: Any, clock: _FakeClock, **kw: Any) -> dict[str, Any]:
+    return flows.wait_for_ingest_complete(
+        "https://host:7777", expected, poll_fn=poll_fn, clock=clock, sleep=clock.sleep,
+        log=lambda _line: None, **kw,
+    )
+
+
+def test_targets_come_from_duration_and_frame_rate() -> None:
+    st = _state()
+    assert st.targets == {"embed": 42, "tags": 42, "raw": 6300}
+    # A container duration a hair past the boundary is not an extra chunk.
+    assert flows.ingest_readiness.chunk_target(210.033, 5.0) == 42
+    assert flows.ingest_readiness.chunk_target(25.0, 5.0) == 5
+    assert flows.ingest_readiness.frame_count(25.0, 10.0) == 250
+    assert flows.ingest_readiness.raw_coverage(18, 381) == "18/381 frames (5%)"
+    assert _warehouse().tag_index == "default_11111111_2222_3333_4444_555555555555"
+
+
+def test_embeddings_reach_their_target_long_before_raw() -> None:
+    """The old probe's pass point: 42/42 embeddings while RT-CV is mid-file."""
+    st = _state()
+    st.observe(_snap(cv=True, raw=3000, last_s=100.0, embed=42, tags=42), now=26.3)
+    assert st.index_done["embed"] and st.index_done["tags"]
+    assert not st.index_done["raw"]
+    assert not st.done
+    assert st.per_index_done_s()["embed"] == pytest.approx(26.3)
+
+
+def test_rtcv_never_listing_the_video_times_out_with_the_webhook_hint() -> None:
+    """No RT-CV listing and no frames: the webhook never reached RT-CV."""
+    clock = _FakeClock(1.2)
+    no_frames = _snap(cv=False, embed=42, tags=42)
+    result = _gate([_warehouse()], lambda: no_frames, clock, deadline_s=30.0)
+
+    assert result["outcome"] == "timed_out"
+    report = result["per_video"][0]
+    assert report["outcome"] == "timed_out"
+    assert report["cv_seen"] is False
+    assert any("RT-CV never listed the stream" in c for c in report["causes"])
+    assert "webhooks.enabled" in flows.format_ingest_failure(result)
+
+
+def test_rtcv_never_listing_a_short_clip_still_confirms_on_complete_stable_frames() -> None:
+    """RT-CV can finish a clip between polls; complete, stable raw stands in."""
+    clock = _FakeClock(1.2)
+    full = _snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42, behavior=8)
+    result = _gate([_warehouse()], lambda: full, clock, deadline_s=60.0)
+
+    assert result["outcome"] == "confirmed"
+    report = result["per_video"][0]
+    assert report["raw_check"] == "rtcv_missing"
+    assert any("RT-CV never listed" in w for w in report["warnings"])
+
+
+def test_rtcv_never_listing_with_a_growing_count_keeps_waiting() -> None:
+    clock = _FakeClock(1.2)
+
+    def growing() -> Any:
+        return _snap(cv=False, raw=int(clock.t * 10), last_s=clock.t, embed=42, tags=42)
+
+    result = _gate([_warehouse()], growing, clock, deadline_s=30.0)
+
+    assert result["outcome"] == "timed_out"
+    causes = result["per_video"][0]["causes"]
+    assert any(
+        "RT-CV never listed the stream" in c and "frame docs (frames with detections), still changing" in c
+        for c in causes
+    )
+
+
+def test_raw_without_behavior_passes_with_a_warning_when_strict() -> None:
+    clock = _FakeClock(1.2)
+    no_behavior = _snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42)
+    result = _gate([_warehouse()], lambda: no_behavior, clock, deadline_s=60.0, absent_grace_s=None)
+
+    assert result["outcome"] == "confirmed"
+    assert result["absent"] == {} and result["degraded"] is False
+    report = result["per_video"][0]
+    assert any("no behavior documents" in w for w in report["warnings"])
+
+
+def test_behavior_empty_for_every_video_is_marked_absent_at_confirmation() -> None:
+    clock = _FakeClock(1.2)
+    no_behavior = _snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42)
+    result = _gate([_warehouse()], lambda: no_behavior, clock, deadline_s=60.0)
+
+    assert result["outcome"] == "confirmed"
+    assert result["degraded"] is True
+    assert list(result["absent"]) == ["behavior"]
+    assert "analytics app" in result["absent"]["behavior"]
+    assert "behavior" in result["require"]
+    report = result["per_video"][0]
+    assert report["absent"] == ["behavior"]
+    assert not any("no behavior documents" in w for w in report["warnings"])
+
+
+def test_ingest_summary_prints_na_and_warnings(capsys: pytest.CaptureFixture[str]) -> None:
+    clock = _FakeClock(1.2)
+    no_behavior = _snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42)
+    result = _gate([_warehouse()], lambda: no_behavior, clock, deadline_s=60.0, absent_grace_s=None)
+
+    flows.print_ingest_summary(flows.aggregate_ingest_stats(result), result["per_video"])
+    out = capsys.readouterr().out
+    assert "behavior=n/a" in out
+    assert "Nones" not in out
+    assert "WARNING: raw documents but no behavior documents" in out
+    assert "(degraded)" not in out
+
+
+def test_ingest_summary_marks_a_degraded_run(capsys: pytest.CaptureFixture[str]) -> None:
+    clock = _FakeClock(1.2)
+    no_behavior = _snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42)
+    result = _gate([_warehouse()], lambda: no_behavior, clock, deadline_s=60.0)
+
+    flows.print_ingest_summary(flows.aggregate_ingest_stats(result), result["per_video"])
+    out = capsys.readouterr().out
+    assert "Outcome:            confirmed (degraded)" in out
+    assert "WARNING: behavior: no documents for any of 1 video(s)" in out
+
+
+def test_tags_empty_for_every_video_are_dropped_after_the_grace() -> None:
+    clock = _FakeClock(1.2)
+    untagged = _snap(cv=False, raw=6298, last_s=209.966, embed=42, behavior=8)
+    result = _gate([_warehouse()], lambda: untagged, clock, deadline_s=600.0)
+
+    assert result["outcome"] == "confirmed"
+    assert list(result["absent"]) == ["tags"]
+    assert "RT-VLM tagging looks off" in result["absent"]["tags"]
+    # Not before the grace: embeddings are in from the first poll.
+    assert result["waited_s"] >= flows.DEFAULT_INGEST_ABSENT_GRACE_S
+
+
+def test_tags_empty_for_every_video_time_out_when_strict() -> None:
+    clock = _FakeClock(1.2)
+    untagged = _snap(cv=False, raw=6298, last_s=209.966, embed=42, behavior=8)
+    result = _gate([_warehouse()], lambda: untagged, clock, deadline_s=120.0, absent_grace_s=None)
+
+    assert result["outcome"] == "timed_out"
+    assert result["absent"] == {}
+
+
+def test_raw_absent_everywhere_takes_behavior_with_it() -> None:
+    clock = _FakeClock(1.2)
+    no_cv = _snap(cv=False, embed=42, tags=42)
+    result = _gate([_warehouse()], lambda: no_cv, clock, deadline_s=120.0)
+
+    assert result["outcome"] == "confirmed"
+    assert sorted(result["absent"]) == ["behavior", "raw"]
+    assert "RT-CV never listed any of 1 video(s)" in result["absent"]["raw"]
+    report = result["per_video"][0]
+    assert report["absent"] == ["behavior", "raw"]
+    assert report["raw_check"] is None
+
+
+def test_an_index_one_video_has_stays_required_for_every_video() -> None:
+    """Tags for one video prove tagging is on, so the untagged one is slow, not absent."""
+    clock = _FakeClock(1.2)
+    other_sid = "99999999-8888-7777-6666-555555555555"
+    other = _warehouse(name="other_sample", video_name="other_sample", sensor_id=other_sid)
+    snap = flows.Snapshot(
+        cv_active={"some-other-camera"},
+        raw={_NAME: (6298, _ANCHOR_MS + 209_966), "other_sample": (6298, _ANCHOR_MS + 209_966)},
+        embed={_SID: 42, other_sid: 42},
+        tags={_warehouse().tag_index: 42},
+        behavior={_NAME: 8, "other_sample": 8},
+    )
+    result = _gate([_warehouse(), other], lambda: snap, clock, deadline_s=120.0)
+
+    assert result["outcome"] == "timed_out"
+    assert result["absent"] == {}
+    timed_out = [r for r in result["per_video"] if r["outcome"] == "timed_out"]
+    assert [r["video_name"] for r in timed_out] == ["other_sample"]
+
+
+def test_degraded_paths_names_only_queries_that_read_an_absent_index() -> None:
+    raw_absent = {"raw": "r", "behavior": "b"}
+    assert flows.degraded_paths(raw_absent, {"embed": 10, "attribute": 3, "fusion": 2}) == {
+        "absent": ["behavior", "raw"],
+        "affected_paths": {"attribute": 3, "fusion": 2},
+    }
+    assert flows.degraded_paths(raw_absent, {"embed": 10}) is None
+    assert flows.degraded_paths({"tags": "t"}, {"embed": 10, "fusion": 2}) is None
+    assert flows.degraded_paths({}, {"fusion": 2}) is None
+    assert flows.degraded_paths(raw_absent, None) is None
+
+
+def test_ingest_strict_disables_the_absent_grace() -> None:
+    import run_eval_flows as rf
+
+    default = rf.parse_args(["--endpoint", "https://host:8000"])
+    assert default.ingest_absent_grace_s == flows.DEFAULT_INGEST_ABSENT_GRACE_S
+    assert rf.build_ingest_watcher(default, "https://host:7777").absent_grace_s == default.ingest_absent_grace_s
+
+    strict = rf.parse_args(["--endpoint", "https://host:8000", "--ingest-strict"])
+    assert rf.build_ingest_watcher(strict, "https://host:7777").absent_grace_s is None
+
+    with pytest.raises(SystemExit):
+        rf.parse_args(["--endpoint", "https://host:8000", "--ingest-absent-grace-s", "-1"])
+
+
+def test_watcher_polls_before_videos_are_added_and_waits_for_seal() -> None:
+    """A clip RT-CV lists and drops mid-upload is remembered; nothing confirms unsealed."""
+    clock = _FakeClock(0.0)
+    snaps = iter([_snap(cv=True), _snap(cv=False)])
+    full = _snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42, behavior=8)
+    seen: list[list[str]] = []
+
+    def poll(videos: list[Any]) -> Any:
+        seen.append([v.name for v in videos])
+        return next(snaps, full)
+
+    watcher = flows.IngestWatcher(
+        "https://host:7777", poll_fn=poll, clock=clock, sleep=clock.sleep, log=lambda _line: None,
+    )
+    assert watcher._step() is None  # listed while the upload is still in flight
+    clock.sleep(2.0)
+    assert watcher._step() is None  # already dropped
+    watcher.add(_warehouse(upload_start_mono=0.0))
+    for _ in range(20):
+        clock.sleep(2.0)
+        assert watcher._step() is None  # complete, but the set is not sealed
+    assert seen[0] == [] and seen[-1] == [_NAME]
+
+    clock.sleep(1.0)
+    watcher.seal(deadline_s=30.0)
+    sealed_at = clock.t
+    result = watcher.wait()
+
+    assert result["outcome"] == "confirmed"
+    report = result["per_video"][0]
+    assert report["cv_seen"] is True
+    assert report["raw_check"] == "rtcv_released"
+    assert result["waited_s"] == pytest.approx(clock.t - sealed_at)
+    assert result["polled_s"] > result["waited_s"]
+
+
+def test_watcher_deadline_counts_from_seal_not_from_start() -> None:
+    clock = _FakeClock(0.0)
+    empty = _snap()
+    watcher = flows.IngestWatcher(
+        "https://host:7777", poll_fn=lambda _v: empty, clock=clock, sleep=clock.sleep,
+        log=lambda _line: None,
+    )
+    watcher.add(_warehouse())
+    for _ in range(50):  # 100 s of uploading, well past the deadline below
+        assert watcher._step() is None
+        clock.sleep(2.0)
+    watcher.seal(deadline_s=10.0)
+    result = watcher.wait()
+
+    assert result["outcome"] == "timed_out"
+    assert result["waited_s"] == pytest.approx(10.0, abs=2.0)
+
+
+def _threaded_video(i: int) -> Any:
+    sid = f"00000000-0000-0000-0000-{i:012d}"
+    return _warehouse(name=f"clip_{i}", sensor_id=sid, video_name=f"clip_{i}", upload_start_mono=time.monotonic())
+
+
+def test_threaded_watcher_confirms_videos_added_while_it_polls() -> None:
+    """What every vst-direct run does: start, add uploads from another thread, then wait."""
+    def poll(videos: list[Any]) -> Any:
+        return flows.Snapshot(
+            embed={v.sensor_id: 42 for v in videos},
+            tags={v.tag_index: 42 for v in videos},
+        )
+
+    watcher = flows.IngestWatcher(
+        "https://host:7777", require={"embed", "tags"}, poll_s=0.01, quiet_s=0.05,
+        poll_fn=poll, log=lambda _line: None,
+    )
+    watcher.start()
+
+    def upload() -> None:
+        for i in range(3):
+            time.sleep(0.03)
+            watcher.add(_threaded_video(i))
+
+    uploader = threading.Thread(target=upload)
+    uploader.start()
+    uploader.join()
+    result = watcher.wait(deadline_s=10.0)
+
+    assert result["outcome"] == "confirmed"
+    assert sorted(r["sensor"] for r in result["per_video"]) == ["clip_0", "clip_1", "clip_2"]
+    assert result["polls"] > 1
+
+
+def test_a_watcher_thread_that_crashes_says_so_instead_of_blaming_the_deadline() -> None:
+    def poll(_videos: list[Any]) -> Any:
+        raise AttributeError("'list' object has no attribute 'get'")
+
+    watcher = flows.IngestWatcher(
+        "https://host:7777", poll_s=0.01, poll_fn=poll, log=lambda _line: None,
+    )
+    watcher.start()
+    watcher._thread.join(timeout=5.0)
+
+    crashed = watcher.crashed
+    assert crashed is not None and crashed["outcome"] == "failed"
+    message = flows.format_ingest_failure(crashed)
+    assert "stopped polling on an unexpected error: AttributeError" in message
+    assert "will not help" in message
+    assert "Raise --ingest-deadline-s" not in message
+
+
+def test_a_watcher_that_is_still_polling_has_not_crashed() -> None:
+    watcher = flows.IngestWatcher("https://host:7777", poll_fn=lambda _v: _snap(), log=lambda _line: None)
+    assert watcher.crashed is None
+
+
+def test_a_malformed_msearch_reply_is_a_poll_error_not_a_crash(monkeypatch: Any) -> None:
+    from flows import ingest_readiness as ir
+
+    class _List(_EsResp):
+        def json(self) -> Any:
+            return ["not", "an", "object"]
+
+    monkeypatch.setattr(ir.requests, "post", lambda *_a, **_k: _List({}))
+    with pytest.raises(ir.IngestPollError):
+        ir._msearch("https://h:7777", [("embed", ir.EMBED_INDEX, {})], timeout=1)
+
+
+def test_a_one_poll_gap_in_rtcv_does_not_start_the_flush_window() -> None:
+    """The window counts from the release that sticks, not from a flicker."""
+    st = _state(_sparse(), quiet_s=15.0)
+    st.observe(_sparse_snap(cv=True), now=2.0)
+    st.observe(_sparse_snap(cv=False), now=4.0)
+    assert st.cv_dropped_at == 4.0
+    st.observe(_sparse_snap(cv=True), now=6.0)
+    assert st.cv_dropped_at is None
+    for now in range(8, 101, 2):
+        st.observe(_sparse_snap(cv=True), now=float(now))
+    st.observe(_sparse_snap(cv=False), now=102.0)
+    assert not st.index_done["raw"], "released at 102 s; the flush window has not passed"
+    st.observe(_sparse_snap(cv=False), now=117.0)
+    assert st.index_done["raw"]
+
+
+def test_sparse_raw_is_done_when_rtcv_releases_not_at_the_last_detection() -> None:
+    """A 300 s video, RT-CV busy until 310 s, its last detection seconds in."""
+    st = _state(_warehouse(duration_s=300.0), quiet_s=15.0)
+    st.observe(_snap(cv=True, raw=18, last_s=3.0, embed=60, tags=60), now=20.0)
+    for now in range(30, 301, 10):
+        st.observe(_snap(cv=True, raw=18, last_s=3.0, embed=60, tags=60), now=float(now))
+    st.observe(_snap(cv=False, raw=18, last_s=3.0, embed=60, tags=60), now=310.0)
+    st.observe(_snap(cv=False, raw=18, last_s=3.0, embed=60, tags=60), now=325.0)
+    assert st.done
+    assert st.raw_check == "rtcv_released"
+    assert st.per_index_done_s()["raw"] == pytest.approx(310.0)
+    assert st.report("confirmed")["ingest_s"] == pytest.approx(310.0)
+
+
+def test_raw_never_listed_keeps_the_last_change_as_its_done_time() -> None:
+    st = _state(_sparse(), quiet_s=15.0)
+    st.observe(_sparse_snap(cv=False), now=8.0)
+    st.observe(_sparse_snap(cv=False), now=23.0)
+    assert st.raw_check == "rtcv_missing"
+    assert st.per_index_done_s()["raw"] == pytest.approx(8.0)
+
+
+def test_dense_video_finishes_raw_once_the_count_holds_after_release() -> None:
+    st = _state(quiet_s=15.0)
+    st.observe(_snap(cv=True, raw=100, last_s=3.0, embed=5), now=5.0)
+    st.observe(_snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42), now=218.2)
+    assert st.cv_dropped
+    assert not st.index_done["raw"], "released, but Logstash may still be flushing"
+    st.observe(_snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42), now=233.2)
+    assert st.index_done["raw"]
+    assert st.raw_check == "rtcv_released"
+    assert st.per_index_done_s()["raw"] == pytest.approx(218.2)
+    assert st.report("confirmed")["raw_coverage"] == pytest.approx(1.0, abs=0.01)
+
+
+# Normal_Videos779 on vad-r1-v2: RT-CV writes a raw document only for a frame
+# with a detection, so 18 of 381 frames, the last at 3.77 s of ~12.7 s.
+def _sparse() -> Any:
+    return _warehouse(duration_s=12.7, fps=30.0)
+
+
+def _sparse_snap(*, cv: bool, raw: int = 18) -> Any:
+    return _snap(cv=cv, raw=raw, last_s=3.77, embed=3, tags=3, behavior=2)
+
+
+def test_sparse_video_released_by_rtcv_confirms_once_the_count_holds() -> None:
+    st = _state(_sparse(), quiet_s=15.0)
+    st.observe(_sparse_snap(cv=True, raw=5), now=2.0)
+    st.observe(_sparse_snap(cv=False), now=36.0)
+    st.observe(_sparse_snap(cv=False), now=50.0)
+    assert not st.index_done["raw"], "14 s since the drop; the window is 15 s"
+    st.observe(_sparse_snap(cv=False), now=51.0)
+    assert st.done
+    assert st.raw_check == "rtcv_released"
+    report = st.report("confirmed")
+    assert report["targets"]["raw"] == 381
+    assert report["raw_last_s"] == pytest.approx(3.77)
+    assert report["targets"]["raw_last_s"] == pytest.approx(12.7)
+    assert report["raw_coverage"] == pytest.approx(0.047)
+
+
+def test_sparse_video_still_listed_by_rtcv_is_not_done_even_when_flat() -> None:
+    st = _state(_sparse(), quiet_s=15.0)
+    for now in (2.0, 36.0, 100.0, 600.0):
+        st.observe(_sparse_snap(cv=True), now=now)
+    assert not st.index_done["raw"]
+    assert any("RT-CV is still processing the stream; 18 frame docs" in c for c in st.causes())
+
+
+def test_released_but_count_still_growing_is_not_done() -> None:
+    st = _state(_sparse(), quiet_s=15.0)
+    st.observe(_sparse_snap(cv=True, raw=5), now=2.0)
+    st.observe(_sparse_snap(cv=False, raw=10), now=30.0)
+    st.observe(_sparse_snap(cv=False, raw=14), now=40.0)
+    st.observe(_sparse_snap(cv=False, raw=18), now=50.0)
+    assert not st.index_done["raw"]
+    cause = next(c for c in st.causes() if c.startswith("raw:"))
+    assert cause == (
+        "raw: RT-CV released the stream; 18 frame docs (frames with detections), "
+        "still changing within the 15s quiet window"
+    )
+    st.observe(_sparse_snap(cv=False), now=65.0)
+    assert st.index_done["raw"]
+
+
+def test_sparse_gate_end_to_end_reports_coverage_not_a_stall() -> None:
+    clock = _FakeClock(1.2)
+
+    def timeline() -> Any:
+        return _sparse_snap(cv=clock.t < 36.0)
+
+    result = _gate([_sparse()], timeline, clock, quiet_s=15.0, deadline_s=120.0)
+    assert result["outcome"] == "confirmed"
+    assert result["per_video"][0]["raw_coverage"] == pytest.approx(0.047)
+
+
+def test_released_with_no_detections_passes_with_a_warning() -> None:
+    st = _state(_sparse(), quiet_s=15.0)
+    st.observe(_snap(cv=True, embed=3, tags=3), now=2.0)
+    st.observe(_snap(cv=False, embed=3, tags=3), now=30.0)
+    st.observe(_snap(cv=False, embed=3, tags=3), now=45.0)
+    assert st.done
+    assert any("wrote no frame docs" in w for w in st.warnings())
+
+
+def test_behavior_waits_out_the_quiet_window_while_counts_move() -> None:
+    st = _state(quiet_s=15.0)
+    st.observe(_snap(cv=True, raw=10, last_s=0.3), now=3.0)
+    st.observe(_snap(raw=6298, last_s=209.966, embed=42, tags=42, behavior=4), now=218.0)
+    st.observe(_snap(raw=6298, last_s=209.966, embed=42, tags=42, behavior=8), now=220.0)
+    st.observe(_snap(raw=6298, last_s=209.966, embed=42, tags=42, behavior=8), now=230.0)
+    assert not st.index_done["behavior"], "changed 10 s ago; the window is 15 s"
+    st.observe(_snap(raw=6298, last_s=209.966, embed=42, tags=42, behavior=8), now=235.0)
+    assert st.done
+    assert st.per_index_done_s()["behavior"] == pytest.approx(220.0)
+
+
+def test_zero_behavior_objects_is_done_with_no_done_time() -> None:
+    st = _state(quiet_s=15.0)
+    st.observe(_snap(cv=True, raw=10, last_s=0.3), now=3.0)
+    st.observe(_snap(raw=6298, last_s=209.966, embed=42, tags=42), now=218.0)
+    st.observe(_snap(raw=6298, last_s=209.966, embed=42, tags=42), now=233.0)
+    assert st.done
+    assert st.per_index_done_s()["behavior"] is None
+    assert st.report("confirmed")["ingest_s"] == pytest.approx(218.0)
+
+
+def test_done_time_is_the_last_change_not_the_end_of_the_quiet_window() -> None:
+    """The measured run end to end: raw last changes at the first poll after 218.2 s."""
+    clock = _FakeClock(1.2)
+    result = _gate([_warehouse()], lambda: _measured_timeline(clock.t), clock, poll_s=2.0, quiet_s=15.0)
+
+    assert result["outcome"] == "confirmed"
+    report = result["per_video"][0]
+    done = report["per_index_done_s"]
+    assert done["tags"] == pytest.approx(9.2)
+    assert done["embed"] == pytest.approx(27.2)
+    assert done["behavior"] == pytest.approx(187.2)
+    assert done["raw"] == pytest.approx(219.2)
+    assert report["ingest_s"] == pytest.approx(219.2), "not 234.2, when the window closed"
+    assert result["waited_s"] >= 15.0 + 219.2 - 1.2 - 1e-6
+    assert report["counts"] == {"raw": 6298, "embed": 42, "tags": 42, "behavior": 8}
+    assert report["over_target"] == []
+
+
+def test_a_transient_elasticsearch_error_keeps_polling() -> None:
+    import requests
+
+    clock = _FakeClock(300.0)
+    finished = _snap(cv=False, raw=6298, last_s=209.966, embed=42, tags=42, behavior=8)
+    responses: list[Any] = [
+        _snap(cv=True, raw=10, last_s=0.3),
+        requests.ConnectionError("ingress reset"),
+        flows.ingest_readiness.IngestPollError("_msearch returned None"),
+    ]
+
+    def poll() -> Any:
+        item = responses.pop(0) if responses else finished
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    result = _gate([_warehouse()], poll, clock, quiet_s=4.0, deadline_s=600.0)
+    assert result["outcome"] == "confirmed"
+    assert result["poll_errors"] == 2
+
+
+def test_double_processing_is_flagged_not_failed() -> None:
+    st = _state()
+    st.observe(_snap(cv=True, raw=10, last_s=0.3), now=3.0)
+    st.observe(_snap(raw=6298, last_s=209.966, embed=84, tags=42, behavior=8), now=218.0)
+    st.observe(_snap(raw=6298, last_s=209.966, embed=84, tags=42, behavior=8), now=240.0)
+    assert st.done
+    assert st.report("confirmed")["over_target"] == ["embed"]
+
+
+def test_an_unknown_duration_fails_fast_instead_of_waiting_out_the_deadline() -> None:
+    clock = _FakeClock()
+    result = _gate([_warehouse(duration_s=None)], lambda: pytest.fail("must not poll"), clock)
+    assert result["outcome"] == "failed"
+    assert "duration unknown" in result["per_video"][0]["causes"][0]
+
+
+def test_required_indexes_can_be_narrowed_for_profiles_without_vlm_or_cv() -> None:
+    st = _state(require={"embed"})
+    st.observe(_snap(embed=42), now=27.0)
+    assert st.done
+    with pytest.raises(ValueError):
+        flows.wait_for_ingest_complete("https://h", [_warehouse()], require={"behavior"})
+
+
+def test_missing_tags_say_why_and_how_to_opt_out() -> None:
+    st = _state(require={"embed", "tags"})
+    st.observe(_snap(embed=42), now=27.0)
+    assert not st.done
+    assert any("--ingest-require" in c for c in st.causes())
+
+
+def test_a_poll_is_three_requests_with_counts_from_search_not_cat(monkeypatch: Any) -> None:
+    import requests
+
+    calls: list[tuple[str, str]] = []
+
+    class _Resp:
+        def __init__(self, payload: Any) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Any:
+            return self._payload
+
+    def fake_get(url: str, **_kw: Any) -> Any:
+        calls.append(("GET", url))
+        return _Resp({"stream-info": {"stream-count": 1, "stream-info": [
+            {"camera_id": _SID, "camera_name": _NAME, "source_id": 0}
+        ]}})
+
+    def fake_post(url: str, **kw: Any) -> Any:
+        calls.append(("POST", url))
+        if url.endswith("/_msearch"):
+            lines = [json.loads(line) for line in kw["data"].strip().splitlines()]
+            assert [h["index"] for h in lines[::2]] == [
+                flows.RAW_INDEX, flows.EMBED_INDEX, flows.BEHAVIOR_INDEX,
+            ]
+            # Filtered to the expected sensors, sized to cover them all.
+            raw_body = lines[1]
+            assert raw_body["query"] == {"terms": {"sensorId.keyword": [_NAME]}}
+            assert raw_body["aggs"]["by"]["terms"]["size"] == 1
+            assert lines[3]["query"] == {"terms": {"sensor.id.keyword": [_SID]}}
+            return _Resp({"responses": [
+                {"aggregations": {"by": {"buckets": [
+                    {"key": _NAME, "doc_count": 6298, "last": {"value": _ANCHOR_MS + 209966.0}}
+                ]}}},
+                {"aggregations": {"by": {"buckets": [{"key": _SID, "doc_count": 42}]}}},
+                {"aggregations": {"by": {"buckets": [{"key": _NAME, "doc_count": 8}]}}},
+            ]})
+        assert "/elasticsearch/default_*/_search" in url
+        assert kw["params"] == {"ignore_unavailable": "true"}
+        return _Resp({"aggregations": {"by": {"buckets": [
+            {"key": "default_" + _SID.replace("-", "_"), "doc_count": 42}
+        ]}}})
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(requests, "post", fake_post)
+    snap = flows.poll_ingest("https://host:7777/", [_warehouse()])
+
+    assert [m for m, _ in calls] == ["GET", "POST", "POST"]
+    assert calls[0][1] == "https://host:7777/rtvi-cv/api/v1/stream/get-stream-info"
+    assert _NAME in snap.cv_active and _SID in snap.cv_active
+    assert snap.raw[_NAME] == (6298, _ANCHOR_MS + 209966.0)
+    assert snap.embed == {_SID: 42}
+    assert snap.behavior == {_NAME: 8}
+    assert snap.tags == {"default_" + _SID.replace("-", "_"): 42}
+
+
+def test_an_elasticsearch_error_inside_msearch_is_a_poll_failure(monkeypatch: Any) -> None:
+    import requests
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Any:
+            return {"responses": [{"error": {"type": "search_phase_execution_exception"}}]}
+
+    monkeypatch.setattr(requests, "post", lambda *_a, **_k: _Resp())
+    with pytest.raises(ValueError, match="search_phase_execution_exception"):
+        flows.poll_ingest("https://h:7777", [_warehouse()], require={"embed"})
+
+
+def test_stale_documents_before_upload_abort_the_run(monkeypatch: Any, tmp_path: Path) -> None:
+    import requests
+
+    import run_eval_flows as rf
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Any:
+            return {"responses": [
+                {"aggregations": {"by": {"buckets": [{"key": _NAME, "doc_count": 6298}]}}},
+                {"aggregations": {"by": {"buckets": []}}},
+            ]}
+
+    sent: list[dict[str, Any]] = []
+
+    def fake_post(_url: str, **kw: Any) -> Any:
+        sent.extend(json.loads(line) for line in kw["data"].strip().splitlines())
+        return _Resp()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(SystemExit, match="stale documents") as exc:
+        rf.check_stale_documents(
+            "https://h:7777", [tmp_path / f"{_NAME}.mp4"], flows.DEFAULT_REQUIRE
+        )
+    assert "raw 6298" in str(exc.value)
+    # Both VST spellings are asked, in the case ES stores them.
+    assert {_NAME, f"{_NAME}.mp4"} <= set(sent[1]["query"]["terms"]["sensorId.keyword"])
+
+
+def test_clean_indexes_let_the_upload_proceed(monkeypatch: Any, tmp_path: Path) -> None:
+    import requests
+
+    import run_eval_flows as rf
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Any:
+            return {"responses": [{"aggregations": {"by": {"buckets": []}}}] * 2}
+
+    monkeypatch.setattr(requests, "post", lambda *_a, **_k: _Resp())
+    rf.check_stale_documents("https://h:7777", [tmp_path / "clip.mp4"], flows.DEFAULT_REQUIRE)
+
+
+def test_batch_stats_fill_the_doc_table() -> None:
+    clock = _FakeClock(1.2)
+    long_video = _warehouse()
+    short_video = _warehouse(
+        name="warehouse_safety_0001", sensor_id="99999999-2222-3333-4444-555555555555",
+        duration_s=25.0, fps=10.0, upload_start_mono=1.5, video_name="warehouse_safety_0001",
+        file_size_mb=6.6,
+    )
+
+    def poll() -> Any:
+        snap = _measured_timeline(clock.t)
+        t = clock.t - 1.5
+        short_tag = "default_" + short_video.sensor_id.replace("-", "_")
+        if t > 0:
+            snap.cv_active |= {short_video.name} if t < 30 else set()
+            snap.raw[short_video.name] = (244 if t >= 31 else 10, _ANCHOR_MS + (24.6 if t >= 31 else 1.0) * 1000)
+            snap.embed[short_video.sensor_id] = 5 if t >= 10 else 1
+            snap.tags[short_tag] = 5
+        return snap
+
+    result = _gate([long_video, short_video], poll, clock)
+    assert result["outcome"] == "confirmed"
+    stats = flows.aggregate_ingest_stats(result)
+
+    assert stats["videos"] == 2
+    assert stats["duration_range_s"] == [25.0, 210.0]
+    assert stats["total_size_mb"] == 156.6
+    assert stats["chunks"] == {"total": 47, "avg_per_video": 23.5}
+    assert stats["behavior_check"] == "quiet_window"
+    assert stats["poll_interval_s"] == 2.0
+    assert stats["wall_s"] == pytest.approx(219.2)
+    assert stats["video_min_per_min"] == pytest.approx(235.0 / 219.2, abs=1e-3)
+    assert set(stats["embed_done_s"]) == {"mean", "p90"}
+    assert stats["ingest_s"]["p90"] == pytest.approx(219.2)
+    assert {r["sensor"] for r in result["per_video"]} == {_NAME, "warehouse_safety_0001"}
+    assert "per_video" not in stats, "the per-video report lives once, in flow.ingest_readiness"
+
+
+def test_ingest_gate_options_and_their_validation() -> None:
+    import run_eval_flows as rf
+
+    parsed = rf.parse_args(["--endpoint", "https://host:8000"])
+    assert parsed.ingest_require == flows.DEFAULT_REQUIRE
+    assert parsed.ingest_poll_s == 2.0
+    assert parsed.ingest_quiet_s == 15.0
+    assert parsed.chunk_s == 5.0
+    assert parsed.ingest_deadline_s is None
+    assert parsed.legacy_index_probe is False
+    assert flows.vss_origin_for("https://host:8000") == "https://host:7777"
+
+    narrowed = rf.parse_args(["--endpoint", "https://h:8000", "--ingest-require", "embed, raw"])
+    assert narrowed.ingest_require == frozenset({"embed", "raw"})
+    for bad in ("embed,bogus", "behavior", ""):
+        with pytest.raises(SystemExit):
+            rf.parse_args(["--endpoint", "https://h:8000", "--ingest-require", bad])
+
+
+def test_upload_records_carry_what_the_gate_times_from(tmp_path: Path, monkeypatch: Any) -> None:
+    import requests
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"x")
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"sensorId": "abc-123"}
+
+    monkeypatch.setattr(requests, "post", lambda *_a, **_k: _Resp())
+    monkeypatch.setattr(flows.ingest, "probe_media", lambda _p: {"duration_s": 25.0, "fps": 10.0})
+    record = flows.VstDirectIngest("https://host:30888").upload(video)
+
+    assert record["duration_s"] == 25.0
+    assert record["fps"] == 10.0
+    assert isinstance(record["upload_start_mono"], float)
+    assert record["upload_start_utc"]
+
+
+def test_frame_rate_parsing_handles_ntsc_and_unknown() -> None:
+    assert flows.ingest._parse_rate("30000/1001") == pytest.approx(29.97)
+    assert flows.ingest._parse_rate("30/1") == 30.0
+    assert flows.ingest._parse_rate("0/0") is None
+    assert flows.ingest._parse_rate(None) is None
+
+
+def test_timeline_duration_is_the_fallback_when_ffprobe_is_missing() -> None:
+    timeline = {"start_time": "2025-01-01T00:00:00.000Z", "end_time": "2025-01-01T00:03:30.000Z"}
+    assert flows.timeline_duration_s(timeline) == 210.0
+    assert flows.timeline_duration_s({"checked": False}) is None

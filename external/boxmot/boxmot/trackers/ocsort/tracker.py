@@ -1,0 +1,310 @@
+# Mikel Broström 🔥 BoxMOT 🧾 AGPL-3.0 license
+
+"""
+This script is adopted from the SORT script by Alex Bewley alex@bewley.ai
+"""
+
+import numpy as np
+from typing_extensions import Unpack
+
+from boxmot.trackers.common.association import (
+    AssociationStage,
+    apply_motion_fusion,
+    detection_track_similarity_assignment,
+    fuse_score,
+    run_association_stage,
+    solve_assignment,
+)
+from boxmot.trackers.common.association.velocity import associate
+from boxmot.trackers.common.box.base import BoxTracker
+from boxmot.trackers.common.constructor import BoxTrackerOptions, validate_runtime_options
+from boxmot.trackers.common.motion.batching import (
+    current_track_boxes,
+    observation_output_boxes,
+    predict_tracks,
+    update_tracks,
+)
+from boxmot.trackers.common.motion.cmc.registry import create_cmc
+from boxmot.trackers.common.motion.kalman_filters.config import KalmanConfig
+from boxmot.trackers.common.tracking.observations import k_previous_obs
+from boxmot.trackers.ocsort.config import OcSortConfig
+from boxmot.trackers.ocsort.track import KalmanBoxTracker
+
+
+class OcSort(BoxTracker):
+    """Track AABB or OBB detections using observation-centric Kalman motion.
+
+    Matching combines geometric similarity with observed motion direction.
+    Centroid association additionally uses frame dimensions.
+
+    Attributes:
+        frame_count (int): Number of processed frames.
+        active_tracks (list): Currently active tracks.
+    """
+
+    supports_variable_dt = True
+
+    uses_frame_dimensions_for_association = True
+
+    def __init__(
+        self,
+        config: OcSortConfig | None = None,
+        *,
+        kalman: KalmanConfig | None = None,
+        **kwargs: Unpack[BoxTrackerOptions],
+    ) -> None:
+        """Configure observation history and optional low-confidence recovery.
+
+        Args:
+            config: Immutable algorithm settings. None selects OcSortConfig defaults.
+            kalman: Immutable filter noise, timing, and supported behavior settings.
+                None preserves tracker defaults.
+            **kwargs: Runtime ``per_class``, ``is_obb``, ``class_ids``, ``class_names``,
+                ``mask_guidance``, and ``edgetam`` settings.
+        """
+        config = OcSortConfig.resolve(config)
+        validate_runtime_options(kwargs)
+        self.config = config
+        super().__init__(
+            det_thresh=config.det_thresh,
+            max_age=config.max_age,
+            max_obs=config.max_obs,
+            min_hits=config.min_hits,
+            iou_threshold=config.iou_threshold,
+            asso_func=config.asso_func,
+            centroid_max_distance=config.centroid_max_distance,
+            kalman=kalman,
+            **kwargs,
+        )
+
+        # Store OcSort-specific parameters
+        self.min_conf: float = config.min_conf
+        self.delta_t: int = config.delta_t
+        self.inertia: float = config.inertia
+        self.use_byte: bool = config.use_byte
+        self.frame_count: int = 0
+        self.cmc = create_cmc(config.cmc_method, enabled=config.use_cmc)
+        self._requires_frame = self._requires_frame or self.cmc is not None
+        if self.cmc is not None:
+            self._requires_frame_dimensions_only = False
+
+        # Initialize tracker collections
+        self.active_tracks: list = []
+
+    def _first_pass_similarity(
+        self, similarity: np.ndarray, tracks: list, detections: np.ndarray, *, threshold: float
+    ) -> np.ndarray:
+        """Optionally score-fuse geometry before existing first-pass guidance."""
+        if self.config.fuse_detection_score:
+            scores = detections[:, self.detection_layout.conf_idx]
+            similarity = 1.0 - fuse_score((1.0 - similarity).T, scores).T
+        return self._condition_similarity(similarity, tracks, detections, threshold=threshold)
+
+    def _track_detections(
+        self,
+        dets: np.ndarray,
+        img: np.ndarray,
+        embs: np.ndarray = None,
+        masks: np.ndarray = None,
+    ) -> np.ndarray:
+        """Update tracks for one frame.
+
+        Args:
+            dets: Detection array for the current frame in the active BoxMOT
+                layout.
+            img: Current image frame.
+            embs: Optional appearance embeddings aligned with ``dets``.
+
+        Returns:
+            Array of active tracks with the object ID in the last column.
+
+        Notes:
+            Call this once per frame, including frames with no detections.
+            Pass an empty detection array with the matching layout when a frame
+            has no detections. The number of returned tracks may differ from the
+            number of detections provided.
+        """
+
+        self.frame_count += 1
+        cmc_dets = dets
+
+        batch = self._make_detection_batch(dets, embs=embs, masks=masks, copy=False)
+        high_batch, second_batch = batch.split_by_confidence(
+            high_thresh=self.det_thresh,
+            low_thresh=self.min_conf,
+        )
+        dets_second = second_batch.as_box_conf_detections(dtype=dets.dtype)
+        dets = high_batch.as_box_conf_detections(dtype=dets.dtype)
+
+        # get predicted locations from existing trackers.
+        predictions = predict_tracks(self.active_tracks, dt=self._prediction_dt)
+        if self.cmc is not None:
+            self.apply_cmc(img, cmc_dets, self.active_tracks)
+            boxes = current_track_boxes(self.active_tracks, is_obb=self.is_obb)
+        else:
+            boxes = np.asarray([prediction[0][: self.detection_layout.box_cols] for prediction in predictions]).reshape(
+                -1, self.detection_layout.box_cols
+            )
+        valid = np.isfinite(boxes).all(axis=1)
+        if not valid.all():
+            self.active_tracks = [track for track, keep in zip(self.active_tracks, valid, strict=True) if keep]
+            boxes = boxes[valid]
+        trks = np.zeros((len(boxes), self.detection_layout.box_with_conf_cols))
+        trks[:, : self.detection_layout.box_cols] = boxes
+
+        velocities = np.array(
+            [trk.velocity if trk.velocity is not None else (0, 0) for trk in self.active_tracks]
+        )
+
+        k_observations = np.array(
+            [k_previous_obs(trk.observations, trk.age, self.delta_t, is_obb=self.is_obb) for trk in self.active_tracks]
+        )
+
+        """
+            First round of association
+        """
+        first_stage = AssociationStage(
+            name="ocsort_high",
+            threshold=self.iou_threshold,
+            matcher=lambda _tracks, _detections: associate(
+                dets,
+                trks,
+                self.asso_func,
+                self.iou_threshold,
+                velocities,
+                k_observations,
+                self.inertia,
+                is_obb=self.is_obb,
+                gate_before_assignment=self._asso_func_base_name == "centroid",
+                similarity_conditioner=lambda similarity: self._first_pass_similarity(
+                    similarity, _tracks, _detections, threshold=self.iou_threshold
+                ),
+                cost_conditioner=(
+                    lambda costs: apply_motion_fusion(
+                        (1.0 + costs).T,
+                        _tracks,
+                        _detections[:, : self.detection_layout.box_cols],
+                        mode=self.config.motion_fusion,
+                        only_position=self.config.motion_fusion_only_position,
+                        lambda_=self.config.motion_fusion_lambda,
+                    ).T - 1.0
+                ) if self.config.motion_fusion != "off" else None,
+            ),
+        )
+        first_result = run_association_stage(first_stage, self.active_tracks, dets)
+        matched = first_result.matches
+        unmatched_dets = first_result.unmatched_dets
+        unmatched_trks = first_result.unmatched_tracks
+        update_tracks(
+            [self.active_tracks[t] for t, _ in matched],
+            [dets[d] for _, d in matched],
+            [high_batch.clss[d] for _, d in matched],
+            [high_batch.det_inds[d] for _, d in matched],
+        )
+
+        """
+            Second round of associaton by OCR
+        """
+        # BYTE association
+        if self.use_byte and len(dets_second) > 0 and unmatched_trks.shape[0] > 0:
+            u_trks = trks[unmatched_trks]
+            similarity = np.asarray(self.asso_func(dets_second, u_trks))
+            similarity = self._condition_similarity(
+                similarity,
+                [self.active_tracks[t] for t in unmatched_trks],
+                dets_second,
+                threshold=self.iou_threshold,
+            )
+            low_stage = AssociationStage(
+                name="ocsort_low",
+                threshold=self.iou_threshold,
+                matcher=lambda _tracks, _detections: detection_track_similarity_assignment(
+                    similarity,
+                    self.iou_threshold,
+                    solve_assignment,
+                    gate_before_assignment=self._asso_func_base_name == "centroid",
+                ),
+            )
+            low_result = run_association_stage(low_stage, u_trks, dets_second)
+            to_remove_trk_indices = [unmatched_trks[t] for t, _ in low_result.matches]
+            update_tracks(
+                [self.active_tracks[t] for t in to_remove_trk_indices],
+                [dets_second[d] for _, d in low_result.matches],
+                [second_batch.clss[d] for _, d in low_result.matches],
+                [second_batch.det_inds[d] for _, d in low_result.matches],
+            )
+            unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
+
+        if unmatched_dets.shape[0] > 0 and unmatched_trks.shape[0] > 0:
+            left_dets = dets[unmatched_dets]
+            last_boxes = np.asarray([self.active_tracks[index].last_observation for index in unmatched_trks])
+            # New tracks retain a negative-confidence sentinel until their first
+            # explicit update. Keep those rows out of strict OBB geometry while
+            # preserving the mapping back to active-track indices.
+            observed = last_boxes[:, -1] >= 0
+            rematch_trk_indices = unmatched_trks[observed]
+            if rematch_trk_indices.size:
+                left_trks = last_boxes[observed]
+                similarity = np.asarray(self.asso_func(left_dets, left_trks))
+                similarity = self._condition_similarity(
+                    similarity,
+                    [self.active_tracks[t] for t in rematch_trk_indices],
+                    left_dets,
+                    threshold=self.iou_threshold,
+                )
+                rematch_stage = AssociationStage(
+                    name="ocsort_high_rematch",
+                    threshold=self.iou_threshold,
+                    matcher=lambda _tracks, _detections: detection_track_similarity_assignment(
+                        similarity,
+                        self.iou_threshold,
+                        solve_assignment,
+                        gate_before_assignment=self._asso_func_base_name == "centroid",
+                    ),
+                )
+                rematch_result = run_association_stage(rematch_stage, left_trks, left_dets)
+                to_remove_det_indices = [unmatched_dets[d] for _, d in rematch_result.matches]
+                to_remove_trk_indices = [rematch_trk_indices[t] for t, _ in rematch_result.matches]
+                update_tracks(
+                    [self.active_tracks[t] for t in to_remove_trk_indices],
+                    [dets[d] for d in to_remove_det_indices],
+                    [high_batch.clss[d] for d in to_remove_det_indices],
+                    [high_batch.det_inds[d] for d in to_remove_det_indices],
+                )
+                unmatched_dets = np.setdiff1d(unmatched_dets, np.array(to_remove_det_indices))
+                unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
+
+        for m in unmatched_trks:
+            self.active_tracks[m].update(None, None, None)
+
+        # create and initialise new trackers for unmatched detections
+        for i in unmatched_dets:
+            trk = KalmanBoxTracker(
+                dets[i],
+                high_batch.clss[i],
+                high_batch.det_inds[i],
+                delta_t=self.delta_t,
+                max_obs=self.max_obs,
+                is_obb=self.is_obb,
+                id_allocator=self.id_allocator,
+                noise_config=self.kalman_noise_config,
+                kalman_type=self.kalman_config.type,
+            )
+            self.active_tracks.append(trk)
+        i = len(self.active_tracks)
+        output_tracks = []
+        for trk in reversed(self.active_tracks):
+            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                output_tracks.append(trk)
+            i -= 1
+            # remove dead tracklet
+            if trk.time_since_update > self.max_age:
+                self.active_tracks.pop(i)
+        return self.format_outputs(
+            output_tracks,
+            boxes=observation_output_boxes(output_tracks, is_obb=self.is_obb),
+            dtype=np.float32,
+        )
+
+    def reset(self) -> None:
+        self._reset_common_state()
