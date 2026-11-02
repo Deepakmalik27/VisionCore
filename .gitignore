@@ -1,3 +1,20 @@
+# ── generated decks & large presentation artifacts ─────────────────────────
+docs/deck/*.pptx
+docs/deck/index.html
+docs/deck/~*
+docs/deck/frame_zones.png
+
+# ── datasets & frame captures ───────────────────────────────────────────────
+label_pkg/*/images/
+
+# ── raw cvat dumps ──────────────────────────────────────────────────────────
+eval/cvat_snapshots/
+
+# ── tool cache & generated AST ──────────────────────────────────────────────
+graphify-out/
+
+# ── manual backups ──────────────────────────────────────────────────────────
+backups/
 # ── data & artefacts (never in git) ─────────────────────────────────────────
 data/
 output/
